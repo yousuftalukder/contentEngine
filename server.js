@@ -73,6 +73,12 @@ const stripHtml = (s) => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g
 const decodeXml = (s) => String(s || "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, "&");
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const tmpPath = (ext) => join(TMP, `${randomUUID()}.${ext}`);
+// Which worker lanes this process runs. Default: all. Split for production: web service LANES=ingest,text,image,publish,metrics
+// and a Render Background Worker with LANES=video (ffmpeg/yt-dlp memory stays away from the dashboard). The periodic sweeps
+// (polling sources, publishing due assets, review deadlines, metrics, cleanup) run where "ingest" runs unless RUN_SWEEPS overrides.
+const ALL_QUEUES = ["ingest", "text", "image", "video", "publish", "metrics"];
+const LANES = (ENV.LANES ? ENV.LANES.split(",").map((s) => s.trim()).filter((s) => ALL_QUEUES.includes(s)) : ALL_QUEUES);
+const RUN_SWEEPS = ENV.RUN_SWEEPS != null ? flag(ENV.RUN_SWEEPS) : LANES.includes("ingest");
 function tokenCost(model, inTok = 0, outTok = 0) {
   const hit = Object.entries(PRICES).find(([k]) => String(model || "").startsWith(k));
   const [i, o] = hit ? hit[1] : [0, 0];
@@ -637,10 +643,23 @@ function svgCard(headline, specs) {
   const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1115"/><stop offset="1" stop-color="#22305a"/></linearGradient></defs><rect width="${w}" height="${h}" fill="url(#g)"/><rect x="60" y="${h - 160}" width="180" height="10" fill="#6c8cff"/>${lines.slice(0, 6).map((l, i) => `<text x="60" y="${h / 2 - (lines.length * 30) + i * 70}" font-family="DejaVu Sans, Arial, sans-serif" font-size="56" font-weight="700" fill="#ffffff">${esc(l)}</text>`).join("")}<text x="60" y="${h - 90}" font-family="DejaVu Sans, Arial" font-size="28" fill="#9aa1ae">${esc(specs.brand || "Content Engine")}</text></svg>`;
 }
+// Instagram accepts JPEG only and Facebook prefers it; every generated raster image is stored as JPEG. SVG (mock) stays SVG
+// unless this ffmpeg build can rasterise it. Falls back to the original bytes if conversion fails.
+async function toJpeg(bytes, mime, quality = 3) {
+  if (mime === "image/jpeg") return { bytes, mime, ext: "jpg" };
+  const inp = tmpPath(mime === "image/svg+xml" ? "svg" : mime === "image/webp" ? "webp" : "png"), out = tmpPath("jpg");
+  try { await writeFile(inp, bytes); await exec("ffmpeg", ["-y", "-i", inp, "-vf", "format=yuv420p", "-q:v", String(quality), out], { timeoutMs: 60000 }); return { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; }
+  catch (e) { warn(`jpeg conversion skipped: ${e.message.slice(0, 120)}`); return { bytes, mime, ext: mime === "image/svg+xml" ? "svg" : mime === "image/webp" ? "webp" : "png" }; }
+  finally { await cleanup(inp, out); }
+}
+async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}) {
+  const j = await toJpeg(bytes, mime);
+  const url = await storeFile(`images/${newId()}.${j.ext}`, j.bytes, j.mime);
+  return recordMedia({ contentItemId, kind: "IMAGE", url, mime: j.mime, width: dims.width || null, height: dims.height || null, meta: { ...meta, source_mime: mime } });
+}
 impl("IMAGE", "image_mock", { label: "Mock image (SVG card)", create: () => ({
   async generate({ headline, specs = {}, contentItemId }) {
-    const url = await storeFile(`images/${newId()}.svg`, Buffer.from(svgCard(headline, specs)), "image/svg+xml");
-    return recordMedia({ contentItemId, kind: "IMAGE", url, mime: "image/svg+xml", width: specs.width || 1080, height: specs.height || 1080, meta: { mock: true } });
+    return storeImage(Buffer.from(svgCard(headline, specs)), "image/svg+xml", contentItemId, { mock: true }, { width: specs.width || 1080, height: specs.height || 1080 });
   } }) });
 impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_IMAGE_MODEL } }, create: (cfg, ctx = {}) => ({
   async generate({ prompt, headline, specs = {}, contentItemId }) {
@@ -653,8 +672,7 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
       const part = (body.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData || p.inline_data);
       if (!part) throw new Error("Gemini returned no image (blocked by safety, or wrong model id?)");
       const d = part.inlineData || part.inline_data; const mime = d.mimeType || d.mime_type || "image/png";
-      const url = await storeFile(`images/${newId()}.${mime.includes("jpeg") ? "jpg" : "png"}`, Buffer.from(d.data, "base64"), mime);
-      const media = await recordMedia({ contentItemId, kind: "IMAGE", url, mime, meta: { model, prompt: full } });
+      const media = await storeImage(Buffer.from(d.data, "base64"), mime, contentItemId, { model, prompt: full });
       return { ...media, cost: IMAGE_PRICE_USD, units: 1 };
     }, ctx.pin);
   } }) });
@@ -667,8 +685,7 @@ impl("IMAGE", "openai_image", { label: "OpenAI image generation", configSchema: 
     return withKey("openai", async (key) => {
       const body = await fetchJson("https://api.openai.com/v1/images/generations", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify({ model, prompt: full, size, quality: cfg.quality || "medium", n: 1 }) });
       const b64 = body.data?.[0]?.b64_json; if (!b64) throw new Error("OpenAI returned no image");
-      const url = await storeFile(`images/${newId()}.png`, Buffer.from(b64, "base64"), "image/png");
-      const media = await recordMedia({ contentItemId, kind: "IMAGE", url, mime: "image/png", meta: { model, prompt: full } });
+      const media = await storeImage(Buffer.from(b64, "base64"), "image/png", contentItemId, { model, prompt: full });
       return { ...media, cost: Number(ENV.OPENAI_IMAGE_PRICE_USD ?? 0.04), units: 1 };
     }, ctx.pin);
   } }) });
@@ -747,14 +764,15 @@ async function publishRender(file, contentItemId, meta = {}) {
   return recordMedia({ contentItemId, kind: "VIDEO", url, mime: "video/mp4", duration: dur, meta });
 }
 impl("RENDER", "render_mock", { label: "Mock renderer", create: () => ({
-  async renderForChannel({ media }) { return { url: media?.url || `mock://render/${newId()}.mp4`, kind: media?.kind || "VIDEO" }; },
+  async renderForChannel({ media }) { return media ? { url: media.url, kind: media.kind } : { url: null, kind: "TEXT" }; },
   async renderClip({ clip, contentItemId }) { return recordMedia({ contentItemId, kind: "VIDEO", url: `mock://render/${newId()}.mp4`, mime: "video/mp4", duration: clip.end - clip.start, meta: { mock: true } }); },
   async renderSlideshow({ contentItemId, audio }) { return recordMedia({ contentItemId, kind: "VIDEO", url: `mock://render/${newId()}.mp4`, mime: "video/mp4", duration: audio?.duration_seconds || 30, meta: { mock: true } }); },
 }) });
 impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
   // Per-channel conversion at publish time: vertical for short-form, otherwise passthrough.
   async renderForChannel({ media, channel, item }) {
-    if (!media) throw new Error("no hero media to render");
+    // No hero media = a text-only post (LONG_POST with cover_image:false). Publishers post the caption alone.
+    if (!media) return { url: null, kind: "TEXT" };
     if (media.kind !== "VIDEO" || channel.format !== "SHORT_FORM_VOICEOVER") return { url: media.url, kind: media.kind };
     const meta = P(media.meta) || {}; if (meta.orientation === "9:16") return { url: media.url, kind: "VIDEO" };
     const src = await toTmpFile(media.url, "mp4"); const out = tmpPath("mp4");
@@ -801,7 +819,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     if (!images.length) throw new Error("slideshow needs at least one image");
     const a = await toTmpFile(audio.url, "mp3"); const dur = (await ffprobeDuration(a)) || audio.duration_seconds || images.length * 4;
     const per = dur / images.length; const files = [];
-    for (const im of images) files.push(await toTmpFile(im.url, "png"));
+    for (const im of images) files.push(await toTmpFile(im.url));
     const list = tmpPath("txt"); await writeFile(list, files.map((f) => `file '${f}'\nduration ${per.toFixed(3)}`).join("\n") + `\nfile '${files.at(-1)}'\n`);
     const [w, h] = orientation === "16:9" ? [1920, 1080] : [1080, 1920];
     const vf = [`scale=${w}:${h}:force_original_aspect_ratio=increase`, `crop=${w}:${h}`, `zoompan=z='min(zoom+0.0008,1.12)':d=${Math.round(per * 30)}:s=${w}x${h}:fps=30`, "format=yuv420p"];
@@ -844,6 +862,7 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
         const r = await post(`${acct}/feed`, { message: caption, access_token: token }); return { externalId: r.id, publishedUrl: `https://www.facebook.com/${r.id}` };
       }
       if (channel.platform === "INSTAGRAM") {
+        if (mediaKind !== "IMAGE" && mediaKind !== "VIDEO") throw new Error("Instagram cannot publish a text-only post — give this program a cover image or unlink the Instagram channel");
         const isVideo = mediaKind === "VIDEO";
         const c = await post(`${acct}/media`, isVideo ? { video_url: mediaUrl, media_type: "REELS", caption, access_token: token } : { image_url: mediaUrl, caption, access_token: token });
         for (let i = 0; i < 40; i++) { const s = await fetchJson(`${base}/${c.id}?${form({ fields: "status_code,status", access_token: token })}`); if (s.status_code === "FINISHED") break; if (s.status_code === "ERROR") throw new Error(`IG container error: ${s.status}`); if (!isVideo && i > 2) break; await sleep(5000); }
@@ -870,7 +889,7 @@ async function youtubeAccessToken(channel, cfg) {
 }
 impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { privacy: { type: "string", default: "public" }, category_id: { type: "string", default: "22" } }, create: (cfg, ctx = {}) => ({
   async publish({ channel, mediaUrl, mediaKind, caption, title, hashtags = [] }) {
-    if (mediaKind !== "VIDEO") throw new Error("YouTube channel needs a VIDEO asset");
+    if (mediaKind !== "VIDEO") throw new Error(`YouTube channel needs a VIDEO asset (got ${mediaKind})`);
     const token = await youtubeAccessToken(channel, cfg); const pc = P(channel.platform_config) || {};
     const file = await toTmpFile(mediaUrl, "mp4"); const bytes = await readFile(file); await cleanup(file);
     const isShort = channel.format === "SHORT_FORM_VOICEOVER";
@@ -1049,9 +1068,32 @@ function styleBlock(style) {
 const llmFor = (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, niche.script_adapter_fallbacks, fn);
 const imageFor = (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", niche.image_adapter_fallbacks, fn);
 
+// Fetch the source page of an article and keep its main text, so the writer works from the real story instead of
+// the one-line RSS summary. Readability-lite: drop scripts/nav/etc, prefer <article>, keep substantial <p> blocks.
+// Result is cached in source_items.raw.article_text; failures are non-fatal (the summary is used as before).
+const ARTICLE_TEXT_MAX = Number(ENV.ARTICLE_TEXT_MAX_CHARS) || 6000;
+function extractArticleText(html) {
+  let h = String(html).replace(/<!--[\s\S]*?-->/g, "").replace(/<(script|style|noscript|svg|iframe|form|nav|header|footer|aside|figure)\b[\s\S]*?<\/\1>/gi, " ");
+  const art = h.match(/<article\b[\s\S]*?<\/article>/i)?.[0] || h.match(/<main\b[\s\S]*?<\/main>/i)?.[0] || h;
+  const paras = [...art.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)].map((m) => decodeXml(stripHtml(m[1]))).filter((t) => t.length > 60 && /[.!?।]/.test(t));
+  const text = paras.join("\n\n").trim();
+  return text.length > 200 ? text.slice(0, ARTICLE_TEXT_MAX) : "";
+}
+async function articleText(sourceItem) {
+  const raw = P(sourceItem.raw) || {};
+  if (typeof raw.article_text === "string") return raw.article_text;                       // cached (may be "" = tried, nothing usable)
+  if (!(await setting("ingest.fetch_article_text", true)) || !/^https?:/.test(sourceItem.url || "")) return "";
+  let text = "";
+  try {
+    const res = await fetch(sourceItem.url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "user-agent": "Mozilla/5.0 (compatible; ContentEngine/1.0; +article-fetch)", accept: "text/html,*/*" } });
+    if (res.ok && /html/i.test(res.headers.get("content-type") || "")) text = extractArticleText((await res.text()).slice(0, 1.5e6));
+  } catch (e) { warn(`article fetch ${sourceItem.url}: ${e.message.slice(0, 120)}`); }
+  await q(`UPDATE source_items SET raw = COALESCE(raw, '{}'::jsonb) || $2::jsonb WHERE id = $1`, [sourceItem.id, JSON.stringify({ article_text: text })]).catch(() => {});
+  return text;
+}
 // Resolve the raw material for a text item: a routed source_item, or a legacy TOPIC adapter pull.
 async function materialFor(item, niche) {
-  if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); return { title: s.title, summary: s.summary, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, raw: P(s.raw) }; }
+  if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); const text = s.kind === "ARTICLE" ? await articleText(s) : ""; return { title: s.title, summary: s.summary, text, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, raw: P(s.raw) }; }
   const src = P(item.source_data_ref); if (item.topic && src && src.provider !== "topic_adapter_pending") return { title: item.topic, summary: src.description || src.summary || "", url: src.url || null, raw: src };
   const past = (await q(`SELECT topic FROM content_items WHERE niche_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 100`, [niche.id, item.id])).map((r) => r.topic);
   const ts = await resolve("TOPIC", niche.topic_source_adapter || "newsapi_mock");
@@ -1069,7 +1111,7 @@ async function generateStatic(item, niche, style) {
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
     system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style)}`,
-    prompt: `SOURCE MATERIAL\nTitle: ${m.title}\nSummary: ${m.summary || "(none)"}\nURL: ${m.url || "(none)"}\n\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a 350-600 word news article as simple HTML (<p>, <h2>) written from the material, ending with a one-line source credit\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
+    prompt: `SOURCE MATERIAL\nTitle: ${m.title}\nSummary: ${m.summary || "(none)"}\nURL: ${m.url || "(none)"}\n${m.text ? `Full text of the source article:\n"""\n${m.text}\n"""\n` : "(Only the summary above is available — write ONLY what it supports; keep the article short rather than padding it.)\n"}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${m.text ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line source credit\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
     mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
   await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: d.captions || {}, hashtags: Array.isArray(d.hashtags) ? d.hashtags : [], image_prompt: d.image_prompt || null });
@@ -1084,7 +1126,7 @@ async function generateLongPost(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts with sources. Never fabricate a citation.",
-    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""} ${m.url || ""}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
+    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""} ${m.url || ""}${m.text ? `\nSource article text:\n${m.text.slice(0, 3000)}` : ""}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
     mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
   await addCost(item.id, research.cost);
   const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
@@ -1105,7 +1147,7 @@ async function generateSlideshowVideo(item, niche, style) {
   const slides = mc.slides || (long ? 12 : 10);
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 2500,
     system: `You write ${long ? "researched long-form YouTube video scripts" : "punchy 60-90 second facts videos"} for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Every sentence must be spoken narration — no stage directions.`,
-    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""}\nWrite a script split into exactly ${slides} sections. Return JSON: {"title": "video title", "sections": [{"narration": "spoken text for this section", "image_prompt": "what the viewer sees, no text"}], "description": "YouTube description", "hashtags": ["..."]}`,
+    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""}${m.text ? `\nSource article text:\n${m.text.slice(0, 3000)}` : ""}\nWrite a script split into exactly ${slides} sections. Return JSON: {"title": "video title", "sections": [{"narration": "spoken text for this section", "image_prompt": "what the viewer sees, no text"}], "description": "YouTube description", "hashtags": ["..."]}`,
     mock: { title: m.title, sections: Array.from({ length: Math.min(slides, 4) }, (_, i) => ({ narration: `Mock narration section ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["facts"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = d.sections || [];
   const script = sections.map((s) => s.narration).join("\n\n");
@@ -1263,7 +1305,7 @@ async function checkAndRepurpose(assetId) {
 }
 
 // === 9. worker lanes =====================================================
-const QUEUES = ["ingest", "text", "image", "video", "publish", "metrics"];
+const QUEUES = ALL_QUEUES;
 async function enqueue(type, payload, { queue = "text", priority = 0, runAfter = null, contentItemId = null, dedupeKey = null, maxAttempts = 3 } = {}) {
   if (dedupeKey) { const dup = await one(`SELECT id FROM jobs WHERE dedupe_key=$1 AND status IN ('PENDING','RUNNING')`, [dedupeKey]); if (dup) return dup.id; }
   const id = newId();
@@ -1346,7 +1388,9 @@ async function recoverAbandonedWork() {
   if (r1.length || r2.length) log(`recovered ${r1.length} jobs, failed ${r2.length} stuck items`);
 }
 function startWorkers() {
-  for (const qn of QUEUES) workerLoop(qn);
+  if (!LANES.length) { warn("LANES is set but names no known lane — this process serves HTTP only"); return; }
+  for (const qn of LANES) workerLoop(qn);
+  if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
   every(60000, sweepDueSources); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
@@ -1394,7 +1438,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
@@ -1586,5 +1630,5 @@ app.post("/api/seed", async (ctx) => {
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
   await recoverAbandonedWork();
   if (!ENV.DASHBOARD_PASSWORD) warn("DASHBOARD_PASSWORD is not set — the dashboard and API are OPEN. Fine locally, never on Render.");
-  server.listen(PORT, async () => { log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, storage: ${(await storageBackend()).name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`); startWorkers(); });
+  server.listen(PORT, async () => { log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, lanes: ${LANES.join(",") || "none"}, sweeps: ${RUN_SWEEPS}, storage: ${(await storageBackend()).name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`); startWorkers(); });
 })().catch((e) => { console.error("boot failed:", e); process.exit(1); });

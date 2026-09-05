@@ -1,11 +1,13 @@
 # Render Blueprint. Connect the GitHub repo in Render → "New Blueprint" and it picks this up.
-services:
-  - type: web
-    name: content-engine
-    runtime: docker
-    plan: starter          # free tier sleeps and kills background workers; starter or above for 24/7 polling
-    healthCheckPath: /health
-    autoDeploy: true
+#
+# Two processes from the same Dockerfile:
+#   content-engine        web service: dashboard + API + the light lanes (ingest, text, image, publish, metrics) + all sweeps
+#   content-engine-video  background worker: the video lane only (yt-dlp downloads, transcription, ffmpeg renders)
+# Both read the same secrets from the "content-engine-shared" env group, so a key is set once. Fill the group's values
+# in Render → Environment Groups after the first deploy (they are created empty).
+
+envVarGroups:
+  - name: content-engine-shared
     envVars:
       - key: DATABASE_URL          # Supabase → Connect → Session pooler (port 5432)
         sync: false
@@ -13,21 +15,15 @@ services:
         value: admin
       - key: DASHBOARD_PASSWORD
         sync: false
-      - key: SECRETS_KEY            # long random string (openssl rand -hex 32). Encrypts secrets stored from the dashboard. Never rotate casually.
+      - key: SECRETS_KEY            # openssl rand -hex 32. Encrypts secrets stored from the dashboard. Never lose it.
         sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
-      - key: SUPABASE_BUCKET
-        value: media
-      - key: PUBLIC_BASE_URL       # e.g. https://content-engine.onrender.com (used for portal links)
+      - key: PUBLIC_BASE_URL       # https://content-engine.onrender.com (portal links, local media URLs)
         sync: false
       - key: PORTAL_BASE_URL       # your news portal domain if different from PUBLIC_BASE_URL
         sync: false
       - key: STORAGE_BACKEND       # optional: r2 | supabase | local. Default: first configured of r2, supabase, local
         sync: false
-      - key: R2_ACCOUNT_ID         # Cloudflare R2 (recommended for video: free egress). Can also be stored from the dashboard as an "r2" credential.
+      - key: R2_ACCOUNT_ID         # Cloudflare R2 (or store as an "r2" credential in the dashboard). public_url is mandatory.
         sync: false
       - key: R2_ACCESS_KEY_ID
         sync: false
@@ -37,6 +33,13 @@ services:
         sync: false
       - key: R2_PUBLIC_URL         # https://pub-xxxx.r2.dev or your custom domain (bucket must be public)
         sync: false
+      - key: SUPABASE_URL          # only if using Supabase Storage instead of R2
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: media
+      # Provider keys are optional here — prefer adding them on the API keys page (vault). Env vars remain a fallback.
       - key: OPENAI_API_KEY
         sync: false
       - key: ANTHROPIC_API_KEY
@@ -57,3 +60,31 @@ services:
         sync: false
       - key: YOUTUBE_REFRESH_TOKEN
         sync: false
+
+services:
+  - type: web
+    name: content-engine
+    runtime: docker
+    plan: starter          # free tier sleeps and kills background workers; starter or above for 24/7 polling
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: content-engine-shared
+      - key: LANES
+        value: ingest,text,image,publish,metrics
+      - key: PG_POOL_MAX
+        value: "6"
+
+  - type: worker
+    name: content-engine-video
+    runtime: docker
+    plan: standard         # 2 GB: ffmpeg 1080p encodes + yt-dlp downloads need the headroom; scale up for long podcasts
+    autoDeploy: true
+    envVars:
+      - fromGroup: content-engine-shared
+      - key: LANES
+        value: video
+      - key: RUN_SWEEPS      # sweeps live on the web service; the worker only pulls jobs from the video queue
+        value: "0"
+      - key: PG_POOL_MAX
+        value: "4"
