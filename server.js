@@ -643,6 +643,25 @@ function svgCard(headline, specs) {
   const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1115"/><stop offset="1" stop-color="#22305a"/></linearGradient></defs><rect width="${w}" height="${h}" fill="url(#g)"/><rect x="60" y="${h - 160}" width="180" height="10" fill="#6c8cff"/>${lines.slice(0, 6).map((l, i) => `<text x="60" y="${h / 2 - (lines.length * 30) + i * 70}" font-family="DejaVu Sans, Arial, sans-serif" font-size="56" font-weight="700" fill="#ffffff">${esc(l)}</text>`).join("")}<text x="60" y="${h - 90}" font-family="DejaVu Sans, Arial" font-size="28" fill="#9aa1ae">${esc(specs.brand || "Content Engine")}</text></svg>`;
 }
+// ---- Headline overlay (compose step) -------------------------------------------------------------------------------
+// Image models are asked for the photo only; the headline is burned on afterwards with libass (the subtitles filter), which
+// shapes Bangla correctly via HarfBuzz and wraps text itself. Layout: dark stepped band over the lower third, brand tag,
+// headline. Set image_specs.render_text=true on a program to let the model draw the text instead (overlay is then skipped),
+// or image_specs.overlay=false for no text at all.
+const OVERLAY_FONT = ENV.OVERLAY_FONT || "Noto Sans Bengali";
+const assEsc = (t) => String(t || "").replace(/[\r\n]+/g, " ").replace(/[{}\\]/g, "").trim();
+const assColor = (hex, alpha = "00") => { const m = /^#?([0-9a-f]{6})$/i.exec(hex || ""); if (!m) return `&H${alpha}FFFFFF`; const h = m[1]; return `&H${alpha}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`.toUpperCase(); };
+async function imageDims(file) { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file]); const [w, h] = out.trim().split(",").map(Number); return { width: w || 1080, height: h || 1080 }; }
+async function composeHeadline(inPath, headline, specs = {}) {
+  const { width: w, height: h } = await imageDims(inPath);
+  const short = w > h, size = Math.round(h * (short ? 0.062 : 0.05) * (specs.overlay_scale || 1)), small = Math.round(size * 0.48);
+  const mL = Math.round(w * 0.06), mV = Math.round(h * 0.075), accent = assColor(specs.accent_color || "#6c8cff"), fg = assColor(specs.text_color || "#ffffff");
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${Math.round(h * 0.7)})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
+  const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
+  const band = [0.58, 0.68, 0.78].map((y, i) => `drawbox=x=0:y=ih*${y}:w=iw:h=ih:color=black@${0.18 + i * 0.16}:t=fill`).join(",");
+  try { await exec("ffmpeg", ["-y", "-i", inPath, "-vf", `${band},subtitles=${assPath.replace(/\\/g, "/").replace(/:/g, "\\:")}`, "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
+  finally { await cleanup(assPath); }
+}
 // Instagram accepts JPEG only and Facebook prefers it; every generated raster image is stored as JPEG. SVG (mock) stays SVG
 // unless this ffmpeg build can rasterise it. Falls back to the original bytes if conversion fails.
 async function toJpeg(bytes, mime, quality = 3) {
@@ -652,8 +671,14 @@ async function toJpeg(bytes, mime, quality = 3) {
   catch (e) { warn(`jpeg conversion skipped: ${e.message.slice(0, 120)}`); return { bytes, mime, ext: mime === "image/svg+xml" ? "svg" : mime === "image/webp" ? "webp" : "png" }; }
   finally { await cleanup(inp, out); }
 }
-async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}) {
-  const j = await toJpeg(bytes, mime);
+async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}, compose = null) {
+  let j = await toJpeg(bytes, mime);
+  if (compose?.headline && compose.specs?.render_text !== true && compose.specs?.overlay !== false && j.mime === "image/jpeg") {
+    const inp = tmpPath("jpg"); await writeFile(inp, j.bytes);
+    try { const out = await composeHeadline(inp, compose.headline, compose.specs); j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; meta = { ...meta, overlay: true }; await cleanup(out); }
+    catch (e) { warn(`headline overlay skipped: ${e.message.slice(0, 160)}`); }
+    finally { await cleanup(inp); }
+  }
   const url = await storeFile(`images/${newId()}.${j.ext}`, j.bytes, j.mime);
   return recordMedia({ contentItemId, kind: "IMAGE", url, mime: j.mime, width: dims.width || null, height: dims.height || null, meta: { ...meta, source_mime: mime } });
 }
@@ -665,14 +690,14 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
   async generate({ prompt, headline, specs = {}, contentItemId }) {
     const model = cfg.model || DEFAULTS.GEMINI_IMAGE_MODEL;
     const ar = specs.aspect_ratio || (specs.height > specs.width ? "9:16" : specs.width > specs.height ? "16:9" : "1:1");
-    const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === false ? "Do not render any text." : `Render this headline as bold, legible overlay text: "${headline}".`} Aspect ratio ${ar}.`;
+    const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === true ? `Render this headline as bold, legible overlay text: "${headline}".` : "Do not render any text, letters, captions or logos anywhere in the image; leave the lower third visually calm."} Aspect ratio ${ar}.`;
     return withKey("gemini", async (key) => {
       const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
         body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) });
       const part = (body.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData || p.inline_data);
       if (!part) throw new Error("Gemini returned no image (blocked by safety, or wrong model id?)");
       const d = part.inlineData || part.inline_data; const mime = d.mimeType || d.mime_type || "image/png";
-      const media = await storeImage(Buffer.from(d.data, "base64"), mime, contentItemId, { model, prompt: full });
+      const media = await storeImage(Buffer.from(d.data, "base64"), mime, contentItemId, { model, prompt: full }, {}, { headline, specs });
       return { ...media, cost: IMAGE_PRICE_USD, units: 1 };
     }, ctx.pin);
   } }) });
@@ -681,11 +706,11 @@ impl("IMAGE", "openai_image", { label: "OpenAI image generation", configSchema: 
   async generate({ prompt, headline, specs = {}, contentItemId }) {
     const model = cfg.model || DEFAULTS.OPENAI_IMAGE_MODEL;
     const size = specs.height > specs.width ? "1024x1536" : specs.width > specs.height ? "1536x1024" : "1024x1024";
-    const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === false ? "Do not render any text." : `Render this headline as bold, legible overlay text: "${headline}".`}`;
+    const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === true ? `Render this headline as bold, legible overlay text: "${headline}".` : "Do not render any text, letters, captions or logos anywhere in the image; leave the lower third visually calm."}`;
     return withKey("openai", async (key) => {
       const body = await fetchJson("https://api.openai.com/v1/images/generations", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify({ model, prompt: full, size, quality: cfg.quality || "medium", n: 1 }) });
       const b64 = body.data?.[0]?.b64_json; if (!b64) throw new Error("OpenAI returned no image");
-      const media = await storeImage(Buffer.from(b64, "base64"), "image/png", contentItemId, { model, prompt: full });
+      const media = await storeImage(Buffer.from(b64, "base64"), "image/png", contentItemId, { model, prompt: full }, {}, { headline, specs });
       return { ...media, cost: Number(ENV.OPENAI_IMAGE_PRICE_USD ?? 0.04), units: 1 };
     }, ctx.pin);
   } }) });
@@ -748,7 +773,7 @@ async function writeSrt(segments, start, end) {
 }
 const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
 const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black";
-const captionsVf = (srt, marginV = 190) => `subtitles=${srt.replace(/\\/g, "/").replace(/:/g, "\\:")}:force_style='FontName=DejaVu Sans,FontSize=17,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=${marginV}'`;
+const captionsVf = (srt, marginV = 190) => `subtitles=${srt.replace(/\\/g, "/").replace(/:/g, "\\:")}:force_style='FontName=${OVERLAY_FONT},FontSize=17,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=${marginV}'`;
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"];
 async function cutClip(input, start, end, { vertical = true, srt = null, hook = null } = {}) {
   const vf = [vertical ? VF_VERTICAL : VF_LANDSCAPE];
@@ -1153,7 +1178,7 @@ async function generateSlideshowVideo(item, niche, style) {
   const script = sections.map((s) => s.narration).join("\n\n");
   await setItem(item.id, { headline: d.title || m.title, script, summary: d.description || "", captions: { default: d.description || m.title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
   const images = [];
-  for (const s of sections) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: s.image_prompt, headline: d.title || m.title, specs: { width: long ? 1920 : 1080, height: long ? 1080 : 1920, brand: niche.display_name, render_text: false, ...(P(niche.image_specs) || {}) }, contentItemId: item.id })); await addCost(item.id, img.cost); images.push(img); }
+  for (const s of sections) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: s.image_prompt, headline: d.title || m.title, specs: { width: long ? 1920 : 1080, height: long ? 1080 : 1920, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}) }, contentItemId: item.id })); await addCost(item.id, img.cost); images.push(img); }
   const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock");
   const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: item.id }); await addCost(item.id, audio.cost);
   await setItem(item.id, { voice_asset_url: audio.url, status: "RENDERING" });
