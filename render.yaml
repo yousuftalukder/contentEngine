@@ -1,0 +1,43 @@
+# Render Blueprint. Connect the GitHub repo in Render → "New Blueprint" and it picks this up.
+services:
+  - type: web
+    name: content-engine
+    runtime: docker
+    plan: starter          # free tier sleeps and kills background workers; starter or above for 24/7 polling
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL          # Supabase → Connect → Session pooler (port 5432)
+        sync: false
+      - key: DASHBOARD_USERNAME
+        value: admin
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: media
+      - key: PUBLIC_BASE_URL       # e.g. https://content-engine.onrender.com (used for portal links)
+        sync: false
+      - key: PORTAL_BASE_URL       # your news portal domain if different from PUBLIC_BASE_URL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: META_ACCESS_TOKEN
+        sync: false
+      - key: YOUTUBE_CLIENT_ID
+        sync: false
+      - key: YOUTUBE_CLIENT_SECRET
+        sync: false
+      - key: YOUTUBE_REFRESH_TOKEN
+        sync: false
