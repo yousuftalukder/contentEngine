@@ -79,7 +79,7 @@ const tag = (s) => h("span", { class: "tag " + (STATUS_COLOR[s] || "") }, nice(s
 const CONTENT_TYPES = ["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"];
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
 const PLATFORMS = ["FACEBOOK", "INSTAGRAM", "YOUTUBE", "PORTAL"];
-const FORMATS = ["STATIC_IMAGE_CAPTION", "TEXT_POST", "SHORT_VIDEO", "LONG_VIDEO", "ARTICLE"];
+const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Text-only post"], ["SHORT_FORM_VOICEOVER", "Short vertical video (Reels / Shorts)"], ["LONG_FORM_VIDEO", "Long landscape video"]];
 const PROVIDERS = ["anthropic", "gemini", "elevenlabs", "newsapi", "youtube", "meta"];
 const PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
 
@@ -548,7 +548,7 @@ function channelDialog(c, brands, programs, publishers) {
       c ? null : field("Key", text("key", "", { placeholder: "e.g. fb_main" })),
       c ? null : field("Brand", select("brandId", brands.map((b) => [b.id, b.name]))),
       field("Platform", select("platform", PLATFORMS, c?.platform || "FACEBOOK")),
-      field("Format", select("format", FORMATS.map((f) => [f, nice(f)]), c?.format || "STATIC_IMAGE_CAPTION")),
+      field("Format", select("format", FORMATS, c?.format || "STATIC_IMAGE_CAPTION"), "Short vertical is the only format that triggers 9:16 rendering and #Shorts tagging."),
       field("Publisher adapter", select("publisherAdapter", [["", "(platform default)"], ...publishers], c?.publisher_adapter || "")),
       field("Platform account id", text("platformAccountId", c?.platform_account_id), "Facebook Page ID, IG business account id, or YouTube channel id."),
       field("Timezone", text("timezone", c?.timezone || "Asia/Dhaka")),
