@@ -80,8 +80,12 @@ const CONTENT_TYPES = ["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDES
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
 const PLATFORMS = ["FACEBOOK", "INSTAGRAM", "YOUTUBE", "PORTAL"];
 const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Text-only post"], ["SHORT_FORM_VOICEOVER", "Short vertical video (Reels / Shorts)"], ["LONG_FORM_VIDEO", "Long landscape video"]];
-const PROVIDERS = ["anthropic", "gemini", "elevenlabs", "newsapi", "youtube", "meta"];
-const PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
+let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
+let PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
+let MULTI_FIELD = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
+const PROVIDER_LABEL = { anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
+const PROVIDER_HELP = { meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
+const password = (name, extra = {}) => h("input", { type: "password", name, autocomplete: "new-password", spellcheck: false, ...extra });
 
 // form field builders
 function field(label, input, help) { return h("label", { class: "field" }, h("span", null, label), input, help ? h("span", { class: "help" }, help) : null); }
@@ -525,29 +529,34 @@ function clipsDialog(c) {
 
 // ---------------------------------------------------------------- channels
 pages.channels = async () => {
-  const [channels, brands, programs, configs] = await Promise.all([get("/api/channels"), get("/api/brands"), get("/api/programs"), get("/api/adapter-configs")]);
+  const [channels, brands, programs, configs, creds] = await Promise.all([get("/api/channels"), get("/api/brands"), get("/api/programs"), get("/api/adapter-configs"), get("/api/credentials")]);
   const publishers = configs.filter((c) => c.stage === "PUBLISH" && yes(c.enabled)).map((c) => [c.key, `${c.label} (${c.key})`]);
   const root = h("div", null, pageHead("Channels", "Where approved content goes: a Facebook page, an Instagram account, a YouTube channel. Each channel subscribes to programs.",
-    h("button", { class: "btn primary", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers) }, "New channel")));
+    h("button", { class: "btn primary", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers, creds) }, "New channel")));
   if (!channels.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No channels yet"), "Add one and subscribe it to a program."));
   for (const c of channels) root.appendChild(h("div", { class: "panel" }, h("div", { class: "row" },
     h("div", null, h("h3", { style: "margin:0" }, c.display_name, " ", yes(c.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
-      h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · up to ", c.max_posts_per_day ?? "∞", "/day, ", c.min_gap_minutes ?? 0, " min apart · ", c.timezone),
+      h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · token ", c.credential_id ? h("span", { class: "tag green" }, creds.find((k) => k.id === c.credential_id)?.label || "linked") : h("span", { class: "tag" }, "env default"), " · up to ", c.max_posts_per_day ?? "∞", "/day, ", c.min_gap_minutes ?? 0, " min apart · ", c.timezone),
       h("div", { class: "small", style: "margin-top:4px" }, "Programs: ", (c.niches || []).length ? c.niches.map((n) => n.display_name).join(", ") : h("span", { class: "mute" }, "none — subscribe from Programs"))),
     h("div", { class: "right row" },
       h("button", { class: "btn sm", onclick: () => run(async () => jsonDialog("Test publish result", await post(`/api/channels/${c.id}/test-publish`, { message: "Content Engine connection test" }))) }, "Test"),
-      h("button", { class: "btn sm", onclick: () => channelDialog(c, brands, programs, publishers) }, "Edit"),
+      h("button", { class: "btn sm", onclick: () => channelDialog(c, brands, programs, publishers, creds) }, "Edit"),
       h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/channels/${c.id}`, { isActive: !yes(c.is_active) }), "Saved").then(route) }, yes(c.is_active) ? "Pause" : "Activate"),
       h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete channel?", "Only works if nothing was ever published to it.", () => run(() => del(`/api/channels/${c.id}`), "Deleted").then(route)) }, "Delete")))));
   return root;
 };
-function channelDialog(c, brands, programs, publishers) {
+function channelDialog(c, brands, programs, publishers, creds = []) {
+  const platSel = select("platform", PLATFORMS, c?.platform || "FACEBOOK");
+  const credSel = select("credentialId", [], c?.credential_id || "");
+  const fillCreds = () => { const want = platSel.value === "YOUTUBE" ? "youtube_oauth" : "meta"; credSel.innerHTML = ""; credSel.appendChild(h("option", { value: "" }, platSel.value === "PORTAL" ? "(not needed)" : `(Render env default: ${want === "meta" ? "META_ACCESS_TOKEN" : "YOUTUBE_CLIENT_ID/SECRET/REFRESH_TOKEN"})`)); for (const k of creds.filter((k) => k.provider === want)) credSel.appendChild(h("option", { value: k.id, selected: k.id === c?.credential_id }, `${k.label}${k.source === "missing" ? " (missing!)" : ""}`)); };
+  platSel.onchange = fillCreds; fillCreds();
   formDialog(c ? "Edit channel" : "New channel", h("div", null,
     h("div", { class: "grid2" },
       field("Name", text("displayName", c?.display_name)),
       c ? null : field("Key", text("key", "", { placeholder: "e.g. fb_main" })),
       c ? null : field("Brand", select("brandId", brands.map((b) => [b.id, b.name]))),
-      field("Platform", select("platform", PLATFORMS, c?.platform || "FACEBOOK")),
+      field("Platform", platSel),
+      field("Publishing token", credSel, 'Add tokens on the API keys page (provider "meta" or "youtube_oauth"), then pick one here. One token per page / channel.'),
       field("Format", select("format", FORMATS, c?.format || "STATIC_IMAGE_CAPTION"), "Short vertical is the only format that triggers 9:16 rendering and #Shorts tagging."),
       field("Publisher adapter", select("publisherAdapter", [["", "(platform default)"], ...publishers], c?.publisher_adapter || "")),
       field("Platform account id", text("platformAccountId", c?.platform_account_id), "Facebook Page ID, IG business account id, or YouTube channel id."),
@@ -557,7 +566,7 @@ function channelDialog(c, brands, programs, publishers) {
     field("Caption template", area("captionTemplate", c?.caption_template, { placeholder: "{caption}\n\n{hashtags}" }), "Placeholders: {caption} {headline} {hashtags} {portal_url}"),
     field("Platform config (JSON)", area("platformConfig", JSON.stringify(c?.platform_config || {}, null, 2), { "data-json": "obj", class: "mono" }), 'e.g. {"token_env": "META_ACCESS_TOKEN_PAGE2"} to use a different token for this page.'),
     c ? null : field("Subscribe to programs", multi("nicheIds", programs.map((p) => [p.id, p.display_name])))),
-    async (v) => { if (!v.publisherAdapter) delete v.publisherAdapter; if (c) await patch(`/api/channels/${c.id}`, v); else { v.nicheIds = Array.from(document.querySelector("[name=nicheIds]").selectedOptions).map((o) => o.value); await post("/api/channels", v); } toast("Channel saved"); route(); }, { wide: true });
+    async (v) => { if (!v.publisherAdapter) delete v.publisherAdapter; if (!v.credentialId) v.credentialId = null; if (c) await patch(`/api/channels/${c.id}`, v); else { v.nicheIds = Array.from(document.querySelector("[name=nicheIds]").selectedOptions).map((o) => o.value); await post("/api/channels", v); } toast("Channel saved"); route(); }, { wide: true });
 }
 
 // ---------------------------------------------------------------- adapters
@@ -593,7 +602,7 @@ function adapterDialog(c, impls, creds) {
   stageSel.onchange = fillImpls; implSel.onchange = showSchema; fillImpls();
   formDialog(c ? "Edit adapter instance" : "New adapter instance", h("div", null,
     h("div", { class: "grid2" }, field("Stage", stageSel), field("Implementation", implSel), c ? null : field("Key", text("key", "", { placeholder: "e.g. anthropic_live" }), "How programs refer to it."), field("Label", text("label", c?.label)),
-      field("Credential", select("credentialId", [["", "(auto: any enabled key for the provider)"], ...creds.map((k) => [k.id, `${k.provider}: ${k.label}`])], c?.credential_id || ""))),
+      field("Pinned key", select("credentialId", [["", "(auto: rotate through the provider's keys)"], ...creds.map((k) => [k.id, `${k.provider}: ${k.label}`])], c?.credential_id || ""), "Use one specific key for this instance, e.g. a separate Gemini key for images. Falls back to the pool if it's cooling down.")),
     field("Config (JSON)", area("config", JSON.stringify(c?.config || {}, null, 2), { "data-json": "obj", class: "mono" }), schema),
     check("enabled", "Enabled", c ? yes(c.enabled) : true)),
     async (v) => { if (!v.credentialId) v.credentialId = null; if (c) { delete v.stage; await patch(`/api/adapter-configs/${c.id}`, v); } else await post("/api/adapter-configs", v); toast("Adapter saved"); route(); });
@@ -601,49 +610,74 @@ function adapterDialog(c, impls, creds) {
 
 // ---------------------------------------------------------------- API keys
 pages.keys = async () => {
-  const [creds, usage] = await Promise.all([get("/api/credentials"), get("/api/usage")]);
-  const root = h("div", null, pageHead("API keys", "Keys never live in the database. Add the secret as an environment variable on Render, then register which variable holds it here so the engine can rotate between keys and track quota.",
-    h("button", { class: "btn primary", onclick: () => credDialog(null) }, "Register a key")));
-  root.appendChild(h("div", { class: "panel" }, h("h3", null, "Default environment variables"),
-    h("p", { class: "muted small", style: "margin:0 0 8px" }, "If you set these on Render, the matching provider works with no registration. Register keys only when you want several per provider or a daily quota."),
-    h("div", { class: "row" }, PROVIDERS.map((p) => h("span", { class: "tag" }, h("span", { class: "mono" }, PROVIDER_ENV[p]))))));
-  if (!creds.length) root.appendChild(h("div", { class: "empty", style: "margin-top:12px" }, h("b", null, "No keys registered"), "Everything is running on mocks. That's fine until you're ready to go live."));
+  const [creds, usage, meta] = await Promise.all([get("/api/credentials"), get("/api/usage"), get("/api/credentials/meta")]);
+  PROVIDERS = meta.providers; PROVIDER_ENV = meta.defaultEnv; MULTI_FIELD = meta.multiField;
+  const root = h("div", null, pageHead("API keys", "Paste a key here and it is encrypted and stored in the database (AES-256-GCM under SECRETS_KEY on Render). Keys are never shown again, only their last 4 characters. You can still point a credential at a Render env var instead.",
+    h("button", { class: "btn primary", onclick: () => credDialog(null) }, "Add a key")));
+  if (!meta.vault) root.appendChild(h("div", { class: "panel", style: "border-color:var(--amber)" }, h("b", null, "Vault is off. "), "Set ", h("span", { class: "mono" }, "SECRETS_KEY"), " on Render (any long random string, e.g. ", h("span", { class: "mono" }, "openssl rand -hex 32"), ") and redeploy. Until then you can only register env-var names, not paste secrets."));
+  root.appendChild(h("div", { class: "panel" }, h("h3", null, "How keys are used"),
+    h("p", { class: "muted small", style: "margin:0 0 6px" }, "Writing, images, voice, transcription and ingest adapters ask for a provider's pool and rotate on quota errors. To dedicate a key to one job, pin it on the ", h("a", { href: "#/adapters" }, "Adapters"), " page (instance → Pinned key). Publishing tokens (Meta, YouTube OAuth) are chosen per channel on the ", h("a", { href: "#/channels" }, "Channels"), " page."),
+    h("p", { class: "muted small", style: "margin:0" }, "Env-var fallbacks, if you prefer Render: ", Object.values(PROVIDER_ENV).map((v) => h("span", { class: "tag", style: "margin-right:4px" }, h("span", { class: "mono" }, v))))));
+  if (!creds.length) root.appendChild(h("div", { class: "empty", style: "margin-top:12px" }, h("b", null, "No keys yet"), "Everything is running on mocks. Add keys when you're ready to go live."));
   else root.appendChild(h("div", { class: "table-wrap", style: "margin-top:12px" }, h("table", null,
-    h("thead", null, h("tr", null, h("th", null, "Provider"), h("th", null, "Label"), h("th", null, "Env var"), h("th", null, "On Render?"), h("th", null, "Today"), h("th", null, "Quota"), h("th", null, "State"), h("th"))),
+    h("thead", null, h("tr", null, h("th", null, "Provider"), h("th", null, "Label"), h("th", null, "Secret"), h("th", null, "Today"), h("th", null, "Quota"), h("th", null, "State"), h("th"))),
     h("tbody", null, creds.map((k) => h("tr", null,
-      h("td", null, k.provider), h("td", null, k.label, h("span", { class: "sub" }, "priority ", k.priority)), h("td", { class: "mono" }, k.env_var),
-      h("td", null, k.env_present ? h("span", { class: "tag green" }, "set") : h("span", { class: "tag red" }, "missing")),
+      h("td", null, PROVIDER_LABEL[k.provider] || k.provider, h("span", { class: "sub mono" }, k.provider)), h("td", null, k.label, h("span", { class: "sub" }, "priority ", k.priority)),
+      h("td", null, k.source === "vault" ? h("span", null, h("span", { class: "tag green" }, "stored"), " ", h("span", { class: "mono small mute" }, k.secret_hint || ""), !k.vault_ok ? h("span", { class: "tag red", title: "SECRETS_KEY changed since this was stored" }, "cannot decrypt") : null)
+        : k.source === "env" ? h("span", null, h("span", { class: "tag blue" }, "env"), " ", h("span", { class: "mono small" }, k.env_var))
+        : h("span", null, h("span", { class: "tag red" }, "missing"), k.env_var ? h("span", { class: "sub mono" }, k.env_var, " not set on Render") : null)),
       h("td", { class: "small" }, k.used_today, " units · ", usd(k.cost_today)), h("td", { class: "small" }, k.daily_quota || "—"),
       h("td", null, !yes(k.enabled) ? h("span", { class: "tag red" }, "disabled") : k.cooldown_until && new Date(k.cooldown_until) > Date.now() ? h("span", { class: "tag amber", title: k.last_error || "" }, "cooling down") : h("span", { class: "tag green" }, "ready"), k.last_error ? h("span", { class: "sub", style: "color:var(--red)" }, k.last_error.slice(0, 80)) : null),
       h("td", { class: "row" },
+        h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post(`/api/credentials/${k.id}/test`); toast(r.ok ? `${k.label}: works` : `${k.label}: ${r.error}`, !r.ok); }) }, "Test"),
         k.cooldown_until ? h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/credentials/${k.id}`, { clearCooldown: true }), "Cooldown cleared").then(route) }, "Clear cooldown") : null,
         h("button", { class: "btn sm", onclick: () => credDialog(k) }, "Edit"),
         h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/credentials/${k.id}`, { enabled: !yes(k.enabled) }), "Saved").then(route) }, yes(k.enabled) ? "Disable" : "Enable"),
-        h("button", { class: "btn sm danger", onclick: () => run(() => del(`/api/credentials/${k.id}`), "Removed").then(route) }, "Remove"))))))));
+        h("button", { class: "btn sm danger", onclick: () => confirmModal("Remove key?", "Channels and adapter instances pointing at it must be unlinked first.", () => run(() => del(`/api/credentials/${k.id}`), "Removed").then(route)) }, "Remove"))))))));
   if (usage.length) { root.appendChild(h("h2", null, "Usage, last 30 days")); root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
     h("thead", null, h("tr", null, h("th", null, "Day"), h("th", null, "Provider"), h("th", null, "Units"), h("th", null, "Cost"))),
     h("tbody", null, usage.map((u) => h("tr", null, h("td", { class: "small" }, u.day?.slice(0, 10)), h("td", null, u.provider), h("td", null, u.units), h("td", null, usd(u.cost_usd)))))))); }
   return root;
 };
 function credDialog(k) {
-  const prov = select("provider", PROVIDERS, k?.provider || "anthropic", { disabled: !!k });
-  const env = text("envVar", k?.env_var || PROVIDER_ENV.anthropic);
-  prov.onchange = () => { if (!k) env.value = PROVIDER_ENV[prov.value]; };
-  formDialog(k ? "Edit key" : "Register a key", h("div", null,
-    h("div", { class: "grid2" }, field("Provider", prov), field("Environment variable", env, "Set the secret under this name in Render → Environment."),
-      field("Label", text("label", k?.label)), field("Priority", num("priority", k?.priority ?? 0), "Higher is tried first."), field("Daily quota (units)", num("dailyQuota", k?.daily_quota), "Empty for none.")),
-    k ? check("enabled", "Enabled", yes(k.enabled)) : null),
-    async (v) => { if (k) { delete v.provider; await patch(`/api/credentials/${k.id}`, v); } else await post("/api/credentials", v); toast("Key registered"); route(); });
+  const prov = select("provider", PROVIDERS.map((p) => [p, PROVIDER_LABEL[p] || p]), k?.provider || "anthropic", { disabled: !!k });
+  const secretBox = h("div", null); const envBox = h("div", null); const help = h("p", { class: "muted small", style: "margin:0 0 8px" });
+  const mode = select("_mode", [["vault", "Paste the secret here (stored encrypted)"], ["env", "Use an env var on Render"]], k?.source === "env" ? "env" : "vault");
+  const draw = () => {
+    const p = prov.value; const fields = MULTI_FIELD[p]; help.textContent = PROVIDER_HELP[p] || "";
+    secretBox.innerHTML = ""; envBox.innerHTML = "";
+    if (mode.value === "vault") {
+      if (fields) secretBox.appendChild(h("div", { class: "grid2" }, fields.map((f) => field(nice(f), /secret|token|key/i.test(f) ? password(`f_${f}`) : text(`f_${f}`, ""), k?.has_secret ? "Leave blank to keep the stored value" : null))));
+      else secretBox.appendChild(field(k?.has_secret ? `New secret (currently stored ${k.secret_hint || ""})` : "Secret", password("secret", { placeholder: k?.has_secret ? "leave blank to keep" : "sk-… / AIza… / EAA…" })));
+    } else envBox.appendChild(field("Environment variable on Render", text("envVar", k?.env_var || PROVIDER_ENV[p] || ""), fields ? "For multi-field providers the env var must hold a JSON object with: " + fields.join(", ") : "The value must be set under this name in Render → Environment."));
+  };
+  prov.onchange = draw; mode.onchange = draw; draw();
+  formDialog(k ? "Edit key" : "Add a key", h("div", null,
+    h("div", { class: "grid2" }, field("Provider", prov), field("Where is the secret?", mode)), help, secretBox, envBox,
+    h("div", { class: "grid2" }, field("Label", text("label", k?.label), 'e.g. "Gemini — writing", "FB page: Sports"'), field("Priority", num("priority", k?.priority ?? 0), "Higher is tried first."), field("Daily quota (units)", num("dailyQuota", k?.daily_quota), "Empty for none.")),
+    k ? h("div", { class: "row" }, check("enabled", "Enabled", yes(k.enabled)), k.has_secret ? check("clearSecret", "Forget stored secret", false) : null) : null),
+    async (v) => {
+      const p = prov.value; const body = { label: v.label, priority: v.priority, dailyQuota: v.dailyQuota };
+      if (k) { body.enabled = v.enabled; if (v.clearSecret) body.clearSecret = true; } else body.provider = p;
+      if (v._mode === "vault") {
+        if (MULTI_FIELD[p]) { const f = {}; let any = false; for (const n of MULTI_FIELD[p]) { f[n] = v[`f_${n}`] || ""; if (f[n]) any = true; } if (any) body.fields = f; else if (!k) throw new Error("Fill in the fields"); }
+        else if (v.secret) body.secret = v.secret; else if (!k) throw new Error("Paste the secret");
+        if (!k) body.envVar = "";
+      } else { if (!v.envVar) throw new Error("Env var name is required"); body.envVar = v.envVar; if (k?.has_secret) body.clearSecret = true; }
+      if (k) await patch(`/api/credentials/${k.id}`, body); else await post("/api/credentials", body);
+      toast("Key saved"); route();
+    }, { wide: true });
 }
 
 // ---------------------------------------------------------------- settings
 pages.settings = async () => {
-  const s = await get("/api/settings");
+  const [s, storage] = await Promise.all([get("/api/settings"), get("/api/storage")]);
   const val = (k, d) => (s[k] === undefined ? d : s[k]);
   const save = (k, v, msg) => run(() => put(`/api/settings/${k}`, { value: v }), msg || "Saved").then(route);
   const cap = num(null, val("budget.daily_cap_usd", 5), { step: "0.5", min: 0, style: "max-width:140px" });
   const thr = num(null, val("repurpose.view_threshold", 500), { min: 0, style: "max-width:140px" });
-  const known = ["queues.enabled", "publishing.global_pause", "budget.daily_cap_usd", "ingest.enabled", "repurpose.view_threshold"];
+  const hrs = num(null, val("storage.cleanup_after_publish_hours", 48), { min: 1, style: "max-width:120px" });
+  const known = ["queues.enabled", "publishing.global_pause", "budget.daily_cap_usd", "ingest.enabled", "repurpose.view_threshold", "storage.cleanup_enabled", "storage.cleanup_after_publish_hours"];
   const other = Object.entries(s).filter(([k]) => !known.includes(k));
   return h("div", null, pageHead("Settings", "Global switches. Program-level behaviour lives on each program."),
     h("div", { class: "panel" }, h("h3", null, "Publishing"),
@@ -658,10 +692,15 @@ pages.settings = async () => {
     h("div", { class: "panel" }, h("h3", null, "Repurposing threshold"),
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "Once a published post crosses this many views, a new draft is queued to repurpose it into other formats (still goes through Review)."),
       h("div", { class: "row" }, thr, h("span", { class: "small mute" }, "views"), h("button", { class: "btn", onclick: () => save("repurpose.view_threshold", Number(thr.value)) }, "Save threshold"))),
+    h("div", { class: "panel" }, h("h3", null, "Media storage"),
+      h("p", { class: "muted small", style: "margin:0 0 8px" }, "Active backend: ", h("b", null, storage.backend), storage.backend === "r2" && storage.r2 ? ` (bucket ${storage.r2.bucket}${storage.r2.public_url ? "" : " — public_url missing, platforms can't fetch files"})` : "", " · configured: ", ["r2", "supabase", "local"].filter((k) => storage.available[k]).join(", "), " · ", storage.filesLive, " files live, ", storage.filesCleaned, " cleaned up.",
+        storage.backend === "local" ? " Local disk is wiped on every deploy — add R2 (API keys → Cloudflare R2, or R2_* env vars) before going live." : ""),
+      h("p", { class: "muted small", style: "margin:0 0 8px" }, "Cleanup deletes an item's media from storage once every channel has published it and this many hours have passed (platforms keep their own copy). Rows and metrics stay."),
+      h("div", { class: "row" }, h("button", { class: "btn", onclick: () => save("storage.cleanup_enabled", !val("storage.cleanup_enabled", true)) }, val("storage.cleanup_enabled", true) ? "Disable cleanup" : "Enable cleanup"), h("span", null, "after"), hrs, h("span", { class: "small mute" }, "hours"), h("button", { class: "btn", onclick: () => save("storage.cleanup_after_publish_hours", Number(hrs.value)) }, "Save"), h("button", { class: "btn", onclick: () => run(() => post("/api/storage/cleanup"), "Cleanup run").then(route) }, "Run cleanup now"))),
     h("div", { class: "panel" }, h("h3", null, "Worker lanes"), h("p", { class: "muted small", style: "margin:0" }, "Pause and resume individual lanes from the ", h("a", { href: "#/overview" }, "Overview"), " page.")),
     other.length ? h("div", { class: "panel" }, h("h3", null, "Other settings"), other.map(([k, v]) => h("div", { class: "row small", style: "padding:4px 0" }, h("span", { class: "mono" }, k), h("span", { class: "mute" }, JSON.stringify(v))))) : null,
     h("div", { class: "panel" }, h("h3", null, "Engine"),
-      h("div", { class: "small muted" }, "Worker ", h("span", { class: "mono" }, health?.worker), " · storage ", health?.storage, " · ffmpeg ", health?.ffmpeg ? "available" : "missing", " · yt-dlp ", health?.ytdlp ? "available" : "missing (video download will use the mock)")),
+      h("div", { class: "small muted" }, "Worker ", h("span", { class: "mono" }, health?.worker), " · storage ", health?.storage, " · vault ", health?.vault ? "on" : "off (set SECRETS_KEY)", " · ffmpeg ", health?.ffmpeg ? "available" : "missing", " · yt-dlp ", health?.ytdlp ? "available" : "missing (video download will use the mock)")),
   );
 };
 
