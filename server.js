@@ -262,7 +262,9 @@ async function r2Request(method, path, body = null, contentType = null) {
 }
 const STORAGE = {
   r2: {
-    name: "r2", available: async () => !!(await r2Config()),
+    // Not "available" without public_url: platforms fetch files by URL, so a bucket with no public address is useless
+    // and the engine keeps using the next backend (and says so on the Storage page) instead of failing every upload.
+    name: "r2", available: async () => !!(await r2Config())?.public_url,
     publicBase: async () => { const c = await r2Config(); if (!c.public_url) throw new Error("R2 needs public_url (R2_PUBLIC_URL): enable the r2.dev subdomain or a custom domain on the bucket"); return c.public_url; },
     put: async (path, bytes, ct) => { await r2Request("PUT", path, bytes, ct); return `${await STORAGE.r2.publicBase()}/${path}`; },
     del: async (path) => { await r2Request("DELETE", path); },
@@ -309,11 +311,16 @@ async function recordMedia({ contentItemId = null, kind, url, mime = null, durat
 async function sweepStorageCleanup() {
   if (!(await setting("storage.cleanup_enabled", true))) return;
   const hours = Number(await setting("storage.cleanup_after_publish_hours", 48)) || 48;
+  // Guards, in order: the item must have at least one channel asset (a portal-only item has none, and the guards below
+  // would pass vacuously); every asset published; all of them older than the window; no other live item reuses the file;
+  // and the file is not the hero image of a portal article — the portal serves it forever, so it is never cleaned.
   const rows = await q(`SELECT m.id, m.url FROM media_assets m JOIN content_items ci ON ci.id = m.content_item_id
     WHERE m.deleted_at IS NULL AND m.url LIKE 'http%' AND ci.status = 'PUBLISHED'
+      AND EXISTS (SELECT 1 FROM content_assets a WHERE a.content_item_id = ci.id)
       AND NOT EXISTS (SELECT 1 FROM content_assets a WHERE a.content_item_id = ci.id AND a.status <> 'PUBLISHED')
       AND NOT EXISTS (SELECT 1 FROM content_assets a WHERE a.content_item_id = ci.id AND a.published_at > now() - ($1 || ' hours')::interval)
       AND NOT EXISTS (SELECT 1 FROM content_items d WHERE d.hero_media_id = m.id AND d.id <> ci.id AND d.status NOT IN ('PUBLISHED','REJECTED','FAILED'))
+      AND NOT EXISTS (SELECT 1 FROM portal_articles pa WHERE pa.hero_image_url = m.url)
     LIMIT 40`, [String(hours)]);
   let n = 0;
   for (const m of rows) {
@@ -689,8 +696,17 @@ impl("VOICE", "openai_tts", { label: "OpenAI TTS", configSchema: { voice: { type
   async synthesize({ script, voiceId, contentItemId }) {
     const voice = voiceId || cfg.voice || DEFAULTS.OPENAI_TTS_VOICE, model = cfg.model || DEFAULTS.OPENAI_TTS_MODEL;
     return withKey("openai", async (key) => {
-      const bytes = await fetchBytes("https://api.openai.com/v1/audio/speech", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify({ model, voice, input: script.slice(0, 4096), response_format: "mp3", instructions: cfg.instructions || undefined }) });
-      const f = tmpPath("mp3"); await writeFile(f, bytes); const dur = await ffprobeDuration(f);
+      // The endpoint caps input at 4096 chars. Long scripts (LONG_FORM_VIDEO) are split at sentence ends and joined.
+      const parts = []; let cur = "";
+      for (const s of script.split(/(?<=[.!?।])\s+/)) { if ((cur + " " + s).length > 3800 && cur) { parts.push(cur.trim()); cur = s; } else cur += " " + s; } if (cur.trim()) parts.push(cur.trim());
+      const files = [];
+      for (const p of parts) {
+        const bytes = await fetchBytes("https://api.openai.com/v1/audio/speech", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify({ model, voice, input: p.slice(0, 4096), response_format: "mp3", instructions: cfg.instructions || undefined }) });
+        const pf = tmpPath("mp3"); await writeFile(pf, bytes); files.push(pf);
+      }
+      let f = files[0];
+      if (files.length > 1) { const list = tmpPath("txt"); await writeFile(list, files.map((x) => `file '${x}'`).join("\n")); f = tmpPath("mp3"); await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", f]); await cleanup(list, ...files); }
+      const dur = await ffprobeDuration(f);
       const url = await storeLocal(f, `audio/${newId()}.mp3`, "audio/mpeg"); await cleanup(f);
       const media = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur || script.length / 15, meta: { voice, model, chars: script.length } });
       return { ...media, units: script.length, cost: script.length * Number(ENV.OPENAI_TTS_USD_PER_CHAR || 0.000015) };
@@ -874,7 +890,9 @@ function jaccard(a, b) { const A = tokenize(a), B = tokenize(b); if (!A.size || 
 function cosine(a, b) { let d = 0, x = 0, y = 0; for (let i = 0; i < Math.min(a.length, b.length); i++) { d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i]; } return x && y ? d / Math.sqrt(x * y) : 0; }
 async function checkDuplicate(text, niche, seriesId = null, excludeId = null) {
   // excludeId: the item being generated already has its topic set at routing time — never compare it with itself.
-  const past = await q(`SELECT id, topic, topic_embedding FROM content_items WHERE niche_id = $1 ${seriesId ? "AND series_id = $2" : ""} AND status NOT IN ('FAILED','REJECTED') AND topic <> '' AND id <> $${seriesId ? 3 : 2} ORDER BY created_at DESC LIMIT 300`, seriesId ? [niche.id, seriesId, excludeId || ""] : [niche.id, excludeId || ""]);
+  // QUEUED siblings are skipped too: routed items carry their title as topic before they are drafted, so a near-duplicate
+  // still waiting in the queue must not make the first one fail (the loser is caught when its own turn comes).
+  const past = await q(`SELECT id, topic, topic_embedding FROM content_items WHERE niche_id = $1 ${seriesId ? "AND series_id = $2" : ""} AND status NOT IN ('FAILED','REJECTED','QUEUED') AND topic <> '' AND id <> $${seriesId ? 3 : 2} ORDER BY created_at DESC LIMIT 300`, seriesId ? [niche.id, seriesId, excludeId || ""] : [niche.id, excludeId || ""]);
   let vec = null;
   try { vec = await (await resolve("EMBED", niche.embed_adapter || "embed_mock")).embed(text); } catch (e) { warn("embedding failed, using Jaccard:", e.message); }
   let best = null;
@@ -1230,8 +1248,16 @@ async function checkAndRepurpose(assetId) {
   if (!latest || latest.views < Number(await setting("repurpose.view_threshold", 500))) return null;
   const src = await one(`SELECT * FROM content_items WHERE id=$1`, [asset.content_item_id]); if (!src || src.status === "REPURPOSED") return null;
   const id = newId();
-  await q(`INSERT INTO content_items (id, niche_id, series_id, derived_from_id, content_type, topic, headline, summary, body, script, captions, hashtags, hero_media_id, status, source_data_ref) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'PENDING_REVIEW',$14)`,
-    [id, src.niche_id, src.series_id, src.id, src.content_type, `[Repurposed] ${src.topic}`, src.headline, src.summary, src.body, src.script, J(P(src.captions) || {}), J(P(src.hashtags) || []), src.hero_media_id, J({ repurposedFrom: src.id, triggerViews: latest.views })]);
+  // Storage cleanup may have removed the original hero file (48h after publish, metrics run for 14 days). If so, start
+  // the repurposed item without a hero and queue an image regeneration; it lands in review once the new image exists.
+  const hero = src.hero_media_id ? await one(`SELECT id, kind, deleted_at FROM media_assets WHERE id=$1`, [src.hero_media_id]) : null;
+  const heroGone = !!hero?.deleted_at;
+  await q(`INSERT INTO content_items (id, niche_id, series_id, derived_from_id, content_type, topic, headline, summary, body, script, captions, hashtags, hero_media_id, image_prompt, status, source_data_ref) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+    [id, src.niche_id, src.series_id, src.id, src.content_type, `[Repurposed] ${src.topic}`, src.headline, src.summary, src.body, src.script, J(P(src.captions) || {}), J(P(src.hashtags) || []), heroGone ? null : src.hero_media_id, src.image_prompt, heroGone ? "DRAFTING" : "PENDING_REVIEW", J({ repurposedFrom: src.id, triggerViews: latest.views, heroRegenerated: heroGone })]);
+  if (heroGone) {
+    if (hero.kind === "IMAGE") await enqueue("REGENERATE", { itemId: id, part: "image" }, { queue: "image", priority: 5, contentItemId: id });
+    else await setItem(id, { status: "FAILED", rejection_note: "Repurposed, but the original video/audio was removed by storage cleanup. Regenerate (all) to rebuild it." });
+  }
   await q(`UPDATE content_items SET status='REPURPOSED' WHERE id=$1`, [src.id]);
   return one(`SELECT * FROM content_items WHERE id=$1`, [id]);
 }
@@ -1379,7 +1405,7 @@ app.get("/api/stats", async (ctx) => {
 app.get("/api/storage", async (ctx) => {
   const b = await storageBackend(); const r2 = await r2Config();
   const [live, gone] = await Promise.all([one(`SELECT COUNT(*)::int AS n FROM media_assets WHERE deleted_at IS NULL AND url LIKE 'http%'`), one(`SELECT COUNT(*)::int AS n FROM media_assets WHERE deleted_at IS NOT NULL`)]);
-  json(ctx, 200, { backend: b.name, available: { r2: !!r2, supabase: await STORAGE.supabase.available(), local: true }, r2: r2 ? { bucket: r2.bucket, public_url: r2.public_url || null } : null, filesLive: live.n, filesCleaned: gone.n, cleanupEnabled: await setting("storage.cleanup_enabled", true), cleanupAfterHours: await setting("storage.cleanup_after_publish_hours", 48) });
+  json(ctx, 200, { backend: b.name, available: { r2: !!r2?.public_url, supabase: await STORAGE.supabase.available(), local: true }, r2: r2 ? { bucket: r2.bucket, public_url: r2.public_url || null, ready: !!r2.public_url, warning: r2.public_url ? null : "R2 keys are set but public_url is missing (R2_PUBLIC_URL or the r2 credential's public_url) — R2 is ignored until it is" } : null, filesLive: live.n, filesCleaned: gone.n, cleanupEnabled: await setting("storage.cleanup_enabled", true), cleanupAfterHours: await setting("storage.cleanup_after_publish_hours", 48) });
 });
 app.post("/api/storage/cleanup", async (ctx) => { await sweepStorageCleanup(); json(ctx, 200, { ok: true }); });
 // ---- settings
