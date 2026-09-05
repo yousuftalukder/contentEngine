@@ -1,15 +1,28 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Content Engine</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div id="root"></div>
-  <!-- Plain vanilla JS, no framework, no CDN, no build step. Runs fully offline. -->
+  <div id="app">
+    <nav id="rail" aria-label="Sections">
+      <div class="rail-brand">
+        <span class="rail-mark"></span>
+        <span class="rail-title">Content Engine</span>
+        <button class="rail-toggle" id="railToggle" aria-label="Toggle menu">☰</button>
+      </div>
+      <div class="rail-links" id="railLinks"></div>
+      <div class="rail-foot" id="railFoot"></div>
+    </nav>
+    <main id="main" tabindex="-1"></main>
+  </div>
+  <div id="toasts" aria-live="polite"></div>
+  <div id="modal" hidden></div>
   <script src="/app.js"></script>
 </body>
 </html>
- 
