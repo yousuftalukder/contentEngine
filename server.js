@@ -19,7 +19,7 @@ import http from "node:http";
 import { readFile, writeFile, mkdir, unlink, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -44,12 +44,18 @@ const DEFAULTS = {
   ELEVENLABS_MODEL: ENV.ELEVENLABS_MODEL || "eleven_multilingual_v2",
   ELEVENLABS_VOICE: ENV.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM",
   META_API_VERSION: ENV.META_API_VERSION || "v21.0",
+  OPENAI_MODEL: ENV.OPENAI_MODEL || "gpt-4o-mini",
+  OPENAI_TTS_MODEL: ENV.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
+  OPENAI_TTS_VOICE: ENV.OPENAI_TTS_VOICE || "alloy",
+  OPENAI_IMAGE_MODEL: ENV.OPENAI_IMAGE_MODEL || "gpt-image-1",
+  OPENAI_WHISPER_MODEL: ENV.OPENAI_WHISPER_MODEL || "whisper-1",
 };
 // $ per million tokens (in, out). Re-verify periodically; only used for budget accounting.
 const PRICES = {
   "claude-opus": [15, 75], "claude-sonnet": [3, 15], "claude-haiku": [1, 5],
   "gemini-2.5-pro": [1.25, 10], "gemini-pro": [1.25, 10], "gemini-2.5-flash-lite": [0.1, 0.4],
   "gemini-flash-lite": [0.1, 0.4], "gemini-2.5-flash": [0.3, 2.5], "gemini-flash": [0.3, 2.5], "gemini": [0.3, 2.5],
+  "gpt-4o-mini": [0.15, 0.6], "gpt-4o": [2.5, 10], "gpt-4.1-mini": [0.4, 1.6], "gpt-4.1-nano": [0.1, 0.4], "gpt-4.1": [2, 8], "gpt-5-mini": [0.25, 2], "gpt-5-nano": [0.05, 0.4], "gpt-5": [1.25, 10], "o4-mini": [1.1, 4.4],
 };
 const IMAGE_PRICE_USD = Number(ENV.IMAGE_PRICE_USD ?? 0.039);
 
@@ -143,17 +149,55 @@ async function putSetting(key, value) {
 async function spentTodayUsd() { return Number((await one(`SELECT COALESCE(SUM(cost_usd),0) AS c FROM api_usage_daily WHERE day = CURRENT_DATE`)).c) || 0; }
 async function budgetOk() { const cap = Number(await setting("budget.daily_cap_usd", 0)); if (!cap) return true; return (await spentTodayUsd()) < cap; }
 
-const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
-async function credentialsFor(provider) {
+// ---- 3a. secrets vault. Secrets pasted in the dashboard are encrypted with AES-256-GCM under SECRETS_KEY
+// (any long random string on Render; it is hashed to a 32-byte key). Without SECRETS_KEY the dashboard can
+// still *register* env-var names, but cannot store secret values. Secrets are never returned by any route.
+const SECRETS_KEY = ENV.SECRETS_KEY ? createHash("sha256").update(ENV.SECRETS_KEY).digest() : null;
+const vaultReady = () => !!SECRETS_KEY;
+function encryptSecret(plain) {
+  if (!SECRETS_KEY) throw new ApiError(400, null, "SECRETS_KEY is not set on Render — add a long random string (e.g. `openssl rand -hex 32`) and redeploy before storing secrets in the dashboard.");
+  const iv = randomBytes(12), c = createCipheriv("aes-256-gcm", SECRETS_KEY, iv);
+  const ct = Buffer.concat([c.update(String(plain), "utf8"), c.final()]);
+  return `v1.${iv.toString("base64url")}.${c.getAuthTag().toString("base64url")}.${ct.toString("base64url")}`;
+}
+function decryptSecret(blob) {
+  if (!blob) return null;
+  if (!SECRETS_KEY) throw new Error("A stored secret exists but SECRETS_KEY is not set — restore the same SECRETS_KEY on Render");
+  const [v, iv, tag, ct] = String(blob).split("."); if (v !== "v1") throw new Error("unknown secret format");
+  const d = createDecipheriv("aes-256-gcm", SECRETS_KEY, Buffer.from(iv, "base64url")); d.setAuthTag(Buffer.from(tag, "base64url"));
+  try { return Buffer.concat([d.update(Buffer.from(ct, "base64url")), d.final()]).toString("utf8"); }
+  catch { throw new Error("Stored secret could not be decrypted — SECRETS_KEY on Render differs from the one used to store it"); }
+}
+const secretHint = (s) => { const t = String(s || "").trim(); return t.length > 8 ? `…${t.slice(-4)}` : "…"; };
+// Some providers need several values (YouTube OAuth). Those are stored as one JSON secret and exposed as an object.
+const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
+const parseSecret = (provider, raw) => (MULTI_FIELD_PROVIDERS[provider] && raw ? (P(raw) || {}) : raw);
+
+const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
+const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2"];
+// Resolve the usable secret of one credential row: vault first, then the named env var.
+function credSecret(r) {
+  if (r.secret_enc) return { secret: parseSecret(r.provider, decryptSecret(r.secret_enc)), source: "vault" };
+  if (r.env_var && ENV[r.env_var]) return { secret: parseSecret(r.provider, ENV[r.env_var]), source: "env" };
+  return null;
+}
+async function credentialById(id) { const r = id ? await one(`SELECT * FROM api_credentials WHERE id=$1`, [id]) : null; if (!r) return null; const s = credSecret(r); return s ? { id: r.id, label: r.label, provider: r.provider, ...s } : null; }
+// Ordered list of keys to try for a provider. `pin` (an api_credentials id from adapter_configs.credential_id) is tried first;
+// if it is cooling down / over quota the rest of the provider's pool follows, then the default env var.
+async function credentialsFor(provider, pin = null) {
   const rows = await q(
     `SELECT c.*, COALESCE(u.units,0) AS used_today FROM api_credentials c
        LEFT JOIN api_usage_daily u ON u.credential_id = c.id AND u.day = CURRENT_DATE
       WHERE c.provider = $1 AND c.enabled::int = 1 AND (c.cooldown_until IS NULL OR c.cooldown_until <= now())
-      ORDER BY c.priority DESC, used_today ASC`, [provider]);
-  const list = rows.filter((r) => ENV[r.env_var]).filter((r) => !r.daily_quota || Number(r.used_today) < r.daily_quota)
-    .map((r) => ({ id: r.id, label: r.label, secret: ENV[r.env_var] }));
+      ORDER BY (c.id = $2) DESC, c.priority DESC, used_today ASC`, [provider, pin || ""]);
+  const list = [];
+  for (const r of rows) {
+    if (r.daily_quota && Number(r.used_today) >= r.daily_quota) continue;
+    let s; try { s = credSecret(r); } catch (e) { warn(`credential ${r.label}: ${e.message}`); continue; }
+    if (s) list.push({ id: r.id, label: r.label, ...s });
+  }
   const envName = DEFAULT_ENV[provider];
-  if (!list.length && envName && ENV[envName]) list.push({ id: `env:${provider}`, label: envName, secret: ENV[envName] });
+  if (!list.length && envName && ENV[envName]) list.push({ id: `env:${provider}`, label: envName, secret: ENV[envName], source: "env" });
   return list;
 }
 async function recordUsage(credId, provider, units = 1, cost = 0) {
@@ -162,9 +206,9 @@ async function recordUsage(credId, provider, units = 1, cost = 0) {
     [newId(), credId, provider, units, cost]).catch((e) => warn("usage record failed", e.message));
 }
 // Runs fn(secret) against the best key; on 429/quota errors cools that key down and tries the next one.
-async function withKey(provider, fn) {
-  const creds = await credentialsFor(provider);
-  if (!creds.length) throw new Error(`No API key for "${provider}". Set ${DEFAULT_ENV[provider] || "an env var"} on Render, or add a credential on the API keys page.`);
+async function withKey(provider, fn, pin = null) {
+  const creds = await credentialsFor(provider, pin);
+  if (!creds.length) throw new Error(`No API key for "${provider}". Add one on the API keys page${DEFAULT_ENV[provider] ? ` (or set ${DEFAULT_ENV[provider]} on Render)` : ""}.`);
   let last;
   for (const c of creds) {
     try {
@@ -183,26 +227,100 @@ async function withKey(provider, fn) {
 }
 
 // === 4. storage & processes ===========================================
-async function storeFile(path, bytes, contentType) {
-  if (ENV.SUPABASE_URL && ENV.SUPABASE_SERVICE_ROLE_KEY) {
-    const bucket = ENV.SUPABASE_BUCKET || "media";
-    await fetchJson(`${ENV.SUPABASE_URL}/storage/v1/object/${bucket}/${path}`, {
-      method: "POST", body: bytes,
-      headers: { Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, "Content-Type": contentType, "x-upsert": "true" },
-    });
-    return `${ENV.SUPABASE_URL}/storage/v1/object/public/${bucket}/${path}`;
-  }
-  const full = join(LOCAL_MEDIA_DIR, path);
-  await mkdir(dirname(full), { recursive: true });
-  await writeFile(full, bytes);
-  return `${ENV.PUBLIC_BASE_URL || `http://localhost:${PORT}`}/media/${path}`;
+// Backends: Cloudflare R2 (S3 API, SigV4 signed here — no SDK), Supabase Storage, or local disk.
+// R2 config comes from env (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_URL) or from
+// a vault credential with provider "r2" (one JSON secret with those five fields, set on the API keys page).
+// STORAGE_BACKEND=r2|supabase|local forces a choice; otherwise the first configured one wins in that order.
+const hmac = (k, s) => createHmac("sha256", k).update(s).digest();
+const hex = (b) => Buffer.from(b).toString("hex");
+function sigV4({ method, host, path, headers, body, region, service, accessKey, secretKey }) {
+  const now = new Date(), amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ""), date = amzDate.slice(0, 8);
+  const payloadHash = createHash("sha256").update(body || "").digest("hex");
+  const hdr = { ...headers, host, "x-amz-date": amzDate, "x-amz-content-sha256": payloadHash };
+  const signedKeys = Object.keys(hdr).map((k) => k.toLowerCase()).sort();
+  const canonHeaders = signedKeys.map((k) => `${k}:${String(hdr[Object.keys(hdr).find((x) => x.toLowerCase() === k)]).trim()}\n`).join("");
+  const canonPath = path.split("/").map((s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())).join("/");
+  const canonical = [method, canonPath, "", canonHeaders, signedKeys.join(";"), payloadHash].join("\n");
+  const scope = `${date}/${region}/${service}/aws4_request`;
+  const sts = ["AWS4-HMAC-SHA256", amzDate, scope, createHash("sha256").update(canonical).digest("hex")].join("\n");
+  const kSign = hmac(hmac(hmac(hmac(`AWS4${secretKey}`, date), region), service), "aws4_request");
+  hdr.Authorization = `AWS4-HMAC-SHA256 Credential=${accessKey}/${scope}, SignedHeaders=${signedKeys.join(";")}, Signature=${hex(hmac(kSign, sts))}`;
+  return hdr;
 }
+async function r2Config() {
+  const vault = (await credentialsFor("r2"))[0]?.secret;
+  const c = vault && typeof vault === "object" ? vault : { account_id: ENV.R2_ACCOUNT_ID, access_key_id: ENV.R2_ACCESS_KEY_ID, secret_access_key: ENV.R2_SECRET_ACCESS_KEY, bucket: ENV.R2_BUCKET, public_url: ENV.R2_PUBLIC_URL };
+  if (!c.account_id || !c.access_key_id || !c.secret_access_key || !c.bucket) return null;
+  return { ...c, host: `${c.account_id}.r2.cloudflarestorage.com`, public_url: String(c.public_url || "").replace(/\/+$/, "") };
+}
+async function r2Request(method, path, body = null, contentType = null) {
+  const c = await r2Config(); if (!c) throw new Error("R2 is not configured");
+  const headers = sigV4({ method, host: c.host, path: `/${c.bucket}/${path}`, headers: contentType ? { "content-type": contentType } : {}, body, region: "auto", service: "s3", accessKey: c.access_key_id, secretKey: c.secret_access_key });
+  const res = await fetch(`https://${c.host}/${c.bucket}/${path}`, { method, headers, body });
+  if (!res.ok && !(method === "DELETE" && res.status === 404)) throw new ApiError(res.status, await res.text().catch(() => ""), `R2 ${method} ${path} -> ${res.status}`);
+  return res;
+}
+const STORAGE = {
+  r2: {
+    name: "r2", available: async () => !!(await r2Config()),
+    publicBase: async () => { const c = await r2Config(); if (!c.public_url) throw new Error("R2 needs public_url (R2_PUBLIC_URL): enable the r2.dev subdomain or a custom domain on the bucket"); return c.public_url; },
+    put: async (path, bytes, ct) => { await r2Request("PUT", path, bytes, ct); return `${await STORAGE.r2.publicBase()}/${path}`; },
+    del: async (path) => { await r2Request("DELETE", path); },
+  },
+  supabase: {
+    name: "supabase", available: async () => !!(ENV.SUPABASE_URL && ENV.SUPABASE_SERVICE_ROLE_KEY),
+    publicBase: async () => `${ENV.SUPABASE_URL}/storage/v1/object/public/${ENV.SUPABASE_BUCKET || "media"}`,
+    put: async (path, bytes, ct) => { const bucket = ENV.SUPABASE_BUCKET || "media"; await fetchJson(`${ENV.SUPABASE_URL}/storage/v1/object/${bucket}/${path}`, { method: "POST", body: bytes, headers: { Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, "Content-Type": ct, "x-upsert": "true" } }); return `${await STORAGE.supabase.publicBase()}/${path}`; },
+    del: async (path) => { await fetchJson(`${ENV.SUPABASE_URL}/storage/v1/object/${ENV.SUPABASE_BUCKET || "media"}`, { method: "DELETE", headers: { Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: [path] }) }).catch((e) => { if (e.status !== 404) throw e; }); },
+  },
+  local: {
+    name: "local", available: async () => true,
+    publicBase: async () => `${ENV.PUBLIC_BASE_URL || `http://localhost:${PORT}`}/media`,
+    put: async (path, bytes) => { const full = join(LOCAL_MEDIA_DIR, path); await mkdir(dirname(full), { recursive: true }); await writeFile(full, bytes); return `${await STORAGE.local.publicBase()}/${path}`; },
+    del: async (path) => { await unlink(join(LOCAL_MEDIA_DIR, path)).catch(() => {}); },
+  },
+};
+const storageCache = { at: 0, backend: null };
+async function storageBackend() {
+  if (Date.now() - storageCache.at < 30000 && storageCache.backend) return storageCache.backend;
+  const forced = (ENV.STORAGE_BACKEND || "").toLowerCase();
+  let b = forced && STORAGE[forced] ? STORAGE[forced] : null;
+  if (!b) for (const k of ["r2", "supabase", "local"]) if (await STORAGE[k].available()) { b = STORAGE[k]; break; }
+  storageCache.backend = b; storageCache.at = Date.now(); return b;
+}
+async function storeFile(path, bytes, contentType) { return (await storageBackend()).put(path, bytes, contentType); }
 async function storeLocal(localPath, destPath, contentType) { return storeFile(destPath, await readFile(localPath), contentType); }
+// Work out which backend/path a stored URL belongs to so it can be deleted later, whichever backend is active now.
+async function locateStored(url) {
+  if (!url || !/^https?:/.test(url)) return null;
+  for (const k of ["r2", "supabase", "local"]) { const b = STORAGE[k]; if (!(await b.available().catch(() => false))) continue; let base; try { base = await b.publicBase(); } catch { continue; } if (url.startsWith(base + "/")) return { backend: b, path: url.slice(base.length + 1) }; }
+  return null;
+}
+async function deleteStored(url) { const loc = await locateStored(url); if (!loc) return false; await loc.backend.del(loc.path); return true; }
 async function recordMedia({ contentItemId = null, kind, url, mime = null, duration = null, width = null, height = null, path = null, meta = {} }) {
   const id = newId();
+  if (!path) path = (await locateStored(url))?.path || null;
   await q(`INSERT INTO media_assets (id, content_item_id, kind, url, mime, width, height, duration_seconds, storage_path, meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`,
     [id, contentItemId, kind, url, mime, width, height, duration, path, JSON.stringify(meta)]);
   return { id, kind, url, mime, duration_seconds: duration };
+}
+// Storage hygiene: once every asset of an item is PUBLISHED (platforms have copied the file) and enough time has
+// passed, delete the item's media from storage. The media rows stay (with deleted_at) so history and metrics survive.
+async function sweepStorageCleanup() {
+  if (!(await setting("storage.cleanup_enabled", true))) return;
+  const hours = Number(await setting("storage.cleanup_after_publish_hours", 48)) || 48;
+  const rows = await q(`SELECT m.id, m.url FROM media_assets m JOIN content_items ci ON ci.id = m.content_item_id
+    WHERE m.deleted_at IS NULL AND m.url LIKE 'http%' AND ci.status = 'PUBLISHED'
+      AND NOT EXISTS (SELECT 1 FROM content_assets a WHERE a.content_item_id = ci.id AND a.status <> 'PUBLISHED')
+      AND NOT EXISTS (SELECT 1 FROM content_assets a WHERE a.content_item_id = ci.id AND a.published_at > now() - ($1 || ' hours')::interval)
+      AND NOT EXISTS (SELECT 1 FROM content_items d WHERE d.hero_media_id = m.id AND d.id <> ci.id AND d.status NOT IN ('PUBLISHED','REJECTED','FAILED'))
+    LIMIT 40`, [String(hours)]);
+  let n = 0;
+  for (const m of rows) {
+    try { await deleteStored(m.url); await q(`UPDATE media_assets SET deleted_at = now() WHERE id=$1`, [m.id]); n++; }
+    catch (e) { warn(`cleanup ${m.id}: ${e.message}`); }
+  }
+  if (n) log(`storage cleanup: deleted ${n} file(s)`);
 }
 // Materialise any media URL (remote, local /media, or file path) as a tmp file.
 async function toTmpFile(url, ext) {
@@ -211,7 +329,9 @@ async function toTmpFile(url, ext) {
   const localPrefix = `/media/`;
   const i = url.indexOf(localPrefix);
   if (!/^https?:/.test(url)) { await writeFile(out, await readFile(url)); return out; }
-  if (i > 0 && !ENV.SUPABASE_URL) { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, url.slice(i + localPrefix.length)))); return out; }
+  if (i > 0 && (await storageBackend()).name === "local") { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, url.slice(i + localPrefix.length)))); return out; }
+  const gone = await one(`SELECT id FROM media_assets WHERE url=$1 AND deleted_at IS NOT NULL`, [url]);
+  if (gone) throw new Error("This media file was already deleted by storage cleanup after publishing — regenerate the item to produce a new file");
   await writeFile(out, await fetchBytes(url));
   return out;
 }
@@ -248,7 +368,10 @@ async function resolve(stage, key) {
   const def = implId && IMPLS[stage]?.[implId];
   if (!def) throw new Error(`Unknown ${stage} adapter "${key}" (impl "${implId || key}" is not registered)`);
   if (row && !flag(row.enabled)) throw new Error(`${stage} adapter instance "${key}" is disabled`);
-  const a = def.create(P(row?.config) || {}, { key, row });
+  const cfg = P(row?.config) || {};
+  // Key pinning: adapter instance may name a specific credential (Adapters page → Credential), so e.g. a "gemini_writing"
+  // instance uses one Gemini key and "gemini_image" another. Falls back to the provider pool if that key is unavailable.
+  const a = def.create(cfg, { key, row, pin: row?.credential_id || cfg.credential_id || null });
   a.key = key; a.impl = implId;
   return a;
 }
@@ -276,7 +399,7 @@ impl("SCRIPT", "llm_mock", { label: "Mock LLM", create: () => ({
     if (json) return { text: JSON.stringify(mock ?? {}), data: mock ?? {}, cost: 0 };
     return { text: `[mock] ${String(prompt).slice(0, 160)}`, data: null, cost: 0 };
   } }) });
-impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: { type: "string", default: DEFAULTS.ANTHROPIC_MODEL } }, create: (cfg) => ({
+impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: { type: "string", default: DEFAULTS.ANTHROPIC_MODEL } }, create: (cfg, ctx = {}) => ({
   async complete({ system, prompt, json = false, maxTokens = 2500 }) {
     const model = cfg.model || DEFAULTS.ANTHROPIC_MODEL;
     return withKey("anthropic", async (key) => {
@@ -287,9 +410,9 @@ impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: 
       const text = (body.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
       const u = body.usage || {};
       return { text, data: json ? extractJson(text) : null, cost: tokenCost(model, u.input_tokens, u.output_tokens), model, units: 1 };
-    });
+    }, ctx.pin);
   } }) });
-impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, grounding: { type: "boolean", default: false } }, create: (cfg) => ({
+impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, grounding: { type: "boolean", default: false } }, create: (cfg, ctx = {}) => ({
   async complete({ system, prompt, json = false, maxTokens = 4000, grounding = false }) {
     const model = cfg.model || DEFAULTS.GEMINI_MODEL;
     const useSearch = grounding || cfg.grounding;
@@ -306,7 +429,21 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
       const u = body.usageMetadata || {};
       const cites = (body.candidates?.[0]?.groundingMetadata?.groundingChunks || []).map((c) => c.web?.uri).filter(Boolean);
       return { text, data: json ? extractJson(text) : null, cost: tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), model, citations: cites, units: 1 };
-    });
+    }, ctx.pin);
+  } }) });
+impl("SCRIPT", "openai", { label: "OpenAI (GPT)", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_MODEL }, temperature: { type: "number", default: 0.7 } }, create: (cfg, ctx = {}) => ({
+  async complete({ system, prompt, json = false, maxTokens = 3000 }) {
+    const model = cfg.model || DEFAULTS.OPENAI_MODEL;
+    return withKey("openai", async (key) => {
+      const messages = []; if (system) messages.push({ role: "system", content: system });
+      messages.push({ role: "user", content: prompt + (json ? "\n\nRespond with ONLY valid JSON." : "") });
+      const req = { model, messages, max_completion_tokens: maxTokens, response_format: json ? { type: "json_object" } : undefined };
+      if (!/^(o\d|gpt-5)/.test(model) && cfg.temperature != null) req.temperature = Number(cfg.temperature);
+      const body = await fetchJson("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(req) });
+      const text = body.choices?.[0]?.message?.content || ""; const u = body.usage || {};
+      let data = null; if (json) { data = extractJson(text); if (data && !Array.isArray(data) && Object.keys(data).length === 1 && Array.isArray(Object.values(data)[0])) data = Object.values(data)[0]; }
+      return { text, data, cost: tokenCost(model, u.prompt_tokens, u.completion_tokens), model, units: 1 };
+    }, ctx.pin);
   } }) });
 
 // ---- 6b. Legacy topic sources (stage TOPIC). fetchCandidate({nicheKey, excludeTopics}) -> {topic, sourceDataRef}
@@ -324,7 +461,7 @@ for (const k of Object.keys(MOCK_TOPICS)) impl("TOPIC", k, { label: `Mock (${k})
     while (excludeTopics.includes(list[i]) && tries++ < list.length) i = (i + 1) % list.length;
     return { topic: list[i], sourceDataRef: { provider: k, fetchedAt: nowIso(), note: "deterministic mock" } };
   } }) });
-impl("TOPIC", "newsapi_topic", { label: "NewsAPI top headline", configSchema: { country: { type: "string", default: "us" }, category: { type: "string", default: "technology" }, query: { type: "string" } }, create: (cfg) => ({
+impl("TOPIC", "newsapi_topic", { label: "NewsAPI top headline", configSchema: { country: { type: "string", default: "us" }, category: { type: "string", default: "technology" }, query: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async fetchCandidate({ excludeTopics }) {
     return withKey("newsapi", async (key) => {
       const p = form({ country: cfg.query ? undefined : cfg.country || "us", category: cfg.query ? undefined : cfg.category || "technology", q: cfg.query, pageSize: 20, apiKey: key });
@@ -332,7 +469,7 @@ impl("TOPIC", "newsapi_topic", { label: "NewsAPI top headline", configSchema: { 
       const art = (body.articles || []).find((a) => a.title && !excludeTopics.includes(a.title)) || body.articles?.[0];
       if (!art) throw new Error("NewsAPI returned no articles");
       return { topic: art.title, sourceDataRef: { provider: "newsapi", url: art.url, outlet: art.source?.name, description: art.description, publishedAt: art.publishedAt }, units: 1, cost: 0 };
-    });
+    }, ctx.pin);
   } }) });
 
 // ---- 6c. Ingest (stage INGEST). fetchItems(source) -> [{external_id,url,title,summary,published_at,thumbnail,kind,duration,views,platform,raw}]
@@ -352,13 +489,13 @@ function parseFeed(xml) {
 }
 impl("INGEST", "ingest_mock", { label: "Mock feed", create: () => ({
   async fetchItems(source) { const n = Date.now(); return [0, 1].map((i) => ({ external_id: `mock-${n}-${i}`, url: `https://example.com/story/${n}-${i}`, title: `Mock story ${n % 1000}-${i} from ${source.name}`, summary: "A deterministic mock story used to exercise the pipeline without any keys.", published_at: nowIso(), kind: "ARTICLE" })); } }) });
-impl("INGEST", "rss", { label: "RSS / Atom", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 30 } }, create: (cfg) => ({
+impl("INGEST", "rss", { label: "RSS / Atom", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 30 } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
     const url = cfg.url || P(source.config)?.url; if (!url) throw new Error("RSS source needs config.url");
     const res = await fetch(url, { headers: { "user-agent": "ContentEngine/1.0 (+rss)" } }); if (!res.ok) throw new Error(`Feed ${url} -> ${res.status}`);
     return parseFeed(await res.text()).slice(0, cfg.limit || P(source.config)?.limit || 30);
   } }) });
-impl("INGEST", "newsapi", { label: "NewsAPI", configSchema: { country: { type: "string" }, category: { type: "string" }, query: { type: "string" }, language: { type: "string" } }, create: (cfg) => ({
+impl("INGEST", "newsapi", { label: "NewsAPI", configSchema: { country: { type: "string" }, category: { type: "string" }, query: { type: "string" }, language: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
     const c = { ...cfg, ...(P(source.config) || {}) };
     return withKey("newsapi", async (key) => {
@@ -366,10 +503,10 @@ impl("INGEST", "newsapi", { label: "NewsAPI", configSchema: { country: { type: "
       const p = form({ country: c.country, category: c.category, q: c.query, language: c.language, pageSize: c.limit || 30, sortBy: endpoint === "everything" ? "publishedAt" : undefined, apiKey: key });
       const body = await fetchJson(`https://newsapi.org/v2/${endpoint}?${p}`);
       return (body.articles || []).filter((a) => a.title && a.url).map((a) => ({ external_id: a.url, url: a.url, title: a.title, summary: a.description || a.content || "", published_at: a.publishedAt, thumbnail: a.urlToImage, kind: "ARTICLE", raw: { outlet: a.source?.name } }));
-    });
+    }, ctx.pin);
   } }) });
 const iso8601ToSec = (d) => { const m = /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/.exec(d || ""); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : null; };
-impl("INGEST", "youtube_api", { label: "YouTube Data API", configSchema: { channel_id: { type: "string" }, query: { type: "string" }, limit: { type: "number", default: 20 }, hours: { type: "number", default: 72 } }, create: (cfg) => ({
+impl("INGEST", "youtube_api", { label: "YouTube Data API", configSchema: { channel_id: { type: "string" }, query: { type: "string" }, limit: { type: "number", default: 20 }, hours: { type: "number", default: 72 } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
     const c = { ...cfg, ...(P(source.config) || {}) };
     return withKey("youtube", async (key) => {
@@ -380,9 +517,9 @@ impl("INGEST", "youtube_api", { label: "YouTube Data API", configSchema: { chann
       const items = (v.items || []).map((x) => ({ external_id: x.id, url: `https://www.youtube.com/watch?v=${x.id}`, title: x.snippet.title, summary: x.snippet.description?.slice(0, 2000), published_at: x.snippet.publishedAt,
         thumbnail: x.snippet.thumbnails?.high?.url, kind: "VIDEO", duration: iso8601ToSec(x.contentDetails?.duration), views: Number(x.statistics?.viewCount || 0), platform: "YOUTUBE", license: x.status?.license === "creativeCommon" ? "CC_BY" : "STANDARD", raw: { channel: x.snippet.channelTitle } }));
       items.units = 101; return items;
-    }).then((r) => Array.isArray(r) ? r : r.items);
+    }, ctx.pin).then((r) => Array.isArray(r) ? r : r.items);
   } }) });
-impl("INGEST", "ytdlp_list", { label: "yt-dlp listing (any site)", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 20 } }, create: (cfg) => ({
+impl("INGEST", "ytdlp_list", { label: "yt-dlp listing (any site)", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 20 } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
     const c = { ...cfg, ...(P(source.config) || {}) }; if (!c.url) throw new Error("ytdlp_list source needs config.url (channel / videos page / playlist / search URL)");
     const args = ["-J", "--flat-playlist", "--playlist-end", String(c.limit || 20), "--no-warnings", c.url];
@@ -397,7 +534,7 @@ impl("INGEST", "ytdlp_list", { label: "yt-dlp listing (any site)", configSchema:
 
 // ---- 6d. Download (stage DOWNLOAD). download(url) -> {path, duration}
 impl("DOWNLOAD", "download_mock", { label: "Mock", create: () => ({ async download() { return { path: null, duration: 600, mock: true }; } }) });
-impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "string", default: "bv*[height<=1080]+ba/b[height<=1080]/b" }, max_minutes: { type: "number", default: 180 } }, create: (cfg) => ({
+impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "string", default: "bv*[height<=1080]+ba/b[height<=1080]/b" }, max_minutes: { type: "number", default: 180 } }, create: (cfg, ctx = {}) => ({
   async download(url) {
     await mkdir(TMP, { recursive: true });
     const base = join(TMP, randomUUID());
@@ -415,7 +552,7 @@ const joinSegments = (segs) => segs.map((s) => s.text).join(" ");
 impl("TRANSCRIBE", "transcribe_mock", { label: "Mock", create: () => ({
   async transcribe({ duration = 600 }) { const segs = []; for (let t = 0; t < Math.min(duration, 1800); t += 8) segs.push({ start: t, end: t + 8, text: `Mock transcript sentence covering seconds ${t} to ${t + 8}; the speaker makes a surprising point here.` }); return { segments: segs, text: joinSegments(segs) }; } }) });
 async function extractAudio(videoPath) { const out = tmpPath("mp3"); await exec("ffmpeg", ["-y", "-i", videoPath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", out]); return out; }
-impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped transcript)", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL } }, create: (cfg) => ({
+impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped transcript)", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL } }, create: (cfg, ctx = {}) => ({
   async transcribe({ path, language }) {
     const audio = await extractAudio(path);
     try {
@@ -436,10 +573,26 @@ impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped 
         const u = body.usageMetadata || {};
         fetch(`https://generativelanguage.googleapis.com/v1beta/${file.name}`, { method: "DELETE", headers: { "x-goog-api-key": key } }).catch(() => {});
         return { segments: segs, text: joinSegments(segs), cost: tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), units: 1 };
-      });
+      }, ctx.pin);
     } finally { await cleanup(audio); }
   } }) });
-impl("TRANSCRIBE", "whisper_local", { label: "Whisper CLI (local)", configSchema: { model: { type: "string", default: "base" } }, create: (cfg) => ({
+impl("TRANSCRIBE", "whisper_api", { label: "OpenAI Whisper API", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_WHISPER_MODEL } }, create: (cfg, ctx = {}) => ({
+  async transcribe({ path, language }) {
+    const audio = await extractAudio(path);
+    try {
+      const bytes = await readFile(audio);
+      if (bytes.length > 25 * 1024 * 1024) throw new Error("Audio exceeds Whisper's 25 MB limit — use whisper_local or gemini_transcribe for long videos");
+      return await withKey("openai", async (key) => {
+        const fd = new FormData(); fd.append("file", new Blob([bytes], { type: "audio/mpeg" }), "audio.mp3"); fd.append("model", cfg.model || DEFAULTS.OPENAI_WHISPER_MODEL);
+        fd.append("response_format", "verbose_json"); fd.append("timestamp_granularities[]", "segment"); if (language) fd.append("language", language);
+        const body = await fetchJson("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${key}` }, body: fd });
+        const segs = (body.segments || []).map((s) => ({ start: Number(s.start) || 0, end: Number(s.end) || 0, text: String(s.text || "").trim() }));
+        const minutes = (body.duration || segs.at(-1)?.end || 0) / 60;
+        return { segments: segs, text: body.text || joinSegments(segs), cost: minutes * Number(ENV.WHISPER_USD_PER_MINUTE || 0.006), units: 1 };
+      }, ctx.pin);
+    } finally { await cleanup(audio); }
+  } }) });
+impl("TRANSCRIBE", "whisper_local", { label: "Whisper CLI (local)", configSchema: { model: { type: "string", default: "base" } }, create: (cfg, ctx = {}) => ({
   async transcribe({ path, language }) {
     const audio = await extractAudio(path); const outDir = join(TMP, randomUUID()); await mkdir(outDir, { recursive: true });
     try {
@@ -455,11 +608,13 @@ impl("TRANSCRIBE", "whisper_local", { label: "Whisper CLI (local)", configSchema
 const methodCfg = (niche) => ({ clip_min_seconds: 25, clip_max_seconds: 75, clips_per_video: 3, min_score: 0.5, orientation: "9:16", ...(P(niche.method_config) || {}) });
 impl("CLIP", "clip_mock", { label: "Mock clipper", create: () => ({
   async selectClips({ transcript, niche }) { const c = methodCfg(niche); const dur = transcript.segments.at(-1)?.end || 300; const out = []; for (let i = 0; i < c.clips_per_video; i++) { const s = Math.min(i * 90, Math.max(0, dur - c.clip_max_seconds)); out.push({ start: s, end: Math.min(dur, s + c.clip_min_seconds + 20), title: `Mock clip ${i + 1}`, hook: "You won't believe this part", score: 0.8 - i * 0.1, reason: "mock" }); } return out; } }) });
-impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", create: () => ({
+impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSchema: { llm: { type: "string", default: "(program's script adapter)" }, llm_fallbacks: { type: "array" } }, create: (cfg) => ({
   async selectClips({ transcript, niche, candidate }) {
     const c = methodCfg(niche);
     const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 120000);
-    const r = await withFallbacks("SCRIPT", niche.script_adapter, niche.script_adapter_fallbacks, (llm) => llm.complete({ json: true, maxTokens: 3000,
+    // config.llm lets clipping run on a different SCRIPT instance (e.g. "openai_live") than the program's writer.
+    const primary = cfg.llm || niche.script_adapter, fallbacks = cfg.llm ? (cfg.llm_fallbacks || []) : niche.script_adapter_fallbacks;
+    const r = await withFallbacks("SCRIPT", primary, fallbacks, (llm) => llm.complete({ json: true, maxTokens: 3000,
       system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}. Tone: ${niche.tone || "engaging"}.`,
       prompt: `Video: "${candidate.title}"\nTimestamped transcript:\n${lines}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why"}]`,
       mock: [{ start: 0, end: c.clip_min_seconds + 10, title: "Mock clip", hook: "Mock hook", score: 0.7, reason: "mock" }] }));
@@ -480,7 +635,7 @@ impl("IMAGE", "image_mock", { label: "Mock image (SVG card)", create: () => ({
     const url = await storeFile(`images/${newId()}.svg`, Buffer.from(svgCard(headline, specs)), "image/svg+xml");
     return recordMedia({ contentItemId, kind: "IMAGE", url, mime: "image/svg+xml", width: specs.width || 1080, height: specs.height || 1080, meta: { mock: true } });
   } }) });
-impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_IMAGE_MODEL } }, create: (cfg) => ({
+impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_IMAGE_MODEL } }, create: (cfg, ctx = {}) => ({
   async generate({ prompt, headline, specs = {}, contentItemId }) {
     const model = cfg.model || DEFAULTS.GEMINI_IMAGE_MODEL;
     const ar = specs.aspect_ratio || (specs.height > specs.width ? "9:16" : specs.width > specs.height ? "16:9" : "1:1");
@@ -494,7 +649,21 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
       const url = await storeFile(`images/${newId()}.${mime.includes("jpeg") ? "jpg" : "png"}`, Buffer.from(d.data, "base64"), mime);
       const media = await recordMedia({ contentItemId, kind: "IMAGE", url, mime, meta: { model, prompt: full } });
       return { ...media, cost: IMAGE_PRICE_USD, units: 1 };
-    });
+    }, ctx.pin);
+  } }) });
+
+impl("IMAGE", "openai_image", { label: "OpenAI image generation", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_IMAGE_MODEL }, quality: { type: "string", default: "medium" } }, create: (cfg, ctx = {}) => ({
+  async generate({ prompt, headline, specs = {}, contentItemId }) {
+    const model = cfg.model || DEFAULTS.OPENAI_IMAGE_MODEL;
+    const size = specs.height > specs.width ? "1024x1536" : specs.width > specs.height ? "1536x1024" : "1024x1024";
+    const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === false ? "Do not render any text." : `Render this headline as bold, legible overlay text: "${headline}".`}`;
+    return withKey("openai", async (key) => {
+      const body = await fetchJson("https://api.openai.com/v1/images/generations", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify({ model, prompt: full, size, quality: cfg.quality || "medium", n: 1 }) });
+      const b64 = body.data?.[0]?.b64_json; if (!b64) throw new Error("OpenAI returned no image");
+      const url = await storeFile(`images/${newId()}.png`, Buffer.from(b64, "base64"), "image/png");
+      const media = await recordMedia({ contentItemId, kind: "IMAGE", url, mime: "image/png", meta: { model, prompt: full } });
+      return { ...media, cost: Number(ENV.OPENAI_IMAGE_PRICE_USD ?? 0.04), units: 1 };
+    }, ctx.pin);
   } }) });
 
 // ---- 6h. Voice (stage VOICE). synthesize({script, voiceId, contentItemId}) -> media row (AUDIO, duration)
@@ -504,7 +673,7 @@ impl("VOICE", "tts_mock", { label: "Mock TTS (silent track)", create: () => ({
     try { const f = tmpPath("mp3"); await exec("ffmpeg", ["-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", dur.toFixed(2), "-q:a", "9", f]); const url = await storeLocal(f, `audio/${newId()}.mp3`, "audio/mpeg"); await cleanup(f); return recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur, meta: { mock: true } }); }
     catch { return { id: null, kind: "AUDIO", url: `mock://audio/${newId()}.mp3`, duration_seconds: dur, mock: true }; }
   } }) });
-impl("VOICE", "elevenlabs", { label: "ElevenLabs", configSchema: { voice_id: { type: "string", default: DEFAULTS.ELEVENLABS_VOICE }, model: { type: "string", default: DEFAULTS.ELEVENLABS_MODEL } }, create: (cfg) => ({
+impl("VOICE", "elevenlabs", { label: "ElevenLabs", configSchema: { voice_id: { type: "string", default: DEFAULTS.ELEVENLABS_VOICE }, model: { type: "string", default: DEFAULTS.ELEVENLABS_MODEL } }, create: (cfg, ctx = {}) => ({
   async synthesize({ script, voiceId, contentItemId }) {
     const voice = voiceId || cfg.voice_id || DEFAULTS.ELEVENLABS_VOICE;
     return withKey("elevenlabs", async (key) => {
@@ -513,15 +682,27 @@ impl("VOICE", "elevenlabs", { label: "ElevenLabs", configSchema: { voice_id: { t
       const url = await storeLocal(f, `audio/${newId()}.mp3`, "audio/mpeg"); await cleanup(f);
       const media = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur || script.length / 15, meta: { voice, chars: script.length } });
       return { ...media, units: script.length, cost: script.length * Number(ENV.ELEVENLABS_USD_PER_CHAR || 0.0002) };
-    });
+    }, ctx.pin);
+  } }) });
+
+impl("VOICE", "openai_tts", { label: "OpenAI TTS", configSchema: { voice: { type: "string", default: DEFAULTS.OPENAI_TTS_VOICE }, model: { type: "string", default: DEFAULTS.OPENAI_TTS_MODEL }, instructions: { type: "string" } }, create: (cfg, ctx = {}) => ({
+  async synthesize({ script, voiceId, contentItemId }) {
+    const voice = voiceId || cfg.voice || DEFAULTS.OPENAI_TTS_VOICE, model = cfg.model || DEFAULTS.OPENAI_TTS_MODEL;
+    return withKey("openai", async (key) => {
+      const bytes = await fetchBytes("https://api.openai.com/v1/audio/speech", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify({ model, voice, input: script.slice(0, 4096), response_format: "mp3", instructions: cfg.instructions || undefined }) });
+      const f = tmpPath("mp3"); await writeFile(f, bytes); const dur = await ffprobeDuration(f);
+      const url = await storeLocal(f, `audio/${newId()}.mp3`, "audio/mpeg"); await cleanup(f);
+      const media = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur || script.length / 15, meta: { voice, model, chars: script.length } });
+      return { ...media, units: script.length, cost: script.length * Number(ENV.OPENAI_TTS_USD_PER_CHAR || 0.000015) };
+    }, ctx.pin);
   } }) });
 
 // ---- 6i. Embeddings (stage EMBED). embed(text) -> number[] | null
 impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { return null; } }) });
-impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg) => ({
+impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg, ctx = {}) => ({
   async embed(text) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL;
-    const r = await withKey("gemini", async (key) => { const b = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) }); return { v: b.embedding?.values || null, units: 1, cost: 0 }; });
+    const r = await withKey("gemini", async (key) => { const b = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) }); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
     return r.v;
   } }) });
 
@@ -620,13 +801,26 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
 const PLATFORM_DEFAULT_PUBLISHER = { FACEBOOK: "meta_graph", INSTAGRAM: "meta_graph", YOUTUBE: "youtube_upload" };
 impl("PUBLISH", "publish_mock", { label: "Mock", create: () => ({ async publish({ channel }) { const id = newId(); return { publishedUrl: `mock://published/${channel.platform.toLowerCase()}/${id}`, externalId: id }; },
   async metrics() { return { views: Math.floor(Math.random() * 2000), likes: 10, comments: 2 }; } }) });
-const metaToken = (channel, cfg) => { const pc = P(channel.platform_config) || {}; const envName = pc.token_env || cfg.token_env || "META_ACCESS_TOKEN"; const t = ENV[envName]; if (!t) throw new Error(`Meta access token env var ${envName} is not set (channel.platform_config.token_env)`); return t; };
-impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema: { token_env: { type: "string", default: "META_ACCESS_TOKEN" }, api_version: { type: "string", default: DEFAULTS.META_API_VERSION } }, create: (cfg) => {
+// Channel secrets: channels.credential_id points at an api_credentials row (provider "meta" or "youtube_oauth") whose
+// value lives in the vault or in a named env var. Legacy platform_config.*_env names still work as a fallback.
+async function channelCredential(channel, provider) {
+  const pc = P(channel.platform_config) || {};
+  const id = channel.credential_id || pc.credential_id; if (!id) return null;
+  const c = await credentialById(id); if (!c) throw new Error(`Channel "${channel.display_name}" points at credential ${id} but it has no usable secret (missing on Render, or SECRETS_KEY changed)`);
+  if (c.provider !== provider) throw new Error(`Channel "${channel.display_name}" credential is for "${c.provider}", but this publisher needs "${provider}"`);
+  return c.secret;
+}
+async function metaToken(channel, cfg) {
+  const fromVault = await channelCredential(channel, "meta"); if (fromVault) return fromVault;
+  const pc = P(channel.platform_config) || {}; const envName = pc.token_env || cfg.token_env || "META_ACCESS_TOKEN"; const t = ENV[envName];
+  if (!t) throw new Error(`No Meta access token for this channel: pick a "meta" credential on the channel (API keys page → add one), or set ${envName} on Render`); return t;
+}
+impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema: { token_env: { type: "string", default: "META_ACCESS_TOKEN" }, api_version: { type: "string", default: DEFAULTS.META_API_VERSION } }, create: (cfg, ctx = {}) => {
   const base = `https://graph.facebook.com/${cfg.api_version || DEFAULTS.META_API_VERSION}`;
   const post = (path, body) => fetchJson(`${base}/${path}`, { method: "POST", body: form(body) });
   return {
     async publish({ channel, mediaUrl, mediaKind, caption, title }) {
-      const token = metaToken(channel, cfg); const acct = channel.platform_account_id; if (!acct) throw new Error("channel.platform_account_id (Page ID / IG user ID) is required");
+      const token = await metaToken(channel, cfg); const acct = channel.platform_account_id; if (!acct) throw new Error("channel.platform_account_id (Page ID / IG user ID) is required");
       if (mediaUrl?.startsWith("mock://")) throw new Error("Cannot publish a mock:// media URL to a real platform — switch the program's image/render adapter to a live one");
       if (channel.platform === "FACEBOOK") {
         if (mediaKind === "VIDEO") { const r = await post(`${acct}/videos`, { file_url: mediaUrl, description: caption, title, access_token: token }); return { externalId: r.id, publishedUrl: `https://www.facebook.com/${r.id}` }; }
@@ -644,7 +838,7 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
       throw new Error(`meta_graph cannot publish to ${channel.platform}`);
     },
     async metrics({ channel, asset }) {
-      const token = metaToken(channel, cfg);
+      const token = await metaToken(channel, cfg);
       if (channel.platform === "INSTAGRAM") { const r = await fetchJson(`${base}/${asset.external_id}?${form({ fields: "like_count,comments_count", access_token: token })}`); return { views: 0, likes: r.like_count, comments: r.comments_count }; }
       const r = await fetchJson(`${base}/${asset.external_id}?${form({ fields: "likes.summary(true),comments.summary(true),shares", access_token: token })}`);
       return { views: 0, likes: r.likes?.summary?.total_count, comments: r.comments?.summary?.total_count, shares: r.shares?.count };
@@ -652,12 +846,13 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
   }; } });
 async function youtubeAccessToken(channel, cfg) {
   const pc = P(channel.platform_config) || {};
-  const id = ENV[pc.client_id_env || cfg.client_id_env || "YOUTUBE_CLIENT_ID"], secret = ENV[pc.client_secret_env || cfg.client_secret_env || "YOUTUBE_CLIENT_SECRET"], refresh = ENV[pc.refresh_token_env || cfg.refresh_token_env || "YOUTUBE_REFRESH_TOKEN"];
-  if (!id || !secret || !refresh) throw new Error("YouTube upload needs YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET / YOUTUBE_REFRESH_TOKEN (or the env names set in channel.platform_config)");
+  const v = await channelCredential(channel, "youtube_oauth");
+  const id = v?.client_id || ENV[pc.client_id_env || cfg.client_id_env || "YOUTUBE_CLIENT_ID"], secret = v?.client_secret || ENV[pc.client_secret_env || cfg.client_secret_env || "YOUTUBE_CLIENT_SECRET"], refresh = v?.refresh_token || ENV[pc.refresh_token_env || cfg.refresh_token_env || "YOUTUBE_REFRESH_TOKEN"];
+  if (!id || !secret || !refresh) throw new Error('No YouTube OAuth for this channel: pick a "youtube_oauth" credential on the channel (API keys page → add one with client id, secret, refresh token), or set YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET / YOUTUBE_REFRESH_TOKEN on Render');
   const t = await fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: id, client_secret: secret, refresh_token: refresh, grant_type: "refresh_token" }) });
   return t.access_token;
 }
-impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { privacy: { type: "string", default: "public" }, category_id: { type: "string", default: "22" } }, create: (cfg) => ({
+impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { privacy: { type: "string", default: "public" }, category_id: { type: "string", default: "22" } }, create: (cfg, ctx = {}) => ({
   async publish({ channel, mediaUrl, mediaKind, caption, title, hashtags = [] }) {
     if (mediaKind !== "VIDEO") throw new Error("YouTube channel needs a VIDEO asset");
     const token = await youtubeAccessToken(channel, cfg); const pc = P(channel.platform_config) || {};
@@ -670,15 +865,16 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
     return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts" : "watch?v="}${r.id}` };
   },
   async metrics({ asset }) {
-    return withKey("youtube", async (key) => { const r = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?${form({ part: "statistics", id: asset.external_id, key })}`); const s = r.items?.[0]?.statistics || {}; return { views: Number(s.viewCount || 0), likes: Number(s.likeCount || 0), comments: Number(s.commentCount || 0), units: 1 }; });
+    return withKey("youtube", async (key) => { const r = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?${form({ part: "statistics", id: asset.external_id, key })}`); const s = r.items?.[0]?.statistics || {}; return { views: Number(s.viewCount || 0), likes: Number(s.likeCount || 0), comments: Number(s.commentCount || 0), units: 1 }; }, ctx.pin);
   } }) });
 
 // === 7. dedup / router / scheduler / review helpers ===================
 const tokenize = (t) => new Set(String(t).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2));
 function jaccard(a, b) { const A = tokenize(a), B = tokenize(b); if (!A.size || !B.size) return 0; let n = 0; for (const t of A) if (B.has(t)) n++; return n / (A.size + B.size - n); }
 function cosine(a, b) { let d = 0, x = 0, y = 0; for (let i = 0; i < Math.min(a.length, b.length); i++) { d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i]; } return x && y ? d / Math.sqrt(x * y) : 0; }
-async function checkDuplicate(text, niche, seriesId = null) {
-  const past = await q(`SELECT id, topic, topic_embedding FROM content_items WHERE niche_id = $1 ${seriesId ? "AND series_id = $2" : ""} AND status NOT IN ('FAILED','REJECTED') AND topic <> '' ORDER BY created_at DESC LIMIT 300`, seriesId ? [niche.id, seriesId] : [niche.id]);
+async function checkDuplicate(text, niche, seriesId = null, excludeId = null) {
+  // excludeId: the item being generated already has its topic set at routing time — never compare it with itself.
+  const past = await q(`SELECT id, topic, topic_embedding FROM content_items WHERE niche_id = $1 ${seriesId ? "AND series_id = $2" : ""} AND status NOT IN ('FAILED','REJECTED') AND topic <> '' AND id <> $${seriesId ? 3 : 2} ORDER BY created_at DESC LIMIT 300`, seriesId ? [niche.id, seriesId, excludeId || ""] : [niche.id, excludeId || ""]);
   let vec = null;
   try { vec = await (await resolve("EMBED", niche.embed_adapter || "embed_mock")).embed(text); } catch (e) { warn("embedding failed, using Jaccard:", e.message); }
   let best = null;
@@ -842,14 +1038,14 @@ async function materialFor(item, niche) {
   const past = (await q(`SELECT topic FROM content_items WHERE niche_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 100`, [niche.id, item.id])).map((r) => r.topic);
   const ts = await resolve("TOPIC", niche.topic_source_adapter || "newsapi_mock");
   let cand = await ts.fetchCandidate({ nicheKey: niche.key, excludeTopics: past });
-  for (let i = 0; i < 4; i++) { const d = await checkDuplicate(cand.topic, niche, item.series_id); if (!d.isDuplicate) break; cand = await ts.fetchCandidate({ nicheKey: niche.key, excludeTopics: [...past, cand.topic] }); }
+  for (let i = 0; i < 4; i++) { const d = await checkDuplicate(cand.topic, niche, item.series_id, item.id); if (!d.isDuplicate) break; cand = await ts.fetchCandidate({ nicheKey: niche.key, excludeTopics: [...past, cand.topic] }); }
   return { title: cand.topic, summary: cand.sourceDataRef?.description || "", url: cand.sourceDataRef?.url || null, raw: cand.sourceDataRef };
 }
 
 // ---- 8a. NEWS_STATIC / NICHE_STATIC: headline + captions (+ portal article) + branded image
 async function generateStatic(item, niche, style) {
   const m = await materialFor(item, niche);
-  const dedup = await checkDuplicate(m.title, niche, item.series_id);
+  const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id);
   if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}" (score ${dedup.best.score.toFixed(2)})`);
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
@@ -866,7 +1062,7 @@ async function generateStatic(item, niche, style) {
 // ---- 8b. LONG_POST: research first (notes with citations), then write in the style profile
 async function generateLongPost(item, niche, style) {
   const m = await materialFor(item, niche);
-  const dedup = await checkDuplicate(m.title, niche, item.series_id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
+  const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts with sources. Never fabricate a citation.",
@@ -886,7 +1082,7 @@ async function generateLongPost(item, niche, style) {
 // ---- 8c. IMAGE_SLIDESHOW / LONG_FORM_VIDEO (GENERATIVE): script → images → TTS → ffmpeg
 async function generateSlideshowVideo(item, niche, style) {
   const m = await materialFor(item, niche); const long = item.content_type === "LONG_FORM_VIDEO"; const mc = methodCfg(niche);
-  const dedup = await checkDuplicate(m.title, niche, item.series_id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
+  const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
   const slides = mc.slides || (long ? 12 : 10);
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 2500,
@@ -1128,6 +1324,7 @@ function startWorkers() {
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
   every(60000, sweepDueSources); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
+  every(60 * 60000, sweepStorageCleanup);
 }
 
 // === 10. HTTP =============================================================
@@ -1171,22 +1368,76 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, spentTodayUsd: db ? await spentTodayUsd() : null, storage: ENV.SUPABASE_URL ? "supabase" : "local", ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`)]);
   json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
 });
+// ---- storage
+app.get("/api/storage", async (ctx) => {
+  const b = await storageBackend(); const r2 = await r2Config();
+  const [live, gone] = await Promise.all([one(`SELECT COUNT(*)::int AS n FROM media_assets WHERE deleted_at IS NULL AND url LIKE 'http%'`), one(`SELECT COUNT(*)::int AS n FROM media_assets WHERE deleted_at IS NOT NULL`)]);
+  json(ctx, 200, { backend: b.name, available: { r2: !!r2, supabase: await STORAGE.supabase.available(), local: true }, r2: r2 ? { bucket: r2.bucket, public_url: r2.public_url || null } : null, filesLive: live.n, filesCleaned: gone.n, cleanupEnabled: await setting("storage.cleanup_enabled", true), cleanupAfterHours: await setting("storage.cleanup_after_publish_hours", 48) });
+});
+app.post("/api/storage/cleanup", async (ctx) => { await sweepStorageCleanup(); json(ctx, 200, { ok: true }); });
 // ---- settings
 app.get("/api/settings", async (ctx) => json(ctx, 200, await settings()));
 app.put("/api/settings/:key", async (ctx) => { await putSetting(ctx.params.key, ctx.body.value); json(ctx, 200, { key: ctx.params.key, value: ctx.body.value }); });
-// ---- credentials
-app.get("/api/credentials", async (ctx) => json(ctx, 200, (await q(`SELECT c.*, COALESCE(u.units,0) AS used_today, COALESCE(u.cost_usd,0) AS cost_today FROM api_credentials c LEFT JOIN api_usage_daily u ON u.credential_id=c.id AND u.day=CURRENT_DATE ORDER BY provider, priority DESC`)).map((r) => ({ ...r, env_present: !!ENV[r.env_var] }))));
+// ---- credentials. A credential = provider + (secret in the vault OR name of an env var) + priority/quota.
+// Secrets go IN through POST/PATCH `secret` (or `fields` for multi-field providers) and never come back out: GET only
+// exposes has_secret and a 4-char hint. Storing needs SECRETS_KEY on Render.
+const credView = (r) => { const { secret_enc, ...rest } = r; let vault_ok = true; if (secret_enc) { try { decryptSecret(secret_enc); } catch { vault_ok = false; } }
+  return { ...rest, has_secret: !!secret_enc, vault_ok, env_present: !!(r.env_var && ENV[r.env_var]), source: secret_enc ? "vault" : (r.env_var && ENV[r.env_var]) ? "env" : "missing", fields: MULTI_FIELD_PROVIDERS[r.provider] || null }; };
+function secretFromBody(provider, b) {
+  const fields = MULTI_FIELD_PROVIDERS[provider];
+  if (fields) { const f = b.fields || {}; const missing = fields.filter((k) => !String(f[k] ?? "").trim() && !(provider === "r2" && k === "public_url")); if (b.fields && missing.length) throw new ApiError(400, null, `Missing: ${missing.join(", ")}`); return b.fields ? JSON.stringify(Object.fromEntries(fields.map((k) => [k, String(f[k] ?? "").trim()]))) : null; }
+  const sec = typeof b.secret === "string" ? b.secret.trim() : ""; return sec || null;
+}
+app.get("/api/credentials", async (ctx) => json(ctx, 200, (await q(`SELECT c.*, COALESCE(u.units,0) AS used_today, COALESCE(u.cost_usd,0) AS cost_today FROM api_credentials c LEFT JOIN api_usage_daily u ON u.credential_id=c.id AND u.day=CURRENT_DATE ORDER BY provider, priority DESC`)).map(credView)));
+app.get("/api/credentials/meta", (ctx) => json(ctx, 200, { providers: PROVIDERS, defaultEnv: DEFAULT_ENV, multiField: MULTI_FIELD_PROVIDERS, vault: vaultReady() }));
 app.get("/api/usage", async (ctx) => json(ctx, 200, await q(`SELECT day, provider, credential_id, units, cost_usd FROM api_usage_daily WHERE day > CURRENT_DATE - 30 ORDER BY day DESC, provider`)));
-app.post("/api/credentials", async (ctx) => { const b = ctx.body; if (!b.provider || !b.envVar) throw new ApiError(400, null, "provider and envVar are required"); const id = newId(); await q(`INSERT INTO api_credentials (id, provider, label, env_var, priority, daily_quota) VALUES ($1,$2,$3,$4,$5,$6)`, [id, b.provider, b.label || b.envVar, b.envVar, b.priority ?? 0, b.dailyQuota ?? null]); json(ctx, 201, { ...(await one(`SELECT * FROM api_credentials WHERE id=$1`, [id])), env_present: !!ENV[b.envVar] }); });
-app.patch("/api/credentials/:id", async (ctx) => json(ctx, 200, await patchRow("api_credentials", ctx.params.id, { ...ctx.body, cooldownUntil: ctx.body.clearCooldown ? null : undefined }, { label: "label", envVar: "env_var", priority: "priority", dailyQuota: "daily_quota", enabled: "enabled", cooldownUntil: "cooldown_until" })));
-app.delete("/api/credentials/:id", async (ctx) => { await q(`DELETE FROM api_credentials WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
+app.post("/api/credentials", async (ctx) => {
+  const b = ctx.body; if (!b.provider) throw new ApiError(400, null, "provider is required"); if (!PROVIDERS.includes(b.provider)) throw new ApiError(400, null, `Unknown provider ${b.provider}`);
+  if (rateLimited(`cred:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many credential changes; wait a minute");
+  const plain = secretFromBody(b.provider, b); const envVar = String(b.envVar || "").trim() || null;
+  if (!plain && !envVar) throw new ApiError(400, null, "Give either the secret itself or the name of an env var on Render");
+  const enc = plain ? encryptSecret(plain) : null; const hint = plain ? (MULTI_FIELD_PROVIDERS[b.provider] ? "json" : secretHint(plain)) : null;
+  const id = newId();
+  await q(`INSERT INTO api_credentials (id, provider, label, env_var, priority, daily_quota, secret_enc, secret_hint) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [id, b.provider, b.label || envVar || `${b.provider} key`, envVar || "", b.priority ?? 0, b.dailyQuota ?? null, enc, hint]);
+  json(ctx, 201, credView(await one(`SELECT * FROM api_credentials WHERE id=$1`, [id])));
+});
+app.patch("/api/credentials/:id", async (ctx) => {
+  const row = await one(`SELECT * FROM api_credentials WHERE id=$1`, [ctx.params.id]); if (!row) throw new ApiError(404, null, "Credential not found");
+  const b = ctx.body;
+  const plain = secretFromBody(row.provider, b);
+  if (plain) { if (rateLimited(`cred:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many credential changes; wait a minute"); await q(`UPDATE api_credentials SET secret_enc=$2, secret_hint=$3, cooldown_until=NULL, last_error=NULL WHERE id=$1`, [row.id, encryptSecret(plain), MULTI_FIELD_PROVIDERS[row.provider] ? "json" : secretHint(plain)]); }
+  if (b.clearSecret) await q(`UPDATE api_credentials SET secret_enc=NULL, secret_hint=NULL WHERE id=$1`, [row.id]);
+  const rest = { ...b, cooldownUntil: b.clearCooldown ? null : undefined }; delete rest.secret; delete rest.fields; delete rest.clearSecret; delete rest.clearCooldown;
+  const r = Object.keys(rest).some((k) => ["label", "envVar", "priority", "dailyQuota", "enabled", "cooldownUntil"].includes(k) && rest[k] !== undefined)
+    ? await patchRow("api_credentials", row.id, rest, { label: "label", envVar: "env_var", priority: "priority", dailyQuota: "daily_quota", enabled: "enabled", cooldownUntil: "cooldown_until" })
+    : await one(`SELECT * FROM api_credentials WHERE id=$1`, [row.id]);
+  json(ctx, 200, credView(r));
+});
+app.post("/api/credentials/:id/test", async (ctx) => {
+  const c = await credentialById(ctx.params.id); if (!c) throw new ApiError(404, null, "Credential has no usable secret");
+  const auth = (k) => ({ Authorization: `Bearer ${k}` });
+  const tests = {
+    anthropic: () => fetchJson("https://api.anthropic.com/v1/models?limit=1", { headers: { "x-api-key": c.secret, "anthropic-version": "2023-06-01" } }),
+    gemini: () => fetchJson("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", { headers: { "x-goog-api-key": c.secret } }),
+    openai: () => fetchJson("https://api.openai.com/v1/models?limit=1", { headers: auth(c.secret) }),
+    elevenlabs: () => fetchJson("https://api.elevenlabs.io/v1/user", { headers: { "xi-api-key": c.secret } }),
+    newsapi: () => fetchJson(`https://newsapi.org/v2/top-headlines?country=us&pageSize=1&apiKey=${encodeURIComponent(c.secret)}`),
+    youtube: () => fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=id&chart=mostPopular&maxResults=1&key=${encodeURIComponent(c.secret)}`),
+    meta: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/me?${form({ fields: "id,name", access_token: c.secret })}`),
+    youtube_oauth: () => fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: c.secret.client_id, client_secret: c.secret.client_secret, refresh_token: c.secret.refresh_token, grant_type: "refresh_token" }) }).then((t) => ({ token_type: t.token_type, expires_in: t.expires_in })),
+    r2: async () => { const cfg = await r2Config(); if (!cfg) throw new Error("R2 fields incomplete"); await r2Request("PUT", "healthcheck.txt", Buffer.from("ok"), "text/plain"); await r2Request("DELETE", "healthcheck.txt"); return { bucket: cfg.bucket, public_url: cfg.public_url || "(none — set public_url so platforms can fetch files)" }; },
+  };
+  try { const r = await tests[c.provider](); json(ctx, 200, { ok: true, provider: c.provider, result: typeof r === "object" && r ? Object.fromEntries(Object.entries(r).slice(0, 4).map(([k, v]) => [k, typeof v === "string" ? v.slice(0, 80) : Array.isArray(v) ? `${v.length} item(s)` : v])) : r }); }
+  catch (e) { json(ctx, 200, { ok: false, provider: c.provider, error: String(e.message).slice(0, 400) }); }
+});
+app.delete("/api/credentials/:id", async (ctx) => { const used = await one(`SELECT (SELECT COUNT(*) FROM channels WHERE credential_id=$1)::int + (SELECT COUNT(*) FROM adapter_configs WHERE credential_id=$1)::int AS n`, [ctx.params.id]); if (used.n) throw new ApiError(409, null, "Credential is still used by a channel or adapter instance — unlink it first"); await q(`DELETE FROM api_credentials WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 // ---- adapter instances
 app.get("/api/adapter-configs", async (ctx) => json(ctx, 200, (await instances(true)).map((r) => rowJson(r, ["config"]))));
 app.post("/api/adapter-configs", async (ctx) => { const b = ctx.body; if (!b.key || !b.stage || !b.impl) throw new ApiError(400, null, "key, stage, impl are required"); if (!IMPLS[b.stage]?.[b.impl]) throw new ApiError(400, null, `Unknown impl ${b.impl} for stage ${b.stage}`); const id = newId(); await q(`INSERT INTO adapter_configs (id, key, stage, impl, label, config, credential_id, enabled) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`, [id, b.key, b.stage, b.impl, b.label || b.key, JSON.stringify(b.config || {}), b.credentialId || null, b.enabled === false ? 0 : 1]); instCache.at = 0; json(ctx, 201, rowJson(await one(`SELECT * FROM adapter_configs WHERE id=$1`, [id]), ["config"])); });
@@ -1220,7 +1471,7 @@ app.delete("/api/niches/:id", async (ctx) => { const dep = await one(`SELECT COU
 app.post("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), ctx.params.id, ctx.params.sourceId]); json(ctx, 200, { ok: true }); });
 app.delete("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`DELETE FROM niche_sources WHERE niche_id=$1 AND source_id=$2`, [ctx.params.id, ctx.params.sourceId]); json(ctx, 200, { ok: true }); });
 // ---- channels
-const CHANNEL_MAP = { displayName: "display_name", platform: "platform", format: "format", credentialRef: "credential_ref", scheduleCron: "schedule_cron", timezone: "timezone", isActive: "is_active", platformAccountId: "platform_account_id", platformConfig: "platform_config", publisherAdapter: "publisher_adapter", maxPostsPerDay: "max_posts_per_day", minGapMinutes: "min_gap_minutes", postingWindows: "posting_windows", captionTemplate: "caption_template" };
+const CHANNEL_MAP = { credentialId: "credential_id", displayName: "display_name", platform: "platform", format: "format", credentialRef: "credential_ref", scheduleCron: "schedule_cron", timezone: "timezone", isActive: "is_active", platformAccountId: "platform_account_id", platformConfig: "platform_config", publisherAdapter: "publisher_adapter", maxPostsPerDay: "max_posts_per_day", minGapMinutes: "min_gap_minutes", postingWindows: "posting_windows", captionTemplate: "caption_template" };
 app.get("/api/channels", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM channels WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM channels ORDER BY created_at DESC`); const out = []; for (const ch of rows) out.push({ ...rowJson(ch, ["platform_config", "posting_windows"]), niches: await q(`SELECT n.* FROM niches n JOIN channel_niches cn ON cn.niche_id=n.id WHERE cn.channel_id=$1`, [ch.id]) }); json(ctx, 200, out); });
 app.post("/api/channels", async (ctx) => { const b = ctx.body; for (const r of ["brandId", "key", "displayName", "platform", "format"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`); const id = newId(); await q(`INSERT INTO channels (id, brand_id, key, display_name, platform, format, timezone) VALUES ($1,$2,$3,$4,$5,$6,$7)`, [id, b.brandId, b.key, b.displayName, b.platform, b.format, b.timezone || "Asia/Dhaka"]); const rest = { ...b }; for (const k of ["brandId", "key", "displayName", "platform", "format", "timezone"]) delete rest[k]; const row = Object.keys(rest).some((k) => k in CHANNEL_MAP) ? await patchRow("channels", id, rest, CHANNEL_MAP) : await one(`SELECT * FROM channels WHERE id=$1`, [id]); if (Array.isArray(b.nicheIds)) for (const n of b.nicheIds) await q(`INSERT INTO channel_niches (id, channel_id, niche_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, n]); json(ctx, 201, rowJson(row, ["platform_config", "posting_windows"])); });
 app.patch("/api/channels/:id", async (ctx) => json(ctx, 200, rowJson(await patchRow("channels", ctx.params.id, ctx.body, CHANNEL_MAP), ["platform_config", "posting_windows"])));
@@ -1309,5 +1560,5 @@ app.post("/api/seed", async (ctx) => {
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
   await recoverAbandonedWork();
   if (!ENV.DASHBOARD_PASSWORD) warn("DASHBOARD_PASSWORD is not set — the dashboard and API are OPEN. Fine locally, never on Render.");
-  server.listen(PORT, () => { log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, storage: ${ENV.SUPABASE_URL ? "supabase" : "local"})`); startWorkers(); });
+  server.listen(PORT, async () => { log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, storage: ${(await storageBackend()).name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`); startWorkers(); });
 })().catch((e) => { console.error("boot failed:", e); process.exit(1); });

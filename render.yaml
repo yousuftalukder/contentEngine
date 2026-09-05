@@ -13,6 +13,8 @@ services:
         value: admin
       - key: DASHBOARD_PASSWORD
         sync: false
+      - key: SECRETS_KEY            # long random string (openssl rand -hex 32). Encrypts secrets stored from the dashboard. Never rotate casually.
+        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
@@ -22,6 +24,20 @@ services:
       - key: PUBLIC_BASE_URL       # e.g. https://content-engine.onrender.com (used for portal links)
         sync: false
       - key: PORTAL_BASE_URL       # your news portal domain if different from PUBLIC_BASE_URL
+        sync: false
+      - key: STORAGE_BACKEND       # optional: r2 | supabase | local. Default: first configured of r2, supabase, local
+        sync: false
+      - key: R2_ACCOUNT_ID         # Cloudflare R2 (recommended for video: free egress). Can also be stored from the dashboard as an "r2" credential.
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PUBLIC_URL         # https://pub-xxxx.r2.dev or your custom domain (bucket must be public)
+        sync: false
+      - key: OPENAI_API_KEY
         sync: false
       - key: ANTHROPIC_API_KEY
         sync: false

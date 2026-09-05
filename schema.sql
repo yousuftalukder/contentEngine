@@ -84,6 +84,7 @@ ALTER TABLE channels ADD COLUMN IF NOT EXISTS min_gap_minutes     INTEGER NOT NU
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS posting_windows     JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS caption_template    TEXT;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_published_at   TIMESTAMPTZ;
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS credential_id       TEXT;  -- api_credentials.id (meta / youtube_oauth) used to publish on this channel
 
 CREATE TABLE IF NOT EXISTS channel_niches (
   id         TEXT PRIMARY KEY,
@@ -239,6 +240,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
   meta             JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE media_assets ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;  -- set by storage cleanup once the file is removed from R2/Supabase
 CREATE INDEX IF NOT EXISTS idx_media_assets_item ON media_assets(content_item_id);
 
 CREATE TABLE IF NOT EXISTS portal_articles (
@@ -385,6 +387,10 @@ CREATE TABLE IF NOT EXISTS api_credentials (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Vault: secret pasted in the dashboard, AES-256-GCM under SECRETS_KEY. env_var may be '' when a vault secret is used.
+ALTER TABLE api_credentials ADD COLUMN IF NOT EXISTS secret_enc  TEXT;
+ALTER TABLE api_credentials ADD COLUMN IF NOT EXISTS secret_hint TEXT;
+ALTER TABLE api_credentials ALTER COLUMN env_var SET DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS api_usage_daily (
   id            TEXT PRIMARY KEY,
@@ -489,6 +495,10 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'llm_mock',         'SCRIPT',     'llm_mock',         'Mock LLM',                       '{}'),
   (gen_random_uuid()::text, 'anthropic_live',   'SCRIPT',     'anthropic',        'Anthropic Claude',               '{}'),
   (gen_random_uuid()::text, 'gemini_live',      'SCRIPT',     'gemini',           'Google Gemini',                  '{}'),
+  (gen_random_uuid()::text, 'openai_live',      'SCRIPT',     'openai',           'OpenAI GPT',                     '{}'),
+  (gen_random_uuid()::text, 'whisper_api',      'TRANSCRIBE', 'whisper_api',      'OpenAI Whisper API',             '{}'),
+  (gen_random_uuid()::text, 'openai_image',     'IMAGE',      'openai_image',     'OpenAI image generation',        '{}'),
+  (gen_random_uuid()::text, 'openai_tts',       'VOICE',      'openai_tts',       'OpenAI TTS',                     '{}'),
   (gen_random_uuid()::text, 'image_mock',       'IMAGE',      'image_mock',       'Mock image (SVG card)',          '{}'),
   (gen_random_uuid()::text, 'gemini_image',     'IMAGE',      'gemini_image',     'Gemini image generation',        '{}'),
   (gen_random_uuid()::text, 'tts_mock',         'VOICE',      'tts_mock',         'Mock TTS (silent audio)',        '{}'),
