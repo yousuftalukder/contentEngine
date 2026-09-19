@@ -70,6 +70,16 @@ test("a news story that would be stale by the time the quota returns is dropped,
   assert.equal(job.status, "CANCELLED", "cancelled, so it does not count as a failure");
 });
 
+test("no picture, still a reel: sections fall back to branded backdrops and the video renders", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const p = await program("reel_cards", { contentType: "NEWS_REEL", imageAdapter: "image_no_key", voiceAdapter: "tts_mock", renderAdapter: "ffmpeg", language: "bn", methodConfig: { slides: 2 } });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "পদ্মা সেতুতে টোল আদায়ের রেকর্ড" });
+  const item = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { timeout: 120000, interval: 500, what: "a reel built on backdrops" });
+  assert.equal(item.hero_media.kind, "VIDEO");
+  const cards = await eng.query(`SELECT meta FROM media_assets WHERE content_item_id = $1 AND kind = 'IMAGE'`, [id]);
+  assert.ok(cards.length >= 2, "one backdrop per section");
+  assert.ok(cards.every((c) => c.meta.overlay === "textcard"), "every section picture is a brand backdrop");
+});
+
 test("no picture, still a post: the hero is a branded text card, and a headline edit redraws it", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
   const p = await program("text_cards", { imageAdapter: "image_no_key", language: "bn" });
   await eng.api("POST", `/api/channels/${channel.id}/niches/${p.id}`);
