@@ -431,8 +431,8 @@ function linkPicker(options, onPick, label) {
   const s = h("select", { style: "width:auto;padding:2px 6px;font-size:12px", onchange: (e) => { if (e.target.value) onPick(e.target.value); } }, h("option", { value: "" }, label + "…"), options.map((o) => h("option", { value: o.id }, o.name)));
   return s;
 }
-function programDialog(p, brands, sources, adapters, styles, done) {
-  const a = adapters || {};
+async function programDialog(p, brands, sources, adapters, styles, done) {
+  const a = adapters || {}, uploads = await get("/api/uploads").catch(() => []);
   const opt = (keys, cur) => select(null, [["", "(default)"], ...(keys || []).map((k) => [k, k])], cur || "");
   const f = h("div", null,
     h("div", { class: "grid2" },
@@ -459,16 +459,38 @@ function programDialog(p, brands, sources, adapters, styles, done) {
         field("Download (video)", Object.assign(opt(a.downloadAdapters, p?.download_adapter), { name: "downloadAdapter" })),
         field("Transcript (video)", Object.assign(opt(a.transcriptAdapters, p?.transcript_adapter), { name: "transcriptAdapter" })),
         field("Clipper (video)", Object.assign(opt(a.clipAdapters, p?.clip_adapter), { name: "clipAdapter" })))),
+    videoFields(p, uploads),
     automationFields(p?.method_config || {}),
     p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name])), "Leave empty for a Bangladesh program: it starts with the verified sources for its language (TV channels for video programs)."),
   );
   formDialog(p ? "Edit program" : "New program", f, async (v) => {
-    v.methodConfig = readAutomation(v, p?.method_config || {});
+    v.methodConfig = readAutomation(v, readVideo(v, p?.method_config || {}));
     for (const k of Object.keys(v)) if (v[k] === "" && k !== "tone") delete v[k];
     if (v.sourceIds) v.sourceIds = Array.from(f.querySelector("[name=sourceIds]").selectedOptions).map((o) => o.value);
     if (p) { delete v.brandId; delete v.key; await patch(`/api/programs/${p.id}`, v); } else await post("/api/programs", v);
     toast(p ? "Program saved" : "Program created"); done();
   }, { wide: true });
+}
+// Video options (production method + method_config video keys). Reactor clips and music come from the media library.
+const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["REACTION_OVERLAY", "Reaction short — reactor under the clip"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap — narrated summary"]];
+function videoFields(p, uploads) {
+  const mc = p?.method_config || {}, reactors = uploads.filter((u) => u.meta?.purpose === "reactor"), music = uploads.filter((u) => u.meta?.purpose === "music");
+  return h("fieldset", null, h("legend", null, "Video"),
+    h("div", { class: "grid3" },
+      field("Production method (clips)", select("productionMethod", PRODUCTION_METHODS, p?.production_method || "")),
+      field("Orientation", select("_orientation", [["", "(default)"], ["9:16", "Vertical 9:16"], ["16:9", "Landscape 16:9"]], mc.orientation || "")),
+      field("Vertical layout for landscape footage", select("_verticalLayout", [["crop", "Crop to fill"], ["blurpad", "Whole picture on a blurred fill"]], mc.vertical_layout || "crop")),
+      field("Reactor clip", select("_reactor", [["", reactors.length ? "(none — waveform instead)" : "(upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || "")),
+      field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
+      field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 }))),
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
+}
+function readVideo(v, mc) {
+  const out = { ...mc, captions: !!v._captions, brand_finish: !!v._brandFinish, vertical_layout: v._verticalLayout || "crop", explainer_minutes: v._explainerMinutes ?? 3 };
+  if (v._orientation) out.orientation = v._orientation; else delete out.orientation;
+  if (v._reactor) out.reactor_url = v._reactor; else delete out.reactor_url;
+  if (v._music === "none") out.music = false; else if (v._music) out.music = v._music; else delete out.music;
+  return out;
 }
 // method_config.qa / .desk / .autopilot, edited as plain fields and merged back into the program's method_config.
 function automationFields(mc) {
@@ -523,14 +545,30 @@ function styleDialog(styles, brands) {
 
 // ---------------------------------------------------------------- brands (+ brand kit)
 pages.brands = async () => {
-  const brands = await get("/api/brands");
-  const root = h("div", null, pageHead("Brands", "A brand owns programs and channels. Its kit — logo, colours, font, page handle — styles every photocard and video.",
+  const [brands, uploads] = await Promise.all([get("/api/brands"), get("/api/uploads").catch(() => [])]);
+  const root = h("div", null, pageHead("Brands", "A brand owns programs and channels. Its kit — logo, colours, font, page handle, music — styles every photocard and video.",
     h("button", { class: "btn primary", onclick: () => run(async () => { const name = prompt("Brand name"); if (name) { await post("/api/brands", { name }); route(); } }) }, "New brand")));
   if (!brands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No brands yet"), "Create one, then give it a kit."));
-  for (const b of brands) root.appendChild(brandKitPanel(b));
+  for (const b of brands) root.appendChild(brandKitPanel(b, uploads.filter((u) => u.meta?.purpose === "music")));
+  root.appendChild(mediaLibrary(uploads));
   return root;
 };
-function brandKitPanel(b) {
+// Reactor clips (for reaction videos) and music beds (for reels and explainers), uploaded once and picked per program or kit.
+function mediaLibrary(uploads) {
+  const up = (purpose, accept) => h("input", { type: "file", accept, style: "max-width:230px", onchange: (e) => run(async () => {
+    const f = e.target.files[0]; if (!f) return; toast(`Uploading ${f.name}…`);
+    const res = await fetch(`/api/uploads?purpose=${purpose}&name=${encodeURIComponent(f.name)}`, { method: "POST", headers: { "Content-Type": f.type || "application/octet-stream" }, body: f });
+    const m = await res.json(); if (!res.ok) throw new Error(m.error); route(); }, "Uploaded") });
+  const rows = uploads.filter((u) => ["reactor", "music"].includes(u.meta?.purpose));
+  return h("div", { class: "panel" }, h("h3", null, "Media library"),
+    h("p", { class: "muted small", style: "margin:0 0 10px" }, "Reactor clips are looped beside the source in reaction videos (film yourself or a presenter reacting, 10-60 s). Music beds play quietly under reels and explainers — use tracks you have the rights to."),
+    h("div", { class: "row", style: "gap:16px;flex-wrap:wrap" }, h("span", { class: "small" }, "Add a reactor clip"), up("reactor", "video/mp4,video/webm,video/quicktime"), h("span", { class: "small" }, "Add a music bed"), up("music", "audio/mpeg,audio/mp4,audio/wav,audio/ogg")),
+    rows.length ? h("div", { class: "table-wrap", style: "margin-top:10px" }, h("table", null, h("tbody", null, rows.map((u) => h("tr", null,
+      h("td", null, h("span", { class: "tag" }, u.meta.purpose)), h("td", null, h("a", { href: u.url, target: "_blank" }, u.meta?.name || u.id)),
+      h("td", { class: "small" }, u.duration_seconds ? `${Math.round(u.duration_seconds)} s` : ""), h("td", { class: "small" }, ago(u.created_at)),
+      h("td", null, h("button", { class: "btn sm danger", onclick: () => run(() => del(`/api/uploads/${u.id}`), "Removed").then(route) }, "Remove"))))))) : null);
+}
+function brandKitPanel(b, music = []) {
   const k = b.brand_kit || {};
   const color = (name, v) => h("input", { type: "color", name, value: v, style: "width:60px;height:34px;padding:2px" });
   const logo = text("logo_url", k.logo_url, { placeholder: "https://… (PNG with transparency)" });
@@ -545,9 +583,11 @@ function brandKitPanel(b) {
       field("Font", text("font", k.font, { placeholder: "Noto Sans Bengali" }), "Installed font name, or a font file below."),
       field("Font file URL(s)", text("fonts_url", k.fonts_url, { placeholder: "https://…/HindSiliguri-Bold.ttf" }), "Comma-separated .ttf/.otf."),
       field("Picture share of the card", num("image_ratio", k.image_ratio ?? 0.6, { step: "0.05", min: 0.4, max: 0.75 }))),
-    check("credit_sources", "Credit the source outlets on the card", k.credit_sources !== false));
+    check("credit_sources", "Credit the source outlets on the card", k.credit_sources !== false),
+    music.length ? field("Music beds for this brand's videos", h("select", { name: "music_urls", multiple: true, style: "min-height:70px" }, music.map((m) => h("option", { value: m.url, selected: (k.music_urls || []).includes(m.url) }, m.meta?.name || m.id))), "One is picked at random per video. Ctrl/Cmd-click to choose several.") : null);
   const preview = h("div", { class: "kit-preview" });
-  const collect = () => { const v = readForm(form); const kit = { ...k, primary_color: v.primary_color, accent_color: v.accent_color, text_color: v.text_color, logo_url: v.logo_url || undefined, handle: v.handle || undefined, font: v.font || undefined, fonts_url: v.fonts_url || undefined, image_ratio: v.image_ratio ?? 0.6, credit_sources: v.credit_sources };
+  const collect = () => { const v = readForm(form); const sel = form.querySelector("[name=music_urls]");
+    const kit = { ...k, primary_color: v.primary_color, accent_color: v.accent_color, text_color: v.text_color, logo_url: v.logo_url || undefined, handle: v.handle || undefined, font: v.font || undefined, fonts_url: v.fonts_url || undefined, image_ratio: v.image_ratio ?? 0.6, credit_sources: v.credit_sources, music_urls: sel ? Array.from(sel.selectedOptions).map((o) => o.value) : k.music_urls };
     for (const x of Object.keys(kit)) if (kit[x] === undefined) delete kit[x]; return { name: v.name, description: v.description, brandKit: kit }; };
   const show = (lang) => run(async () => { const r = await post(`/api/brands/${b.id}/preview-card`, { brandKit: collect().brandKit, language: lang }); preview.innerHTML = ""; preview.appendChild(h("img", { src: r.url, alt: "Photocard preview" })); });
   return h("div", { class: "panel" }, h("div", { class: "grid2", style: "align-items:start" },

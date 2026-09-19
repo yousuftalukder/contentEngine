@@ -2,57 +2,43 @@
 #
 # Two processes from the same Dockerfile:
 #   content-engine        web service: dashboard + API + the light lanes (ingest, text, image, publish, metrics) + all sweeps
-#   content-engine-video  background worker: the video lane only (yt-dlp downloads, transcription, ffmpeg renders)
+#   content-engine-video  background worker: the video lane (downloads, transcription, ffmpeg renders, and the studio —
+#                         Remotion in headless Chrome — for news reels and animated explainers)
 # Both read the same secrets from the "content-engine-shared" env group, so a key is set once. Fill the group's values
-# in Render → Environment Groups after the first deploy (they are created empty).
+# in Render → Environment Groups after the first deploy (they are created empty). See README.md → "Environment".
+#
+# The two services do not share a disk, so media must live in Supabase Storage (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)
+# or Cloudflare R2 — the local disk backend only works for a single machine.
 
 envVarGroups:
   - name: content-engine-shared
     envVars:
+      # --- required ---
       - key: DATABASE_URL          # Supabase → Connect → Session pooler (port 5432)
         sync: false
       - key: DASHBOARD_USERNAME
         value: admin
-      - key: DASHBOARD_PASSWORD
+      - key: DASHBOARD_PASSWORD    # the dashboard and API are open without it
         sync: false
-      - key: SECRETS_KEY            # openssl rand -hex 32. Encrypts secrets stored from the dashboard. Never lose it.
+      - key: SECRETS_KEY            # openssl rand -hex 32. Encrypts keys stored from the dashboard. Never lose or change it.
         sync: false
-      - key: PUBLIC_BASE_URL       # https://content-engine.onrender.com (portal links, local media URLs)
+      - key: PUBLIC_BASE_URL       # the web service URL, e.g. https://content-engine.onrender.com (portal links)
         sync: false
-      - key: PORTAL_BASE_URL       # your news portal domain if different from PUBLIC_BASE_URL
+      - key: SUPABASE_URL          # media storage: https://<project-ref>.supabase.co
         sync: false
-      - key: STORAGE_BACKEND       # optional: r2 | supabase | local. Default: first configured of r2, supabase, local
-        sync: false
-      - key: R2_ACCOUNT_ID         # Cloudflare R2 (or store as an "r2" credential in the dashboard). public_url is mandatory.
-        sync: false
-      - key: R2_ACCESS_KEY_ID
-        sync: false
-      - key: R2_SECRET_ACCESS_KEY
-        sync: false
-      - key: R2_BUCKET
-        sync: false
-      - key: R2_PUBLIC_URL         # https://pub-xxxx.r2.dev or your custom domain (bucket must be public)
-        sync: false
-      - key: SUPABASE_URL          # only if using Supabase Storage instead of R2
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
+      - key: SUPABASE_SERVICE_ROLE_KEY  # Supabase → Project Settings → API → service_role (secret)
         sync: false
       - key: SUPABASE_BUCKET
         value: media
-      # Provider keys are optional here — prefer adding them on the API keys page (vault). Env vars remain a fallback.
-      - key: OPENAI_API_KEY
+      - key: GEMINI_API_KEY        # writing, images, embeddings, Bangla TTS, transcription (or add it on the API keys page)
         sync: false
-      - key: ANTHROPIC_API_KEY
+      # --- alerts (recommended) ---
+      - key: TELEGRAM_BOT_TOKEN    # a bot from @BotFather; alerts and the daily digest go to TELEGRAM_CHAT_ID
         sync: false
-      - key: GEMINI_API_KEY
+      - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: ELEVENLABS_API_KEY
-        sync: false
-      - key: NEWSAPI_KEY
-        sync: false
-      - key: YOUTUBE_API_KEY
-        sync: false
-      - key: META_ACCESS_TOKEN
+      # --- publishing (or per-channel keys on the API keys page) ---
+      - key: META_ACCESS_TOKEN     # Facebook Page / Instagram publishing
         sync: false
       - key: YOUTUBE_CLIENT_ID
         sync: false
@@ -60,12 +46,37 @@ envVarGroups:
         sync: false
       - key: YOUTUBE_REFRESH_TOKEN
         sync: false
+      # --- optional ---
+      - key: PORTAL_BASE_URL       # your news portal domain if different from PUBLIC_BASE_URL
+        sync: false
+      - key: STORAGE_BACKEND       # r2 | supabase | local. Default: first configured of r2, supabase, local
+        sync: false
+      - key: R2_ACCOUNT_ID         # Cloudflare R2 instead of Supabase Storage (public_url is mandatory)
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PUBLIC_URL
+        sync: false
+      - key: OPENAI_API_KEY        # backup writer, Whisper transcription, OpenAI TTS / images
+        sync: false
+      - key: ANTHROPIC_API_KEY     # Claude as writer or backup writer (needs a funded account)
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: NEWSAPI_KEY           # not needed for Bangladesh sources (the built-in catalog needs no keys)
+        sync: false
+      - key: YOUTUBE_API_KEY       # not needed for TV channel feeds (the catalog uses keyless YouTube feeds)
+        sync: false
 
 services:
   - type: web
     name: content-engine
     runtime: docker
-    plan: starter          # free tier sleeps and kills background workers; starter or above for 24/7 polling
+    plan: starter          # the free plan sleeps and stops polling and publishing; starter or above runs 24/7
     healthCheckPath: /health
     autoDeploy: true
     envVars:
@@ -78,7 +89,7 @@ services:
   - type: worker
     name: content-engine-video
     runtime: docker
-    plan: standard         # 2 GB: ffmpeg 1080p encodes + yt-dlp downloads need the headroom; scale up for long podcasts
+    plan: standard         # 2 GB: ffmpeg 1080p encodes, yt-dlp downloads and the studio's headless Chrome need the headroom
     autoDeploy: true
     envVars:
       - fromGroup: content-engine-shared
@@ -88,3 +99,5 @@ services:
         value: "0"
       - key: PG_POOL_MAX
         value: "4"
+      - key: REMOTION_CONCURRENCY   # studio render threads; raise with a bigger instance
+        value: "1"
