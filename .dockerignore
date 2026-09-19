@@ -1,0 +1,8 @@
+**/node_modules
+studio/.bundle
+data
+.git
+.github
+test
+.env
+.env.*

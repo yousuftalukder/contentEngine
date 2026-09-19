@@ -1,0 +1,20 @@
+{
+  "name": "content-engine-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remotion compositions for Content Engine: news reels and animated explainers. Rendered by render.mjs, called from server.js.",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "bundle": "node render.mjs --bundle-only"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.526",
+    "@remotion/cli": "4.0.526",
+    "@remotion/google-fonts": "4.0.526",
+    "@remotion/renderer": "4.0.526",
+    "lucide-react": "^1.47.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "remotion": "4.0.526"
+  }
+}

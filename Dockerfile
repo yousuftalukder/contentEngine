@@ -3,16 +3,24 @@
 #   fonts-noto-core  → Noto Sans / Noto Sans Bengali: headline overlays and burned captions in Bangla and English
 #   fonts-dejavu-core → fallback Latin font
 #   fontconfig       → lets libass find fonts by name ("Noto Sans Bengali"); OVERLAY_FONT env var overrides the name
+# The video studio (studio/, Remotion) renders news reels and animated explainers in headless Chrome; the libraries
+# below are what Chrome Headless Shell needs on Debian. Its bundle is built here so the first render starts at once.
 FROM node:22-bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg python3 curl ca-certificates fontconfig fonts-dejavu-core fonts-noto-core \
+      libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libgbm1 libasound2 libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 \
+      libxdamage1 libpango-1.0-0 libcairo2 libcups2 libdrm2 libxshmfence1 \
  && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
  && chmod a+rx /usr/local/bin/yt-dlp \
  && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY studio/package.json studio/package-lock.json ./studio/
+RUN cd studio && npm ci && npx remotion browser ensure
+COPY studio ./studio
+RUN cd studio && node render.mjs --bundle-only
 COPY server.js schema.sql ./
 COPY frontend ./frontend
 ENV NODE_ENV=production PORT=4000 WORK_DIR=/tmp

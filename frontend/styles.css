@@ -186,3 +186,13 @@ td .sub { display: block; color: var(--paper-mute); font-size: 12px; }
   .desk, .review, .grid2, .grid3 { grid-template-columns: 1fr; }
   .proof { padding: 16px; }
 }
+
+/* ---- quality check report, insights bars, brand kit preview ---- */
+.qa { border: 1px solid var(--line); border-left-width: 4px; border-radius: var(--r-sm); padding: 10px 12px; margin-bottom: 14px; background: var(--ink-2); }
+.qa-green { border-left-color: var(--green); }
+.qa-amber { border-left-color: var(--amber); }
+.qa-red { border-left-color: var(--red); }
+.qa-list { margin: 2px 0 0; padding-left: 18px; font-size: 13px; }
+.bar-cell { display: flex; align-items: center; gap: 8px; }
+.bar { height: 8px; min-width: 2px; background: var(--blue); border-radius: 4px; }
+.kit-preview img { width: 100%; max-width: 440px; border-radius: var(--r); border: 1px solid var(--line); }

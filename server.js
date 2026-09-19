@@ -17,12 +17,14 @@
 
 import http from "node:http";
 import { readFile, writeFile, mkdir, unlink, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, createWriteStream, readFileSync } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { tmpdir, totalmem } from "node:os";
 import pg from "pg";
 
 // === 1. config & utils ================================================
@@ -39,11 +41,15 @@ const LOCK_TIMEOUT_MIN = Number(ENV.JOB_LOCK_TIMEOUT_MINUTES) || 45;
 const DEFAULTS = {
   ANTHROPIC_MODEL: ENV.ANTHROPIC_MODEL || "claude-sonnet-5",
   GEMINI_MODEL: ENV.GEMINI_MODEL || "gemini-flash-latest",
+  // Tried in order when the main model is overloaded (503) or unknown (404). Comma-separated; "" disables.
+  GEMINI_FALLBACK_MODELS: (ENV.GEMINI_FALLBACK_MODELS ?? "gemini-flash-lite-latest").split(",").map((s) => s.trim()).filter(Boolean),
   GEMINI_IMAGE_MODEL: ENV.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image",
+  GEMINI_TTS_MODELS: (ENV.GEMINI_TTS_MODELS ?? "gemini-2.5-flash-preview-tts,gemini-2.5-flash-tts,gemini-2.5-pro-preview-tts").split(",").map((s) => s.trim()).filter(Boolean),
+  GEMINI_TTS_VOICE: ENV.GEMINI_TTS_VOICE || "Kore",
   GEMINI_EMBED_MODEL: ENV.GEMINI_EMBED_MODEL || "gemini-embedding-001",
   ELEVENLABS_MODEL: ENV.ELEVENLABS_MODEL || "eleven_multilingual_v2",
   ELEVENLABS_VOICE: ENV.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM",
-  META_API_VERSION: ENV.META_API_VERSION || "v21.0",
+  META_API_VERSION: ENV.META_API_VERSION || "v23.0",
   OPENAI_MODEL: ENV.OPENAI_MODEL || "gpt-4o-mini",
   OPENAI_TTS_MODEL: ENV.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
   OPENAI_TTS_VOICE: ENV.OPENAI_TTS_VOICE || "alloy",
@@ -72,6 +78,7 @@ const slugify = (s) => String(s).toLowerCase().normalize("NFKD").replace(/[^\w\s
 const stripHtml = (s) => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 const decodeXml = (s) => String(s || "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, "&");
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const nice = (s) => String(s || "").replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
 const tmpPath = (ext) => join(TMP, `${randomUUID()}.${ext}`);
 // Which worker lanes this process runs. Default: all. Split for production: web service LANES=ingest,text,image,publish,metrics
 // and a Render Background Worker with LANES=video (ffmpeg/yt-dlp memory stays away from the dashboard). The periodic sweeps
@@ -107,6 +114,31 @@ async function fetchBytes(url, opts = {}) {
   const res = await fetch(url, opts);
   if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => ""), `${url.split("?")[0]} -> ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
+}
+// Error classes drive retries. Transient = likely to work later (rate limit, overloaded model, 5xx, network) → retried
+// with backoff. Permanent = retrying cannot help (bad request, auth, missing key, duplicate) → fail now.
+// e.transient (true/false) set by a caller overrides the guess.
+const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
+const TRANSIENT_TEXT = /UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|try again later|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|timed out/i;
+const PERMANENT_STATUS = new Set([400, 401, 404, 405, 409, 410, 413, 422]);
+const PERMANENT_TEXT = /Dedup:|disabled|No API key|needs |cannot publish|credit balance|not registered|Unknown \w+ adapter/i;
+function isTransient(e) {
+  if (!e) return false;
+  if (typeof e.transient === "boolean") return e.transient;
+  const status = Number(e.status), msg = String(e.message || e);
+  if (status === 403) return /quota|limit|exhausted/i.test(msg + JSON.stringify(e.body || ""));
+  return TRANSIENT_STATUS.has(status) || (!PERMANENT_STATUS.has(status) && TRANSIENT_TEXT.test(msg));
+}
+function isPermanent(e) {
+  if (!e || isTransient(e)) return false;
+  return PERMANENT_STATUS.has(Number(e.status)) || Number(e.status) === 403 || PERMANENT_TEXT.test(String(e.message || e));
+}
+// Short in-call retry for transient failures. 429 is left to withKey, which rotates to the next key instead.
+async function retryTransient(fn, { tries = 3, baseMs = 1500 } = {}) {
+  for (let i = 1; ; i++) {
+    try { return await fn(); }
+    catch (e) { if (i >= tries || e.status === 429 || !isTransient(e)) throw e; await sleep(baseMs * i); }
+  }
 }
 const form = (obj) => new URLSearchParams(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : String(v)]));
 
@@ -179,7 +211,7 @@ const secretHint = (s) => { const t = String(s || "").trim(); return t.length > 
 const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
 const parseSecret = (provider, raw) => (MULTI_FIELD_PROVIDERS[provider] && raw ? (P(raw) || {}) : raw);
 
-const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
+const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN" };
 const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2"];
 // Resolve the usable secret of one credential row: vault first, then the named env var.
 function credSecret(r) {
@@ -388,16 +420,24 @@ async function resolve(stage, key) {
   a.key = key; a.impl = implId;
   return a;
 }
-// Try primary then fallbacks; fn(adapter) is attempted per adapter.
+// Try primary then fallbacks; fn(adapter) is attempted per adapter. When several fail, the error lists all of them and
+// stays retryable if any failure was transient — a fallback's missing key must not turn a temporary outage of the
+// primary into a permanent failure.
 async function withFallbacks(stage, primary, fallbacks, fn) {
-  const keys = [primary, ...(P(fallbacks) || [])].filter(Boolean);
-  let last;
+  const keys = [...new Set([primary, ...(P(fallbacks) || [])].filter(Boolean))];
+  const errors = [];
   for (const k of keys) {
-    let a; try { a = await resolve(stage, k); } catch (e) { last = e; continue; }
-    try { return await fn(a); } catch (e) { last = e; warn(`${stage} adapter ${k} failed: ${e.message}`); }
+    let a; try { a = await resolve(stage, k); } catch (e) { errors.push([k, e]); continue; }
+    try { return await fn(a); } catch (e) { errors.push([k, e]); warn(`${stage} adapter ${k} failed: ${e.message}`); }
   }
-  throw last || new Error(`No ${stage} adapter available`);
+  if (!errors.length) throw new Error(`No ${stage} adapter available`);
+  if (errors.length === 1) throw errors[0][1];
+  const e = new Error(errors.map(([k, x]) => `${k}: ${x.message}`).join(" | "));
+  e.status = errors[0][1].status; e.transient = errors.some(([, x]) => isTransient(x));
+  throw e;
 }
+// A program without its own fallback list uses the global one (Settings → llm.default_fallbacks / image.default_fallbacks).
+async function fallbacksFor(own, settingKey) { const list = P(own) || []; return list.length ? list : (await setting(settingKey, [])) || []; }
 function listAdapterKeys(rows) {
   const by = (stage) => rows.filter((r) => r.stage === stage && flag(r.enabled)).map((r) => r.key);
   return { topicSources: by("TOPIC"), scriptAdapters: by("SCRIPT"), voiceAdapters: by("VOICE"), renderAdapters: by("RENDER"),
@@ -407,8 +447,17 @@ function listAdapterKeys(rows) {
 
 // === 6. adapter impls ==================================================
 // ---- 6a. LLM (stage SCRIPT). Contract: complete({system, prompt, json, mock, maxTokens, grounding}) -> {text, data, cost}
-impl("SCRIPT", "llm_mock", { label: "Mock LLM", create: () => ({
-  async complete({ prompt, json, mock }) {
+// fail_first/fail_status make an instance fail its first N calls — used by tests to exercise retries and fallbacks.
+const mockFailures = new Map();
+// respond = [{match, json}] returns json for calls whose system+prompt contains match (tests script the QA verdict etc.).
+impl("SCRIPT", "llm_mock", { label: "Mock LLM", configSchema: { fail_first: { type: "number", default: 0 }, fail_status: { type: "number", default: 503 }, respond: { type: "array" } }, create: (cfg, ctx = {}) => ({
+  async complete({ system, prompt, json, mock }) {
+    if (cfg.fail_first) {
+      const n = (mockFailures.get(ctx.key) || 0) + 1; mockFailures.set(ctx.key, n);
+      if (n <= cfg.fail_first) throw new ApiError(cfg.fail_status || 503, null, cfg.fail_message || `mock ${cfg.fail_status || 503}: simulated failure ${n} of ${cfg.fail_first}`);
+    }
+    const rule = (cfg.respond || []).find((r) => `${system || ""}\n${prompt}`.includes(r.match));
+    if (rule) return { text: JSON.stringify(rule.json), data: rule.json, cost: 0 };
     if (json) return { text: JSON.stringify(mock ?? {}), data: mock ?? {}, cost: 0 };
     return { text: `[mock] ${String(prompt).slice(0, 160)}`, data: null, cost: 0 };
   } }) });
@@ -416,18 +465,56 @@ impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: 
   async complete({ system, prompt, json = false, maxTokens = 2500 }) {
     const model = cfg.model || DEFAULTS.ANTHROPIC_MODEL;
     return withKey("anthropic", async (key) => {
-      const body = await fetchJson("https://api.anthropic.com/v1/messages", {
+      const body = await retryTransient(() => fetchJson("https://api.anthropic.com/v1/messages", {
         method: "POST", headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
         body: JSON.stringify({ model, max_tokens: maxTokens, system: system || undefined, messages: [{ role: "user", content: prompt + (json ? "\n\nRespond with ONLY valid JSON, no prose, no code fences." : "") }] }),
-      });
+      }));
       const text = (body.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
       const u = body.usage || {};
       return { text, data: json ? extractJson(text) : null, cost: tokenCost(model, u.input_tokens, u.output_tokens), model, units: 1 };
     }, ctx.pin);
   } }) });
-impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, grounding: { type: "boolean", default: false } }, create: (cfg, ctx = {}) => ({
+// Runs call(model) on the main model, then on each fallback model while the failure is an overload (503/5xx) or an
+// unknown model id (404). A 429 or a permanent error is thrown straight away (withKey rotates keys on 429).
+async function withModelFallback(models, call) {
+  let last, lastTransient;
+  for (const model of [...new Set(models.filter(Boolean))]) {
+    try { return await retryTransient(() => call(model)); }
+    catch (e) {
+      last = e;
+      if (e.status === 429) throw e;
+      if (isTransient(e)) { lastTransient = e; warn(`model ${model} unavailable (${e.status || e.message.slice(0, 60)}), trying the next one`); continue; }
+      if (e.status === 404) continue;
+      throw e;
+    }
+  }
+  throw lastTransient || last;
+}
+// Gemini model ids get renamed and retired. When every configured id of a kind answers 404, the account's live model list
+// (cached 6 h) supplies the closest replacements of the same kind, so a retirement doesn't stop the pipeline.
+const geminiCatalog = { at: 0, list: [] };
+const GEMINI_KINDS = { text: (n) => /^gemini-.*(flash|pro)/.test(n) && !/image|tts|audio|live|embedding|vision|thinking-exp/.test(n), image: (n) => /image/.test(n) && /^gemini/.test(n), tts: (n) => /tts/.test(n) };
+async function geminiReplacements(key, kind, tried) {
+  if (Date.now() - geminiCatalog.at > 6 * 3600e3 || !geminiCatalog.list.length) {
+    const r = await fetchJson("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": key } });
+    geminiCatalog.list = (r.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => m.name.replace(/^models\//, "")); geminiCatalog.at = Date.now();
+  }
+  // Prefer "latest" aliases, then the highest version; flash before pro for text (cost), as configured defaults do.
+  return geminiCatalog.list.filter((n) => GEMINI_KINDS[kind](n) && !tried.includes(n))
+    .sort((a, b) => Number(/latest/.test(b)) - Number(/latest/.test(a)) || Number(/lite/.test(a)) - Number(/lite/.test(b)) || Number(/flash/.test(b)) - Number(/flash/.test(a)) || b.localeCompare(a, undefined, { numeric: true })).slice(0, 3);
+}
+async function withGeminiModels(key, kind, models, call) {
+  try { return await withModelFallback(models, call); }
+  catch (e) {
+    if (e.status !== 404) throw e;
+    const alt = await geminiReplacements(key, kind, models).catch(() => []); if (!alt.length) throw e;
+    warn(`Gemini ${kind} model(s) ${models.join(", ")} not found; trying ${alt.join(", ")}`);
+    return withModelFallback(alt, call);
+  }
+}
+impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, fallback_models: { type: "array", default: DEFAULTS.GEMINI_FALLBACK_MODELS }, grounding: { type: "boolean", default: false } }, create: (cfg, ctx = {}) => ({
   async complete({ system, prompt, json = false, maxTokens = 4000, grounding = false }) {
-    const model = cfg.model || DEFAULTS.GEMINI_MODEL;
+    const models = [cfg.model || DEFAULTS.GEMINI_MODEL, ...(Array.isArray(cfg.fallback_models) ? cfg.fallback_models : DEFAULTS.GEMINI_FALLBACK_MODELS)];
     const useSearch = grounding || cfg.grounding;
     return withKey("gemini", async (key) => {
       const req = {
@@ -436,8 +523,8 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
         generationConfig: { maxOutputTokens: maxTokens, responseMimeType: json && !useSearch ? "application/json" : undefined },
         tools: useSearch ? [{ google_search: {} }] : undefined,
       };
-      const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-        method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(req) });
+      const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+        method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(req) }) }));
       const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
       const u = body.usageMetadata || {};
       const cites = (body.candidates?.[0]?.groundingMetadata?.groundingChunks || []).map((c) => c.web?.uri).filter(Boolean);
@@ -452,7 +539,7 @@ impl("SCRIPT", "openai", { label: "OpenAI (GPT)", configSchema: { model: { type:
       messages.push({ role: "user", content: prompt + (json ? "\n\nRespond with ONLY valid JSON." : "") });
       const req = { model, messages, max_completion_tokens: maxTokens, response_format: json ? { type: "json_object" } : undefined };
       if (!/^(o\d|gpt-5)/.test(model) && cfg.temperature != null) req.temperature = Number(cfg.temperature);
-      const body = await fetchJson("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(req) });
+      const body = await retryTransient(() => fetchJson("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(req) }));
       const text = body.choices?.[0]?.message?.content || ""; const u = body.usage || {};
       let data = null; if (json) { data = extractJson(text); if (data && !Array.isArray(data) && Object.keys(data).length === 1 && Array.isArray(Object.values(data)[0])) data = Object.values(data)[0]; }
       return { text, data, cost: tokenCost(model, u.prompt_tokens, u.completion_tokens), model, units: 1 };
@@ -501,12 +588,72 @@ function parseFeed(xml) {
   return items;
 }
 impl("INGEST", "ingest_mock", { label: "Mock feed", create: () => ({
-  async fetchItems(source) { const n = Date.now(); return [0, 1].map((i) => ({ external_id: `mock-${n}-${i}`, url: `https://example.com/story/${n}-${i}`, title: `Mock story ${n % 1000}-${i} from ${source.name}`, summary: "A deterministic mock story used to exercise the pipeline without any keys.", published_at: nowIso(), kind: "ARTICLE" })); } }) });
+  async fetchItems(source) {
+    // config.items = [{title, url, summary?}] makes the feed return exactly those (tests); otherwise two fresh mock stories.
+    const fixed = P(source.config)?.items; if (Array.isArray(fixed)) return fixed.map((x) => ({ external_id: x.url, summary: "", published_at: nowIso(), kind: "ARTICLE", ...x }));
+    const n = Date.now(); return [0, 1].map((i) => ({ external_id: `mock-${n}-${i}`, url: `https://example.com/story/${n}-${i}`, title: `Mock story ${n % 1000}-${i} from ${source.name}`, summary: "A deterministic mock story used to exercise the pipeline without any keys.", published_at: nowIso(), kind: "ARTICLE" })); } }) });
+// Several Bangladeshi outlets answer 403 to non-browser user agents; feeds are public, so a browser UA is used.
+const FEED_UA = ENV.FEED_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36";
+async function fetchFeed(url) {
+  const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(25000), headers: { "user-agent": FEED_UA, accept: "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8" } });
+  if (!res.ok) throw new ApiError(res.status, null, `Feed ${url.split("?")[0]} -> ${res.status}`);
+  return res.text();
+}
 impl("INGEST", "rss", { label: "RSS / Atom", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 30 } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
     const url = cfg.url || P(source.config)?.url; if (!url) throw new Error("RSS source needs config.url");
-    const res = await fetch(url, { headers: { "user-agent": "ContentEngine/1.0 (+rss)" } }); if (!res.ok) throw new Error(`Feed ${url} -> ${res.status}`);
-    return parseFeed(await res.text()).slice(0, cfg.limit || P(source.config)?.limit || 30);
+    return parseFeed(await fetchFeed(url)).slice(0, cfg.limit || P(source.config)?.limit || 30);
+  } }) });
+// Google News needs no key and reaches outlets whose own feeds are blocked (Cloudflare) or missing: a search ("query"
+// and/or "site") or an edition's top stories. Titles arrive as "Headline - Outlet"; the outlet is split off. Links are
+// Google redirect URLs, so the article text usually comes from other outlets in the same story cluster (news desk).
+const GN_NOISE = /e-?paper|ইপেপার|আর্কাইভ|\barchive\b|video gallery|photo gallery|today'?s'? paper|todays'? paper|^[\s\-–|]*$/i;
+function googleNewsUrl(c) {
+  const bn = /^bn/i.test(c.language || c.hl || ""); const gl = c.gl || "BD";
+  const hl = c.hl || (bn ? "bn" : "en-BD"), ceid = c.ceid || `${gl}:${bn ? "bn" : "en"}`;
+  if (!c.query && !c.site) return `https://news.google.com/rss?${form({ hl, gl, ceid })}`;
+  const q = [c.query, c.site ? `site:${c.site}` : null, c.when === "" ? null : `when:${c.when || "1d"}`].filter(Boolean).join(" ");
+  return `https://news.google.com/rss/search?${form({ q, hl, gl, ceid })}`;
+}
+impl("INGEST", "google_news", { label: "Google News (search / edition, no key)", configSchema: { query: { type: "string" }, site: { type: "string" }, language: { type: "string", default: "en" }, when: { type: "string", default: "1d" }, limit: { type: "number", default: 40 } }, create: (cfg) => ({
+  async fetchItems(source) {
+    const c = { ...cfg, ...(P(source.config) || {}) }; const out = [];
+    for (const m of (await fetchFeed(googleNewsUrl(c))).matchAll(/<item\b[\s\S]*?<\/item>/gi)) {
+      const [it] = parseFeed(m[0]); if (!it) continue;
+      const outlet = decodeXml((m[0].match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [])[1] || "").trim();
+      const title = outlet && it.title.endsWith(` - ${outlet}`) ? it.title.slice(0, -(outlet.length + 3)).trim() : it.title;
+      // Google also indexes outlets' tag and section pages ("tech companies", "Tokyo Olympics"): real headlines are longer.
+      if (!title || GN_NOISE.test(title) || title.split(/\s+/).filter(Boolean).length < 4) continue;
+      out.push({ ...it, title, summary: "", raw: { outlet, via: "google_news" } });
+    }
+    return out.slice(0, c.limit || 40);
+  } }) });
+// A YouTube channel's public feed (latest 15 uploads, no key). Duration is unknown until download; views are included.
+impl("INGEST", "youtube_rss", { label: "YouTube channel feed (no key)", configSchema: { channel_id: { type: "string", required: true }, limit: { type: "number", default: 15 } }, create: (cfg) => ({
+  async fetchItems(source) {
+    const c = { ...cfg, ...(P(source.config) || {}) }; if (!c.channel_id) throw new Error("youtube_rss source needs config.channel_id (UC…)");
+    const xml = await fetchFeed(`https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(c.channel_id)}`);
+    const channel = decodeXml((xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/) || [])[1] || "").trim();
+    const tag = (b, t) => decodeXml((b.match(new RegExp(`<${t}(?:\\s[^>]*)?>([\\s\\S]*?)</${t}>`)) || [])[1] || "").trim();
+    return [...xml.matchAll(/<entry>[\s\S]*?<\/entry>/g)].map(({ 0: b }) => {
+      const id = tag(b, "yt:videoId"); if (!id) return null; const published = tag(b, "published");
+      return { external_id: id, url: `https://www.youtube.com/watch?v=${id}`, title: tag(b, "title"), summary: tag(b, "media:description").slice(0, 2000), kind: "VIDEO", platform: "YOUTUBE", license: "STANDARD",
+        published_at: published && !isNaN(Date.parse(published)) ? new Date(published).toISOString() : null, thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+        views: Number((b.match(/<media:statistics views="(\d+)"/) || [])[1] || 0), raw: { channel } };
+    }).filter((x) => x && x.title).slice(0, c.limit || 15);
+  } }) });
+// Google News sitemaps (<news:title>, <news:publication_date>) for outlets without a usable RSS feed. {yyyy} {mm} {dd}
+// in the URL are replaced with today's date (UTC) for sitemaps split by day.
+impl("INGEST", "sitemap", { label: "News sitemap", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 40 } }, create: (cfg) => ({
+  async fetchItems(source) {
+    const c = { ...cfg, ...(P(source.config) || {}) }; if (!c.url) throw new Error("sitemap source needs config.url");
+    const d = new Date().toISOString(); const url = c.url.replace("{yyyy}", d.slice(0, 4)).replace("{mm}", d.slice(5, 7)).replace("{dd}", d.slice(8, 10));
+    const tag = (b, t) => decodeXml(((b.match(new RegExp(`<${t}(?:\\s[^>]*)?>([\\s\\S]*?)</${t}>`, "i")) || [])[1] || "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")).trim();
+    const items = [...(await fetchFeed(url)).matchAll(/<url>[\s\S]*?<\/url>/gi)].map(({ 0: b }) => {
+      const loc = tag(b, "loc"), title = stripHtml(tag(b, "news:title")), date = tag(b, "news:publication_date") || tag(b, "lastmod");
+      return loc && title ? { external_id: loc, url: loc, title, summary: "", kind: "ARTICLE", thumbnail: tag(b, "image:loc") || null, published_at: date && !isNaN(Date.parse(date)) ? new Date(date).toISOString() : null } : null;
+    }).filter(Boolean);
+    return items.sort((a, b) => Date.parse(b.published_at || 0) - Date.parse(a.published_at || 0)).slice(0, c.limit || 40);
   } }) });
 impl("INGEST", "newsapi", { label: "NewsAPI", configSchema: { country: { type: "string" }, category: { type: "string" }, query: { type: "string" }, language: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
@@ -558,6 +705,19 @@ impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "st
     const path = ["mp4", "mkv", "webm"].map((e) => `${base}.${e}`).find((p) => existsSync(p));
     if (!path) throw new Error("yt-dlp finished but produced no file (duration filter or format mismatch?)");
     return { path, duration: await ffprobeDuration(path) };
+  } }) });
+
+// A direct file: an http(s) link to a video (your uploads, a CDN, a partner's link) streamed to disk, or a local path.
+impl("DOWNLOAD", "direct", { label: "Direct link / uploaded file", create: () => ({
+  async download(url) {
+    await mkdir(TMP, { recursive: true });
+    const out = join(TMP, `${randomUUID()}${extname(String(url).split("?")[0]) || ".mp4"}`);
+    if (/^https?:/.test(url)) {
+      const res = await fetch(url, { redirect: "follow" }); if (!res.ok || !res.body) throw new ApiError(res.status, null, `download ${url.split("?")[0]} -> ${res.status}`);
+      await pipeline(Readable.fromWeb(res.body), createWriteStream(out));
+    } else if (existsSync(url)) await writeFile(out, await readFile(url));
+    else throw new Error(`Not a URL or an existing file: ${url}`);
+    return { path: out, duration: await ffprobeDuration(out) };
   } }) });
 
 // ---- 6e. Transcribe (stage TRANSCRIBE). transcribe({path, language}) -> {segments:[{start,end,text}], text}
@@ -626,7 +786,7 @@ impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSch
     const c = methodCfg(niche);
     const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 120000);
     // config.llm lets clipping run on a different SCRIPT instance (e.g. "openai_live") than the program's writer.
-    const primary = cfg.llm || niche.script_adapter, fallbacks = cfg.llm ? (cfg.llm_fallbacks || []) : niche.script_adapter_fallbacks;
+    const primary = cfg.llm || niche.script_adapter, fallbacks = cfg.llm ? (cfg.llm_fallbacks || []) : await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks");
     const r = await withFallbacks("SCRIPT", primary, fallbacks, (llm) => llm.complete({ json: true, maxTokens: 3000,
       system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}. Tone: ${niche.tone || "engaging"}.`,
       prompt: `Video: "${candidate.title}"\nTimestamped transcript:\n${lines}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why"}]`,
@@ -650,6 +810,9 @@ function svgCard(headline, specs) {
 // or image_specs.overlay=false for no text at all.
 const OVERLAY_FONT = ENV.OVERLAY_FONT || "Noto Sans Bengali";
 const assEsc = (t) => String(t || "").replace(/[\r\n]+/g, " ").replace(/[{}\\]/g, "").trim();
+// A file path as a filtergraph option value: quoted so the graph parser passes it through, colon escaped for the option
+// parser (Windows drive letters), forward slashes throughout.
+const ffPath = (p) => `'${String(p).replace(/\\/g, "/").replace(/'/g, "").replace(/:/g, "\\:")}'`;
 const assColor = (hex, alpha = "00") => { const m = /^#?([0-9a-f]{6})$/i.exec(hex || ""); if (!m) return `&H${alpha}FFFFFF`; const h = m[1]; return `&H${alpha}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`.toUpperCase(); };
 async function imageDims(file) { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file]); const [w, h] = out.trim().split(",").map(Number); return { width: w || 1080, height: h || 1080 }; }
 async function composeHeadline(inPath, headline, specs = {}) {
@@ -659,9 +822,60 @@ async function composeHeadline(inPath, headline, specs = {}) {
   const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${Math.round(h * 0.7)})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
   const band = [0.58, 0.68, 0.78].map((y, i) => `drawbox=x=0:y=ih*${y}:w=iw:h=ih:color=black@${0.18 + i * 0.16}:t=fill`).join(",");
-  try { await exec("ffmpeg", ["-y", "-i", inPath, "-vf", `${band},subtitles=${assPath.replace(/\\/g, "/").replace(/:/g, "\\:")}`, "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
+  try { await exec("ffmpeg", ["-y", "-i", inPath, "-vf", `${band},${assVf(assPath)}`, "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
   finally { await cleanup(assPath); }
 }
+// ---- Photocard: the standard Bangladeshi news-page post. Picture on top, a panel in the brand colour holding the headline,
+// an accent rule, the brand logo, the date (Bangla digits for Bangla cards) and the source credit. Also libass for text.
+// Brand kit (brands.brand_kit): logo_url, primary_color, accent_color, text_color, font, fonts_url, handle, image_ratio,
+// logo_scale, credit_sources. image_specs.layout on a program: "photocard" (default) | "overlay" (text over the photo).
+function cardDate(lang, tz = "Asia/Dhaka") {
+  try { return new Intl.DateTimeFormat(lang === "bn" ? "bn-BD" : "en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: tz }).format(new Date()); }
+  catch { return new Date().toISOString().slice(0, 10); }
+}
+// Largest font size (from base down) at which the text, wrapped at an estimated glyph width, fits the box.
+function fitFontSize(text, width, height, base, glyph) {
+  let size = base;
+  for (; size > base * 0.5; size -= 2) { const perLine = Math.max(6, Math.floor(width / (size * glyph))); if (Math.ceil(String(text).length / perLine) * size * 1.3 <= height) break; }
+  return Math.round(size);
+}
+// A brand's custom fonts (fonts_url: a .ttf/.otf, or several comma-separated) are fetched once into a per-process fonts dir.
+const fontsDirCache = new Map();
+async function brandFontsDir(kit) {
+  if (!kit?.fonts_url) return null;
+  if (fontsDirCache.has(kit.fonts_url)) return fontsDirCache.get(kit.fonts_url);
+  const dir = join(TMP, "fonts", sha(kit.fonts_url).slice(0, 12)); await mkdir(dir, { recursive: true });
+  for (const u of String(kit.fonts_url).split(",").map((s) => s.trim()).filter(Boolean)) { try { await writeFile(join(dir, u.split("/").pop().split("?")[0] || "font.ttf"), await fetchBytes(u)); } catch (e) { warn(`brand font ${u}: ${e.message}`); } }
+  fontsDirCache.set(kit.fonts_url, dir); return dir;
+}
+async function composePhotocard(inPath, headline, specs = {}) {
+  const kit = specs.kit || {}, meta = specs.card_meta || {};
+  const W = specs.width || 1080, H = specs.height || 1080, split = Math.round(H * (kit.image_ratio || 0.6)), m = Math.round(W * 0.055);
+  const bn = /[ঀ-৿]/.test(headline), font = kit.font || OVERLAY_FONT;
+  const metaSize = Math.round(H * 0.024), metaBand = Math.round(metaSize * 2.6);
+  const size = fitFontSize(headline, W - 2 * m, H - split - metaBand - Math.round(m * 1.2), Math.round(H * 0.068), bn ? 0.54 : 0.5);
+  const fg = assColor(kit.text_color || "#ffffff"), dim = assColor(kit.text_color || "#ffffff", "50"), acc = assColor(kit.accent_color || "#ffc400");
+  const hex = (c, d) => (/^#?[0-9a-f]{6}$/i.test(c || "") ? c : d).replace("#", "0x");
+  const metaLine = [meta.date, meta.credit].filter(Boolean).join("   •   ");
+  const style = (name, sz, col, bold, align, mv) => `Style: ${name},${font},${sz},${col},${col},&H00000000,&H00000000,${bold ? -1 : 0},0,0,0,100,100,0,0,1,0,0,${align},${m},${m},${mv},1`;
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${W}\nPlayResY: ${H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n`
+    + [style("Head", size, fg, true, 7, split + Math.round(m * 0.8)), style("Meta", metaSize, dim, false, 1, Math.round(metaSize * 0.9)), style("Handle", metaSize, acc, true, 3, Math.round(metaSize * 0.9))].join("\n")
+    + `\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`
+    + (metaLine ? `Dialogue: 0,0:00:00.00,0:00:10.00,Meta,,0,0,0,,${assEsc(metaLine)}\n` : "") + (kit.handle ? `Dialogue: 0,0:00:00.00,0:00:10.00,Handle,,0,0,0,,${assEsc(kit.handle)}\n` : "");
+  const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
+  let logo = null; if (kit.logo_url) { try { logo = await toTmpFile(kit.logo_url, "png"); } catch (e) { warn(`brand logo: ${e.message}`); } }
+  const fontsDir = await brandFontsDir(kit);
+  let fc = `color=c=${hex(kit.primary_color, "#b3121f")}:s=${W}x${H}:d=1[bg];[0:v]scale=${W}:${split}:force_original_aspect_ratio=increase,crop=${W}:${split},setsar=1[img];[bg][img]overlay=0:0[b0];`
+    + `[b0]drawbox=x=0:y=${split}:w=${W}:h=${Math.max(4, Math.round(H * 0.008))}:color=${hex(kit.accent_color, "#ffc400")}@1:t=fill[b1]`;
+  let last = "b1";
+  if (logo) { fc += `;[1:v]scale=${Math.round(W * (kit.logo_scale || 0.17))}:-1[lg];[${last}][lg]overlay=${m}:${m}[b2]`; last = "b2"; }
+  fc += `;[${last}]${assVf(assPath, fontsDir)}[out]`;
+  try { await exec("ffmpeg", ["-y", "-i", inPath, ...(logo ? ["-i", logo] : []), "-filter_complex", fc, "-map", "[out]", "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
+  finally { await cleanup(assPath, logo); }
+}
+// Gemini's supported aspect ratio closest to w:h — the picture area of a photocard is wider than the card.
+const IMAGE_RATIOS = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
+const nearestRatio = (w, h) => IMAGE_RATIOS.map((r) => [r, Math.abs(Math.log((Number(r.split(":")[0]) / Number(r.split(":")[1])) / (w / h)))]).sort((a, b) => a[1] - b[1])[0][0];
 // Instagram accepts JPEG only and Facebook prefers it; every generated raster image is stored as JPEG. SVG (mock) stays SVG
 // unless this ffmpeg build can rasterise it. Falls back to the original bytes if conversion fails.
 async function toJpeg(bytes, mime, quality = 3) {
@@ -675,7 +889,16 @@ async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}, comp
   let j = await toJpeg(bytes, mime);
   if (compose?.headline && compose.specs?.render_text !== true && compose.specs?.overlay !== false && j.mime === "image/jpeg") {
     const inp = tmpPath("jpg"); await writeFile(inp, j.bytes);
-    try { const out = await composeHeadline(inp, compose.headline, compose.specs); j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; meta = { ...meta, overlay: true }; await cleanup(out); }
+    try {
+      const card = (compose.specs.layout || (compose.specs.kit ? "photocard" : "overlay")) === "photocard";
+      const out = card ? await composePhotocard(inp, compose.headline, compose.specs) : await composeHeadline(inp, compose.headline, compose.specs);
+      // The clean picture is kept (IMAGE_BASE) so the card can be redrawn when the headline is edited.
+      const base = await recordMedia({ contentItemId, kind: "IMAGE_BASE", url: await storeFile(`images/${newId()}-base.jpg`, j.bytes, "image/jpeg"), mime: "image/jpeg", meta: { purpose: "card background" } });
+      j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; await cleanup(out);
+      const { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale } = compose.specs;
+      meta = { ...meta, overlay: card ? "photocard" : true, base_media_id: base.id, compose_specs: { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale } };
+      if (card) dims = { width: compose.specs.width || 1080, height: compose.specs.height || 1080 };
+    }
     catch (e) { warn(`headline overlay skipped: ${e.message.slice(0, 160)}`); }
     finally { await cleanup(inp); }
   }
@@ -692,12 +915,12 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
     const ar = specs.aspect_ratio || (specs.height > specs.width ? "9:16" : specs.width > specs.height ? "16:9" : "1:1");
     const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === true ? `Render this headline as bold, legible overlay text: "${headline}".` : "Do not render any text, letters, captions or logos anywhere in the image; leave the lower third visually calm."} Aspect ratio ${ar}.`;
     return withKey("gemini", async (key) => {
-      const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) });
+      const { model: used, body } = await withGeminiModels(key, "image", [model], async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) }) }));
       const part = (body.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData || p.inline_data);
       if (!part) throw new Error("Gemini returned no image (blocked by safety, or wrong model id?)");
       const d = part.inlineData || part.inline_data; const mime = d.mimeType || d.mime_type || "image/png";
-      const media = await storeImage(Buffer.from(d.data, "base64"), mime, contentItemId, { model, prompt: full }, {}, { headline, specs });
+      const media = await storeImage(Buffer.from(d.data, "base64"), mime, contentItemId, { model: used, prompt: full }, {}, { headline, specs });
       return { ...media, cost: IMAGE_PRICE_USD, units: 1 };
     }, ctx.pin);
   } }) });
@@ -755,33 +978,144 @@ impl("VOICE", "openai_tts", { label: "OpenAI TTS", configSchema: { voice: { type
     }, ctx.pin);
   } }) });
 
+// Gemini native TTS: uses the Gemini key the rest of the pipeline already has and speaks Bangla (bn-BD) as well as English.
+// Returns raw 24 kHz PCM, converted to MP3 here. Long scripts are split at sentence ends and joined.
+impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSchema: { voice: { type: "string", default: DEFAULTS.GEMINI_TTS_VOICE }, model: { type: "string", default: DEFAULTS.GEMINI_TTS_MODELS[0] }, style: { type: "string" } }, create: (cfg, ctx = {}) => ({
+  async synthesize({ script, voiceId, contentItemId }) {
+    const voice = voiceId || cfg.voice || DEFAULTS.GEMINI_TTS_VOICE;
+    const models = [cfg.model, ...DEFAULTS.GEMINI_TTS_MODELS];
+    const parts = []; let cur = "";
+    for (const s of String(script).split(/(?<=[.!?।])\s+/)) { if ((cur + " " + s).length > 2800 && cur) { parts.push(cur.trim()); cur = s; } else cur += " " + s; } if (cur.trim()) parts.push(cur.trim());
+    return withKey("gemini", async (key) => {
+      const files = [];
+      try {
+        for (const p of parts) {
+          const text = cfg.style ? `${cfg.style}: ${p}` : p;
+          const body = await withGeminiModels(key, "tts", models.filter(Boolean), (m) => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+            body: JSON.stringify({ contents: [{ parts: [{ text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }) }));
+          const d = (body.candidates?.[0]?.content?.parts || []).find((x) => x.inlineData || x.inline_data); if (!d) throw new Error("Gemini TTS returned no audio");
+          const inl = d.inlineData || d.inline_data; const rate = Number((/rate=(\d+)/.exec(inl.mimeType || inl.mime_type || "") || [])[1]) || 24000;
+          const pcm = tmpPath("pcm"), mp3 = tmpPath("mp3"); await writeFile(pcm, Buffer.from(inl.data, "base64"));
+          await exec("ffmpeg", ["-y", "-f", "s16le", "-ar", String(rate), "-ac", "1", "-i", pcm, "-b:a", "128k", mp3]); await cleanup(pcm); files.push(mp3);
+        }
+        let f = files[0];
+        if (files.length > 1) { const list = tmpPath("txt"); await writeFile(list, files.map((x) => `file '${x.replace(/\\/g, "/")}'`).join("\n")); f = tmpPath("mp3"); await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", f]); await cleanup(list); }
+        const dur = await ffprobeDuration(f);
+        const url = await storeLocal(f, `audio/${newId()}.mp3`, "audio/mpeg"); await cleanup(f);
+        const media = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur || script.length / 15, meta: { voice, provider: "gemini", chars: script.length } });
+        return { ...media, units: 1, cost: (dur || 0) * 25 * 10 / 1e6 };
+      } finally { await cleanup(...files); }
+    }, ctx.pin);
+  } }) });
+
 // ---- 6i. Embeddings (stage EMBED). embed(text) -> number[] | null
-impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { return null; } }) });
+// embedMany(texts, {dimensions, task}) -> (number[] | null)[] — batched for the news desk, which embeds every new headline.
+impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { return null; }, async embedMany(texts) { return texts.map(() => null); } }) });
 impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg, ctx = {}) => ({
   async embed(text) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL;
-    const r = await withKey("gemini", async (key) => { const b = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) }); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
+    const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
     return r.v;
+  },
+  async embedMany(texts, { dimensions = 256, task = "CLUSTERING" } = {}) {
+    const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL; const out = [];
+    for (let i = 0; i < texts.length; i += 100) {
+      const chunk = texts.slice(i, i + 100);
+      const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({ requests: chunk.map((t) => ({ model: `models/${model}`, content: { parts: [{ text: String(t).slice(0, 2000) }] }, taskType: task, outputDimensionality: dimensions })) }) })); return { v: (b.embeddings || []).map((e) => e.values || null), units: 1, cost: 0 }; }, ctx.pin);
+      out.push(...chunk.map((_, j) => r.v[j] || null));
+    }
+    return out;
   } }) });
 
 // ---- 6j. Render (stage RENDER). ffmpeg helpers + renderForChannel({item, media, channel, niche}) -> {url, kind}
-const srtTime = (s) => { const ms = Math.round(s * 1000); const h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60, sec = Math.floor(ms / 1000) % 60; return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")},${String(ms % 1000).padStart(3, "0")}`; };
-async function writeSrt(segments, start, end) {
-  const inRange = segments.filter((s) => s.end > start && s.start < end);
-  const body = inRange.map((s, i) => `${i + 1}\n${srtTime(Math.max(0, s.start - start))} --> ${srtTime(Math.min(end, s.end) - start)}\n${s.text.replace(/\n/g, " ")}\n`).join("\n");
-  const f = tmpPath("srt"); await writeFile(f, body || "1\n00:00:00,000 --> 00:00:01,000\n \n"); return f;
+// Burned-in text is always an ASS file drawn by the `ass` filter with complex shaping: ffmpeg's `subtitles` filter and
+// drawtext use simple shaping, which scrambles Bangla (vowel signs and conjuncts render in the wrong place).
+const assTime = (s) => { const cs = Math.max(0, Math.round(s * 100)); return `${Math.floor(cs / 360000)}:${String(Math.floor(cs / 6000) % 60).padStart(2, "0")}:${String(Math.floor(cs / 100) % 60).padStart(2, "0")}.${String(cs % 100).padStart(2, "0")}`; };
+const assVf = (file, fontsDir = null) => `ass=filename=${ffPath(file)}:shaping=complex${fontsDir ? `:fontsdir=${ffPath(fontsDir)}` : ""}`;
+const ASS_FORMAT = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding";
+// Captions for [start, end] of a timed transcript, shifted to 0 and cut into short phrases (a few words, timed by character
+// count). Karaoke colours each word as it is spoken. An optional hook sits in a box at the top for the first four seconds.
+async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1920, hook = null, font = OVERLAY_FONT, karaoke = true, accent = "#ffd400" } = {}) {
+  const vertical = height > width, size = Math.round(height * (vertical ? 0.04 : 0.052)), maxWords = vertical ? 4 : 8, events = [];
+  const weight = (w) => w.length + 1;
+  for (const s of (segments || []).filter((x) => x.end > start && x.start < end)) {
+    const s0 = Math.max(s.start, start) - start, s1 = Math.min(s.end, end) - start; if (s1 - s0 < 0.2) continue;
+    const words = String(s.text || "").trim().split(/\s+/).filter(Boolean); if (!words.length) continue;
+    const total = words.reduce((n, w) => n + weight(w), 0); let t = s0;
+    for (let i = 0; i < words.length; i += maxWords) {
+      const chunk = words.slice(i, i + maxWords), cw = chunk.reduce((n, w) => n + weight(w), 0), d = ((s1 - s0) * cw) / total;
+      const text = karaoke ? chunk.map((w) => `{\\k${Math.max(1, Math.round((d * 100 * weight(w)) / cw))}}${assEsc(w)}`).join(" ") : assEsc(chunk.join(" "));
+      events.push(`Dialogue: 0,${assTime(t)},${assTime(t + d)},Cap,,0,0,0,,${text}`); t += d;
+    }
+  }
+  if (hook) events.push(`Dialogue: 1,${assTime(0)},${assTime(Math.min(4, Math.max(1, end - start)))},Hook,,0,0,0,,${assEsc(hook).slice(0, 90)}`);
+  const white = assColor("#ffffff"), mx = Math.round(width * 0.07);
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n${ASS_FORMAT}\n`
+    // Karaoke: SecondaryColour = not yet spoken, PrimaryColour = spoken.
+    + `Style: Cap,${font},${size},${karaoke ? assColor(accent) : white},${white},&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(size * 0.09))},${Math.round(size * 0.05)},2,${mx},${mx},${Math.round(height * (vertical ? 0.22 : 0.07))},1\n`
+    + `Style: Hook,${font},${Math.round(size * 1.05)},${white},${white},&H70000000,&H70000000,-1,0,0,0,100,100,0,0,3,${Math.round(size * 0.3)},0,8,${mx},${mx},${Math.round(height * (vertical ? 0.12 : 0.06))},1\n`
+    + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
+  const f = tmpPath("ass"); await writeFile(f, ass); return f;
 }
 const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
+// Landscape footage in a vertical frame without cropping: the whole picture (TV chyrons included) over a blurred fill.
+const VF_VERTICAL_BLURPAD = "split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:4,eq=brightness=-0.18[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=0:(H-h)/2,setsar=1";
 const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black";
-const captionsVf = (srt, marginV = 190) => `subtitles=${srt.replace(/\\/g, "/").replace(/:/g, "\\:")}:force_style='FontName=${OVERLAY_FONT},FontSize=17,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=${marginV}'`;
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"];
-async function cutClip(input, start, end, { vertical = true, srt = null, hook = null } = {}) {
-  const vf = [vertical ? VF_VERTICAL : VF_LANDSCAPE];
-  if (hook) vf.push(`drawtext=text='${hook.replace(/[':\\]/g, " ").slice(0, 60)}':fontsize=54:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${vertical ? 260 : 60}:enable='lt(t,4)'`);
-  if (srt) vf.push(captionsVf(srt, vertical ? 190 : 40));
+async function cutClip(input, start, end, { vertical = true, ass = null, layout = "crop" } = {}) {
+  const vf = [vertical ? (layout === "blurpad" ? VF_VERTICAL_BLURPAD : VF_VERTICAL) : VF_LANDSCAPE];
+  if (ass) vf.push(assVf(ass));
   const out = tmpPath("mp4");
   await exec("ffmpeg", ["-y", "-ss", String(start), "-t", String(Math.max(1, end - start)), "-i", input, "-vf", vf.join(","), ...X264, out]);
   return out;
+}
+const hasAudio = async (file) => { try { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", file]); return out.trim().length > 0; } catch { return false; } };
+// Last pass on every footage video: the brand logo in a corner and loudness normalised for social platforms (-14 LUFS).
+async function brandFinish(file, niche, { vertical = true } = {}) {
+  const { brand } = await studioBrand(niche); const out = tmpPath("mp4"), audio = await hasAudio(file);
+  const logoW = Math.round((vertical ? 1080 : 1920) * (vertical ? 0.2 : 0.12)), margin = vertical ? 48 : 40;
+  try {
+    const args = ["-y", "-i", file, ...(brand.logo ? ["-i", brand.logo] : [])];
+    const fc = brand.logo ? `[1:v]scale=${logoW}:-1,format=rgba,colorchannelmixer=aa=0.88[lg];[0:v][lg]overlay=${margin}:${margin}[v]` : "[0:v]null[v]";
+    await exec("ffmpeg", [...args, "-filter_complex", fc + (audio ? ";[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a]" : ""), "-map", "[v]", ...(audio ? ["-map", "[a]"] : []), ...X264, out]);
+    await cleanup(file); return out;
+  } catch (e) { warn(`brand finish skipped: ${e.message.slice(0, 160)}`); await cleanup(out); return file; }
+  finally { await cleanup(brand.logo, brand.fontUrl); }
+}
+// Long-form reaction: the source plays in segments with the reactor picture-in-picture; between them the video pauses on a
+// blurred still while the commentary is spoken, the reactor large beside the frozen frame, with captions. Without a
+// reactor clip the "unique video" is the commentary's own waveform beside the brand logo. Segments share one format and
+// are joined without re-encoding. beats: [{type:"play", start, end} | {type:"comment", text, audio:{url, duration_seconds}}]
+async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
+  const W = 1920, H = 1080, FMT = ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"];
+  const { brand } = await studioBrand(niche); const reactor = reactorUrl ? await toTmpFile(reactorUrl, "mp4") : null;
+  const accent = (brand.accent || "#ffc400").replace("#", "0x"), srcAudio = await hasAudio(sourcePath), segs = [], temp = [];
+  try {
+    let lastT = 0;
+    for (const [i, b] of beats.entries()) {
+      const seg = tmpPath("mp4"); segs.push(seg);
+      if (b.type === "play") {
+        const dur = Math.max(1, b.end - b.start); lastT = b.end;
+        const inputs = ["-ss", String(b.start), "-t", String(dur), "-i", sourcePath, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : []), ...(srcAudio ? [] : ["-f", "lavfi", "-t", String(dur), "-i", "anullsrc=r=48000:cl=stereo"])];
+        const fc = `[0:v]${VF_LANDSCAPE},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=520:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-40:H-h-40:shortest=1[v]` : ";[m]null[v]");
+        const aIn = srcAudio ? "0:a" : `${reactor ? 2 : 1}:a`;
+        await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", aIn, "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
+      } else {
+        const vo = await toTmpFile(b.audio.url, "mp3"), dur = (await ffprobeDuration(vo)) || b.audio.duration_seconds || 5, still = tmpPath("jpg"); temp.push(vo, still);
+        await exec("ffmpeg", ["-y", "-ss", String(Math.max(0, lastT - 0.1)), "-i", sourcePath, "-frames:v", "1", "-q:v", "2", still]);
+        const ass = await writeCaptionsAss([{ start: 0, end: dur, text: b.text }], 0, dur, { width: W, height: H, accent: brand.accent }); temp.push(ass);
+        const side = reactor ? `[1:v]scale=700:-2,fps=30,setsar=1,pad=iw+10:ih+10:5:5:color=${accent}[r]` : `[2:a]showwaves=s=700x300:mode=cline:colors=${accent}:rate=30,format=yuva420p[r]`;
+        const fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:3,eq=brightness=-0.3[bg];[0:v]scale=1040:-2[fz];[bg][fz]overlay=70:(H-h)/2[a];${side};[a][r]overlay=W-w-80:(H-h)/2[b];[b]${assVf(ass)},fps=30,format=yuv420p[v]`;
+        const inputs = ["-loop", "1", "-t", String(dur), "-i", still, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : ["-f", "lavfi", "-i", "color=c=black:s=16x16"]), "-i", vo];
+        await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", "2:a", "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
+      }
+    }
+    const list = tmpPath("txt"), joined = tmpPath("mp4"); temp.push(list);
+    await writeFile(list, segs.map((s) => `file '${s.replace(/\\/g, "/")}'`).join("\n"));
+    await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", "-movflags", "+faststart", joined], { timeoutMs: 30 * 60000 });
+    return joined;
+  } finally { await cleanup(reactor, brand.logo, brand.fontUrl, ...segs, ...temp); }
 }
 async function publishRender(file, contentItemId, meta = {}) {
   const dur = await ffprobeDuration(file);
@@ -807,12 +1141,17 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     return { url, kind: "VIDEO" };
   },
   async renderClip({ clip, sourcePath, transcript, niche, contentItemId, extras = {} }) {
-    const c = methodCfg(niche); const vertical = c.orientation !== "16:9";
-    const srt = c.captions === false ? null : await writeSrt(transcript.segments, clip.start, clip.end);
-    let file;
+    const c = methodCfg(niche); const vertical = c.orientation !== "16:9" && niche.production_method !== "REACTION_LONG", layout = c.vertical_layout || "crop";
+    const segs = c.captions === false ? [] : transcript.segments;
+    const assFor = (v, withHook = true, s = segs, start = clip.start, end = clip.end) => writeCaptionsAss(s, start, end, { width: v ? 1080 : 1920, height: v ? 1920 : 1080, hook: withHook ? clip.hook : null });
+    const caps = []; let file;
     switch (niche.production_method || "PODCAST_HIGHLIGHT") {
+      case "REACTION_LONG": {
+        if (!extras.beats?.length) throw new Error("REACTION_LONG render needs extras.beats (the planned play/comment timeline)");
+        file = await renderReactionLong({ beats: extras.beats, sourcePath, niche, reactorUrl: c.reactor_url || extras.reactorUrl || null }); break;
+      }
       case "REACTION_OVERLAY": {
-        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false, srt });
+        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false, ass: caps[caps.push(await assFor(false, false)) - 1] });
         const ovUrl = c.overlay_video_url; if (!ovUrl) throw new Error("REACTION_OVERLAY needs method_config.overlay_video_url (your own reaction clip)");
         const ov = await toTmpFile(ovUrl, "mp4"); file = tmpPath("mp4");
         const box = "scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=black";
@@ -822,10 +1161,16 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         await cleanup(main, ov); break;
       }
       case "VOICEOVER": {
-        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical, srt: null, hook: clip.hook });
+        // Our narration over the clip: the cut covers the whole narration, captions follow the new words, and the original
+        // sound stays underneath at a low level instead of being dropped.
         if (!extras.audio?.url) throw new Error("VOICEOVER render needs extras.audio");
-        const a = await toTmpFile(extras.audio.url, "mp3"); file = tmpPath("mp4");
-        await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", file]); await cleanup(main, a); break;
+        const a = await toTmpFile(extras.audio.url, "mp3"); const nd = (await ffprobeDuration(a)) || extras.audio.duration_seconds || clip.end - clip.start;
+        const end = Math.max(clip.end, clip.start + nd + 0.3);
+        const main = await cutClip(sourcePath, clip.start, end, { vertical, layout, ass: caps[caps.push(await assFor(vertical, true, c.captions === false ? [] : [{ start: clip.start, end: clip.start + nd, text: extras.script || "" }], clip.start, end)) - 1] });
+        file = tmpPath("mp4");
+        if (await hasAudio(main)) await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-filter_complex", "[0:a]volume=0.12[bg];[1:a]volume=1.0[vo];[bg][vo]amix=inputs=2:duration=longest:dropout_transition=0[a]", "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-t", String(nd + 0.3), file]);
+        else await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", file]);
+        await cleanup(main, a); break;
       }
       case "MOVIE_RECAP": {
         // extras.scenes = [{start,end}], extras.audio = narration. Concat scenes, put narration on top.
@@ -835,26 +1180,116 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? VF_VERTICAL : VF_LANDSCAPE}[v]`;
         await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
       }
-      default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, srt, hook: clip.hook });
+      default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical)) - 1] });
     }
-    await cleanup(srt);
+    await cleanup(...caps);
+    if (c.brand_finish !== false) file = await brandFinish(file, niche, { vertical });
     return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
   },
-  async renderSlideshow({ images, audio, contentItemId, orientation = "9:16", captions = [] }) {
+  // durations (seconds per picture) follow the narration section by section; without them the pictures share it equally.
+  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [] }) {
     if (!images.length) throw new Error("slideshow needs at least one image");
     const a = await toTmpFile(audio.url, "mp3"); const dur = (await ffprobeDuration(a)) || audio.duration_seconds || images.length * 4;
-    const per = dur / images.length; const files = [];
-    for (const im of images) files.push(await toTmpFile(im.url));
-    const list = tmpPath("txt"); await writeFile(list, files.map((f) => `file '${f}'\nduration ${per.toFixed(3)}`).join("\n") + `\nfile '${files.at(-1)}'\n`);
+    const per = durations?.length === images.length ? durations.map((x) => Math.max(0.5, Number(x) || 0)) : images.map(() => dur / images.length);
     const [w, h] = orientation === "16:9" ? [1920, 1080] : [1080, 1920];
-    const vf = [`scale=${w}:${h}:force_original_aspect_ratio=increase`, `crop=${w}:${h}`, `zoompan=z='min(zoom+0.0008,1.12)':d=${Math.round(per * 30)}:s=${w}x${h}:fps=30`, "format=yuv420p"];
-    let srt = null; if (captions.length) { srt = await writeSrt(captions, 0, dur); vf.push(captionsVf(srt, orientation === "16:9" ? 40 : 190)); }
-    const out = tmpPath("mp4");
-    await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, "-vf", vf.join(","), "-r", "30", "-t", String(dur), ...X264, out]);
-    await cleanup(list, a, srt, ...files);
-    return publishRender(out, contentItemId, { method: "SLIDESHOW", orientation, slides: images.length });
+    // One Ken Burns segment per picture, exactly as long as its narration, zooming in and out alternately; then joined.
+    const segs = [], files = [];
+    try {
+      for (const [i, im] of images.entries()) {
+        const f = await toTmpFile(im.url); files.push(f); const frames = Math.max(15, Math.round(per[i] * 30)), seg = tmpPath("mp4");
+        const z = i % 2 ? `if(eq(on,0),1.12,max(zoom-0.0008,1.0))` : `min(zoom+0.0008,1.12)`;
+        await exec("ffmpeg", ["-y", "-i", f, "-vf", `scale=${Math.round(w * 1.25)}:${Math.round(h * 1.25)}:force_original_aspect_ratio=increase,crop=${Math.round(w * 1.25)}:${Math.round(h * 1.25)},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,format=yuv420p`,
+          "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+        segs.push(seg);
+      }
+      const list = tmpPath("txt"); await writeFile(list, segs.map((s) => `file '${s.replace(/\\/g, "/")}'`).join("\n"));
+      let ass = null; if (captions.length) ass = await writeCaptionsAss(captions, 0, dur, { width: w, height: h });
+      const out = tmpPath("mp4");
+      try { await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, ...(ass ? ["-vf", assVf(ass)] : []), "-map", "0:v", "-map", "1:a", "-shortest", ...X264, out]); }
+      finally { await cleanup(list, ass); }
+      return publishRender(out, contentItemId, { method: "SLIDESHOW", orientation, slides: images.length });
+    } finally { await cleanup(a, ...files, ...segs); }
   },
 }) });
+
+// ---- 6j2. Studio (Remotion). News reels and animated explainers are rendered by studio/render.mjs in a child process,
+// so Chromium's memory and any crash stay out of the engine. Pictures, narration, music, logo and font are handed over as
+// local files; render.mjs stages them into the bundle. The "remotion" RENDER adapter uses the studio for made videos and
+// ffmpeg for everything built from footage (clips, per-channel conversion).
+const STUDIO_DIR = join(__dirname, "studio");
+// The container's real memory limit (cgroup v2 / v1), not the host's: headless Chrome needs room, and on a 512 MB instance
+// a render would take the whole service down with it. Below STUDIO_MIN_MEMORY_MB the studio is treated as unavailable.
+function memoryLimitMb() {
+  for (const f of ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
+    try { const v = readFileSync(f, "utf8").trim(); if (v && v !== "max" && Number(v) < 2 ** 50) return Math.round(Number(v) / 2 ** 20); } catch {}
+  }
+  return Math.round(totalmem() / 2 ** 20);
+}
+const STUDIO_MIN_MEMORY_MB = Number(ENV.STUDIO_MIN_MEMORY_MB) || 1400;
+const studioInstalled = () => existsSync(join(STUDIO_DIR, "render.mjs")) && existsSync(join(STUDIO_DIR, "node_modules", "@remotion", "renderer"));
+const studioReady = () => studioInstalled() && memoryLimitMb() >= STUDIO_MIN_MEMORY_MB;
+const STUDIO_FPS = 30;
+async function studioRender(composition, props, { kind = "video", ext = "mp4", timeoutMs = 90 * 60000 } = {}) {
+  if (!studioInstalled()) throw new Error("The video studio is not installed here (studio/node_modules is missing). The Docker image installs it; locally run `npm install` in studio/.");
+  if (!studioReady()) throw new Error(`This instance has ${memoryLimitMb()} MB of memory; the video studio needs ${STUDIO_MIN_MEMORY_MB} MB. Run the video lane on a bigger instance (the render.yaml worker is 2 GB).`);
+  const propsPath = tmpPath("json"), out = tmpPath(ext);
+  await writeFile(propsPath, JSON.stringify(props));
+  try { await exec(process.execPath, [join(STUDIO_DIR, "render.mjs"), propsPath, out, composition, kind], { timeoutMs }); return out; }
+  finally { await cleanup(propsPath); }
+}
+// The brand kit as the studio's brand, with logo, font and a music bed fetched to local files for the render.
+async function studioBrand(niche) {
+  const b = await one(`SELECT name, brand_kit FROM brands WHERE id=$1`, [niche.brand_id]); const k = P(b?.brand_kit) || {}, mc = methodCfg(niche);
+  const local = async (url, ext) => { if (!url) return undefined; try { return await toTmpFile(url, ext); } catch (e) { warn(`brand asset ${url}: ${e.message}`); return undefined; } };
+  const fontUrl = String(k.fonts_url || "").split(",")[0].trim();
+  const musicList = mc.music === false || mc.music === "none" ? [] : [].concat(mc.music || k.music_urls || []).filter(Boolean);
+  const brand = { name: k.display_name || b?.name || niche.display_name, primary: k.primary_color || "#b3121f", accent: k.accent_color || "#ffc400", text: k.text_color || "#ffffff",
+    handle: k.handle || undefined, logo: await local(k.logo_url), font: fontUrl ? k.font || "BrandFont" : undefined, fontUrl: fontUrl ? await local(fontUrl, extname(fontUrl.split("?")[0]).slice(1) || "ttf") : undefined };
+  return { brand, music: musicList.length ? await local(musicList[Math.floor(Math.random() * musicList.length)], "mp3") : undefined };
+}
+// Word timings for captions: the words spread over the part's measured duration by character count.
+function wordTimings(text, frames, offset = 0) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean), total = words.reduce((n, w) => n + w.length + 1, 0) || 1; let t = offset;
+  return words.map((w) => { const d = (frames * (w.length + 1)) / total, o = { text: w, from: Math.round(t), to: Math.round(t + d) }; t += d; return o; });
+}
+// Narration spoken part by part, so each part's duration is measured rather than guessed, then joined into one track.
+async function narrateParts(niche, parts, contentItemId) {
+  const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); const made = []; let cost = 0;
+  for (const text of parts) { const a = await voice.synthesize({ script: text, voiceId: niche.voice_id, contentItemId }); cost += a.cost || 0; made.push(a); }
+  if (made.some((a) => !a.url || a.url.startsWith("mock://"))) {
+    const durations = made.map((a) => Number(a.duration_seconds) || 2);
+    return { audio: { url: made[0]?.url || null, duration_seconds: durations.reduce((x, y) => x + y, 0), mock: true }, durations, cost };
+  }
+  const files = []; for (const a of made) files.push(await toTmpFile(a.url, "mp3"));
+  const durations = []; for (const [i, f] of files.entries()) durations.push((await ffprobeDuration(f)) || Number(made[i].duration_seconds) || 2);
+  const list = tmpPath("txt"), joined = tmpPath("mp3");
+  await writeFile(list, files.map((f) => `file '${f.replace(/\\/g, "/")}'`).join("\n"));
+  try { await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c:a", "libmp3lame", "-b:a", "160k", joined]); }
+  finally { await cleanup(list, ...files); }
+  const url = await storeLocal(joined, `audio/${newId()}.mp3`, "audio/mpeg"); const total = await ffprobeDuration(joined); await cleanup(joined);
+  const audio = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: total, meta: { parts: parts.length, voice: niche.voice_adapter } });
+  return { audio, durations, cost };
+}
+impl("RENDER", "remotion", { label: "Studio (Remotion) for made videos, ffmpeg for footage", create: (cfg, ctx) => {
+  const ff = IMPLS.RENDER.ffmpeg.create(cfg, ctx);
+  return {
+    renderForChannel: (a) => ff.renderForChannel(a), renderClip: (a) => ff.renderClip(a),
+    // sections: [{image: url, narration, seconds}], audio: media row; returns a VIDEO media row.
+    async renderReel({ sections, audio, niche, headline, kicker, credit, orientation = "9:16", contentItemId }) {
+      const vertical = orientation !== "16:9", { brand, music } = await studioBrand(niche), locals = [];
+      try {
+        const props = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: (niche.language || "en").slice(0, 2), brand, headline, kicker, credit, music, outroFrames: Math.round(2.5 * STUDIO_FPS), sections: [] };
+        props.audio = audio?.url && !audio.mock ? locals[locals.push(await toTmpFile(audio.url, "mp3")) - 1] : undefined;
+        for (const s of sections) {
+          const frames = Math.max(STUDIO_FPS, Math.round(s.seconds * STUDIO_FPS));
+          props.sections.push({ image: locals[locals.push(await toTmpFile(s.image)) - 1], durationInFrames: frames, narration: s.narration, words: wordTimings(s.narration, frames) });
+        }
+        const out = await studioRender("NewsReel", props);
+        return publishRender(out, contentItemId, { method: "STUDIO_REEL", orientation, sections: sections.length });
+      } finally { await cleanup(...locals, brand.logo, brand.fontUrl, music); }
+    },
+  };
+} });
 
 // ---- 6k. Publish (stage PUBLISH). publish({channel, mediaUrl, mediaKind, caption, title, hashtags}) -> {publishedUrl, externalId}
 const PLATFORM_DEFAULT_PUBLISHER = { FACEBOOK: "meta_graph", INSTAGRAM: "meta_graph", YOUTUBE: "youtube_upload" };
@@ -882,6 +1317,15 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
       const token = await metaToken(channel, cfg); const acct = channel.platform_account_id; if (!acct) throw new Error("channel.platform_account_id (Page ID / IG user ID) is required");
       if (mediaUrl?.startsWith("mock://")) throw new Error("Cannot publish a mock:// media URL to a real platform — switch the program's image/render adapter to a live one");
       if (channel.platform === "FACEBOOK") {
+        // Vertical short videos go out as Reels (start → hosted-file upload → finish), which reach far more people than
+        // page videos; everything else is a normal page video.
+        if (mediaKind === "VIDEO" && channel.format === "SHORT_FORM_VOICEOVER") {
+          const s = await post(`${acct}/video_reels`, { upload_phase: "start", access_token: token });
+          const up = await fetchJson(`https://rupload.facebook.com/video-upload/${cfg.api_version || DEFAULTS.META_API_VERSION}/${s.video_id}`, { method: "POST", headers: { Authorization: `OAuth ${token}`, file_url: mediaUrl } });
+          if (up.success === false) throw new Error(`Facebook Reel upload failed: ${JSON.stringify(up).slice(0, 300)}`);
+          await post(`${acct}/video_reels`, { upload_phase: "finish", video_id: s.video_id, video_state: "PUBLISHED", description: caption, title, access_token: token });
+          return { externalId: s.video_id, publishedUrl: `https://www.facebook.com/reel/${s.video_id}` };
+        }
         if (mediaKind === "VIDEO") { const r = await post(`${acct}/videos`, { file_url: mediaUrl, description: caption, title, access_token: token }); return { externalId: r.id, publishedUrl: `https://www.facebook.com/${r.id}` }; }
         if (mediaKind === "IMAGE") { const r = await post(`${acct}/photos`, { url: mediaUrl, message: caption, access_token: token }); return { externalId: r.post_id || r.id, publishedUrl: `https://www.facebook.com/${r.post_id || r.id}` }; }
         const r = await post(`${acct}/feed`, { message: caption, access_token: token }); return { externalId: r.id, publishedUrl: `https://www.facebook.com/${r.id}` };
@@ -913,7 +1357,7 @@ async function youtubeAccessToken(channel, cfg) {
   return t.access_token;
 }
 impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { privacy: { type: "string", default: "public" }, category_id: { type: "string", default: "22" } }, create: (cfg, ctx = {}) => ({
-  async publish({ channel, mediaUrl, mediaKind, caption, title, hashtags = [] }) {
+  async publish({ channel, mediaUrl, mediaKind, caption, title, hashtags = [], thumbnailUrl = null }) {
     if (mediaKind !== "VIDEO") throw new Error(`YouTube channel needs a VIDEO asset (got ${mediaKind})`);
     const token = await youtubeAccessToken(channel, cfg); const pc = P(channel.platform_config) || {};
     const file = await toTmpFile(mediaUrl, "mp4"); const bytes = await readFile(file); await cleanup(file);
@@ -922,6 +1366,8 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
     const start = await fetch("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": String(bytes.length) }, body: JSON.stringify(meta) });
     const loc = start.headers.get("location"); if (!loc) throw new ApiError(start.status, await start.text(), "YouTube resumable start failed");
     const r = await fetchJson(loc, { method: "PUT", headers: { "Content-Type": "video/mp4", "Content-Length": String(bytes.length) }, body: bytes });
+    // Custom thumbnails need a verified channel; a refusal is logged, never fatal to the upload.
+    if (thumbnailUrl && !isShort) { try { const t = await toTmpFile(thumbnailUrl, "jpg"); const tb = await readFile(t); await cleanup(t); await fetchJson(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${r.id}&uploadType=media`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "image/jpeg", "Content-Length": String(tb.length) }, body: tb }); } catch (e) { warn(`YouTube thumbnail for ${r.id}: ${e.message.slice(0, 200)}`); } }
     return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts" : "watch?v="}${r.id}` };
   },
   async metrics({ asset }) {
@@ -929,7 +1375,8 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
   } }) });
 
 // === 7. dedup / router / scheduler / review helpers ===================
-const tokenize = (t) => new Set(String(t).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2));
+// \p{M} keeps combining marks: Bangla vowel signs (া ি ে …) are marks, and stripping them shredded every Bangla word.
+const tokenize = (t) => new Set(String(t).toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2));
 function jaccard(a, b) { const A = tokenize(a), B = tokenize(b); if (!A.size || !B.size) return 0; let n = 0; for (const t of A) if (B.has(t)) n++; return n / (A.size + B.size - n); }
 function cosine(a, b) { let d = 0, x = 0, y = 0; for (let i = 0; i < Math.min(a.length, b.length); i++) { d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i]; } return x && y ? d / Math.sqrt(x * y) : 0; }
 async function checkDuplicate(text, niche, seriesId = null, excludeId = null) {
@@ -960,7 +1407,10 @@ async function underDailyCap(niche) {
   return r.n < niche.max_items_per_day;
 }
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
-const queueFor = (contentType) => VIDEO_TYPES.has(contentType) || contentType === "IMAGE_SLIDESHOW" || contentType === "LONG_FORM_VIDEO" ? "video" : "text";
+// Made videos (narrated reels, explainers) are written from articles like text posts but rendered on the video lane.
+const MADE_VIDEO_TYPES = new Set(["IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "NEWS_REEL", "ANIMATED_EXPLAINER"]);
+const CONTENT_TYPE_SET = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", ...MADE_VIDEO_TYPES, ...VIDEO_TYPES]);
+const queueFor = (contentType) => VIDEO_TYPES.has(contentType) || MADE_VIDEO_TYPES.has(contentType) ? "video" : "text";
 function scoreCandidate(item, niche) {
   const c = methodCfg(niche); let s = 0.35; const reasons = [];
   if (item.views) { const v = Math.min(1, Math.log10(item.views + 1) / 6.5); s += 0.3 * v; reasons.push(`views ${item.views}`); }
@@ -996,6 +1446,150 @@ async function routeSourceItem(item) {
   }
   await q(`UPDATE source_items SET status = $2 WHERE id = $1`, [item.id, routed ? "ROUTED" : "IGNORED"]);
   return routed;
+}
+
+// ---- 7b. Source catalog. Bangladeshi sources verified live on 2026-09-19. Outlets whose own feeds are blocked or missing
+// are reached through Google News (site search). A new program with country Bangladesh gets the entries in its language
+// linked automatically (video programs get the TV channels); anything else can be added from the Sources page.
+const gn = (key, name, language, site, weight = 1) => ({ key, name, language, adapter: "google_news", config: { site, language }, weight, poll: 20 });
+const rss = (key, name, language, url, weight = 1) => ({ key, name, language, adapter: "rss", config: { url }, weight, poll: 10 });
+const ytc = (key, name, channel_id, weight = 1) => ({ key, name, language: "bn", adapter: "youtube_rss", config: { channel_id }, weight, poll: 15, kind: "VIDEO" });
+const SOURCE_CATALOG = [
+  rss("bd-en-dailystar", "The Daily Star", "en", "https://www.thedailystar.net/news/bangladesh/rss.xml", 1.2),
+  rss("bd-en-prothomalo", "Prothom Alo English", "en", "https://en.prothomalo.com/feed/", 1.1),
+  rss("bd-en-dhakatribune", "Dhaka Tribune", "en", "https://www.dhakatribune.com/feed/", 1),
+  rss("bd-en-tbs", "The Business Standard", "en", "https://www.tbsnews.net/top-news/rss.xml", 1),
+  gn("bd-en-bdnews24", "bdnews24.com", "en", "bdnews24.com", 1.1),
+  gn("bd-en-fe", "The Financial Express", "en", "thefinancialexpress.com.bd", 0.9),
+  gn("bd-en-newage", "New Age", "en", "newagebd.net", 0.9),
+  gn("bd-en-unb", "UNB", "en", "unb.com.bd", 0.8),
+  gn("bd-en-bss", "BSS (state news agency)", "en", "bssnews.net", 0.8),
+  { key: "bd-en-gnews", name: "Google News: Bangladesh", language: "en", adapter: "google_news", config: { query: "Bangladesh", language: "en" }, weight: 0.7, poll: 20 },
+  rss("bd-bn-prothomalo", "প্রথম আলো", "bn", "https://www.prothomalo.com/feed/", 1.3),
+  rss("bd-bn-bbc", "বিবিসি বাংলা", "bn", "https://feeds.bbci.co.uk/bengali/rss.xml", 1.2),
+  rss("bd-bn-banglatribune", "বাংলা ট্রিবিউন", "bn", "https://www.banglatribune.com/feed/", 1),
+  rss("bd-bn-dhakapost", "ঢাকা পোস্ট", "bn", "https://www.dhakapost.com/rss/rss.xml", 0.9),
+  rss("bd-bn-dw", "ডয়চে ভেলে বাংলা", "bn", "https://rss.dw.com/xml/rss-ben-all", 0.9),
+  rss("bd-bn-risingbd", "রাইজিংবিডি", "bn", "https://www.risingbd.com/rss/rss.xml", 0.8),
+  gn("bd-bn-bdnews24", "বিডিনিউজ টোয়েন্টিফোর", "bn", "bangla.bdnews24.com", 1.1),
+  gn("bd-bn-kalerkantho", "কালের কণ্ঠ", "bn", "kalerkantho.com", 1),
+  gn("bd-bn-samakal", "সমকাল", "bn", "samakal.com", 1),
+  gn("bd-bn-jugantor", "যুগান্তর", "bn", "jugantor.com", 1),
+  gn("bd-bn-ittefaq", "ইত্তেফাক", "bn", "ittefaq.com.bd", 1),
+  gn("bd-bn-jagonews24", "জাগো নিউজ", "bn", "jagonews24.com", 0.9),
+  gn("bd-bn-kalbela", "কালবেলা", "bn", "kalbela.com", 0.9),
+  gn("bd-bn-bdpratidin", "বাংলাদেশ প্রতিদিন", "bn", "bd-pratidin.com", 0.9),
+  { key: "bd-bn-gnews", name: "Google News: বাংলাদেশ", language: "bn", adapter: "google_news", config: { query: "বাংলাদেশ", language: "bn" }, weight: 0.7, poll: 20 },
+  ytc("bd-tv-somoy", "SOMOY TV", "UCxHoBXkY88Tb8z1Ssj6CWsQ"),
+  ytc("bd-tv-jamuna", "Jamuna TV", "UCN6sm8iHiPd0cnoUardDAnw"),
+  ytc("bd-tv-channel24", "Channel 24", "UCHLqIOMPk20w-6cFgkA90jw"),
+  ytc("bd-tv-ekattor", "Ekattor TV", "UCtqvtAVmad5zywaziN6CbfA"),
+  ytc("bd-tv-independent", "Independent Television", "UCATUkaOHwO9EP_W87zCiPbA"),
+  ytc("bd-tv-atn", "ATN News", "UC9Rgo0CrNyd7OWliLekqqGA", 0.9),
+  ytc("bd-tv-ntv", "NTV News", "UCUDQdVsKssximyFwg4IxnOQ", 0.9),
+  ytc("bd-tv-channeli", "Channel i News", "UC8NcXMG3A3f2aFQyGTpSNww", 0.9),
+  ytc("bd-tv-dbc", "DBC NEWS", "UCUvXoiDEKI8VZJrr58g4VAw", 0.8),
+  ytc("bd-tv-rtv", "Rtv News", "UC2P5Fd5g41Gtdqf0Uzh8Qaw", 0.8),
+].map((e) => ({ country: "Bangladesh", kind: "ARTICLE", ...e }));
+// Catalog entries a program should start with: same country, its language, articles or TV depending on the program type.
+function catalogFor(niche) {
+  if (!/bangladesh|^bd$/i.test(niche.country || "")) return [];
+  const video = VIDEO_TYPES.has(niche.content_type);
+  return SOURCE_CATALOG.filter((e) => (video ? e.kind === "VIDEO" : e.kind === "ARTICLE" && e.language === (niche.language || "en").slice(0, 2)));
+}
+// Creates catalog sources that don't exist yet (one shared row per catalog key) and links them to the given programs.
+async function installCatalogSources(entries, nicheIds = []) {
+  const ids = [];
+  for (const e of entries) {
+    let s = await one(`SELECT id FROM sources WHERE catalog_key = $1`, [e.key]);
+    if (!s) {
+      await q(`INSERT INTO sources (id, name, kind, adapter_key, config, poll_interval_minutes, weight, catalog_key, language) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,
+        [newId(), e.name, e.kind, e.adapter, JSON.stringify(e.config), e.poll || 15, e.weight || 1, e.key, e.language]);
+      s = await one(`SELECT id FROM sources WHERE catalog_key = $1`, [e.key]);
+    }
+    ids.push(s.id);
+    for (const n of nicheIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), n, s.id]);
+  }
+  return ids;
+}
+
+// ---- 7c. News desk. New articles are grouped into story clusters across outlets and languages (embeddings when a
+// program has an embedding adapter, word overlap otherwise). A sweep hands each program its best uncovered stories —
+// ranked by how many outlets carry them, outlet weight and freshness — and the writer then gets every outlet's version,
+// so a story is written once, from several sources, instead of once per outlet from one.
+const DESK_TYPES = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", ...MADE_VIDEO_TYPES]);
+// Per program (method_config.desk): min_sources = outlets required; settle_minutes = wait for more outlets unless already
+// corroborated; max_age_hours = oldest publication date taken; per_sweep / min_gap_minutes = pacing.
+const deskCfg = (niche) => ({ min_sources: 1, settle_minutes: 5, max_age_hours: 12, per_sweep: 2, min_gap_minutes: 10, ...((P(niche.method_config) || {}).desk || {}) });
+const trimVec = (v, n = 256) => (Array.isArray(v) ? v.slice(0, n).map((x) => Math.round(x * 1e4) / 1e4) : null);
+async function deskEmbedder() {
+  const key = await setting("desk.embed_adapter", null) || (await one(`SELECT embed_adapter AS k, COUNT(*) AS n FROM niches WHERE is_active::int = 1 AND embed_adapter <> 'embed_mock' GROUP BY embed_adapter ORDER BY n DESC LIMIT 1`))?.k;
+  if (!key) return null;
+  try { const a = await resolve("EMBED", key); return a.embedMany ? a : null; } catch { return null; }
+}
+async function clusterItems(items, source) {
+  const threshold = Number(await setting("desk.similarity", 0.84)), overlap = Number(await setting("desk.word_overlap", 0.5));
+  let vecs = items.map(() => null);
+  const emb = await deskEmbedder();
+  if (emb) { try { vecs = await emb.embedMany(items.map((i) => `${i.title}. ${String(i.summary || "").slice(0, 300)}`)); } catch (e) { warn("desk embedding failed, clustering by word overlap:", e.message); } }
+  const open = (await q(`SELECT id, title, embedding, outlets, weight_sum, item_count, published_at FROM story_clusters WHERE last_seen_at > now() - interval '36 hours' ORDER BY last_seen_at DESC LIMIT 800`))
+    .map((c) => ({ ...c, vec: P(c.embedding), outlets: P(c.outlets) || [] }));
+  const outlet = (it) => (it.raw?.outlet || source.name);
+  for (const [i, it] of items.entries()) {
+    const v = trimVec(vecs[i]);
+    let best = null, bestScore = 0;
+    for (const c of open) {
+      const s = v && Array.isArray(c.vec) ? cosine(v, c.vec) : jaccard(it.title, c.title) * (threshold / overlap);
+      if (s > bestScore) { best = c; bestScore = s; }
+    }
+    const name = outlet(it), weight = Number(source.weight) || 1;
+    if (best && bestScore >= threshold) {
+      const known = best.outlets.some((o) => o.name === name);
+      if (!known) { best.outlets.push({ name, weight }); best.weight_sum = Number(best.weight_sum) + weight; }
+      best.item_count = Number(best.item_count) + 1;
+      if (v && Array.isArray(best.vec)) best.vec = trimVec(best.vec.map((x, k) => (x * (best.item_count - 1) + (v[k] || 0)) / best.item_count));
+      const pub = it.published_at && (!best.published_at || new Date(it.published_at) < new Date(best.published_at)) ? it.published_at : best.published_at;
+      best.published_at = pub;
+      await q(`UPDATE story_clusters SET item_count=$2, source_count=$3, outlets=$4::jsonb, weight_sum=$5, embedding=$6, published_at=$7, last_seen_at=now(), title = CASE WHEN $8 THEN $9 ELSE title END WHERE id=$1`,
+        [best.id, best.item_count, best.outlets.length, JSON.stringify(best.outlets), best.weight_sum, best.vec ? JSON.stringify(best.vec) : null, pub, !known && weight > Math.max(...best.outlets.filter((o) => o.name !== name).map((o) => o.weight)), it.title]);
+      await q(`UPDATE source_items SET cluster_id=$2, embedding=$3, status='CLUSTERED' WHERE id=$1`, [it.id, best.id, v ? JSON.stringify(v) : null]);
+    } else {
+      const c = { id: newId(), title: it.title, vec: v, outlets: [{ name, weight }], weight_sum: weight, item_count: 1, published_at: it.published_at || null };
+      await q(`INSERT INTO story_clusters (id, title, embedding, outlets, weight_sum, item_count, source_count, published_at) VALUES ($1,$2,$3,$4::jsonb,$5,1,1,$6)`, [c.id, c.title, v ? JSON.stringify(v) : null, JSON.stringify(c.outlets), weight, c.published_at]);
+      await q(`UPDATE source_items SET cluster_id=$2, embedding=$3, status='CLUSTERED' WHERE id=$1`, [it.id, c.id, v ? JSON.stringify(v) : null]);
+      open.unshift(c);
+    }
+  }
+}
+let deskTimer = null;
+const deskSoon = () => { if (!deskTimer) deskTimer = setTimeout(() => { deskTimer = null; sweepNewsDesk().catch((e) => warn("news desk", e.message)); }, 1000); };
+async function sweepNewsDesk() {
+  if (!(await setting("desk.enabled", true))) return;
+  const programs = (await q(`SELECT * FROM niches WHERE is_active::int = 1 ORDER BY priority DESC`)).filter((n) => DESK_TYPES.has(n.content_type));
+  for (const niche of programs) {
+    const cfg = deskCfg(niche);
+    if (!(await underDailyCap(niche))) continue;
+    const last = await one(`SELECT max(created_at) AS t FROM content_items WHERE niche_id = $1 AND cluster_id IS NOT NULL`, [niche.id]);
+    if (last?.t && Date.now() - new Date(last.t).getTime() < cfg.min_gap_minutes * 60000) continue;
+    const rows = await q(`SELECT c.*, LEAST(c.weight_sum, 6) * exp(-extract(epoch FROM now() - c.first_seen_at) / 64800.0) AS score FROM story_clusters c
+      WHERE COALESCE(c.published_at, c.first_seen_at) > now() - ($2 || ' hours')::interval AND c.source_count >= $3
+        AND (c.source_count >= 2 OR c.first_seen_at < now() - ($4 || ' minutes')::interval)
+        AND EXISTS (SELECT 1 FROM source_items si JOIN niche_sources ns ON ns.source_id = si.source_id WHERE si.cluster_id = c.id AND ns.niche_id = $1)
+        AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.niche_id = $1 AND ci.cluster_id = c.id)
+      ORDER BY score DESC LIMIT 40`, [niche.id, String(cfg.max_age_hours), cfg.min_sources, String(cfg.settle_minutes)]);
+    let taken = 0;
+    for (const c of rows) {
+      if (taken >= cfg.per_sweep || !(await underDailyCap(niche))) break;
+      // The lead version comes from the program's own sources, preferring its language and the heaviest outlet.
+      const rep = await one(`SELECT si.* FROM source_items si JOIN sources s ON s.id = si.source_id JOIN niche_sources ns ON ns.source_id = si.source_id AND ns.niche_id = $2
+        WHERE si.cluster_id = $1 ORDER BY COALESCE(s.language = $3, false) DESC, s.weight DESC, si.created_at ASC LIMIT 1`, [c.id, niche.id, (niche.language || "en").slice(0, 2)]);
+      if (!rep || !passesFilters({ title: c.title, summary: rep.summary, published_at: c.published_at }, niche)) continue;
+      const itemId = await createQueuedItem(niche, { sourceItemId: rep.id, clusterId: c.id, topic: rep.title, sourceDataRef: { provider: "news_desk", url: rep.url, title: rep.title, summary: rep.summary, published_at: rep.published_at, outlets: (P(c.outlets) || []).map((o) => o.name) } });
+      await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: niche.priority, contentItemId: itemId });
+      await q(`UPDATE source_items SET status = 'ROUTED' WHERE id = $1`, [rep.id]);
+      taken++;
+    }
+  }
 }
 // Posting scheduler: earliest time satisfying windows, min gap and max posts/day.
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -1066,19 +1660,27 @@ async function approveItem(itemId, { auto = false, scheduledFor = null } = {}) {
   await sweepDueAssets();
   return one(`SELECT * FROM content_items WHERE id = $1`, [itemId]);
 }
-async function rejectItem(itemId, note) { return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, note || "Rejected by reviewer"]); }
+async function rejectItem(itemId, note) {
+  const row = await one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, note || "Rejected by reviewer"]);
+  if (row && note) await logStyleFeedback(row, "REJECT", [{ note }]).catch((e) => warn("style feedback", e.message));
+  return row;
+}
+// Every draft passes the quality gate. MANUAL: always waits for a person (the report is shown in Review). AUTO: a clean
+// draft publishes, a flagged one waits, a REJECT is set aside. AUTO_AFTER_WINDOW: only a clean draft gets the countdown.
 async function finishGeneration(itemId, niche) {
   const mode = niche.approval_mode || "MANUAL";
-  if (mode === "AUTO") { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
-  const deadline = mode === "AUTO_AFTER_WINDOW" ? new Date(Date.now() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;
+  const qa = await qualityGate(itemId, niche), clean = qa.status === "PASS" || qa.status === "SKIPPED";
+  if (mode === "AUTO" && qa.status === "REJECT") return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, `Quality gate: ${qa.report?.summary || "flagged as unsafe to publish"}`]);
+  if (mode === "AUTO" && clean) { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
+  const deadline = mode === "AUTO_AFTER_WINDOW" && clean ? new Date(Date.now() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;
   return one(`UPDATE content_items SET status='PENDING_REVIEW', review_deadline_at=$2 WHERE id=$1 RETURNING *`, [itemId, deadline]);
 }
 
 // === 8. orchestrator ===================================================
-async function createQueuedItem(niche, { sourceItemId = null, seriesId = null, topic = "", sourceDataRef = null, contentType = null, candidateId = null, clipId = null, status = "QUEUED" }) {
+async function createQueuedItem(niche, { sourceItemId = null, seriesId = null, topic = "", sourceDataRef = null, contentType = null, candidateId = null, clipId = null, clusterId = null, status = "QUEUED" }) {
   const id = newId();
-  await q(`INSERT INTO content_items (id, niche_id, series_id, source_item_id, video_candidate_id, clip_id, content_type, status, topic, source_data_ref, niche_profile_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-    [id, niche.id, seriesId, sourceItemId, candidateId, clipId, contentType || niche.content_type, status, topic, J(sourceDataRef), J({ niche, capturedAt: nowIso() })]);
+  await q(`INSERT INTO content_items (id, niche_id, series_id, source_item_id, video_candidate_id, clip_id, cluster_id, content_type, status, topic, source_data_ref, niche_profile_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [id, niche.id, seriesId, sourceItemId, candidateId, clipId, clusterId, contentType || niche.content_type, status, topic, J(sourceDataRef), J({ niche, capturedAt: nowIso() })]);
   return id;
 }
 async function setItem(id, fields) {
@@ -1090,8 +1692,22 @@ function styleBlock(style) {
   if (!style) return "";
   return `\nWRITING STYLE "${style.name}": tone: ${style.tone}. Rules: ${style.rules}. ${style.examples ? `Examples of the voice:\n${style.examples}\n` : ""}${(P(style.banned_terms) || []).length ? `Never use these words/phrases: ${(P(style.banned_terms) || []).join(", ")}.` : ""} ${style.cta ? `End with this call to action: ${style.cta}.` : ""} ${(P(style.hashtags) || []).length ? `Always include hashtags: ${(P(style.hashtags) || []).join(" ")}.` : ""}`;
 }
-const llmFor = (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, niche.script_adapter_fallbacks, fn);
-const imageFor = (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", niche.image_adapter_fallbacks, fn);
+// Specs for a text item's hero picture: photocard layout with the brand kit and a date / source-credit line, overridden by
+// the program's image_specs. News pictures default to illustration: a realistic "photo" of a real event would mislead.
+async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
+  const brand = await one(`SELECT name, brand_kit FROM brands WHERE id = $1`, [niche.brand_id]);
+  const kit = P(brand?.brand_kit) || {}, own = P(niche.image_specs) || {}, lang = (niche.language || "en").slice(0, 2);
+  const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", kit, ...own };
+  if (specs.layout === "photocard") {
+    const outlets = [...new Set((m.versions?.length ? m.versions.map((v) => v.outlet) : [m.raw?.outlet]).filter(Boolean))].slice(0, 2);
+    specs.card_meta = { date: cardDate(lang, /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC"), credit: kit.credit_sources === false || !outlets.length ? null : `${lang === "bn" ? "সূত্র" : "Source"}: ${outlets.join(", ")}` };
+    specs.aspect_ratio = own.aspect_ratio || nearestRatio(specs.width, Math.round(specs.height * (kit.image_ratio || 0.6)));
+  }
+  if (!own.style && niche.content_type === "NEWS_STATIC") specs.style = "Editorial illustration in a modern digital-painting style: rich colour, dramatic light, clearly an illustration rather than a photograph, no identifiable real people, no text.";
+  return specs;
+}
+const llmFor = async (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks"), fn);
+const imageFor = async (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks"), fn);
 
 // Fetch the source page of an article and keep its main text, so the writer works from the real story instead of
 // the one-line RSS summary. Readability-lite: drop scripts/nav/etc, prefer <article>, keep substantial <p> blocks.
@@ -1108,16 +1724,43 @@ async function articleText(sourceItem) {
   const raw = P(sourceItem.raw) || {};
   if (typeof raw.article_text === "string") return raw.article_text;                       // cached (may be "" = tried, nothing usable)
   if (!(await setting("ingest.fetch_article_text", true)) || !/^https?:/.test(sourceItem.url || "")) return "";
+  if (/^https?:\/\/news\.google\.com\//.test(sourceItem.url)) return "";                   // redirect page, no article text
   let text = "";
   try {
-    const res = await fetch(sourceItem.url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "user-agent": "Mozilla/5.0 (compatible; ContentEngine/1.0; +article-fetch)", accept: "text/html,*/*" } });
+    const res = await fetch(sourceItem.url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "user-agent": FEED_UA, accept: "text/html,*/*" } });
     if (res.ok && /html/i.test(res.headers.get("content-type") || "")) text = extractArticleText((await res.text()).slice(0, 1.5e6));
   } catch (e) { warn(`article fetch ${sourceItem.url}: ${e.message.slice(0, 120)}`); }
   await q(`UPDATE source_items SET raw = COALESCE(raw, '{}'::jsonb) || $2::jsonb WHERE id = $1`, [sourceItem.id, JSON.stringify({ article_text: text })]).catch(() => {});
   return text;
 }
-// Resolve the raw material for a text item: a routed source_item, or a legacy TOPIC adapter pull.
+// A news-desk item's material: up to four outlets' versions of the story (the program's lead source first), each with
+// its article text when the outlet's page can be read.
+async function clusterMaterial(item) {
+  const rows = await q(`SELECT si.*, s.name AS source_name, s.weight FROM source_items si JOIN sources s ON s.id = si.source_id WHERE si.cluster_id = $1 ORDER BY (si.id = $2) DESC, s.weight DESC, si.created_at ASC LIMIT 16`, [item.cluster_id, item.source_item_id || ""]);
+  if (!rows.length) return null;
+  const versions = [], seen = new Set();
+  for (const r of rows) {
+    const outlet = P(r.raw)?.outlet || r.source_name; if (seen.has(outlet)) continue; seen.add(outlet);
+    versions.push({ outlet, title: r.title, summary: r.summary || "", text: r.kind === "ARTICLE" ? await articleText(r) : "", url: r.url, published_at: r.published_at });
+    if (versions.length >= 4) break;
+  }
+  const lead = versions[0];
+  return { title: lead.title, summary: lead.summary, text: lead.text, url: lead.url, published_at: lead.published_at, raw: { outlets: versions.map((v) => v.outlet) }, versions };
+}
+// The material as prompt text. Several outlets' versions are each clipped so the total stays near ARTICLE_TEXT_MAX, and
+// the writer is told how to treat agreement and conflict between them.
+function materialBlock(m) {
+  const vs = m.versions?.length ? m.versions : [{ outlet: null, title: m.title, summary: m.summary, text: m.text, url: m.url }];
+  const per = Math.max(1200, Math.floor(ARTICLE_TEXT_MAX / vs.length));
+  const body = vs.map((v, i) => `--- Source ${i + 1}${v.outlet ? `: ${v.outlet}` : ""}${v.url ? ` (${v.url})` : ""}\nHeadline: ${v.title}\n${v.summary ? `Summary: ${v.summary}\n` : ""}${v.text ? `Text:\n"""\n${v.text.slice(0, per)}\n"""\n` : "(headline and summary only)\n"}`).join("\n");
+  return `SOURCE MATERIAL — ${vs.length} source${vs.length > 1 ? "s" : ""} reporting this story\n${body}\n`
+    + (vs.length > 1 ? "Use only facts the sources state. Prefer facts several sources agree on; where they differ (numbers, names, times) use the most careful wording or say that reports differ. Never merge details from different incidents.\n" : "")
+    + (vs.some((v) => v.text) ? "" : "Only headlines/summaries are available — write ONLY what they support and keep it short rather than padding it.\n");
+}
+const richMaterial = (m) => (m.versions?.length ? m.versions.some((v) => v.text) : !!m.text);
+// Resolve the raw material for a text item: a news-desk story cluster, a routed source_item, or a legacy TOPIC adapter pull.
 async function materialFor(item, niche) {
+  if (item.cluster_id) { const m = await clusterMaterial(item); if (m) return m; }
   if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); const text = s.kind === "ARTICLE" ? await articleText(s) : ""; return { title: s.title, summary: s.summary, text, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, raw: P(s.raw) }; }
   const src = P(item.source_data_ref); if (item.topic && src && src.provider !== "topic_adapter_pending") return { title: item.topic, summary: src.description || src.summary || "", url: src.url || null, raw: src };
   const past = (await q(`SELECT topic FROM content_items WHERE niche_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 100`, [niche.id, item.id])).map((r) => r.topic);
@@ -1135,12 +1778,12 @@ async function generateStatic(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
-    system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style)}`,
-    prompt: `SOURCE MATERIAL\nTitle: ${m.title}\nSummary: ${m.summary || "(none)"}\nURL: ${m.url || "(none)"}\n${m.text ? `Full text of the source article:\n"""\n${m.text}\n"""\n` : "(Only the summary above is available — write ONLY what it supports; keep the article short rather than padding it.)\n"}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${m.text ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line source credit\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
+    system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style)}${item._series || ""}`,
+    prompt: `${materialBlock(m)}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${richMaterial(m) ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line credit naming the source outlet(s)\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
     mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
   await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: d.captions || {}, hashtags: Array.isArray(d.hashtags) ? d.hashtags : [], image_prompt: d.image_prompt || null });
-  const specs = { width: 1080, height: 1080, brand: niche.display_name, ...(P(niche.image_specs) || {}) };
+  const specs = await cardSpecs(niche, m);
   const img = await imageFor(niche, (ia) => ia.generate({ prompt: d.image_prompt, headline: d.headline || m.title, specs, contentItemId: item.id }));
   await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id });
 }
@@ -1151,42 +1794,124 @@ async function generateLongPost(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts with sources. Never fabricate a citation.",
-    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""} ${m.url || ""}${m.text ? `\nSource article text:\n${m.text.slice(0, 3000)}` : ""}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
+    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
     mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
   await addCost(item.id, research.cost);
   const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
   await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify(cites), research.model || "mock"]);
   const post = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
-    system: `You write long-form Facebook posts for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Use ONLY the research notes as facts.`,
+    system: `You write long-form Facebook posts for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Use ONLY the research notes as facts.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nReturn JSON: {"headline": "first line hook", "post": "the full 250-600 word post with paragraph breaks", "hashtags": ["..."], "image_prompt": "visual for a cover image"}`,
     mock: { headline: m.title, post: `${m.title}\n\n${notes.map((n) => n.fact).join("\n\n")}`, hashtags: ["longpost"], image_prompt: `Cover for ${m.title}` } }));
   await addCost(item.id, post.cost); const d = post.data || {};
   await setItem(item.id, { headline: d.headline || m.title, body: d.post || "", summary: (d.post || "").slice(0, 280), captions: { facebook: d.post || "", default: d.post || "" }, hashtags: d.hashtags || [], image_prompt: d.image_prompt || null });
   if ((P(niche.method_config) || {}).cover_image !== false) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: d.image_prompt, headline: d.headline || m.title, specs: { width: 1200, height: 630, brand: niche.display_name, ...(P(niche.image_specs) || {}) }, contentItemId: item.id })); await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id }); }
 }
-// ---- 8c. IMAGE_SLIDESHOW / LONG_FORM_VIDEO (GENERATIVE): script → images → TTS → ffmpeg
-async function generateSlideshowVideo(item, niche, style) {
-  const m = await materialFor(item, niche); const long = item.content_type === "LONG_FORM_VIDEO"; const mc = methodCfg(niche);
+// ---- 8c. Narrated reels: NEWS_REEL (a story in 35-60 s), IMAGE_SLIDESHOW (facts video), LONG_FORM_VIDEO (researched,
+// 16:9). Script in sections → one picture per section → narration per section (measured) → the studio renders a branded
+// reel with karaoke captions; without the studio, ffmpeg renders a slideshow with the same per-section timing.
+const REEL_SPEC = {
+  NEWS_REEL: { sections: 6, words: "1-2 short spoken sentences", system: "You turn a news story into a 35-60 second vertical news reel. Open with the news in the first sentence, then the key facts, then what happens next. Facts only from the sources." },
+  IMAGE_SLIDESHOW: { sections: 8, words: "2-3 spoken sentences", system: "You write punchy 60-90 second facts videos." },
+  LONG_FORM_VIDEO: { sections: 12, words: "4-6 spoken sentences", system: "You write researched long-form YouTube video scripts." },
+};
+async function generateReel(item, niche, style) {
+  const m = await materialFor(item, niche); const type = item.content_type || niche.content_type, spec = REEL_SPEC[type] || REEL_SPEC.IMAGE_SLIDESHOW, mc = methodCfg(niche);
+  const long = type === "LONG_FORM_VIDEO", orientation = long ? "16:9" : mc.orientation || "9:16", vertical = orientation !== "16:9", lang = niche.language || "en";
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
-  const slides = mc.slides || (long ? 12 : 10);
-  const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 2500,
-    system: `You write ${long ? "researched long-form YouTube video scripts" : "punchy 60-90 second facts videos"} for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Every sentence must be spoken narration — no stage directions.`,
-    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""}${m.text ? `\nSource article text:\n${m.text.slice(0, 3000)}` : ""}\nWrite a script split into exactly ${slides} sections. Return JSON: {"title": "video title", "sections": [{"narration": "spoken text for this section", "image_prompt": "what the viewer sees, no text"}], "description": "YouTube description", "hashtags": ["..."]}`,
-    mock: { title: m.title, sections: Array.from({ length: Math.min(slides, 4) }, (_, i) => ({ narration: `Mock narration section ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["facts"] } }));
-  await addCost(item.id, r.cost); const d = r.data || {}; const sections = d.sections || [];
-  const script = sections.map((s) => s.narration).join("\n\n");
-  await setItem(item.id, { headline: d.title || m.title, script, summary: d.description || "", captions: { default: d.description || m.title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
+  const count = mc.slides || spec.sections;
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
+    system: `${spec.system} Channel: "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear"}.${styleBlock(style)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
+    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces"}], "description": "post caption / video description", "hashtags": ["..."]}`,
+    mock: { title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
+  await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
+  if (!sections.length) throw new Error("The script came back without sections");
+  const title = d.title || m.title, script = sections.map((s) => s.narration).join("\n\n");
+  await setItem(item.id, { headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
+  const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
   const images = [];
-  for (const s of sections) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: s.image_prompt, headline: d.title || m.title, specs: { width: long ? 1920 : 1080, height: long ? 1080 : 1920, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}) }, contentItemId: item.id })); await addCost(item.id, img.cost); images.push(img); }
-  const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock");
-  const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: item.id }); await addCost(item.id, audio.cost);
-  await setItem(item.id, { voice_asset_url: audio.url, status: "RENDERING" });
-  // rough per-section captions from narration length
-  const totalChars = script.length || 1; let t = 0; const captions = sections.map((s) => { const d2 = (s.narration.length / totalChars) * (audio.duration_seconds || 30); const c = { start: t, end: t + d2, text: s.narration.slice(0, 90) }; t += d2; return c; });
+  for (const s of sections) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: s.image_prompt, headline: title, specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}), style: style2 }, contentItemId: item.id })); await addCost(item.id, img.cost); images.push(img); }
+  const narr = await narrateParts(niche, sections.map((s) => s.narration), item.id); await addCost(item.id, narr.cost);
+  await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
-  const video = await renderer.renderSlideshow({ images, audio, contentItemId: item.id, orientation: long ? "16:9" : mc.orientation || "9:16", captions: mc.captions === false ? [] : captions });
+  const outlets = (m.versions || []).map((v) => v.outlet).filter(Boolean).slice(0, 2);
+  const credit = outlets.length ? `${lang.startsWith("bn") ? "সূত্র" : "Source"}: ${outlets.join(", ")}` : undefined;
+  let video;
+  if (renderer.renderReel && studioReady() && !narr.audio.mock) {
+    video = await renderer.renderReel({ niche, headline: title, kicker: d.kicker, credit, orientation, contentItemId: item.id, audio: narr.audio,
+      sections: sections.map((s, i) => ({ image: images[i].url, narration: s.narration, seconds: narr.durations[i] + 0.15 })) });
+  } else {
+    let t = 0; const captions = sections.map((s, i) => { const c = { start: t, end: t + narr.durations[i], text: s.narration }; t += narr.durations[i]; return c; });
+    video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation, captions: mc.captions === false ? [] : captions });
+  }
   await setItem(item.id, { hero_media_id: video.id });
+}
+
+// ---- 8c2. ANIMATED_EXPLAINER (the animation blueprint). Research → a scene plan in six fixed layouts → narration per
+// scene (measured) → element cues from the narration → the studio renders it; plus a thumbnail and YouTube chapters.
+const EXPLAINER_LAYOUTS = {
+  TitleCard: '{"title": "...", "subtitle": "..."} — an opener or a section title; parts: [one line]',
+  BulletReveal: '{"heading": "...", "bullets": ["3-5 short bullets"]} — parts: one narration line per bullet, in order',
+  IconGrid: '{"heading": "...", "items": [{"icon": "<icon>", "label": "1-3 words"}]} — 2-6 items; parts: one line per item',
+  Comparison: '{"heading": "...", "left": {"title": "...", "points": ["..."]}, "right": {"title": "...", "points": ["..."]}} — parts: [left, right]',
+  DataChart: '{"heading": "...", "kind": "bar|line", "unit": "...", "data": [{"label": "...", "value": 0}]} — ONLY numbers stated in the research; parts: [one line]',
+  FullQuote: '{"quote": "...", "attribution": "..."} — a real quote from the research only; parts: [one line]',
+};
+const EXPLAINER_ICONS = "train-front bus car plane ship bike zap battery sun cloud-rain droplets flame leaf tree-pine factory building-2 house landmark school hospital stethoscope pill heart-pulse users user baby graduation-cap briefcase banknote coins wallet piggy-bank chart-line chart-column trending-up trending-down scale gavel shield shield-check lock key globe map map-pin flag vote megaphone newspaper tv radio smartphone laptop wifi cpu server database cloud rocket lightbulb target clock calendar timer search check x alert-triangle info wheat fish shopping-cart package truck anchor mountain waves";
+function sceneParts(s) { const parts = (Array.isArray(s.parts) ? s.parts : [s.parts]).map((x) => String(x || "").trim()).filter(Boolean); return { intro: String(s.intro || "").trim(), parts: parts.length ? parts : [String(s.narration || s.data?.title || "").trim()].filter(Boolean) }; }
+async function generateExplainer(item, niche, style) {
+  const m = await materialFor(item, niche); const mc = methodCfg(niche), lang = niche.language || "en";
+  const orientation = mc.orientation === "9:16" ? "9:16" : "16:9", vertical = orientation === "9:16", minutes = Number(mc.explainer_minutes) || 3;
+  const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
+  const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
+    system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
+    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
+    mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
+  await addCost(item.id, research.cost);
+  const notes = research.data?.notes || [];
+  await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), research.model || "mock"]);
+  const sceneCount = Math.max(4, Math.round(minutes * 3.5));
+  const plan = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
+    system: `You script animated explainer videos for "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
+    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(EXPLAINER_LAYOUTS).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\nStart with a TitleCard; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
+    mock: { title: m.title, description: `About ${m.title}`, hashtags: ["explained"], scenes: [
+      { layout: "TitleCard", chapter: "Intro", data: { title: m.title, subtitle: "Explained" }, parts: [`Here is ${m.title}, explained.`] },
+      { layout: "BulletReveal", chapter: "Key points", data: { heading: "Key points", bullets: ["First", "Second"] }, parts: ["The first point.", "The second point."] },
+      { layout: "FullQuote", chapter: "Wrap-up", data: { quote: "Mock quote", attribution: "Mock" }, parts: ["That is the story."] }] } }));
+  await addCost(item.id, plan.cost);
+  const p = plan.data || {}; const scenes = (p.scenes || []).filter((s) => s && EXPLAINER_LAYOUTS[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
+  if (!scenes.length) throw new Error("The explainer plan came back without usable scenes");
+  const texts = scenes.map((s) => [s.intro, ...s.parts].filter(Boolean).join(" "));
+  const title = p.title || m.title;
+  await setItem(item.id, { headline: title, script: texts.join("\n\n"), summary: p.description || "", hashtags: p.hashtags || [] });
+  const narr = await narrateParts(niche, texts, item.id); await addCost(item.id, narr.cost);
+  await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
+  // Cue i = when part i starts being spoken; chapters for the description from the cumulative scene times.
+  let at = 0; const chapters = [];
+  const built = scenes.map((s, i) => {
+    const frames = Math.max(STUDIO_FPS * 2, Math.round((narr.durations[i] + 0.35) * STUDIO_FPS)), weight = (x) => x.length + 1;
+    const total = weight(s.intro) * (s.intro ? 1 : 0) + s.parts.reduce((n, x) => n + weight(x), 0) || 1; let pos = s.intro ? weight(s.intro) : 0;
+    const cues = s.parts.map((x) => { const c = Math.round((pos / total) * frames * 0.97); pos += weight(x); return c; });
+    if (s.chapter) chapters.push(`${Math.floor(at / 60)}:${String(Math.floor(at % 60)).padStart(2, "0")} ${s.chapter}`);
+    at += frames / STUDIO_FPS;
+    return { layout: s.layout, chapter: s.chapter || undefined, transition: i % 3 === 1 ? "slide" : "fade", data: s.data, durationInFrames: frames, cues, words: wordTimings(texts[i], frames) };
+  });
+  if (chapters.length && !chapters[0].startsWith("0:00 ")) chapters.unshift(`0:00 ${lang.startsWith("bn") ? "শুরু" : "Intro"}`);
+  const description = [p.description || "", chapters.length >= 3 ? `\n${chapters.join("\n")}` : ""].join("\n").trim();
+  await setItem(item.id, { captions: { youtube: description, default: p.description || title, facebook: p.description || title } });
+  if (narr.audio.mock || !studioReady()) throw new Error("ANIMATED_EXPLAINER needs the video studio and a real voice adapter (the studio renders the animation)");
+  const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(narr.audio.url, "mp3");
+  const props = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), brand, title, audio: audioFile, music, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built };
+  try {
+    const out = await studioRender("Explainer", props);
+    const video = await publishRender(out, item.id, { method: "EXPLAINER", orientation, scenes: built.length });
+    try { const png = await studioRender("Explainer", { ...props, stillFrame: Math.min(45, built[0].durationInFrames - 1) }, { kind: "still", ext: "png" }); const bytes = await readFile(png); await cleanup(png);
+      const j = await toJpeg(bytes, "image/png"); await recordMedia({ contentItemId: item.id, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: props.width, height: props.height, meta: { purpose: "youtube thumbnail" } }); }
+    catch (e) { warn(`explainer thumbnail: ${e.message.slice(0, 160)}`); }
+    await setItem(item.id, { hero_media_id: video.id });
+  } finally { await cleanup(audioFile, brand.logo, brand.fontUrl, music); }
 }
 // ---- 8d. Video candidate: download → transcribe → pick clips → one content_item per clip → RENDER_CLIP jobs
 async function processCandidate(candidateId) {
@@ -1203,7 +1928,8 @@ async function processCandidate(candidateId) {
     await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments })]);
   }
   let clips;
-  if (niche.content_type === "MOVIE_RECAP") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole film" }];
+  // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
+  if (niche.content_type === "MOVIE_RECAP" || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
   else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand })); clips = clips.slice(0, methodCfg(niche).clips_per_video); }
   if (!clips.length) throw new Error("no clip-worthy moments found");
   for (const cl of clips) {
@@ -1233,9 +1959,31 @@ async function renderClipItem(itemId, clipId) {
     await addCost(itemId, r.cost); const d = r.data || {};
     script = recap ? (d.beats || []).map((b) => b.narration).join(" ") : d.narration || script;
     const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, audio.cost);
-    extras.audio = audio;
+    extras.audio = audio; extras.script = script;
     if (recap && d.beats?.length) { const total = d.beats.reduce((s, b) => s + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)), 0) || 1; const k = (audio.duration_seconds || total) / total; extras.scenes = d.beats.map((b) => ({ start: Number(b.start) || 0, end: (Number(b.start) || 0) + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)) * k })); }
     await setItem(itemId, { headline: d.title || clip.title, script, voice_asset_url: audio.url, hashtags: d.hashtags || [] });
+  }
+  if (niche.production_method === "REACTION_LONG") {
+    // Plan the reaction: which parts of the source play, and what we say between them (at least ~30% commentary, so the
+    // video is our own work rather than a re-upload). Each comment is voiced separately and timed by its measured audio.
+    const mcfg = methodCfg(niche), maxPlay = Number(mcfg.max_play_minutes) || 6;
+    const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 110000);
+    const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 5000,
+      system: `You host a reaction and commentary show for "${niche.display_name}". Language of the commentary: ${niche.language || "en"}. Tone: ${niche.tone || "sharp, fair, engaging"}.${styleBlock(style)} You react with context, analysis and opinion clearly framed as opinion; you never invent facts about the video.`,
+      prompt: `Source video: "${cand.title}" (${Math.round((cand.duration_seconds || c.end) / 60)} min)\nTimestamped transcript:\n${lines}\n\nPlan a reaction video: alternate "play" segments of the source (each 15-90 s, ${maxPlay} min of source at most in total, in order) with "comment" segments where we pause and talk (1-4 spoken sentences each). Open with a comment that hooks the viewer, end with a comment giving the verdict and a call to action. Commentary must be at least 30% of the total runtime. Mark 3+ chapters.\nJSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "chapter": "optional chapter name"}, {"type": "play", "start": seconds, "end": seconds, "chapter": "optional"}], "description": "YouTube description", "hashtags": ["..."]}`,
+      mock: { title: `Reacting to ${cand.title}`, beats: [{ type: "comment", text: `Let's watch ${cand.title}.`, chapter: "Intro" }, { type: "play", start: 0, end: Math.min(20, c.end), chapter: "The clip" }, { type: "comment", text: "That is our take.", chapter: "Verdict" }], description: `Our reaction to ${cand.title}`, hashtags: ["reaction"] } }));
+    await addCost(itemId, r.cost); const d = r.data || {};
+    const beats = (d.beats || []).filter((b) => (b.type === "comment" && b.text) || (b.type === "play" && Number(b.end) > Number(b.start))).map((b) => (b.type === "play" ? { ...b, start: clamp(Number(b.start), 0, c.end), end: clamp(Number(b.end), 0, c.end) } : b));
+    if (!beats.some((b) => b.type === "play") || !beats.some((b) => b.type === "comment")) throw new Error("The reaction plan needs both play and comment segments");
+    const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); let at = 0; const chapters = [];
+    for (const b of beats) {
+      if (b.type === "comment") { b.audio = await voice.synthesize({ script: b.text, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, b.audio.cost); }
+      if (b.chapter) chapters.push(`${Math.floor(at / 60)}:${String(Math.floor(at % 60)).padStart(2, "0")} ${b.chapter}`);
+      at += b.type === "play" ? b.end - b.start : Number(b.audio?.duration_seconds) || 5;
+    }
+    if (chapters.length && !chapters[0].startsWith("0:00 ")) chapters.unshift("0:00 Intro");
+    extras.beats = beats; script = beats.filter((b) => b.type === "comment").map((b) => b.text).join("\n\n");
+    await setItem(itemId, { headline: d.title || clip.title, script, summary: d.description || "", hashtags: d.hashtags || [], captions: { youtube: [d.description || "", chapters.length >= 3 ? `\n${chapters.join("\n")}` : ""].join("\n").trim(), default: d.description || d.title || "" } });
   }
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
   const video = await renderer.renderClip({ clip: c, sourcePath: cand.local_path, transcript, niche, contentItemId: itemId, extras });
@@ -1245,7 +1993,9 @@ async function renderClipItem(itemId, clipId) {
     prompt: `Clip title: ${c.title}\nHook: ${c.hook}\nWhat is said: ${script.slice(0, 1500)}\nSource: ${cand.title}\nReturn JSON: {"headline": "video title max 90 chars", "captions": {"facebook": "...", "instagram": "...", "youtube": "description with credit to the source"}, "hashtags": ["..."]}`,
     mock: { headline: c.title, captions: { facebook: c.hook || c.title, instagram: c.hook || c.title, youtube: `Clip from ${cand.title}` }, hashtags: ["shorts"] } }));
   await addCost(itemId, cap.cost); const cd = cap.data || {};
-  await setItem(itemId, { hero_media_id: video.id, headline: cd.headline || c.title, captions: cd.captions || {}, hashtags: cd.hashtags || [], summary: c.hook || "" });
+  // A long reaction already has its title and a YouTube description with chapters from its plan; keep those.
+  const planned = niche.production_method === "REACTION_LONG" ? await one(`SELECT headline, captions, summary FROM content_items WHERE id=$1`, [itemId]) : null;
+  await setItem(itemId, { hero_media_id: video.id, headline: planned?.headline || cd.headline || c.title, captions: { ...(cd.captions || {}), ...(planned ? { youtube: P(planned.captions)?.youtube } : {}) }, hashtags: cd.hashtags || [], summary: planned?.summary || c.hook || "" });
   await finishGeneration(itemId, niche);
 }
 // ---- 8e. entry point for every text/slideshow item
@@ -1255,9 +2005,11 @@ async function runGeneration(itemId) {
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   await setItem(itemId, { status: "FETCHING_DATA", rejection_note: null });
   const type = item.content_type || niche.content_type || "NICHE_STATIC";
-  if (item.series_id && item.episode_number == null) { const s = await one(`SELECT episode_counter FROM series WHERE id=$1`, [item.series_id]); if (s) await setItem(itemId, { episode_number: s.episode_counter + 1 }); }
+  if (item.series_id && item.episode_number == null) { const s = await one(`SELECT episode_counter FROM series WHERE id=$1`, [item.series_id]); if (s) { await setItem(itemId, { episode_number: s.episode_counter + 1 }); item.episode_number = s.episode_counter + 1; } }
+  item._series = await seriesBlock(item);
   if (type === "LONG_POST") await generateLongPost(item, niche, style);
-  else if (type === "IMAGE_SLIDESHOW" || type === "LONG_FORM_VIDEO") await generateSlideshowVideo(item, niche, style);
+  else if (type === "ANIMATED_EXPLAINER") await generateExplainer(item, niche, style);
+  else if (MADE_VIDEO_TYPES.has(type)) await generateReel(item, niche, style);
   else await generateStatic(item, niche, style);
   return finishGeneration(itemId, niche);
 }
@@ -1265,7 +2017,7 @@ async function runGeneration(itemId) {
 async function regenerate(itemId, part) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
-  if (part === "image") { const img = await imageFor(niche, (ia) => ia.generate({ prompt: item.image_prompt, headline: item.headline || item.topic, specs: { width: 1080, height: 1080, brand: niche.display_name, ...(P(niche.image_specs) || {}) }, contentItemId: itemId })); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
+  if (part === "image") { const specs = await cardSpecs(niche, { versions: (P(item.source_data_ref)?.outlets || []).map((outlet) => ({ outlet })) }); const img = await imageFor(niche, (ia) => ia.generate({ prompt: item.image_prompt, headline: item.headline || item.topic, specs, contentItemId: itemId })); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
   if (part === "all") { await setItem(itemId, { headline: null, summary: null, body: null, hero_media_id: null }); return runGeneration(itemId); }
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500, system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)}`,
     prompt: `Current headline: ${item.headline}\nSummary: ${item.summary}\nBody: ${(item.body || "").slice(0, 3000)}\n\nRewrite ONLY the ${part} to be stronger, keeping the facts identical. Return JSON: ${part === "headline" ? '{"headline": "..."}' : part === "captions" ? '{"captions": {"facebook": "...", "instagram": "...", "x": "...", "linkedin": "..."}, "hashtags": ["..."]}' : '{"body": "..."}'}`,
@@ -1289,7 +2041,8 @@ async function publishAsset(assetId) {
     const pubKey = channel.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[channel.platform] || "publish_mock";
     const publisher = await resolve("PUBLISH", pubKey);
     await q(`UPDATE content_assets SET status='PUBLISHING' WHERE id=$1`, [assetId]);
-    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption: asset.caption || renderCaption(item, channel, null), title: item.headline || item.topic, hashtags: P(item.hashtags) || [] });
+    const thumb = await one(`SELECT url FROM media_assets WHERE content_item_id=$1 AND kind='THUMBNAIL' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`, [item.id]);
+    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption: asset.caption || renderCaption(item, channel, null), title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
     await q(`UPDATE content_assets SET status='PUBLISHED', published_url=$2, external_id=$3, published_at=now(), error_message=NULL WHERE id=$1`, [assetId, res.publishedUrl, res.externalId]);
     await q(`UPDATE channels SET last_published_at=now() WHERE id=$1`, [channel.id]);
   } catch (e) {
@@ -1329,6 +2082,246 @@ async function checkAndRepurpose(assetId) {
   return one(`SELECT * FROM content_items WHERE id=$1`, [id]);
 }
 
+// ---- 8h. Quality gate. Every draft is checked by the LLM against its own source material before it can publish:
+// claims the sources don't support, a headline more alarming or certain than the facts, legal and safety risks
+// (defamation, communal or political incitement, graphic detail, minors), and language. The verdict is computed from the
+// findings as well as taken from the model, whichever is stricter. PASS lets automatic programs publish; a REVIEW draft
+// is revised once from the report and re-checked (auto_fix); what is still not clean waits for a person.
+async function qaCfg(niche) {
+  const own = (P(niche.method_config) || {}).qa || {};
+  return { enabled: own.enabled ?? (await setting("qa.enabled", true)), min_score: Number(own.min_score ?? (await setting("qa.min_score", 0.75))), auto_fix: own.auto_fix ?? (await setting("qa.auto_fix", true)) };
+}
+function draftText(item) {
+  const caps = P(item.captions) || {};
+  return [`Headline: ${item.headline || item.topic}`, item.summary && `Summary: ${item.summary}`, item.body && `Body:\n${stripHtml(item.body).slice(0, 6000)}`,
+    item.script && !item.body && `Script:\n${String(item.script).slice(0, 6000)}`, Object.keys(caps).length && `Captions:\n${Object.entries(caps).map(([k, v]) => `- ${k}: ${v}`).join("\n")}`].filter(Boolean).join("\n");
+}
+// The facts a draft may use: its story cluster / source article, a clip's transcript, a long post's research notes, or
+// (for planner and manual topics) only what was given — never a fresh topic pull.
+async function qaMaterial(item, niche) {
+  if (item.clip_id) { const c = await one(`SELECT title, transcript_text FROM clips WHERE id=$1`, [item.clip_id]); return { title: c?.title || item.topic, summary: "", text: c?.transcript_text || "", url: P(item.source_data_ref)?.url || null }; }
+  const src = P(item.source_data_ref) || {};
+  const m = item.cluster_id || item.source_item_id ? await materialFor(item, niche) : { title: item.topic, summary: src.summary || src.description || "", text: "", url: src.url || null };
+  const notes = await one(`SELECT notes FROM research_notes WHERE content_item_id=$1 ORDER BY created_at DESC LIMIT 1`, [item.id]);
+  if (notes && (P(notes.notes) || []).length) {
+    const versions = m.versions?.length ? [...m.versions] : [{ outlet: "Source", title: m.title, summary: m.summary, text: m.text, url: m.url }];
+    versions.push({ outlet: "Research notes", title: m.title, summary: "", text: (P(notes.notes) || []).map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n") });
+    return { ...m, versions };
+  }
+  return m;
+}
+async function runQa(itemId, niche) {
+  const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]);
+  const m = await qaMaterial(item, niche), lang = niche.language || "en", cfg = await qaCfg(niche);
+  const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500,
+    system: `You are the standards editor of "${niche.display_name}"${niche.country ? ` (${niche.country})` : ""}. Before anything is published you check it against its sources and for legal and safety risks. Be specific and strict, and do not rewrite the draft. Answer in English JSON even when the draft is in another language.${style ? `\nHouse style the draft should follow:${styleBlock(style)}` : ""}`,
+    prompt: `${materialBlock(m)}\nDRAFT (language: ${lang})\n${draftText(item)}\n\nCheck:\n1. Facts: list each claim in the draft the sources do not support (numbers, names, places, dates, quotes, causes, blame). Rewording is fine; new facts are not.\n2. Headline: accurate, and not more alarming or certain than the sources?\n3. Safety: defamation (wrongdoing attributed to a named person as fact without attribution), religious, communal or political incitement, graphic detail of violence or suicide, identifying minors or victims of sexual violence, health or financial claims, rumour presented as fact.\n4. Language: natural, correct ${lang}.\nReturn JSON: {"fact_issues": ["..."], "headline_ok": true, "headline_issue": "", "safety_flags": [{"type": "...", "severity": "low|medium|high", "detail": "..."}], "language_issues": ["..."], "score": 0.0, "verdict": "PASS|REVIEW|REJECT", "summary": "one sentence"}`,
+    mock: { fact_issues: [], headline_ok: true, safety_flags: [], language_issues: [], score: 0.95, verdict: "PASS", summary: "mock review: no issues" } }));
+  await addCost(itemId, r.cost);
+  const d = r.data || {}, flags = (Array.isArray(d.safety_flags) ? d.safety_flags : []).filter((f) => f && f.type), facts = (Array.isArray(d.fact_issues) ? d.fact_issues : []).filter(Boolean);
+  let status = flags.some((f) => /high/i.test(f.severity)) ? "REJECT"
+    : facts.length || d.headline_ok === false || flags.some((f) => /medium/i.test(f.severity)) || !(Number(d.score) >= cfg.min_score) ? "REVIEW" : "PASS";
+  const rank = { PASS: 0, REVIEW: 1, REJECT: 2 }, said = String(d.verdict || "").toUpperCase();
+  if (rank[said] > rank[status]) status = said;
+  const report = { summary: d.summary || "", score: Number(d.score) || 0, fact_issues: facts, headline_ok: d.headline_ok !== false, headline_issue: d.headline_issue || "", safety_flags: flags, language_issues: (d.language_issues || []).filter(Boolean), verdict: status, model: r.model || null, checked_at: nowIso() };
+  await q(`UPDATE content_items SET qa_status=$2, qa_score=$3, qa_report=$4::jsonb WHERE id=$1`, [itemId, status, report.score, JSON.stringify(report)]);
+  return { status, report };
+}
+async function reviseFromQa(itemId, niche, report) {
+  const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const m = await qaMaterial(item, niche);
+  const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
+  const notes = [...report.fact_issues.map((x) => `- Not supported by the sources: ${x}`), report.headline_ok ? null : `- Headline: ${report.headline_issue}`, ...report.language_issues.map((x) => `- Language: ${x}`), ...report.safety_flags.map((f) => `- ${f.type} (${f.severity}): ${f.detail}`)].filter(Boolean);
+  if (!notes.length) return false;
+  const caps = P(item.captions) || {};
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 4000,
+    system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone || "clear"}.${styleBlock(style)} Fix exactly what the standards editor flagged, keep everything else, and never add a fact the sources do not state.`,
+    prompt: `${materialBlock(m)}\nCURRENT DRAFT\n${draftText(item)}\n\nSTANDARDS EDITOR'S NOTES\n${notes.join("\n")}\n\nReturn JSON with the corrected fields: {"headline": "...", "summary": "..."${item.body ? ', "body": "... (same HTML format)"' : ""}${Object.keys(caps).length ? `, "captions": {${Object.keys(caps).map((k) => `"${k}": "..."`).join(", ")}}` : ""}}`,
+    mock: {} }));
+  await addCost(itemId, r.cost); const d = r.data || {}, upd = {};
+  for (const k of ["headline", "summary", "body", "captions"]) if (d[k] && (k !== "body" || item.body)) upd[k] = d[k];
+  if (!Object.keys(upd).length) return false;
+  await setItem(itemId, upd);
+  if (upd.headline && upd.headline !== item.headline) await recomposeCard(itemId).catch((e) => warn(`card recompose ${itemId}: ${e.message}`));
+  return true;
+}
+async function qualityGate(itemId, niche) {
+  const cfg = await qaCfg(niche); if (!cfg.enabled) return { status: "SKIPPED" };
+  try {
+    let qa = await runQa(itemId, niche);
+    if (qa.status === "REVIEW" && cfg.auto_fix && (await reviseFromQa(itemId, niche, qa.report))) {
+      qa = await runQa(itemId, niche);
+      await q(`UPDATE content_items SET qa_report = qa_report || '{"revised": true}'::jsonb WHERE id=$1`, [itemId]);
+    }
+    return qa;
+  } catch (e) {
+    warn(`quality gate ${itemId}: ${e.message}`);
+    await q(`UPDATE content_items SET qa_status='REVIEW', qa_report=$2::jsonb WHERE id=$1`, [itemId, JSON.stringify({ verdict: "REVIEW", summary: `The quality check could not run (${e.message.slice(0, 200)}) — review by hand.` })]);
+    return { status: "REVIEW" };
+  }
+}
+// Photocards carry the headline, so a changed headline (QA fix, reviewer edit) redraws the card from the stored picture.
+async function recomposeCard(itemId) {
+  const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); if (!item?.hero_media_id) return null;
+  const hero = await one(`SELECT * FROM media_assets WHERE id=$1`, [item.hero_media_id]); const meta = P(hero?.meta) || {};
+  if (!meta.base_media_id || !meta.overlay || !meta.compose_specs) return null;
+  const base = await one(`SELECT * FROM media_assets WHERE id=$1 AND deleted_at IS NULL`, [meta.base_media_id]); if (!base) return null;
+  const file = await toTmpFile(base.url, "jpg");
+  try {
+    const out = meta.overlay === "photocard" ? await composePhotocard(file, item.headline || item.topic, meta.compose_specs) : await composeHeadline(file, item.headline || item.topic, meta.compose_specs);
+    const url = await storeLocal(out, `images/${newId()}.jpg`, "image/jpeg"); await cleanup(out);
+    const media = await recordMedia({ contentItemId: itemId, kind: "IMAGE", url, mime: "image/jpeg", width: hero.width, height: hero.height, meta: { ...meta, recomposed_at: nowIso() } });
+    await setItem(itemId, { hero_media_id: media.id }); return media;
+  } finally { await cleanup(file); }
+}
+
+// ---- 8i. House style. A profile per brand + program is written by the LLM from the brand, the program and optional
+// sample posts. Reviewers' edits and rejection notes are logged as feedback; a refinement pass folds them — and the
+// program's best-performing posts — back into the rules and examples, keeping earlier versions in history.
+const pseudoNiche = async (brand) => { const d = await smartAdapterDefaults(); return { display_name: brand.name, language: "en", script_adapter: d.scriptAdapter, script_adapter_fallbacks: JSON.stringify(d.scriptAdapterFallbacks) }; };
+const asText = (v, sep = "\n") => (Array.isArray(v) ? v.join(sep) : String(v ?? ""));
+async function generateStyle({ brandId, nicheId = null, samples = "", name = null, apply = false }) {
+  const brand = await one(`SELECT * FROM brands WHERE id=$1`, [brandId]); if (!brand) throw new ApiError(404, null, "Brand not found");
+  const niche = nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [nicheId]) : null;
+  const lang = (niche?.language || "en").slice(0, 2), kit = P(brand.brand_kit) || {};
+  const r = await llmFor(niche || (await pseudoNiche(brand)), (llm) => llm.complete({ json: true, maxTokens: 2500,
+    system: "You write house style guides for news and social-media brands. Your guides are concrete, short and directly usable by a writer.",
+    prompt: `Brand: ${brand.name}${brand.description ? ` — ${brand.description}` : ""}${kit.handle ? ` (${kit.handle})` : ""}\n${niche ? `Program: ${niche.display_name} — ${nice(niche.content_type)} in ${lang}${niche.country ? ` for ${niche.country}` : ""}. Requested tone: ${niche.tone || "(none)"}.\n` : ""}Platforms: Facebook, Instagram, YouTube.\n${samples ? `The brand's own posts, showing its voice:\n"""\n${String(samples).slice(0, 6000)}\n"""\n` : ""}${lang === "bn" ? "For Bangla: standard written Bangla (প্রমিত বাংলা), Bangla digits, no Banglish, names spelled as the major Bangladeshi outlets spell them.\n" : ""}Write the style guide. Return JSON: {"name": "short name", "tone": "one line", "rules": "10-14 short bullet rules: headlines, sentence length, attribution, numbers and dates, sensitive topics, emoji, per-platform captions", "examples": "3 short example posts in this style${lang === "bn" ? ", in Bangla" : ""}", "banned_terms": ["..."], "cta": "one short call to action", "hashtags": ["3-6 brand hashtags"]}`,
+    mock: { name: `${brand.name} house style`, tone: niche?.tone || "clear, factual", rules: "- Lead with the news.\n- Attribute every claim to its source.", examples: "", banned_terms: [], cta: "", hashtags: [] } }));
+  const d = r.data || {}, id = newId();
+  await q(`INSERT INTO style_profiles (id, brand_id, niche_id, name, language, tone, rules, examples, banned_terms, cta, hashtags, generated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11::jsonb,1)`,
+    [id, brand.id, niche?.id || null, name || d.name || `${brand.name} — ${niche?.display_name || "house style"}`, lang, d.tone || "", asText(d.rules), asText(d.examples, "\n\n"), JSON.stringify(d.banned_terms || []), d.cta || "", JSON.stringify(d.hashtags || [])]);
+  if (niche && (apply || !niche.style_profile_id)) await q(`UPDATE niches SET style_profile_id=$2 WHERE id=$1`, [niche.id, id]);
+  return one(`SELECT * FROM style_profiles WHERE id=$1`, [id]);
+}
+async function logStyleFeedback(item, kind, fields) {
+  const niche = await one(`SELECT id, style_profile_id FROM niches WHERE id=$1`, [item.niche_id]); if (!niche?.style_profile_id) return;
+  for (const f of fields) await q(`INSERT INTO style_feedback (id, style_profile_id, niche_id, content_item_id, kind, field, old_text, new_text, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [newId(), niche.style_profile_id, niche.id, item.id, kind, f.field || null, f.old ?? null, f.new ?? null, f.note ?? null]);
+}
+async function refineStyle(profileId) {
+  const p = await one(`SELECT * FROM style_profiles WHERE id=$1`, [profileId]); if (!p) return null;
+  const fb = await q(`SELECT * FROM style_feedback WHERE style_profile_id=$1 AND used_at IS NULL ORDER BY created_at DESC LIMIT 40`, [profileId]);
+  const top = p.niche_id ? await q(`SELECT ci.headline, MAX(COALESCE((a.last_metrics->>'views')::int, 0)) AS views, MAX(COALESCE((a.last_metrics->>'likes')::int, 0)) AS likes FROM content_items ci JOIN content_assets a ON a.content_item_id = ci.id
+    WHERE ci.niche_id = $1 AND a.status = 'PUBLISHED' AND a.published_at > now() - interval '30 days' GROUP BY ci.id
+    ORDER BY MAX(COALESCE((a.last_metrics->>'views')::int, 0)) + 10 * MAX(COALESCE((a.last_metrics->>'likes')::int, 0)) DESC LIMIT 5`, [p.niche_id]) : [];
+  if (!fb.length && !top.length) return null;
+  const niche = p.niche_id ? await one(`SELECT * FROM niches WHERE id=$1`, [p.niche_id]) : await pseudoNiche(await one(`SELECT * FROM brands WHERE id=$1`, [p.brand_id]) || { name: p.name });
+  const clip = (s) => String(s || "").replace(/\s+/g, " ").slice(0, 300);
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 2500,
+    system: "You maintain a brand's house style guide. Update it from evidence: keep what works, change what the editors corrected, and keep it short.",
+    prompt: `CURRENT GUIDE\nTone: ${p.tone}\nRules:\n${p.rules}\nExamples:\n${p.examples}\nBanned terms: ${(P(p.banned_terms) || []).join(", ")}\nCall to action: ${p.cta}\n\nEDITOR CORRECTIONS (AI draft -> what the editor changed it to)\n${fb.filter((f) => f.kind === "EDIT").map((f) => `[${f.field}] "${clip(f.old_text)}" -> "${clip(f.new_text)}"`).join("\n") || "(none)"}\n\nREJECTED DRAFTS (editor's reason)\n${fb.filter((f) => f.kind === "REJECT").map((f) => `- ${clip(f.note)}`).join("\n") || "(none)"}\n\nBEST-PERFORMING POSTS (last 30 days)\n${top.map((t) => `- "${t.headline}" (${t.views} views, ${t.likes} likes)`).join("\n") || "(none)"}\n\nReturn the full updated guide as JSON: {"tone": "...", "rules": "...", "examples": "...", "banned_terms": ["..."], "cta": "...", "changes": "one line: what changed and why"}`,
+    mock: { tone: p.tone, rules: p.rules, examples: p.examples, banned_terms: P(p.banned_terms) || [], cta: p.cta, changes: "mock refinement" } }));
+  const d = r.data || {};
+  const history = [...(P(p.history) || []), { at: nowIso(), tone: p.tone, rules: p.rules, examples: p.examples, banned_terms: P(p.banned_terms) || [], cta: p.cta, changes: d.changes || "" }].slice(-10);
+  await q(`UPDATE style_profiles SET tone=$2, rules=$3, examples=$4, banned_terms=$5::jsonb, cta=$6, history=$7::jsonb, refined_at=now() WHERE id=$1`,
+    [p.id, d.tone || p.tone, asText(d.rules) || p.rules, asText(d.examples, "\n\n") || p.examples, JSON.stringify(d.banned_terms || P(p.banned_terms) || []), d.cta ?? p.cta, JSON.stringify(history)]);
+  if (fb.length) await q(`UPDATE style_feedback SET used_at = now() WHERE id = ANY($1)`, [fb.map((f) => f.id)]);
+  return { changes: d.changes || "" };
+}
+async function sweepStyleRefinement() {
+  if (!(await setting("style.auto_refine", true))) return;
+  const due = await q(`SELECT sp.id FROM style_profiles sp WHERE (SELECT COUNT(*) FROM style_feedback f WHERE f.style_profile_id = sp.id AND f.used_at IS NULL) >= 5 AND (sp.refined_at IS NULL OR sp.refined_at < now() - interval '1 day') LIMIT 5`);
+  for (const s of due) await enqueue("STYLE_REFINE", { profileId: s.id }, { queue: "text", dedupeKey: `style:${s.id}`, maxAttempts: 2 });
+}
+
+// ---- 8j. Planner and series. Daily per active program (and on demand) the LLM reads the program's recent output with
+// its performance, its series and the desk's uncovered trending stories, and proposes ideas: topics, next episodes, new
+// series, format and timing changes. method_config.autopilot = {topics_per_day: N} accepts the best topic ideas itself.
+// Series with auto_generate get their next episode every cadence_days, written with the earlier episodes as context.
+async function programStats(niche, days = 30) {
+  const posts = await q(`SELECT ci.id, ci.headline, ci.content_type, ci.series_id, a.published_at, c.platform,
+      COALESCE((a.last_metrics->>'views')::int, 0) AS views, COALESCE((a.last_metrics->>'likes')::int, 0) AS likes, COALESCE((a.last_metrics->>'comments')::int, 0) AS comments
+    FROM content_items ci JOIN content_assets a ON a.content_item_id = ci.id JOIN channels c ON c.id = a.channel_id
+    WHERE ci.niche_id = $1 AND a.status = 'PUBLISHED' AND a.published_at > now() - ($2 || ' days')::interval ORDER BY a.published_at DESC LIMIT 300`, [niche.id, String(days)]);
+  const group = (key) => Object.values(posts.reduce((acc, p) => { const k = key(p); const g = (acc[k] ||= { key: k, posts: 0, views: 0, likes: 0, comments: 0 }); g.posts++; g.views += p.views; g.likes += p.likes; g.comments += p.comments; return acc; }, {}))
+    .map((g) => ({ ...g, avg_views: Math.round(g.views / g.posts), avg_likes: +(g.likes / g.posts).toFixed(1) })).sort((a, b) => b.avg_views - a.avg_views);
+  const tz = /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC";
+  const hour = (p) => Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(new Date(p.published_at)));
+  const score = (p) => p.views + 10 * p.likes + 20 * p.comments;
+  return { posts: posts.length, timezone: tz, byType: group((p) => p.content_type), byPlatform: group((p) => p.platform), byHour: group(hour).sort((a, b) => a.key - b.key),
+    top: [...posts].sort((a, b) => score(b) - score(a)).slice(0, 8), bottom: [...posts].sort((a, b) => score(a) - score(b)).slice(0, 5) };
+}
+async function planProgram(nicheId) {
+  const niche = await one(`SELECT * FROM niches WHERE id=$1`, [nicheId]); if (!niche) return null;
+  const brand = await one(`SELECT * FROM brands WHERE id=$1`, [niche.brand_id]);
+  const st = await programStats(niche);
+  const series = await q(`SELECT s.id, s.key, s.display_name, s.premise, s.episode_counter, (SELECT json_agg(x) FROM (SELECT headline, episode_number FROM content_items WHERE series_id = s.id ORDER BY created_at DESC LIMIT 5) x) AS recent FROM series s WHERE s.niche_id = $1 AND s.is_active::int = 1`, [nicheId]);
+  const trending = DESK_TYPES.has(niche.content_type) ? await q(`SELECT c.title, c.source_count FROM story_clusters c WHERE c.last_seen_at > now() - interval '24 hours' AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.cluster_id = c.id AND ci.niche_id = $1) ORDER BY c.weight_sum DESC LIMIT 15`, [nicheId]) : [];
+  const recent = await q(`SELECT COALESCE(headline, topic) AS t FROM content_items WHERE niche_id=$1 AND status NOT IN ('FAILED','REJECTED') ORDER BY created_at DESC LIMIT 40`, [nicheId]);
+  const line = (g) => `${g.key}: ${g.posts} posts, avg ${g.avg_views} views / ${g.avg_likes} likes`;
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
+    system: `You are the content strategist for "${niche.display_name}" (${brand?.name || "brand"}): ${nice(niche.content_type)} in ${niche.language || "en"} for ${niche.country || "a general audience"}. You propose specific, publishable ideas grounded in the data given. Topics are written in ${niche.language || "en"}.`,
+    prompt: `PERFORMANCE, last 30 days (${st.posts} published posts)\nBy format:\n${st.byType.map(line).join("\n") || "(no data yet)"}\nBy platform:\n${st.byPlatform.map(line).join("\n") || "(no data yet)"}\nBy hour (${st.timezone}):\n${st.byHour.map(line).join("\n") || "(no data yet)"}\nBest posts:\n${st.top.map((p) => `- ${p.headline} (${p.views} views, ${p.likes} likes)`).join("\n") || "(none)"}\nWeakest posts:\n${st.bottom.map((p) => `- ${p.headline} (${p.views} views)`).join("\n") || "(none)"}\n\nSERIES\n${series.map((s) => `- ${s.key} "${s.display_name}" (${s.episode_counter} episodes). Premise: ${s.premise || "-"}. Latest: ${(s.recent || []).map((x) => x.headline).join(" | ")}`).join("\n") || "(none)"}\n\nTRENDING STORIES NOT YET COVERED\n${trending.map((t) => `- ${t.title} (${t.source_count} outlets)`).join("\n") || "(none)"}\n\nRECENTLY COVERED (do not repeat)\n${recent.map((x) => `- ${x.t}`).join("\n") || "(none)"}\n\nPropose up to 8 ideas. JSON: {"ideas": [{"kind": "TOPIC|SERIES_EPISODE|NEW_SERIES|FORMAT|TIMING", "title": "...", "rationale": "why, citing the data above", "topic": "TOPIC/SERIES_EPISODE: the exact topic to write", "summary": "what the piece should cover", "series_key": "SERIES_EPISODE: existing series key", "series_name": "NEW_SERIES: name", "premise": "NEW_SERIES: premise", "cadence_days": 7, "content_type": "optional format for this piece", "score": 0.0}]}`,
+    mock: { ideas: [{ kind: "TOPIC", title: `Explainer for ${niche.display_name}`, rationale: "mock planner idea", topic: `What to know this week: ${niche.display_name}`, summary: "", score: 0.6 }] } }));
+  const ideas = (Array.isArray(r.data) ? r.data : r.data?.ideas || []).filter((x) => x && x.title && ["TOPIC", "SERIES_EPISODE", "NEW_SERIES", "FORMAT", "TIMING", "NEW_PROGRAM"].includes(String(x.kind).toUpperCase()));
+  const made = [];
+  for (const x of ideas.slice(0, 8)) {
+    const dup = await one(`SELECT id FROM suggestions WHERE niche_id=$1 AND lower(title)=lower($2) AND created_at > now() - interval '14 days'`, [nicheId, x.title]); if (dup) continue;
+    const s = series.find((y) => y.key === x.series_key);
+    const id = newId(); await q(`INSERT INTO suggestions (id, brand_id, niche_id, series_id, kind, title, rationale, payload, score) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`,
+      [id, niche.brand_id, nicheId, s?.id || null, String(x.kind).toUpperCase(), String(x.title).slice(0, 300), x.rationale || "", JSON.stringify(x), clamp(Number(x.score) || 0.5, 0, 1)]);
+    made.push(id);
+  }
+  const ap = (P(niche.method_config) || {}).autopilot;
+  if (ap?.topics_per_day) {
+    const today = await one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE niche_id=$1 AND status='ACCEPTED' AND acted_at >= CURRENT_DATE AND payload->>'autopilot' = 'true'`, [nicheId]);
+    const pick = await q(`SELECT id FROM suggestions WHERE niche_id=$1 AND status='NEW' AND kind IN ('TOPIC','SERIES_EPISODE') AND score >= $2 ORDER BY score DESC LIMIT $3`, [nicheId, Number(ap.min_score ?? 0.5), Math.max(0, ap.topics_per_day - today.n)]);
+    for (const p of pick) { await q(`UPDATE suggestions SET payload = payload || '{"autopilot": true}'::jsonb WHERE id=$1`, [p.id]); await acceptSuggestion(p.id); }
+  }
+  return { created: made.length, cost: r.cost || 0 };
+}
+async function acceptSuggestion(id) {
+  const s = await one(`SELECT * FROM suggestions WHERE id=$1`, [id]); if (!s) throw new ApiError(404, null, "Suggestion not found");
+  if (s.status === "ACCEPTED") return { suggestion: s };
+  const niche = await one(`SELECT * FROM niches WHERE id=$1`, [s.niche_id]); const p = P(s.payload) || {}; const out = {};
+  if (s.kind === "TOPIC" || s.kind === "SERIES_EPISODE") {
+    const seriesId = s.series_id || (p.series_key ? (await one(`SELECT id FROM series WHERE niche_id=$1 AND key=$2`, [niche.id, p.series_key]))?.id : null) || null;
+    const type = p.content_type && CONTENT_TYPE_SET.has(p.content_type) && !VIDEO_TYPES.has(p.content_type) ? p.content_type : null;
+    out.itemId = await createQueuedItem(niche, { seriesId, contentType: type, topic: p.topic || s.title, sourceDataRef: { provider: "planner", summary: p.summary || s.rationale || "", suggestionId: s.id } });
+    await enqueue("GENERATE_CONTENT", { itemId: out.itemId }, { queue: queueFor(type || niche.content_type), priority: 3, contentItemId: out.itemId });
+  } else if (s.kind === "NEW_SERIES") {
+    out.seriesId = newId();
+    await q(`INSERT INTO series (id, niche_id, key, display_name, premise, cadence_days, auto_generate, next_due_at) VALUES ($1,$2,$3,$4,$5,$6,1,now()) ON CONFLICT (niche_id, key) DO NOTHING`,
+      [out.seriesId, niche.id, slugify(p.series_name || s.title).slice(0, 40), p.series_name || s.title, p.premise || s.rationale || "", Number(p.cadence_days) || 7]);
+  }
+  await q(`UPDATE suggestions SET status='ACCEPTED', acted_at=now(), content_item_id=$2 WHERE id=$1`, [id, out.itemId || null]);
+  return { suggestion: await one(`SELECT * FROM suggestions WHERE id=$1`, [id]), ...out };
+}
+async function sweepPlanner() {
+  if (!(await setting("planner.enabled", true))) return;
+  const due = await q(`SELECT n.id FROM niches n WHERE n.is_active::int = 1 AND NOT EXISTS (SELECT 1 FROM suggestions s WHERE s.niche_id = n.id AND s.created_at > now() - interval '23 hours')
+    AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'PLAN_PROGRAM' AND j.dedupe_key = 'plan:' || n.id AND j.created_at > now() - interval '23 hours') LIMIT 10`);
+  for (const n of due) await enqueue("PLAN_PROGRAM", { nicheId: n.id }, { queue: "text", dedupeKey: `plan:${n.id}`, maxAttempts: 2 });
+}
+// The series' premise and latest episodes, for every prompt that writes an episode.
+async function seriesBlock(item) {
+  if (!item.series_id) return "";
+  const s = await one(`SELECT * FROM series WHERE id=$1`, [item.series_id]); if (!s) return "";
+  const eps = await q(`SELECT episode_number, headline, left(summary, 240) AS summary FROM content_items WHERE series_id=$1 AND id <> $2 AND status NOT IN ('FAILED','REJECTED') ORDER BY created_at DESC LIMIT 6`, [s.id, item.id]);
+  return `\nSERIES: this is episode ${item.episode_number || s.episode_counter + 1} of "${s.display_name}".${s.premise ? ` Premise: ${s.premise}.` : ""}${eps.length ? `\nEarlier episodes (newest first):\n${eps.map((e) => `- Ep ${e.episode_number ?? "?"}: ${e.headline} — ${e.summary || ""}`).join("\n")}\nContinue the series: build on earlier episodes where natural and never repeat one.` : ""}`;
+}
+async function sweepSeries() {
+  const due = await q(`SELECT s.id, s.cadence_days FROM series s JOIN niches n ON n.id = s.niche_id WHERE s.auto_generate::int = 1 AND s.is_active::int = 1 AND n.is_active::int = 1 AND (s.next_due_at IS NULL OR s.next_due_at <= now()) LIMIT 10`);
+  for (const s of due) {
+    await q(`UPDATE series SET next_due_at = now() + ($2 || ' days')::interval WHERE id = $1`, [s.id, String(Number(s.cadence_days) || 7)]);
+    await enqueue("SERIES_NEXT", { seriesId: s.id }, { queue: "text", dedupeKey: `series:${s.id}`, maxAttempts: 3 });
+  }
+}
+async function nextEpisode(seriesId) {
+  const s = await one(`SELECT * FROM series WHERE id=$1`, [seriesId]); if (!s) return null;
+  const niche = await one(`SELECT * FROM niches WHERE id=$1`, [s.niche_id]);
+  const eps = await q(`SELECT episode_number, headline, left(summary, 240) AS summary FROM content_items WHERE series_id=$1 AND status NOT IN ('FAILED','REJECTED') ORDER BY created_at DESC LIMIT 8`, [s.id]);
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 800,
+    system: `You plan the episodes of the series "${s.display_name}" for "${niche.display_name}". Language: ${niche.language || "en"}.`,
+    prompt: `Premise: ${s.premise || "(none)"}\nEpisodes so far (newest first):\n${eps.map((e) => `- Ep ${e.episode_number ?? "?"}: ${e.headline} — ${e.summary || ""}`).join("\n") || "(none yet: plan the first episode)"}\n\nPropose the next episode. It continues naturally and repeats none of the above. JSON: {"topic": "...", "summary": "what it covers"}`,
+    mock: { topic: `${s.display_name}: episode ${s.episode_counter + 1}`, summary: "" } }));
+  const d = r.data || {};
+  const itemId = await createQueuedItem(niche, { seriesId: s.id, topic: d.topic || `${s.display_name} ${s.episode_counter + 1}`, sourceDataRef: { provider: "series", summary: d.summary || "" } });
+  await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: 2, contentItemId: itemId });
+  return { itemId };
+}
+
 // === 9. worker lanes =====================================================
 const QUEUES = ALL_QUEUES;
 async function enqueue(type, payload, { queue = "text", priority = 0, runAfter = null, contentItemId = null, dedupeKey = null, maxAttempts = 3 } = {}) {
@@ -1342,15 +2335,22 @@ const HANDLERS = {
     const source = await one(`SELECT * FROM sources WHERE id=$1`, [sourceId]); if (!source || !flag(source.is_active)) return { skipped: true };
     try {
       const ing = await resolve("INGEST", source.adapter_key || "rss"); const items = await ing.fetchItems(source); let added = 0, routed = 0;
+      const desk = await setting("desk.enabled", true), toCluster = [];
+      const maxAgeMs = Number(await setting("ingest.max_age_hours", 72)) * 3600e3;
       for (const it of items) {
+        // Stale articles (feeds that never rotate, indexed archive pages) are not taken in at all; old videos still are.
+        if ((it.kind || "ARTICLE") === "ARTICLE" && it.published_at && Date.now() - Date.parse(it.published_at) > maxAgeMs) continue;
         const hash = sha(it.url); const id = newId();
         const ins = await q(`INSERT INTO source_items (id, source_id, external_id, url, url_hash, title, summary, published_at, thumbnail_url, kind, raw) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT (url_hash) DO NOTHING RETURNING id`,
           [id, sourceId, it.external_id || null, it.url, hash, it.title.slice(0, 500), it.summary || null, it.published_at || null, it.thumbnail || null, it.kind || "ARTICLE", JSON.stringify({ ...(it.raw || {}), duration: it.duration, views: it.views, platform: it.platform, license: it.license })]);
         if (!ins.length) continue; added++;
-        routed += await routeSourceItem({ ...it, id, source_id: sourceId });
+        // Articles go to the news desk (clustered, then picked per program); videos are routed to video programs directly.
+        if (desk && (it.kind || "ARTICLE") === "ARTICLE") toCluster.push({ ...it, id, source_id: sourceId });
+        else routed += await routeSourceItem({ ...it, id, source_id: sourceId });
       }
+      if (toCluster.length) { await clusterItems(toCluster, source); deskSoon(); }
       await q(`UPDATE sources SET last_polled_at=now(), last_error=NULL WHERE id=$1`, [sourceId]);
-      return { fetched: items.length, added, routed };
+      return { fetched: items.length, added, routed, clustered: toCluster.length };
     } catch (e) { await q(`UPDATE sources SET last_polled_at=now(), last_error=$2 WHERE id=$1`, [sourceId, String(e.message).slice(0, 800)]); throw e; }
   },
   async GENERATE_CONTENT({ itemId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return runGeneration(itemId); },
@@ -1359,7 +2359,23 @@ const HANDLERS = {
   async RENDER_CLIP({ itemId, clipId }) { return renderClipItem(itemId, clipId); },
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
   async POLL_METRICS({ assetId }) { return pollMetrics(assetId); },
+  async STYLE_GENERATE({ brandId, nicheId, samples }) { const s = await generateStyle({ brandId, nicheId, samples }); return { styleProfileId: s.id }; },
+  async STYLE_REFINE({ profileId }) { return refineStyle(profileId); },
+  async PLAN_PROGRAM({ nicheId }) { return planProgram(nicheId); },
+  async SERIES_NEXT({ seriesId }) { return nextEpisode(seriesId); },
 };
+// Seconds until the next attempt, or null to give up. Transient failures (overloaded model, rate limit, network) back
+// off exponentially — 1, 2, 4 … 32 min, about an hour in all — for jobs that are safe to repeat. Publishing keeps its
+// own small attempt count so a slow platform cannot cause double posts. Permanent failures stop at once.
+const TRANSIENT_MAX_ATTEMPTS = Number(ENV.TRANSIENT_MAX_ATTEMPTS) || 7;
+const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "RENDER_CLIP", "POLL_METRICS", "STYLE_GENERATE", "STYLE_REFINE", "PLAN_PROGRAM", "SERIES_NEXT"]);
+function retryDelay(job, e) {
+  if (isPermanent(e)) return null;
+  const transient = isTransient(e);
+  const max = transient && PATIENT_JOBS.has(job.type) ? Math.max(job.max_attempts || 3, TRANSIENT_MAX_ATTEMPTS) : (job.max_attempts || 3);
+  if (job.attempts >= max) return null;
+  return transient ? Math.min(60 * 2 ** Math.max(0, job.attempts - 1), 3600) : 30 * job.attempts;
+}
 async function deferJob(job, minutes) { await q(`UPDATE jobs SET status='PENDING', run_after=now() + ($2 || ' minutes')::interval, attempts=attempts-1, locked_by=NULL WHERE id=$1`, [job.id, String(minutes)]); job._deferred = true; }
 async function runJob(job) {
   const h = HANDLERS[job.type]; const payload = P(job.payload) || {};
@@ -1369,10 +2385,11 @@ async function runJob(job) {
     if (job._deferred) return;
     await q(`UPDATE jobs SET status='SUCCEEDED', result=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, J(result ?? null)?.slice(0, 5000) ?? null]);
   } catch (e) {
-    const msg = String(e?.message || e).slice(0, 1500); const retry = job.attempts < (job.max_attempts || 3) && !/Dedup:|disabled|No API key|needs |cannot publish/i.test(msg);
-    warn(`job ${job.type} ${job.id} failed (attempt ${job.attempts}): ${msg}`);
-    if (retry) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE id=$1`, [job.id, msg, String(30 * job.attempts)]);
+    const msg = String(e?.message || e).slice(0, 1500); const delay = retryDelay(job, e);
+    warn(`job ${job.type} ${job.id} failed (attempt ${job.attempts}${delay != null ? `, retrying in ${delay}s` : ", giving up"}): ${msg}`);
+    if (delay != null) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE id=$1`, [job.id, msg, String(delay)]);
     else {
+      await alertOnFailure(job, msg).catch((err) => warn("alert", err.message));
       await q(`UPDATE jobs SET status='FAILED', error_message=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, msg]);
       const itemId = job.content_item_id || payload.itemId; if (itemId) await q(`UPDATE content_items SET status='FAILED', rejection_note=$2 WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED','REJECTED')`, [itemId, msg]);
       if (payload.candidateId) await q(`UPDATE video_candidates SET status='FAILED', error_message=$2 WHERE id=$1`, [payload.candidateId, msg]);
@@ -1412,12 +2429,99 @@ async function recoverAbandonedWork() {
   const r2 = await q(`UPDATE content_items ci SET status='FAILED', rejection_note='Recovered at boot: generation was interrupted (process restarted). Regenerate to retry.' WHERE status IN ('FETCHING_DATA','DRAFTING','RENDERING') AND updated_at < now() - interval '90 minutes' AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.content_item_id = ci.id AND j.status IN ('PENDING','RUNNING')) RETURNING id`);
   if (r1.length || r2.length) log(`recovered ${r1.length} jobs, failed ${r2.length} stuck items`);
 }
+// ---- 9b. Alerts. Problems a person has to act on — an AI key rejected or out of credit, a feed that keeps failing, an
+// expired publishing token, the budget cap, a stalled pipeline, a growing review queue — are recorded for the dashboard and
+// sent to Telegram when a bot token (TELEGRAM_BOT_TOKEN or a "telegram" key) and a chat id (TELEGRAM_CHAT_ID or setting
+// alerts.telegram_chat_id) are set. An alert is not repeated within its cooldown. The engine cannot report being asleep:
+// an external uptime monitor on /health covers that.
+async function telegramTarget() {
+  const token = ENV.TELEGRAM_BOT_TOKEN || (await credentialsFor("telegram"))[0]?.secret, chat = ENV.TELEGRAM_CHAT_ID || (await setting("alerts.telegram_chat_id", null));
+  return token && chat ? { token, chat: String(chat) } : null;
+}
+async function notify(kind, title, body = "", { level = "warn", key = null, cooldownHours = 6 } = {}) {
+  const dedupe = key || `${kind}:${sha(title).slice(0, 16)}`;
+  if (await one(`SELECT id FROM notifications WHERE dedupe_key=$1 AND created_at > now() - ($2 || ' hours')::interval`, [dedupe, String(cooldownHours)])) return false;
+  const id = newId();
+  await q(`INSERT INTO notifications (id, kind, level, title, body, dedupe_key) VALUES ($1,$2,$3,$4,$5,$6)`, [id, kind, level, String(title).slice(0, 300), String(body || "").slice(0, 3000), dedupe]);
+  const tg = await telegramTarget().catch(() => null);
+  if (tg) {
+    const icon = { error: "🔴", warn: "🟠", info: "🟢" }[level] || "🟠";
+    try { await fetchJson(`https://api.telegram.org/bot${tg.token}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: tg.chat, text: `${icon} ${title}${body ? `\n\n${body}` : ""}`.slice(0, 4000), disable_web_page_preview: true }) }); await q(`UPDATE notifications SET delivered=1 WHERE id=$1`, [id]); }
+    catch (e) { warn("telegram alert failed:", e.message.slice(0, 160)); }
+  }
+  return true;
+}
+// Which provider an error message is about, from the API host it names.
+const PROVIDER_HOSTS = [["api.anthropic.com", "Anthropic"], ["generativelanguage.googleapis.com", "Gemini"], ["api.openai.com", "OpenAI"], ["api.elevenlabs.io", "ElevenLabs"], ["graph.facebook.com", "Meta (Facebook/Instagram)"], ["googleapis.com/upload/youtube", "YouTube"], ["oauth2.googleapis.com", "YouTube OAuth"], ["newsapi.org", "NewsAPI"]];
+// Called when a job gives up: failures a person must fix (billing, keys, tokens) become alerts.
+async function alertOnFailure(job, msg) {
+  const provider = PROVIDER_HOSTS.find(([h]) => msg.includes(h))?.[1] || (msg.match(/No API key for "(\w+)"/) || [])[1] || "an API";
+  const rule = [
+    [/credit balance|billing|insufficient_quota|exceeded your current quota|payment/i, `${provider} account is out of credit`, "Top it up, or switch the program to another writer (Programs → Edit → Script / LLM)."],
+    [/No API key/i, `No key for ${provider}`, "Add it on the API keys page or set the env var on Render."],
+    [/API key not valid|invalid[_ ]api[_ ]key|Incorrect API key|\b401\b|PERMISSION_DENIED|Unauthorized/i, `${provider} rejected the key`, "Check the key on the API keys page (Test button)."],
+    [/access token|OAuthException|Session has expired|\(#190\)|invalid_grant/i, `${provider} publishing token expired or was revoked`, "Create a new token and update the channel's key."],
+  ].find(([re]) => re.test(msg));
+  if (rule) await notify("provider", rule[1], `${rule[2]}\n\nLast error (${job.type}): ${msg.slice(0, 400)}`, { level: "error", key: `provider:${rule[1]}`, cooldownHours: 6 });
+}
+async function sweepHealth() {
+  const tz = "Asia/Dhaka", hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(new Date()));
+  for (const s of await q(`SELECT s.name, s.last_error FROM sources s WHERE s.is_active::int = 1 AND s.last_error IS NOT NULL AND s.last_polled_at > now() - interval '2 hours'
+      AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.source_id = s.id) AND NOT EXISTS (SELECT 1 FROM source_items si WHERE si.source_id = s.id AND si.created_at > now() - interval '24 hours')`))
+    await notify("source", `Source "${s.name}" keeps failing`, s.last_error.slice(0, 500), { key: `source:${s.name}`, cooldownHours: 24 });
+  const cap = Number(await setting("budget.daily_cap_usd", 0));
+  if (cap && (await spentTodayUsd()) >= cap) await notify("budget", `Daily budget of $${cap} reached`, "Generation is paused until tomorrow (Settings → Daily spend cap).", { key: `budget:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 24 });
+  const gen = await one(`SELECT COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed, COUNT(*)::int AS total, (array_agg(left(error_message, 300) ORDER BY finished_at DESC) FILTER (WHERE status = 'FAILED'))[1] AS last FROM jobs WHERE type IN ('GENERATE_CONTENT','RENDER_CLIP','PROCESS_CANDIDATE') AND finished_at > now() - interval '2 hours'`);
+  if (gen.total >= 5 && gen.failed / gen.total > 0.5) await notify("failures", `${gen.failed} of ${gen.total} generation jobs failed in 2 hours`, `Most recent error: ${gen.last || "?"}`, { key: "failures", cooldownHours: 4 });
+  const active = await one(`SELECT COUNT(*)::int AS n FROM niches n WHERE n.is_active::int = 1 AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.niche_id = n.id)`);
+  const recent = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE created_at > now() - interval '6 hours'`);
+  if (active.n && !recent.n && hour >= 9 && hour <= 23 && (await setting("ingest.enabled", true))) await notify("stalled", "No new content in 6 hours", "Sources may be failing, the desk may be off, or every story was filtered out. Check Sources and the News desk.", { key: "stalled", cooldownHours: 12 });
+  const backlog = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE status = 'PENDING_REVIEW' AND created_at < now() - interval '12 hours'`);
+  if (backlog.n >= 30) await notify("review", `${backlog.n} drafts have waited over 12 hours in Review`, "Approve them, or let clean drafts publish on their own (Programs → Review: auto-approve after a window).", { key: "review", cooldownHours: 24 });
+  // Daily digest at 21:00 Dhaka time.
+  if (hour === 21) {
+    const d = await one(`SELECT (SELECT COUNT(*)::int FROM content_assets WHERE status='PUBLISHED' AND published_at > now() - interval '24 hours') AS published,
+      (SELECT COUNT(*)::int FROM content_items WHERE created_at > now() - interval '24 hours') AS made, (SELECT COUNT(*)::int FROM content_items WHERE status='FAILED' AND updated_at > now() - interval '24 hours') AS failed,
+      (SELECT COUNT(*)::int FROM content_items WHERE status='PENDING_REVIEW') AS waiting`);
+    const top = await one(`SELECT ci.headline, (a.last_metrics->>'views')::int AS views FROM content_assets a JOIN content_items ci ON ci.id = a.content_item_id WHERE a.published_at > now() - interval '48 hours' AND a.last_metrics IS NOT NULL ORDER BY (a.last_metrics->>'views')::int DESC NULLS LAST LIMIT 1`);
+    await notify("digest", `Today: ${d.published} posts published, ${d.made} made`, `${d.failed} failed · ${d.waiting} waiting in Review · spent $${(await spentTodayUsd()).toFixed(2)}${top ? `\nTop post: ${top.headline} (${top.views} views)` : ""}`, { level: "info", key: `digest:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 20 });
+  }
+}
+// Programs created before the source catalog existed get its sources (and a house style) once.
+async function upgradeExistingPrograms() {
+  if (await setting("upgrade.catalog_v1", false)) return;
+  for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
+    const linked = await one(`SELECT 1 AS x FROM niche_sources ns JOIN sources s ON s.id = ns.source_id WHERE ns.niche_id = $1 AND s.catalog_key IS NOT NULL LIMIT 1`, [n.id]);
+    const entries = linked ? [] : catalogFor(n);
+    if (entries.length) { await installCatalogSources(entries, [n.id]); log(`upgrade: linked ${entries.length} catalog sources to "${n.display_name}"`); }
+    if (!n.style_profile_id && n.script_adapter !== "llm_mock") await enqueue("STYLE_GENERATE", { brandId: n.brand_id, nicheId: n.id }, { queue: "text", dedupeKey: `style-gen:${n.id}` });
+  }
+  await putSetting("upgrade.catalog_v1", true);
+}
+
+// Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
+// ledger and story clusters are pruned once nothing refers to them, bulky fields (article text, embeddings) are dropped
+// after a few days, and finished jobs are cleared. Content items, media rows and metrics are never pruned.
+async function sweepRetention() {
+  const days = String(Number(await setting("retention.source_items_days", 14)) || 14);
+  const a = await q(`DELETE FROM source_items si WHERE si.created_at < now() - ($1 || ' days')::interval
+    AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.source_item_id = si.id) AND NOT EXISTS (SELECT 1 FROM video_candidates vc WHERE vc.source_item_id = si.id) RETURNING id`, [days]);
+  await q(`UPDATE source_items SET raw = raw - 'article_text', embedding = NULL WHERE created_at < now() - interval '3 days' AND (embedding IS NOT NULL OR raw ? 'article_text')`);
+  const b = await q(`DELETE FROM story_clusters c WHERE c.last_seen_at < now() - interval '7 days' AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.cluster_id = c.id) RETURNING id`);
+  await q(`UPDATE story_clusters SET embedding = NULL WHERE last_seen_at < now() - interval '3 days' AND embedding IS NOT NULL`);
+  const c = await q(`DELETE FROM jobs WHERE (status = 'SUCCEEDED' AND finished_at < now() - interval '7 days') OR (status = 'FAILED' AND finished_at < now() - interval '30 days') RETURNING id`);
+  await q(`UPDATE content_items SET topic_embedding = NULL WHERE created_at < now() - interval '60 days' AND topic_embedding IS NOT NULL`);
+  if (a.length || b.length || c.length) log(`retention: removed ${a.length} old source items, ${b.length} story clusters, ${c.length} finished jobs`);
+}
 function startWorkers() {
   if (!LANES.length) { warn("LANES is set but names no known lane — this process serves HTTP only"); return; }
   for (const qn of LANES) workerLoop(qn);
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
-  every(60000, sweepDueSources); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
+  every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
+  every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
+  every(15 * 60000, sweepHealth);
+  upgradeExistingPrograms().catch((e) => warn("upgrade", e.message));
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
@@ -1456,19 +2560,20 @@ const server = http.createServer(async (req, res) => {
       return send(res, 404, { error: "Not found", path: pathname });
     }
     const groups = match.re.exec(pathname).slice(1); const params = {}; match.names.forEach((n, i) => (params[n] = groups[i]));
-    const body = ["POST", "PATCH", "PUT"].includes(req.method) ? await readBody(req) : {};
+    const streamed = req.method === "POST" && pathname === "/api/uploads"; // the handler reads the raw body itself
+    const body = !streamed && ["POST", "PATCH", "PUT"].includes(req.method) ? await readBody(req) : {};
     const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress;
     await match.handler({ req, res, params, query: url.searchParams, body, ip });
   } catch (e) { const status = e instanceof ApiError ? e.status : 500; if (status >= 500) warn(`${req.method} ${pathname}:`, e.message); send(res, status, { error: String(e.message || e) }); }
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
-  const [items, assets, cand, srcs] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
+  const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
 });
 // ---- storage
 app.get("/api/storage", async (ctx) => {
@@ -1527,6 +2632,7 @@ app.post("/api/credentials/:id/test", async (ctx) => {
     youtube: () => fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=id&chart=mostPopular&maxResults=1&key=${encodeURIComponent(c.secret)}`),
     meta: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/me?${form({ fields: "id,name", access_token: c.secret })}`),
     youtube_oauth: () => fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: c.secret.client_id, client_secret: c.secret.client_secret, refresh_token: c.secret.refresh_token, grant_type: "refresh_token" }) }).then((t) => ({ token_type: t.token_type, expires_in: t.expires_in })),
+    telegram: () => fetchJson(`https://api.telegram.org/bot${c.secret}/getMe`).then((r) => ({ bot: r.result?.username })),
     r2: async () => { const cfg = await r2Config(); if (!cfg) throw new Error("R2 fields incomplete"); await r2Request("PUT", "healthcheck.txt", Buffer.from("ok"), "text/plain"); await r2Request("DELETE", "healthcheck.txt"); return { bucket: cfg.bucket, public_url: cfg.public_url || "(none — set public_url so platforms can fetch files)" }; },
   };
   try { const r = await tests[c.provider](); json(ctx, 200, { ok: true, provider: c.provider, result: typeof r === "object" && r ? Object.fromEntries(Object.entries(r).slice(0, 4).map(([k, v]) => [k, typeof v === "string" ? v.slice(0, 80) : Array.isArray(v) ? `${v.length} item(s)` : v])) : r }); }
@@ -1541,8 +2647,39 @@ app.delete("/api/adapter-configs/:id", async (ctx) => { await q(`DELETE FROM ada
 app.post("/api/adapter-configs/:key/test", async (ctx) => { const row = (await instances(true)).find((r) => r.key === ctx.params.key); if (!row) throw new ApiError(404, null, "Unknown adapter key"); const a = await resolve(row.stage, row.key); let result; if (row.stage === "SCRIPT") result = await a.complete({ prompt: "Reply with the single word OK.", mock: {} }); else if (row.stage === "INGEST") result = { items: (await a.fetchItems({ name: "test", config: ctx.body.config || row.config })).slice(0, 3) }; else if (row.stage === "EMBED") result = { dims: (await a.embed("test"))?.length ?? null }; else result = { ok: true, note: "resolved; run it through a program to test end-to-end" }; json(ctx, 200, result); });
 // ---- brands
 app.get("/api/brands", async (ctx) => json(ctx, 200, await q(`SELECT * FROM brands ORDER BY created_at DESC`)));
-app.post("/api/brands", async (ctx) => { if (!ctx.body.name) throw new ApiError(400, null, "name is required"); const id = newId(); await q(`INSERT INTO brands (id, name, description) VALUES ($1,$2,$3)`, [id, ctx.body.name, ctx.body.description ?? null]); json(ctx, 201, await one(`SELECT * FROM brands WHERE id=$1`, [id])); });
-app.patch("/api/brands/:id", async (ctx) => json(ctx, 200, await patchRow("brands", ctx.params.id, ctx.body, { name: "name", description: "description" })));
+app.post("/api/brands", async (ctx) => { if (!ctx.body.name) throw new ApiError(400, null, "name is required"); const id = newId(); await q(`INSERT INTO brands (id, name, description, brand_kit) VALUES ($1,$2,$3,$4::jsonb)`, [id, ctx.body.name, ctx.body.description ?? null, JSON.stringify(ctx.body.brandKit || {})]); json(ctx, 201, await one(`SELECT * FROM brands WHERE id=$1`, [id])); });
+app.patch("/api/brands/:id", async (ctx) => json(ctx, 200, await patchRow("brands", ctx.params.id, ctx.body, { name: "name", description: "description", brandKit: "brand_kit" })));
+// Photocard preview for a brand kit (and optional headline) without generating content: renders a card from a neutral
+// gradient so the kit's colours, logo and font can be checked on the Brands page.
+app.post("/api/brands/:id/preview-card", async (ctx) => {
+  const brand = await one(`SELECT * FROM brands WHERE id=$1`, [ctx.params.id]); if (!brand) throw new ApiError(404, null, "Brand not found");
+  const kit = { ...(P(brand.brand_kit) || {}), ...(ctx.body.brandKit || {}) }, lang = ctx.body.language || "bn";
+  const bg = tmpPath("jpg"); await exec("ffmpeg", ["-y", "-f", "lavfi", "-i", "gradients=s=1080x720:c0=0x1d2b4f:c1=0x6a7fb5:x0=0:y0=0:x1=1080:y1=720:d=1", "-frames:v", "1", bg]);
+  try {
+    const out = await composePhotocard(bg, ctx.body.headline || (lang === "bn" ? "সিলেটে বন্যা পরিস্থিতির অবনতি, নদীর পানি বিপৎসীমার ওপরে" : "Flood worsens in Sylhet as rivers cross the danger mark"),
+      { width: 1080, height: 1080, kit, card_meta: { date: cardDate(lang), credit: `${lang === "bn" ? "সূত্র" : "Source"}: ${lang === "bn" ? "প্রথম আলো" : "The Daily Star"}` } });
+    const url = await storeLocal(out, `previews/${brand.id}.jpg`, "image/jpeg"); await cleanup(out);
+    json(ctx, 200, { url: `${url}?t=${Date.now()}` });
+  } finally { await cleanup(bg); }
+});
+// ---- uploads (logos, fonts, music beds, reactor clips): raw body streamed to storage, recorded as an UPLOAD media row.
+const UPLOAD_MAX_BYTES = Number(ENV.UPLOAD_MAX_MB || 300) * 1024 * 1024;
+app.post("/api/uploads", async (ctx) => {
+  const name = String(ctx.query.get("name") || "upload.bin").replace(/[^\w.\-]+/g, "_").slice(-80), purpose = String(ctx.query.get("purpose") || "other");
+  const ct = ctx.req.headers["content-type"] || "application/octet-stream", file = tmpPath(extname(name).slice(1) || "bin");
+  await new Promise((resolve, reject) => {
+    let n = 0; const ws = createWriteStream(file);
+    ctx.req.on("data", (c) => { n += c.length; if (n > UPLOAD_MAX_BYTES) { ctx.req.destroy(); ws.destroy(); reject(new ApiError(413, null, `Upload exceeds ${UPLOAD_MAX_BYTES >> 20} MB`)); } });
+    ctx.req.pipe(ws); ws.on("finish", resolve); ws.on("error", reject); ctx.req.on("error", reject);
+  });
+  try {
+    const url = await storeLocal(file, `uploads/${purpose}/${newId()}-${name}`, ct);
+    const kind = /^video\//.test(ct) ? "VIDEO" : /^audio\//.test(ct) ? "AUDIO" : /^image\//.test(ct) ? "IMAGE" : "FILE";
+    json(ctx, 201, await recordMedia({ kind: "UPLOAD", url, mime: ct, duration: kind === "VIDEO" || kind === "AUDIO" ? await ffprobeDuration(file) : null, meta: { name, purpose, media: kind } }));
+  } finally { await cleanup(file); }
+});
+app.get("/api/uploads", async (ctx) => { const p = ctx.query.get("purpose"); json(ctx, 200, await q(`SELECT * FROM media_assets WHERE kind = 'UPLOAD' AND deleted_at IS NULL AND ($1::text IS NULL OR meta->>'purpose' = $1) ORDER BY created_at DESC LIMIT 200`, [p])); });
+app.delete("/api/uploads/:id", async (ctx) => { const m = await one(`SELECT * FROM media_assets WHERE id=$1 AND kind='UPLOAD'`, [ctx.params.id]); if (m) { await deleteStored(m.url).catch(() => {}); await q(`UPDATE media_assets SET deleted_at = now() WHERE id=$1`, [m.id]); } json(ctx, 200, { ok: true }); });
 app.delete("/api/brands/:id", async (ctx) => { const dep = await one(`SELECT (SELECT COUNT(*) FROM niches WHERE brand_id=$1)::int + (SELECT COUNT(*) FROM channels WHERE brand_id=$1)::int AS n`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, "Brand still has programs or channels"); await q(`DELETE FROM brands WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 // ---- niches (programs)
 const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks"];
@@ -1551,12 +2688,33 @@ const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visu
   downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", embedAdapter: "embed_adapter" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
+// Adapters a new program starts with when the request doesn't name them: the live ones whose provider has a key (vault or
+// env), mocks otherwise — so "create a program" yields real output without visiting the Adapters page.
+async function smartAdapterDefaults() {
+  const has = async (p) => (await credentialsFor(p)).length > 0;
+  const [gem, oai, ant, el] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("elevenlabs")]);
+  const ffmpeg = await exec("ffmpeg", ["-version"], { timeoutMs: 10000 }).then(() => true).catch(() => false);
+  return {
+    scriptAdapter: gem ? "gemini_live" : oai ? "openai_live" : ant ? "anthropic_live" : "llm_mock",
+    scriptAdapterFallbacks: [gem && "gemini_live", oai && "openai_live", ant && "anthropic_live"].filter(Boolean).slice(1),
+    imageAdapter: gem ? "gemini_image" : oai ? "openai_image" : "image_mock",
+    embedAdapter: gem ? "gemini_embed" : "embed_mock",
+    voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
+    transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
+    // "remotion" falls back to ffmpeg by itself when the rendering instance lacks the memory, so it's safe to pick here.
+    renderAdapter: studioInstalled() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",
+  };
+}
 app.post("/api/niches", async (ctx) => {
-  const b = ctx.body; for (const r of ["brandId", "key", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
+  const b = { ...(ctx.body.useMocks ? {} : await smartAdapterDefaults()), ...ctx.body }; for (const r of ["brandId", "key", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
   const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter) VALUES ($1,$2,$3,$4,$5,$6)`, [id, b.brandId, b.key, b.displayName, b.tone || "", b.topicSourceAdapter || "newsapi_mock"]);
   const rest = { ...b }; delete rest.brandId; delete rest.key; delete rest.displayName; delete rest.tone; delete rest.topicSourceAdapter;
   const row = Object.keys(rest).some((k) => k in NICHE_MAP) ? await patchRow("niches", id, rest, NICHE_MAP) : await one(`SELECT * FROM niches WHERE id=$1`, [id]);
   if (Array.isArray(b.sourceIds)) for (const s of b.sourceIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, s]);
+  // A Bangladesh program with no sources picked gets the catalog's sources for its language (or the TV channels).
+  if (b.autoSources !== false && !(b.sourceIds || []).length) await installCatalogSources(catalogFor(row), [id]);
+  // No style picked: the LLM writes one for this brand + program in the background.
+  if (b.autoStyle !== false && !b.styleProfileId) await enqueue("STYLE_GENERATE", { brandId: row.brand_id, nicheId: id }, { queue: "text", priority: 8, dedupeKey: `style-gen:${id}` });
   json(ctx, 201, rowJson(row, NICHE_JSON));
 });
 app.post("/api/programs", async (ctx) => { ctx.req.url = "/api/niches"; const r = app.routes.find((x) => x.method === "POST" && x.re.test("/api/niches")); return r.handler(ctx); });
@@ -1576,8 +2734,25 @@ app.delete("/api/channels/:id/niches/:nicheId", async (ctx) => { await q(`DELETE
 app.post("/api/channels/:id/test-publish", async (ctx) => { const ch = await one(`SELECT * FROM channels WHERE id=$1`, [ctx.params.id]); if (!ch) throw new ApiError(404, null, "Channel not found"); const pub = await resolve("PUBLISH", ch.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[ch.platform] || "publish_mock"); if (ch.platform !== "FACEBOOK" || pub.impl !== "meta_graph") return json(ctx, 200, { ok: true, note: `resolved publisher ${pub.key}; only Facebook text test-posts are supported here` }); json(ctx, 200, await pub.publish({ channel: ch, mediaKind: "TEXT", caption: ctx.body.message || "Content Engine connection test", title: "test" })); });
 // ---- series
 app.get("/api/series", async (ctx) => { const n = ctx.query.get("nicheId"); json(ctx, 200, n ? await q(`SELECT * FROM series WHERE niche_id=$1 ORDER BY created_at DESC`, [n]) : await q(`SELECT * FROM series ORDER BY created_at DESC`)); });
-app.post("/api/series", async (ctx) => { const b = ctx.body; if (!b.nicheId || !b.key || !b.displayName) throw new ApiError(400, null, "nicheId, key, displayName are required"); const id = newId(); await q(`INSERT INTO series (id, niche_id, key, display_name) VALUES ($1,$2,$3,$4)`, [id, b.nicheId, b.key, b.displayName]); json(ctx, 201, await one(`SELECT * FROM series WHERE id=$1`, [id])); });
-app.patch("/api/series/:id", async (ctx) => json(ctx, 200, await patchRow("series", ctx.params.id, ctx.body, { displayName: "display_name", isActive: "is_active", episodeCounter: "episode_counter" })));
+const SERIES_MAP = { displayName: "display_name", isActive: "is_active", episodeCounter: "episode_counter", premise: "premise", cadenceDays: "cadence_days", autoGenerate: "auto_generate", nextDueAt: "next_due_at" };
+app.post("/api/series", async (ctx) => { const b = ctx.body; if (!b.nicheId || !b.key || !b.displayName) throw new ApiError(400, null, "nicheId, key, displayName are required"); const id = newId(); await q(`INSERT INTO series (id, niche_id, key, display_name) VALUES ($1,$2,$3,$4)`, [id, b.nicheId, b.key, b.displayName]); const rest = { ...b }; for (const k of ["nicheId", "key", "displayName"]) delete rest[k]; json(ctx, 201, Object.keys(rest).some((k) => k in SERIES_MAP) ? await patchRow("series", id, rest, SERIES_MAP) : await one(`SELECT * FROM series WHERE id=$1`, [id])); });
+app.patch("/api/series/:id", async (ctx) => json(ctx, 200, await patchRow("series", ctx.params.id, ctx.body, SERIES_MAP)));
+app.post("/api/series/:id/next", async (ctx) => json(ctx, 202, await nextEpisode(ctx.params.id)));
+// ---- style generation, planner, insights
+app.post("/api/style-profiles/generate", async (ctx) => { const b = ctx.body; if (!b.brandId) throw new ApiError(400, null, "brandId is required"); json(ctx, 201, rowJson(await generateStyle({ brandId: b.brandId, nicheId: b.nicheId || null, samples: b.samples || "", name: b.name || null, apply: !!b.apply }), ["banned_terms", "hashtags", "history"])); });
+app.post("/api/style-profiles/:id/refine", async (ctx) => json(ctx, 200, (await refineStyle(ctx.params.id)) || { changes: null, note: "Nothing to learn from yet: no edits, rejections or published posts with metrics." }));
+app.get("/api/suggestions", async (ctx) => { const n = ctx.query.get("nicheId"), st = ctx.query.get("status") || "NEW"; json(ctx, 200, (await q(`SELECT s.*, n.display_name AS program_name FROM suggestions s LEFT JOIN niches n ON n.id = s.niche_id WHERE ($1::text IS NULL OR s.niche_id=$1) AND ($2 = 'ALL' OR s.status=$2) ORDER BY s.created_at DESC, s.score DESC LIMIT 200`, [n, st])).map((r) => rowJson(r, ["payload"]))); });
+app.post("/api/suggestions/:id/accept", async (ctx) => json(ctx, 200, await acceptSuggestion(ctx.params.id)));
+app.post("/api/suggestions/:id/dismiss", async (ctx) => json(ctx, 200, await one(`UPDATE suggestions SET status='DISMISSED', acted_at=now() WHERE id=$1 RETURNING *`, [ctx.params.id])));
+app.post("/api/programs/:id/plan", async (ctx) => json(ctx, 200, await planProgram(ctx.params.id)));
+app.get("/api/insights", async (ctx) => {
+  const nicheId = ctx.query.get("nicheId"), days = Math.min(180, Number(ctx.query.get("days")) || 30);
+  const niches = nicheId ? [await one(`SELECT * FROM niches WHERE id=$1`, [nicheId])].filter(Boolean) : await q(`SELECT * FROM niches WHERE is_active::int = 1 ORDER BY priority DESC`);
+  const programs = []; for (const n of niches) programs.push({ program: { id: n.id, name: n.display_name, type: n.content_type }, ...(await programStats(n, days)) });
+  const totals = await one(`SELECT COUNT(*)::int AS published, COALESCE(SUM((last_metrics->>'views')::int), 0)::int AS views, COALESCE(SUM((last_metrics->>'likes')::int), 0)::int AS likes, COALESCE(SUM((last_metrics->>'comments')::int), 0)::int AS comments FROM content_assets WHERE status = 'PUBLISHED' AND published_at > now() - ($1 || ' days')::interval`, [String(days)]);
+  const qa = await q(`SELECT qa_status, COUNT(*)::int AS n FROM content_items WHERE created_at > now() - ($1 || ' days')::interval AND qa_status IS NOT NULL GROUP BY qa_status`, [String(days)]);
+  json(ctx, 200, { days, totals, qa: Object.fromEntries(qa.map((r) => [r.qa_status, r.n])), programs });
+});
 // ---- style profiles
 app.get("/api/style-profiles", async (ctx) => json(ctx, 200, (await q(`SELECT * FROM style_profiles ORDER BY name`)).map((r) => rowJson(r, ["banned_terms", "hashtags"]))));
 app.post("/api/style-profiles", async (ctx) => { const b = ctx.body; if (!b.name) throw new ApiError(400, null, "name is required"); const id = newId(); await q(`INSERT INTO style_profiles (id, brand_id, name, language, tone, rules, examples, banned_terms, cta, hashtags) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb)`, [id, b.brandId || null, b.name, b.language || "en", b.tone || "", b.rules || "", b.examples || "", JSON.stringify(b.bannedTerms || []), b.cta || "", JSON.stringify(b.hashtags || [])]); json(ctx, 201, rowJson(await one(`SELECT * FROM style_profiles WHERE id=$1`, [id]), ["banned_terms", "hashtags"])); });
@@ -1590,6 +2765,61 @@ app.patch("/api/sources/:id", async (ctx) => json(ctx, 200, rowJson(await patchR
 app.delete("/api/sources/:id", async (ctx) => { await q(`DELETE FROM sources WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/sources/:id/poll", async (ctx) => { const jobId = await enqueue("INGEST_SOURCE", { sourceId: ctx.params.id }, { queue: "ingest", dedupeKey: `ingest:${ctx.params.id}`, priority: 10, maxAttempts: 1 }); json(ctx, 202, { jobId }); });
 app.post("/api/sources/:id/preview", async (ctx) => { const s = await one(`SELECT * FROM sources WHERE id=$1`, [ctx.params.id]); if (!s) throw new ApiError(404, null, "Source not found"); const ing = await resolve("INGEST", s.adapter_key); json(ctx, 200, (await ing.fetchItems(s)).slice(0, 10)); });
+// ---- schedule: what goes out where and when (next days), and what just went out
+app.get("/api/schedule", async (ctx) => json(ctx, 200, {
+  upcoming: await q(`SELECT a.id, a.status, a.scheduled_for, c.display_name AS channel, c.platform, ci.id AS item_id, COALESCE(ci.headline, ci.topic) AS headline, ci.content_type, m.url AS hero_url, m.kind AS hero_kind
+    FROM content_assets a JOIN channels c ON c.id = a.channel_id JOIN content_items ci ON ci.id = a.content_item_id LEFT JOIN media_assets m ON m.id = ci.hero_media_id
+    WHERE a.status IN ('PENDING','RENDERING','RENDERED','PUBLISHING') ORDER BY a.scheduled_for NULLS FIRST LIMIT 200`),
+  recent: await q(`SELECT a.id, a.status, a.published_at, a.published_url, a.error_message, c.display_name AS channel, c.platform, ci.id AS item_id, COALESCE(ci.headline, ci.topic) AS headline
+    FROM content_assets a JOIN channels c ON c.id = a.channel_id JOIN content_items ci ON ci.id = a.content_item_id
+    WHERE a.status IN ('PUBLISHED','FAILED') AND a.updated_at > now() - interval '48 hours' ORDER BY a.updated_at DESC LIMIT 100`),
+}));
+// ---- setup checklist: what still stands between this install and running on its own
+app.get("/api/setup-status", async (ctx) => {
+  const has = async (p) => (await credentialsFor(p)).length > 0;
+  const [gem, oai, ant] = await Promise.all([has("gemini"), has("openai"), has("anthropic")]);
+  const storage = (await storageBackend()).name;
+  const kit = await one(`SELECT COUNT(*)::int AS n FROM brands WHERE brand_kit ? 'logo_url' OR brand_kit ? 'primary_color'`);
+  const programs = await one(`SELECT COUNT(*)::int AS n FROM niches WHERE is_active::int = 1`);
+  const live = await q(`SELECT c.* FROM channels c WHERE c.is_active::int = 1 AND COALESCE(c.publisher_adapter, '') <> 'publish_mock' AND c.platform <> 'PORTAL'`);
+  let liveReady = 0; for (const c of live) { const needs = c.platform === "YOUTUBE" ? "youtube_oauth" : "meta"; if (c.credential_id || (needs === "meta" ? ENV.META_ACCESS_TOKEN : ENV.YOUTUBE_REFRESH_TOKEN)) liveReady++; }
+  const items = [
+    { key: "ai", ok: gem || oai || ant, title: "An AI key", detail: gem ? "Gemini is set" : oai ? "OpenAI is set" : ant ? "Anthropic is set" : "Add a Gemini key (API keys page, or GEMINI_API_KEY on Render)", link: "#/keys" },
+    { key: "password", ok: !!ENV.DASHBOARD_PASSWORD, title: "Dashboard password", detail: ENV.DASHBOARD_PASSWORD ? "Set" : "Set DASHBOARD_PASSWORD on Render — the dashboard is open to anyone", link: null },
+    { key: "vault", ok: vaultReady(), title: "Key vault", detail: vaultReady() ? "On" : "Set SECRETS_KEY on Render to store keys from the dashboard", link: null },
+    { key: "storage", ok: storage !== "local", title: "Media storage", detail: storage !== "local" ? `Using ${storage}` : "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on Render (local disk is wiped on deploy and isn't shared with the video worker)", link: "#/settings" },
+    { key: "public_url", ok: !!ENV.PUBLIC_BASE_URL, title: "Public URL", detail: ENV.PUBLIC_BASE_URL || "Set PUBLIC_BASE_URL to this service's address (portal links)", link: null },
+    { key: "brand", ok: kit.n > 0, title: "A brand kit", detail: kit.n ? "Set" : "Give a brand its logo and colours — every photocard and video uses them", link: "#/brands" },
+    { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
+    { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
+    { key: "alerts", ok: !!(await telegramTarget().catch(() => null)), title: "Alerts on your phone", detail: "Telegram bot token + chat id (Settings → Alerts)", link: "#/settings" },
+    { key: "studio", ok: studioInstalled(), title: "Video studio", detail: studioInstalled() ? `Installed. Renders run where the video lane runs and need ${STUDIO_MIN_MEMORY_MB} MB (this instance: ${memoryLimitMb()} MB)` : "Installed by the Docker image (reels and explainers)", link: null },
+  ];
+  json(ctx, 200, { items, done: items.filter((i) => i.ok).length, total: items.length });
+});
+// ---- alerts
+app.get("/api/notifications", async (ctx) => json(ctx, 200, await q(`SELECT * FROM notifications ORDER BY created_at DESC LIMIT ${Math.min(200, Number(ctx.query.get("limit")) || 50)}`)));
+app.post("/api/notifications/read-all", async (ctx) => { await q(`UPDATE notifications SET read_at = now() WHERE read_at IS NULL`); json(ctx, 200, { ok: true }); });
+app.post("/api/notifications/test", async (ctx) => { const tg = await telegramTarget(); await notify("test", "Test alert from Content Engine", tg ? "Alerts reach this chat." : "Telegram is not configured: this alert is only in the dashboard.", { level: "info", key: `test:${newId()}` }); json(ctx, 200, { telegram: !!tg }); });
+// ---- source catalog + news desk
+app.get("/api/source-catalog", async (ctx) => {
+  const rows = await q(`SELECT s.catalog_key, s.id, s.is_active, s.last_polled_at, s.last_error, (SELECT json_agg(n.display_name) FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id WHERE ns.source_id = s.id) AS programs FROM sources s WHERE s.catalog_key IS NOT NULL`);
+  const by = Object.fromEntries(rows.map((r) => [r.catalog_key, r]));
+  json(ctx, 200, SOURCE_CATALOG.map((e) => ({ ...e, installed: !!by[e.key], sourceId: by[e.key]?.id || null, programs: by[e.key]?.programs || [], lastPolledAt: by[e.key]?.last_polled_at || null, lastError: by[e.key]?.last_error || null })));
+});
+app.post("/api/source-catalog/install", async (ctx) => {
+  const keys = new Set(ctx.body.keys || []); const entries = SOURCE_CATALOG.filter((e) => keys.has(e.key));
+  if (!entries.length) throw new ApiError(400, null, "keys must name catalog entries");
+  json(ctx, 200, { sourceIds: await installCatalogSources(entries, ctx.body.nicheIds || []) });
+});
+app.get("/api/desk", async (ctx) => {
+  const hours = String(Math.min(72, Number(ctx.query.get("hours")) || 24));
+  json(ctx, 200, await q(`SELECT c.id, c.title, c.outlets, c.source_count, c.item_count, c.published_at, c.first_seen_at, c.last_seen_at,
+      LEAST(c.weight_sum, 6) * exp(-extract(epoch FROM now() - c.first_seen_at) / 64800.0) AS score,
+      (SELECT json_agg(json_build_object('program', n.display_name, 'itemId', ci.id, 'status', ci.status)) FROM content_items ci JOIN niches n ON n.id = ci.niche_id WHERE ci.cluster_id = c.id) AS coverage
+    FROM story_clusters c WHERE c.last_seen_at > now() - ($1 || ' hours')::interval ORDER BY score DESC LIMIT 150`, [hours]));
+});
+app.post("/api/desk/run", async (ctx) => { await sweepNewsDesk(); json(ctx, 200, { ok: true }); });
 app.get("/api/source-items", async (ctx) => { const s = ctx.query.get("sourceId"), st = ctx.query.get("status"); json(ctx, 200, await q(`SELECT si.*, s.name AS source_name FROM source_items si JOIN sources s ON s.id=si.source_id WHERE ($1::text IS NULL OR si.source_id=$1) AND ($2::text IS NULL OR si.status=$2) ORDER BY si.created_at DESC LIMIT 200`, [s, st])); });
 app.post("/api/source-items/:id/route", async (ctx) => { const it = await one(`SELECT * FROM source_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); const raw = P(it.raw) || {}; const n = await routeSourceItem({ ...it, thumbnail: it.thumbnail_url, duration: raw.duration, views: raw.views, platform: raw.platform, license: raw.license }); json(ctx, 200, { routed: n }); });
 // ---- video candidates & clips
@@ -1625,7 +2855,17 @@ app.post("/api/generate", async (ctx) => {
 app.post("/api/content-items/:id/approve", async (ctx) => { if (rateLimited(`appr:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many approve requests"); json(ctx, 200, await itemWithMedia(await approveItem(ctx.params.id, { scheduledFor: ctx.body.scheduledFor || null }))); });
 app.post("/api/content-items/:id/reject", async (ctx) => json(ctx, 200, await rejectItem(ctx.params.id, ctx.body.note)));
 app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); if (VIDEO_TYPES.has(it.content_type) && part === "all") { await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: "video", contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : queueFor(it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
-app.patch("/api/content-items/:id", async (ctx) => { const b = ctx.body; const map = { script: "script", headline: "headline", summary: "summary", body: "body", captions: "captions", hashtags: "hashtags", imagePrompt: "image_prompt", scheduledFor: "scheduled_for", heroMediaId: "hero_media_id" }; const row = await patchRow("content_items", ctx.params.id, b, map); json(ctx, 200, await itemWithMedia(row)); });
+// Reviewer edits to an AI draft are logged as style feedback, and a changed headline redraws the photocard.
+app.patch("/api/content-items/:id", async (ctx) => {
+  const b = ctx.body; const map = { script: "script", headline: "headline", summary: "summary", body: "body", captions: "captions", hashtags: "hashtags", imagePrompt: "image_prompt", scheduledFor: "scheduled_for", heroMediaId: "hero_media_id" };
+  const before = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!before) throw new ApiError(404, null, "Not found");
+  let row = await patchRow("content_items", ctx.params.id, b, map);
+  const txt = (v) => (v && typeof v === "object" ? JSON.stringify(v) : String(v ?? ""));
+  const changed = ["headline", "summary", "body", "script", "captions"].filter((f) => f in b && txt(P(b[f]) ?? b[f]) !== txt(P(before[f]) ?? before[f]));
+  if (changed.length && before.status === "PENDING_REVIEW") await logStyleFeedback(before, "EDIT", changed.map((f) => ({ field: f, old: txt(P(before[f]) ?? before[f]).slice(0, 4000), new: txt(P(b[f]) ?? b[f]).slice(0, 4000) }))).catch((e) => warn("style feedback", e.message));
+  if (changed.includes("headline") && !("heroMediaId" in b)) { if (await recomposeCard(row.id).catch((e) => warn(`card recompose: ${e.message}`))) row = await one(`SELECT * FROM content_items WHERE id=$1`, [row.id]); }
+  json(ctx, 200, await itemWithMedia(row));
+});
 app.delete("/api/content-items/:id", async (ctx) => { await q(`DELETE FROM content_items WHERE id=$1 AND status IN ('FAILED','REJECTED')`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/content-items/:id/publish-now", async (ctx) => { await q(`UPDATE content_assets SET scheduled_for=now(), status='PENDING', error_message=NULL WHERE content_item_id=$1 AND status IN ('PENDING','FAILED')`, [ctx.params.id]); await sweepDueAssets(); json(ctx, 202, { ok: true }); });
 // ---- assets / performance
@@ -1640,7 +2880,8 @@ app.post("/api/jobs/:id/retry", async (ctx) => { await q(`UPDATE jobs SET status
 // ---- seed (safe to call repeatedly)
 app.post("/api/seed", async (ctx) => {
   let brand = await one(`SELECT * FROM brands WHERE name=$1`, ["Demo Media Co"]); if (!brand) { const id = newId(); await q(`INSERT INTO brands (id, name, description) VALUES ($1,$2,$3)`, [id, "Demo Media Co", "Starter brand"]); brand = await one(`SELECT * FROM brands WHERE id=$1`, [id]); }
-  let niche = await one(`SELECT * FROM niches WHERE brand_id=$1 AND key=$2`, [brand.id, "bd_news"]); if (!niche) { const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter, content_type, country, language, publish_to_portal, approval_mode) VALUES ($1,$2,'bd_news','Bangladesh News','clear, factual, click-worthy','newsapi_mock','NEWS_STATIC','Bangladesh','en',1,'MANUAL')`, [id, brand.id]); niche = await one(`SELECT * FROM niches WHERE id=$1`, [id]); }
+  let niche = await one(`SELECT * FROM niches WHERE brand_id=$1 AND key=$2`, [brand.id, "bd_news"]); if (!niche) { const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter, content_type, country, language, publish_to_portal, approval_mode) VALUES ($1,$2,'bd_news','Bangladesh News','clear, factual, click-worthy','newsapi_mock','NEWS_STATIC','Bangladesh','en',1,'MANUAL')`, [id, brand.id]);
+    await q(`UPDATE niches SET method_config = '{"desk": {"settle_minutes": 0, "min_gap_minutes": 0}}'::jsonb WHERE id = $1`, [id]); niche = await one(`SELECT * FROM niches WHERE id=$1`, [id]); }
   let source = await one(`SELECT * FROM sources WHERE name=$1`, ["Mock BD feed"]); if (!source) { const id = newId(); await q(`INSERT INTO sources (id, brand_id, name, kind, adapter_key, config, poll_interval_minutes) VALUES ($1,$2,'Mock BD feed','MOCK','ingest_mock','{}',60)`, [id, brand.id]); source = await one(`SELECT * FROM sources WHERE id=$1`, [id]); }
   await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), niche.id, source.id]);
   let ch = await one(`SELECT * FROM channels WHERE brand_id=$1 AND key=$2`, [brand.id, "fb_main"]); if (!ch) { const id = newId(); await q(`INSERT INTO channels (id, brand_id, key, display_name, platform, format, publisher_adapter, max_posts_per_day, min_gap_minutes) VALUES ($1,$2,'fb_main','Main Facebook Page','FACEBOOK','STATIC_IMAGE_CAPTION','publish_mock',12,30)`, [id, brand.id]); ch = await one(`SELECT * FROM channels WHERE id=$1`, [id]); }

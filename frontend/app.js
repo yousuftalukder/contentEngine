@@ -76,15 +76,16 @@ const STATUS_COLOR = {
 };
 const tag = (s) => h("span", { class: "tag " + (STATUS_COLOR[s] || "") }, nice(s));
 
-const CONTENT_TYPES = ["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"];
+const CONTENT_TYPES = ["NEWS_STATIC", "NEWS_REEL", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "ANIMATED_EXPLAINER", "PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"];
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
+const MADE_VIDEO_TYPES = new Set(["IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "NEWS_REEL", "ANIMATED_EXPLAINER"]);
 const PLATFORMS = ["FACEBOOK", "INSTAGRAM", "YOUTUBE", "PORTAL"];
 const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Text-only post"], ["SHORT_FORM_VOICEOVER", "Short vertical video (Reels / Shorts)"], ["LONG_FORM_VIDEO", "Long landscape video"]];
 let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
 let PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
 let MULTI_FIELD = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
-const PROVIDER_LABEL = { anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
-const PROVIDER_HELP = { meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
+const PROVIDER_LABEL = { telegram: "Telegram bot (alerts)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
+const PROVIDER_HELP = { telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
 const password = (name, extra = {}) => h("input", { type: "password", name, autocomplete: "new-password", spellcheck: false, ...extra });
 
 // form field builders
@@ -119,8 +120,9 @@ function jsonDialog(title, obj) { modal(title, h("div", null, h("pre", null, JSO
 
 // ---------------------------------------------------------------- shell
 const PAGES = [
-  ["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["programs", "Programs"], ["sources", "Sources"],
-  ["candidates", "Video candidates"], ["channels", "Channels"], ["adapters", "Adapters"], ["keys", "API keys"], ["settings", "Settings"],
+  ["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"], ["insights", "Insights"],
+  ["programs", "Programs"], ["brands", "Brands"], ["sources", "Sources"], ["candidates", "Video candidates"], ["channels", "Channels"],
+  ["adapters", "Adapters"], ["keys", "API keys"], ["settings", "Settings"],
 ];
 let health = null, stats = null;
 
@@ -129,9 +131,10 @@ function renderRail(active) {
   for (const [id, label, badge] of PAGES) {
     const a = h("a", { href: "#/" + id, class: active === id ? "active" : "" }, label);
     if (badge === "review") { const n = stats?.items?.PENDING_REVIEW || 0; if (n) a.appendChild(h("span", { class: "count" }, n)); }
+    if (badge === "ideas") { const n = stats?.ideas || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n)); }
     if (id === "items") { const n = stats?.items?.FAILED || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n + " failed")); }
     links.appendChild(a);
-    if (id === "overview" || id === "items" || id === "channels") links.appendChild(h("div", { class: "rail-sep" }));
+    if (id === "overview" || id === "items" || id === "insights" || id === "channels") links.appendChild(h("div", { class: "rail-sep" }));
   }
   const f = $("#railFoot"); f.innerHTML = "";
   if (health) f.append(
@@ -163,7 +166,7 @@ const pages = {};
 
 // ---------------------------------------------------------------- overview
 pages.overview = async () => {
-  const [programs, sources, channels] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels")]);
+  const [programs, sources, channels, alerts, setup] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null)]);
   const it = stats?.items || {}, as = stats?.assets || {};
   const pending = it.PENDING_REVIEW || 0;
   const seeded = programs.length > 0;
@@ -185,6 +188,13 @@ pages.overview = async () => {
         stat((it.FAILED || 0) + (as.FAILED || 0), "Failed", (it.FAILED || as.FAILED) ? "red" : ""),
         stat(stats?.activeSources ?? 0, "Active sources"))),
 
+    h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
+    h("div", { class: "panel" }, alerts.length ? [
+      alerts.map((a) => h("div", { class: "row", style: `padding:6px 0;border-bottom:1px solid var(--ink-3);opacity:${a.read_at ? 0.6 : 1}` },
+        h("span", { class: `tag ${{ error: "red", warn: "amber", info: "green" }[a.level] || ""}` }, a.level), h("div", { class: "grow" }, h("b", { style: "font-weight:500" }, a.title), a.body ? h("span", { class: "sub", style: "white-space:pre-wrap" }, a.body.slice(0, 400)) : null), h("span", { class: "small mute" }, ago(a.created_at)))),
+      h("div", { class: "row", style: "margin-top:10px" }, h("button", { class: "btn sm", onclick: () => run(() => post("/api/notifications/read-all"), "Marked as read").then(route) }, "Mark all read"), h("a", { class: "small", href: "#/settings" }, "Send alerts to Telegram"))]
+      : h("p", { class: "muted", style: "margin:0" }, "No alerts. Problems you need to act on — a rejected or unpaid AI key, a failing feed, an expired publishing token, the budget cap — show up here and, if you connect Telegram, on your phone.")),
+
     h("h2", null, "Worker lanes"),
     h("div", { class: "panel" },
       h("p", { class: "muted", style: "margin:0 0 10px" }, "Click a lane to pause or resume it. Paused lanes keep their jobs and pick them up when resumed."),
@@ -194,7 +204,10 @@ pages.overview = async () => {
       } }, h("span", { class: "dot" }), l))),
       stats?.globalPause ? h("p", { style: "margin:12px 0 0;color:var(--amber)" }, "Publishing is globally paused (Settings). Approved items will wait.") : null),
 
-    h("h2", null, "Getting the first item through"),
+    setup ? h("h2", null, "Setup ", h("span", { class: `tag ${setup.done === setup.total ? "green" : "amber"}` }, `${setup.done} of ${setup.total}`)) : null,
+    setup ? h("div", { class: "panel" }, h("ol", { class: "steps" }, setup.items.map((s) => step(s.ok, h("span", null, h("b", { style: "font-weight:500" }, s.title), " — ", s.link && !s.ok ? h("a", { href: s.link }, s.detail) : s.detail))))) : null,
+
+    h("h2", null, "Try it with mock data"),
     h("div", { class: "panel" },
       h("ol", { class: "steps" },
         step(seeded, h("span", null, "Create the starter setup: a demo brand, a mock news feed, the “Bangladesh News” program and a mock Facebook channel. ",
@@ -235,7 +248,7 @@ pages.review = async (sub) => {
 };
 
 function proofView(it, onDone) {
-  const isVideo = VIDEO_TYPES.has(it.content_type) || it.content_type === "IMAGE_SLIDESHOW" || it.content_type === "LONG_FORM_VIDEO";
+  const isVideo = VIDEO_TYPES.has(it.content_type) || MADE_VIDEO_TYPES.has(it.content_type);
   const caps = it.captions || {};
   const hero = it.hero_media;
   const heroEl = !hero ? null
@@ -267,6 +280,7 @@ function proofView(it, onDone) {
 
   const src = it.source_data_ref || {};
   return h("div", { class: "proof" },
+    qaPanel(it),
     h("div", { class: "row small mute" }, tag(it.status), h("span", null, it.program_name), h("span", null, nice(it.content_type)), h("span", null, "created ", ago(it.created_at)), h("span", null, "cost ", usd(it.generation_cost_usd)),
       it.review_deadline_at ? h("span", { class: "deadline" }, untilText(it.review_deadline_at)) : null,
       h("button", { class: "btn link sm right", onclick: () => jsonDialog("Raw item", it) }, "Raw JSON")),
@@ -278,7 +292,8 @@ function proofView(it, onDone) {
     imgPrompt ? field("Image prompt", imgPrompt, "Edit and regenerate the image to get a different visual.") : null,
     capBlock ? h("div", { class: "field" }, h("span", null, "Captions by platform"), capBlock) : null,
     field("Hashtags", hashtags, "Comma-separated."),
-    src.url || src.provider ? h("p", { class: "small mute" }, "Source: ", src.provider || "", " ", src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener" }, src.url) : null) : null,
+    src.outlets?.length ? h("p", { class: "small mute" }, "Reported by: ", src.outlets.map((o) => h("span", { class: "tag", style: "margin-right:4px" }, o))) : null,
+    src.url || src.provider ? h("p", { class: "small mute" }, "Source: ", nice(src.provider || ""), " ", src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener" }, src.url) : null) : null,
     it.assets?.length ? h("div", { class: "small mute" }, "Will publish to: ", it.assets.map((a) => `${a.channel_name} (${a.platform})`).join(", ")) : null,
     h("div", { class: "bar" },
       h("button", { class: "btn primary", onclick: approve }, "Approve & publish"),
@@ -289,6 +304,20 @@ function proofView(it, onDone) {
       h("button", { class: "btn", onclick: () => regen("all") }, "Regenerate everything")),
     h("div", { class: "row" }, note, h("button", { class: "btn danger", onclick: reject }, "Reject")),
   );
+}
+
+// The quality gate's report on a draft: verdict, what it found, and whether the draft was already revised once.
+function qaPanel(it) {
+  const r = it.qa_report; if (!it.qa_status || !r) return null;
+  const color = { PASS: "green", REVIEW: "amber", REJECT: "red" }[it.qa_status] || "";
+  const list = (title, items) => items?.length ? h("div", { style: "margin-top:6px" }, h("div", { class: "small mute" }, title), h("ul", { class: "qa-list" }, items.map((x) => h("li", null, x)))) : null;
+  return h("div", { class: `qa qa-${color}` },
+    h("div", { class: "row" }, h("b", null, "Quality check"), h("span", { class: `tag ${color}` }, nice(it.qa_status)), r.score != null ? h("span", { class: "small mute" }, "score ", Number(r.score).toFixed(2)) : null, r.revised ? h("span", { class: "tag violet" }, "revised once") : null),
+    r.summary ? h("p", { class: "small", style: "margin:6px 0 0" }, r.summary) : null,
+    list("Not supported by the sources", r.fact_issues),
+    r.headline_ok === false ? list("Headline", [r.headline_issue || "Misleading or overstated"]) : null,
+    list("Safety", (r.safety_flags || []).map((f) => `${nice(f.type)} (${f.severity}): ${f.detail || ""}`)),
+    list("Language", r.language_issues));
 }
 
 // ---------------------------------------------------------------- content ledger
@@ -374,19 +403,50 @@ function programCard(p, brands, sources, channels, adapters, styles) {
       h("div", null, h("div", { class: "small muted" }, "Publishes to"),
         h("div", { class: "row", style: "margin-top:4px" }, (p.channels || []).map((c) => h("span", { class: "tag green" }, c.name, " ", h("a", { href: "#", title: "Unsubscribe", onclick: (e) => { e.preventDefault(); run(() => del(`/api/channels/${c.id}/niches/${p.id}`), "Channel unsubscribed").then(route); } }, "×"))),
           linkPicker(channels.filter((c) => !(p.channels || []).some((x) => x.id === c.id)).map((c) => ({ id: c.id, name: c.display_name })), (id) => run(() => post(`/api/channels/${id}/niches/${p.id}`), "Channel subscribed").then(route), "Add channel")))),
+    h("div", { class: "small mute", style: "margin-top:8px" }, "Style: ", p.style_profile_id ? (styles.find((s) => s.id === p.style_profile_id)?.name || "linked") : h("span", null, "none yet (being generated, or pick one in Edit)"),
+      " · quality check: ", (p.method_config?.qa?.enabled ?? true) ? `on${(p.method_config?.qa?.auto_fix ?? true) ? " with auto-fix" : ""}` : "off",
+      p.method_config?.autopilot?.topics_per_day ? ` · autopilot: ${p.method_config.autopilot.topics_per_day} idea(s)/day` : ""),
     h("div", { class: "row", style: "margin-top:12px" },
       isVideo ? h("span", { class: "small mute" }, "Video programs generate from video candidates, not from a topic.") : [topic,
         h("button", { class: "btn sm", onclick: () => run(async () => { await post("/api/generate", { nicheId: p.id, topic: topic.value || undefined }); }, "Generating — it will land in Review").then(() => { topic.value = ""; refreshMeta().then(() => renderRail("programs")); }) }, topic.value ? "Generate from topic" : "Generate now")],
       isVideo ? h("button", { class: "btn sm", onclick: () => candidateDialog(p.id) }, "Add a video URL") : null,
+      h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post(`/api/programs/${p.id}/plan`); toast(`${r.created} new idea(s)`); location.hash = `#/ideas/${p.id}`; }) }, "Plan ideas now"),
+      h("button", { class: "btn sm", onclick: () => seriesDialog(p) }, "Series"),
+      h("a", { class: "btn sm link", href: `#/ideas/${p.id}` }, "Ideas"),
       h("a", { class: "btn sm link", href: `#/items` }, "See its content")));
+}
+async function seriesDialog(p) {
+  const list = await get(`/api/series?nicheId=${p.id}`);
+  const form = h("div", { class: "grid2" }, field("Name", text("displayName", "", { placeholder: "e.g. Rivers of Bangladesh" })), field("Key", text("key", "", { placeholder: "rivers" })),
+    field("Every (days)", num("cadenceDays", 7)), check("autoGenerate", "Write the next episode automatically", true));
+  const premise = area("premise", "", { placeholder: "What the series is about; each episode covers…" });
+  const close = modal(`Series: ${p.display_name}`, h("div", null,
+    list.length ? h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, list.map((s) => h("tr", null,
+      h("td", null, s.display_name, h("span", { class: "sub" }, s.premise || "")), h("td", { class: "small" }, s.episode_counter, " episodes", s.auto_generate ? h("span", { class: "sub" }, "next ", fmtDate(s.next_due_at)) : null),
+      h("td", { class: "row" },
+        h("button", { class: "btn sm", onclick: () => run(() => post(`/api/series/${s.id}/next`), "Next episode is being written") }, "Next episode now"),
+        h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/series/${s.id}`, { autoGenerate: !yes(s.auto_generate), nextDueAt: yes(s.auto_generate) ? null : new Date().toISOString() }), "Saved").then(() => { close(); seriesDialog(p); }) }, yes(s.auto_generate) ? "Stop auto" : "Auto"))))))) : h("p", { class: "mute" }, "No series yet. A series keeps a running premise; each episode is written with the earlier ones as context."),
+    h("h3", { style: "margin-top:14px" }, "New series"), form, field("Premise", premise),
+    h("div", { class: "foot" }, h("button", { class: "btn primary", onclick: () => run(async () => { const v = readForm(form); await post("/api/series", { nicheId: p.id, ...v, key: v.key || v.displayName.toLowerCase().replace(/\W+/g, "_"), premise: premise.value, nextDueAt: v.autoGenerate ? new Date().toISOString() : null }); close(); seriesDialog(p); }, "Series created") }, "Create series"))), { wide: true });
 }
 function linkPicker(options, onPick, label) {
   if (!options.length) return null;
   const s = h("select", { style: "width:auto;padding:2px 6px;font-size:12px", onchange: (e) => { if (e.target.value) onPick(e.target.value); } }, h("option", { value: "" }, label + "…"), options.map((o) => h("option", { value: o.id }, o.name)));
   return s;
 }
-function programDialog(p, brands, sources, adapters, styles, done) {
-  const a = adapters || {};
+// One-pick starting points for new programs: they fill the form; everything stays editable.
+const PRESETS = {
+  bn_photocards: { label: "Bangla news — photocards", key: "bn_news", displayName: "বাংলা খবর", contentType: "NEWS_STATIC", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 20, maxItemsPerDay: 48, tone: "দ্রুত, নির্ভুল ও নিরপেক্ষ", _deskGap: 15 },
+  bn_reels: { label: "Bangla news — reels", key: "bn_reels", displayName: "খবর রিল", contentType: "NEWS_REEL", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 30, maxItemsPerDay: 12, _orientation: "9:16", _deskMinSources: 2, _deskGap: 60 },
+  en_photocards: { label: "English news — photocards", key: "en_news", displayName: "Bangladesh News", contentType: "NEWS_STATIC", language: "en", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 20, maxItemsPerDay: 36, tone: "clear, factual, fast", _deskGap: 20 },
+  tv_clips: { label: "TV news — clip reels (reuse)", key: "tv_clips", displayName: "TV Clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 10, _orientation: "9:16", _verticalLayout: "blurpad" },
+  tv_voiceover: { label: "TV news — voice-over reels", key: "tv_voiceover", displayName: "News in 60 seconds", contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 8, _orientation: "9:16", _verticalLayout: "blurpad" },
+  reaction_long: { label: "Reaction videos — long-form", key: "reactions", displayName: "Reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 2, _orientation: "16:9" },
+  explainers: { label: "Animated explainers of big stories", key: "explainers", displayName: "Explained", contentType: "ANIMATED_EXPLAINER", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 2, _orientation: "16:9", _explainerMinutes: 4, _deskMinSources: 3, _deskGap: 240 },
+  facts_series: { label: "Facts videos — daily, planner-driven", key: "facts", displayName: "Facts", contentType: "IMAGE_SLIDESHOW", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 60, maxItemsPerDay: 3, _orientation: "9:16", _apTopics: 1, autoSources: false },
+};
+async function programDialog(p, brands, sources, adapters, styles, done) {
+  const a = adapters || {}, uploads = await get("/api/uploads").catch(() => []); let preset = null;
   const opt = (keys, cur) => select(null, [["", "(default)"], ...(keys || []).map((k) => [k, k])], cur || "");
   const f = h("div", null,
     h("div", { class: "grid2" },
@@ -413,14 +473,67 @@ function programDialog(p, brands, sources, adapters, styles, done) {
         field("Download (video)", Object.assign(opt(a.downloadAdapters, p?.download_adapter), { name: "downloadAdapter" })),
         field("Transcript (video)", Object.assign(opt(a.transcriptAdapters, p?.transcript_adapter), { name: "transcriptAdapter" })),
         field("Clipper (video)", Object.assign(opt(a.clipAdapters, p?.clip_adapter), { name: "clipAdapter" })))),
-    p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name]))),
+    videoFields(p, uploads),
+    automationFields(p?.method_config || {}),
+    p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name])), "Leave empty for a Bangladesh program: it starts with the verified sources for its language (TV channels for video programs)."),
   );
+  if (!p) {
+    const pick = select(null, [["", "Start from a preset…"], ...Object.entries(PRESETS).map(([k, x]) => [k, x.label])], "", { onchange: (e) => {
+      preset = PRESETS[e.target.value]; if (!preset) return;
+      for (const [k, val] of Object.entries(preset)) { const el = f.querySelector(`[name="${k}"]`); if (!el) continue; if (el.type === "checkbox") el.checked = !!val; else el.value = val; }
+    } });
+    f.prepend(field("Preset", pick, "Fills the form for a common kind of program — adjust anything before creating it."));
+  }
   formDialog(p ? "Edit program" : "New program", f, async (v) => {
+    if (preset?.autoSources === false) v.autoSources = false;
+    v.methodConfig = readAutomation(v, readVideo(v, p?.method_config || {}));
     for (const k of Object.keys(v)) if (v[k] === "" && k !== "tone") delete v[k];
     if (v.sourceIds) v.sourceIds = Array.from(f.querySelector("[name=sourceIds]").selectedOptions).map((o) => o.value);
     if (p) { delete v.brandId; delete v.key; await patch(`/api/programs/${p.id}`, v); } else await post("/api/programs", v);
     toast(p ? "Program saved" : "Program created"); done();
   }, { wide: true });
+}
+// Video options (production method + method_config video keys). Reactor clips and music come from the media library.
+const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["REACTION_OVERLAY", "Reaction short — reactor under the clip"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap — narrated summary"]];
+function videoFields(p, uploads) {
+  const mc = p?.method_config || {}, reactors = uploads.filter((u) => u.meta?.purpose === "reactor"), music = uploads.filter((u) => u.meta?.purpose === "music");
+  return h("fieldset", null, h("legend", null, "Video"),
+    h("div", { class: "grid3" },
+      field("Production method (clips)", select("productionMethod", PRODUCTION_METHODS, p?.production_method || "")),
+      field("Orientation", select("_orientation", [["", "(default)"], ["9:16", "Vertical 9:16"], ["16:9", "Landscape 16:9"]], mc.orientation || "")),
+      field("Vertical layout for landscape footage", select("_verticalLayout", [["crop", "Crop to fill"], ["blurpad", "Whole picture on a blurred fill"]], mc.vertical_layout || "crop")),
+      field("Reactor clip", select("_reactor", [["", reactors.length ? "(none — waveform instead)" : "(upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || "")),
+      field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
+      field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 }))),
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
+}
+function readVideo(v, mc) {
+  const out = { ...mc, captions: !!v._captions, brand_finish: !!v._brandFinish, vertical_layout: v._verticalLayout || "crop", explainer_minutes: v._explainerMinutes ?? 3 };
+  if (v._orientation) out.orientation = v._orientation; else delete out.orientation;
+  if (v._reactor) out.reactor_url = v._reactor; else delete out.reactor_url;
+  if (v._music === "none") out.music = false; else if (v._music) out.music = v._music; else delete out.music;
+  return out;
+}
+// method_config.qa / .desk / .autopilot, edited as plain fields and merged back into the program's method_config.
+function automationFields(mc) {
+  const qa = mc.qa || {}, d = mc.desk || {}, ap = mc.autopilot || {};
+  return h("fieldset", null, h("legend", null, "Automation"),
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_qaEnabled", "Quality check every draft", qa.enabled ?? true), check("_qaAutoFix", "Let it fix flagged drafts once", qa.auto_fix ?? true)),
+    h("div", { class: "grid3", style: "margin-top:8px" },
+      field("Pass score (0-1)", num("_qaMinScore", qa.min_score ?? 0.75, { step: "0.05", min: 0, max: 1 })),
+      field("Outlets required", num("_deskMinSources", d.min_sources ?? 1, { min: 1 }), "News: 2+ waits until a second outlet confirms a story."),
+      field("Wait for more outlets (min)", num("_deskSettle", d.settle_minutes ?? 5, { min: 0 })),
+      field("Oldest story taken (hours)", num("_deskMaxAge", d.max_age_hours ?? 12, { min: 1 })),
+      field("Stories per pass", num("_deskPerSweep", d.per_sweep ?? 2, { min: 1 })),
+      field("Minutes between stories", num("_deskGap", d.min_gap_minutes ?? 10, { min: 0 })),
+      field("Autopilot ideas per day", num("_apTopics", ap.topics_per_day ?? 0, { min: 0 }), "The planner writes this many of its best ideas itself. 0 = off.")));
+}
+function readAutomation(v, mc) {
+  const out = { ...mc, qa: { ...(mc.qa || {}), enabled: !!v._qaEnabled, auto_fix: !!v._qaAutoFix, min_score: v._qaMinScore ?? 0.75 },
+    desk: { ...(mc.desk || {}), min_sources: v._deskMinSources ?? 1, settle_minutes: v._deskSettle ?? 5, max_age_hours: v._deskMaxAge ?? 12, per_sweep: v._deskPerSweep ?? 2, min_gap_minutes: v._deskGap ?? 10 },
+    autopilot: { ...(mc.autopilot || {}), topics_per_day: v._apTopics ?? 0 } };
+  for (const k of Object.keys(v)) if (k.startsWith("_")) delete v[k];
+  return out;
 }
 function multi(name, options) { return h("select", { name, multiple: true, style: "min-height:90px" }, options.map(([v, l]) => h("option", { value: v }, l))); }
 function brandDialog(brands) {
@@ -436,11 +549,160 @@ function styleDialog(styles, brands) {
     field("Banned terms", text("bannedTerms", (s?.banned_terms || []).join(", "), { "data-list": "1" }), "Comma-separated."),
     field("Call to action", text("cta", s?.cta)), field("Default hashtags", text("hashtags", (s?.hashtags || []).join(", "), { "data-list": "1" }), "Comma-separated.")),
     async (v) => { if (!v.brandId) delete v.brandId; if (s) await patch(`/api/style-profiles/${s.id}`, v); else await post("/api/style-profiles", v); toast("Style profile saved"); route(); });
+  const generate = async () => {
+    const programs = await get("/api/programs");
+    formDialog("Write a house style with AI", h("div", null,
+      h("div", { class: "grid2" }, field("Brand", select("brandId", brands.map((b) => [b.id, b.name]))), field("Program (optional)", select("nicheId", [["", "(whole brand)"], ...programs.map((p) => [p.id, p.display_name])]))),
+      field("Sample posts (optional)", area("samples", "", { placeholder: "Paste a few of the brand's best posts; the style is modelled on them." })),
+      check("apply", "Use it for the program right away", true)),
+      async (v) => { if (!v.nicheId) delete v.nicheId; const s = await post("/api/style-profiles/generate", v); toast(`Style "${s.name}" written`); route(); }, { saveLabel: "Write style", wide: true });
+  };
   modal("Style profiles", h("div", null,
-    styles.length ? styles.map((s) => h("div", { class: "row", style: "padding:6px 0;border-bottom:1px solid var(--ink-3)" }, h("b", { style: "font-weight:500" }, s.name), h("span", { class: "mute small" }, s.tone),
-      h("span", { class: "right row" }, h("button", { class: "btn sm", onclick: () => edit(s) }, "Edit"), h("button", { class: "btn sm danger", onclick: () => run(() => del(`/api/style-profiles/${s.id}`), "Deleted").then(route) }, "Delete")))) : h("p", { class: "mute" }, "A style profile tells the LLM how your brand writes. Programs pick one."),
-    h("div", { class: "foot" }, h("button", { class: "btn primary", onclick: () => edit(null) }, "New style profile"))));
+    styles.length ? styles.map((s) => h("div", { class: "row", style: "padding:6px 0;border-bottom:1px solid var(--ink-3)" }, h("b", { style: "font-weight:500" }, s.name), h("span", { class: "mute small" }, s.tone, s.generated ? " · AI-written" : "", s.history?.length ? ` · refined ${s.history.length}×` : ""),
+      h("span", { class: "right row" },
+        h("button", { class: "btn sm", title: "Learn from reviewers' edits and the best-performing posts", onclick: () => run(async () => { const r = await post(`/api/style-profiles/${s.id}/refine`); toast(r.changes || r.note || "Refined"); }).then(route) }, "Refine now"),
+        h("button", { class: "btn sm", onclick: () => edit(s) }, "Edit"), h("button", { class: "btn sm danger", onclick: () => run(() => del(`/api/style-profiles/${s.id}`), "Deleted").then(route) }, "Delete")))) : h("p", { class: "mute" }, "A style profile tells the LLM how your brand writes. New programs get one written automatically; reviewers' edits keep improving it."),
+    h("div", { class: "foot" }, h("button", { class: "btn", onclick: () => edit(null) }, "New by hand"), h("button", { class: "btn primary", onclick: generate }, "Write with AI"))), { wide: true });
 }
+
+// ---------------------------------------------------------------- brands (+ brand kit)
+pages.brands = async () => {
+  const [brands, uploads] = await Promise.all([get("/api/brands"), get("/api/uploads").catch(() => [])]);
+  const root = h("div", null, pageHead("Brands", "A brand owns programs and channels. Its kit — logo, colours, font, page handle, music — styles every photocard and video.",
+    h("button", { class: "btn primary", onclick: () => run(async () => { const name = prompt("Brand name"); if (name) { await post("/api/brands", { name }); route(); } }) }, "New brand")));
+  if (!brands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No brands yet"), "Create one, then give it a kit."));
+  for (const b of brands) root.appendChild(brandKitPanel(b, uploads.filter((u) => u.meta?.purpose === "music")));
+  root.appendChild(mediaLibrary(uploads));
+  return root;
+};
+// Reactor clips (for reaction videos) and music beds (for reels and explainers), uploaded once and picked per program or kit.
+function mediaLibrary(uploads) {
+  const up = (purpose, accept) => h("input", { type: "file", accept, style: "max-width:230px", onchange: (e) => run(async () => {
+    const f = e.target.files[0]; if (!f) return; toast(`Uploading ${f.name}…`);
+    const res = await fetch(`/api/uploads?purpose=${purpose}&name=${encodeURIComponent(f.name)}`, { method: "POST", headers: { "Content-Type": f.type || "application/octet-stream" }, body: f });
+    const m = await res.json(); if (!res.ok) throw new Error(m.error); route(); }, "Uploaded") });
+  const rows = uploads.filter((u) => ["reactor", "music"].includes(u.meta?.purpose));
+  return h("div", { class: "panel" }, h("h3", null, "Media library"),
+    h("p", { class: "muted small", style: "margin:0 0 10px" }, "Reactor clips are looped beside the source in reaction videos (film yourself or a presenter reacting, 10-60 s). Music beds play quietly under reels and explainers — use tracks you have the rights to."),
+    h("div", { class: "row", style: "gap:16px;flex-wrap:wrap" }, h("span", { class: "small" }, "Add a reactor clip"), up("reactor", "video/mp4,video/webm,video/quicktime"), h("span", { class: "small" }, "Add a music bed"), up("music", "audio/mpeg,audio/mp4,audio/wav,audio/ogg")),
+    rows.length ? h("div", { class: "table-wrap", style: "margin-top:10px" }, h("table", null, h("tbody", null, rows.map((u) => h("tr", null,
+      h("td", null, h("span", { class: "tag" }, u.meta.purpose)), h("td", null, h("a", { href: u.url, target: "_blank" }, u.meta?.name || u.id)),
+      h("td", { class: "small" }, u.duration_seconds ? `${Math.round(u.duration_seconds)} s` : ""), h("td", { class: "small" }, ago(u.created_at)),
+      h("td", null, h("button", { class: "btn sm danger", onclick: () => run(() => del(`/api/uploads/${u.id}`), "Removed").then(route) }, "Remove"))))))) : null);
+}
+function brandKitPanel(b, music = []) {
+  const k = b.brand_kit || {};
+  const color = (name, v) => h("input", { type: "color", name, value: v, style: "width:60px;height:34px;padding:2px" });
+  const logo = text("logo_url", k.logo_url, { placeholder: "https://… (PNG with transparency)" });
+  const upload = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", style: "max-width:220px", onchange: (e) => run(async () => { const f = e.target.files[0]; if (!f) return; const res = await fetch(`/api/uploads?purpose=logo&name=${encodeURIComponent(f.name)}`, { method: "POST", headers: { "Content-Type": f.type }, body: f }); const m = await res.json(); if (!res.ok) throw new Error(m.error); logo.value = m.url; }, "Logo uploaded") });
+  const form = h("div", null,
+    h("div", { class: "grid2" }, field("Name", text("name", b.name)), field("Description", text("description", b.description || ""), "Used when the AI writes the house style.")),
+    h("div", { class: "grid3" },
+      field("Panel colour", color("primary_color", k.primary_color || "#b3121f")), field("Accent colour", color("accent_color", k.accent_color || "#ffc400")), field("Text colour", color("text_color", k.text_color || "#ffffff"))),
+    field("Logo", h("div", { class: "row" }, logo, upload)),
+    h("div", { class: "grid2" },
+      field("Page handle / website", text("handle", k.handle, { placeholder: "fb.com/yourpage" })),
+      field("Font", text("font", k.font, { placeholder: "Noto Sans Bengali" }), "Installed font name, or a font file below."),
+      field("Font file URL(s)", text("fonts_url", k.fonts_url, { placeholder: "https://…/HindSiliguri-Bold.ttf" }), "Comma-separated .ttf/.otf."),
+      field("Picture share of the card", num("image_ratio", k.image_ratio ?? 0.6, { step: "0.05", min: 0.4, max: 0.75 }))),
+    check("credit_sources", "Credit the source outlets on the card", k.credit_sources !== false),
+    music.length ? field("Music beds for this brand's videos", h("select", { name: "music_urls", multiple: true, style: "min-height:70px" }, music.map((m) => h("option", { value: m.url, selected: (k.music_urls || []).includes(m.url) }, m.meta?.name || m.id))), "One is picked at random per video. Ctrl/Cmd-click to choose several.") : null);
+  const preview = h("div", { class: "kit-preview" });
+  const collect = () => { const v = readForm(form); const sel = form.querySelector("[name=music_urls]");
+    const kit = { ...k, primary_color: v.primary_color, accent_color: v.accent_color, text_color: v.text_color, logo_url: v.logo_url || undefined, handle: v.handle || undefined, font: v.font || undefined, fonts_url: v.fonts_url || undefined, image_ratio: v.image_ratio ?? 0.6, credit_sources: v.credit_sources, music_urls: sel ? Array.from(sel.selectedOptions).map((o) => o.value) : k.music_urls };
+    for (const x of Object.keys(kit)) if (kit[x] === undefined) delete kit[x]; return { name: v.name, description: v.description, brandKit: kit }; };
+  const show = (lang) => run(async () => { const r = await post(`/api/brands/${b.id}/preview-card`, { brandKit: collect().brandKit, language: lang }); preview.innerHTML = ""; preview.appendChild(h("img", { src: r.url, alt: "Photocard preview" })); });
+  return h("div", { class: "panel" }, h("div", { class: "grid2", style: "align-items:start" },
+    h("div", null, form, h("div", { class: "row", style: "margin-top:10px" },
+      h("button", { class: "btn primary", onclick: () => run(() => patch(`/api/brands/${b.id}`, collect()), "Brand saved") }, "Save"),
+      h("button", { class: "btn", onclick: () => show("bn") }, "Preview Bangla card"), h("button", { class: "btn", onclick: () => show("en") }, "Preview English card"),
+      h("button", { class: "btn danger right", onclick: () => confirmModal("Delete brand?", "Only works when it has no programs or channels.", () => run(() => del(`/api/brands/${b.id}`), "Deleted").then(route)) }, "Delete"))),
+    preview));
+}
+
+// ---------------------------------------------------------------- schedule
+pages.schedule = async () => {
+  const s = await get("/api/schedule");
+  const thumb = (r) => r.hero_url ? (r.hero_kind === "VIDEO" ? h("span", { class: "tag blue" }, "video") : h("img", { src: r.hero_url, alt: "", style: "width:54px;height:54px;object-fit:cover;border-radius:4px" })) : h("span", { class: "tag" }, "text");
+  const root = h("div", null, pageHead("Schedule", "Approved posts waiting for their slot, per channel's posting windows, gaps and daily limits — and what went out in the last 48 hours.",
+    h("button", { class: "btn", onclick: () => route() }, "Refresh")));
+  root.appendChild(h("h2", null, "Coming up"));
+  root.appendChild(!s.upcoming.length ? h("div", { class: "empty" }, h("b", null, "Nothing scheduled"), "Approved items get a slot on every channel subscribed to their program.") :
+    h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, s.upcoming.map((r) => h("tr", null,
+      h("td", { style: "width:64px" }, thumb(r)),
+      h("td", null, h("a", { href: "#", onclick: (e) => { e.preventDefault(); openItem(r.item_id); } }, r.headline || "(untitled)"), h("span", { class: "sub" }, nice(r.content_type))),
+      h("td", { class: "small" }, r.channel, h("span", { class: "sub" }, r.platform)),
+      h("td", { class: "small" }, r.scheduled_for ? fmtDate(r.scheduled_for) : "now", h("span", { class: "sub" }, r.scheduled_for && new Date(r.scheduled_for) > Date.now() ? `in ${Math.round((new Date(r.scheduled_for) - Date.now()) / 60000)} min` : "")),
+      h("td", null, tag(r.status))))))));
+  root.appendChild(h("h2", null, "Last 48 hours"));
+  root.appendChild(!s.recent.length ? h("p", { class: "mute" }, "Nothing published yet.") :
+    h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, s.recent.map((r) => h("tr", null,
+      h("td", null, r.headline || "(untitled)"), h("td", { class: "small" }, r.channel, h("span", { class: "sub" }, r.platform)),
+      h("td", null, tag(r.status), r.error_message ? h("span", { class: "sub", style: "color:var(--red)" }, r.error_message.slice(0, 140)) : null),
+      h("td", { class: "small" }, r.published_url ? h("a", { href: r.published_url, target: "_blank", rel: "noopener" }, "View") : "", r.published_at ? h("span", { class: "sub" }, ago(r.published_at)) : null)))))));
+  return root;
+};
+
+// ---------------------------------------------------------------- ideas (planner suggestions)
+const KIND_COLOR = { TOPIC: "blue", SERIES_EPISODE: "violet", NEW_SERIES: "violet", FORMAT: "amber", TIMING: "amber", NEW_PROGRAM: "green" };
+pages.ideas = async (sub) => {
+  const [ideas, programs] = await Promise.all([get(`/api/suggestions${sub ? `?nicheId=${sub}` : ""}`), get("/api/programs")]);
+  const root = h("div", null, pageHead("Ideas", "The planner reads what performed, your series and the trending stories you haven't covered, and suggests what to make next. Accept one and it is written; programs on autopilot accept their best ideas themselves.",
+    select(null, [["", "All programs"], ...programs.map((p) => [p.id, p.display_name])], sub || "", { style: "width:auto", onchange: (e) => (location.hash = `#/ideas/${e.target.value}`) }),
+    sub ? h("button", { class: "btn primary", onclick: () => run(async () => { const r = await post(`/api/programs/${sub}/plan`); toast(`${r.created} new idea(s)`); route(); }) }, "Plan now") : null));
+  if (!ideas.length) { root.appendChild(h("div", { class: "empty" }, h("b", null, "No open ideas"), "Ideas appear once a day per program, or pick a program and press Plan now.")); return root; }
+  root.appendChild(h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, ideas.map((s) => h("tr", null,
+    h("td", null, h("span", { class: `tag ${KIND_COLOR[s.kind] || ""}` }, nice(s.kind))),
+    h("td", null, h("b", { style: "font-weight:500" }, s.title), h("span", { class: "sub" }, s.rationale), s.payload?.summary ? h("span", { class: "sub" }, "Covers: ", s.payload.summary) : null),
+    h("td", { class: "small" }, s.program_name, h("span", { class: "sub" }, "score ", Number(s.score).toFixed(2), " · ", ago(s.created_at))),
+    h("td", { class: "row" },
+      ["TOPIC", "SERIES_EPISODE", "NEW_SERIES"].includes(s.kind) ? h("button", { class: "btn sm primary", onclick: () => run(async () => { const r = await post(`/api/suggestions/${s.id}/accept`); toast(r.itemId ? "Being written — it will land in Review" : r.seriesId ? "Series created; the first episode is on its way" : "Accepted"); route(); }) }, s.kind === "NEW_SERIES" ? "Start series" : "Write it") : h("button", { class: "btn sm", onclick: () => run(() => post(`/api/suggestions/${s.id}/accept`), "Noted").then(route) }, "Noted"),
+      h("button", { class: "btn sm", onclick: () => run(() => post(`/api/suggestions/${s.id}/dismiss`), "Dismissed").then(route) }, "Dismiss"))))))));
+  return root;
+};
+
+// ---------------------------------------------------------------- news desk
+pages.desk = async () => {
+  const clusters = await get("/api/desk?hours=24");
+  const root = h("div", null, pageHead("News desk", "Every story seen in the last 24 hours, grouped across outlets and languages. Stories carried by more (and weightier) outlets rank higher; each program takes its best uncovered ones.",
+    h("button", { class: "btn", onclick: () => run(() => post("/api/desk/run"), "Desk pass queued").then(route) }, "Run a desk pass now")));
+  if (!clusters.length) { root.appendChild(h("div", { class: "empty" }, h("b", null, "No stories yet"), "Link sources to a news program; stories appear as feeds are polled.")); return root; }
+  root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
+    h("thead", null, h("tr", null, h("th", null, "Story"), h("th", null, "Outlets"), h("th", null, "Rank"), h("th", null, "Covered by"))),
+    h("tbody", null, clusters.map((c) => h("tr", null,
+      h("td", null, c.title, h("span", { class: "sub" }, "first seen ", ago(c.first_seen_at), c.published_at ? ` · published ${ago(c.published_at)}` : "")),
+      h("td", null, (c.outlets || []).slice(0, 6).map((o) => h("span", { class: "tag", style: "margin:0 4px 4px 0" }, o.name)), c.outlets?.length > 6 ? h("span", { class: "small mute" }, `+${c.outlets.length - 6}`) : null),
+      h("td", { class: "small" }, Number(c.score).toFixed(2), h("span", { class: "sub" }, c.source_count, " outlet(s), ", c.item_count, " report(s)")),
+      h("td", { class: "small" }, (c.coverage || []).map((x) => h("div", null, h("a", { href: "#", onclick: (e) => { e.preventDefault(); openItem(x.itemId); } }, x.program), " ", tag(x.status))))))))));
+  return root;
+};
+
+// ---------------------------------------------------------------- insights
+pages.insights = async (sub) => {
+  const days = Number(sub) || 30;
+  const d = await get(`/api/insights?days=${days}`);
+  const bars = (rows, label) => {
+    const max = Math.max(1, ...rows.map((r) => r.avg_views));
+    return rows.length ? h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, rows.map((r) => h("tr", null,
+      h("td", { class: "small", style: "width:32%" }, label(r)),
+      h("td", null, h("div", { class: "bar-cell" }, h("div", { class: "bar", style: `width:${Math.max(2, (r.avg_views / max) * 100)}%` }), h("span", { class: "small mute" }, r.avg_views, " avg views"))),
+      h("td", { class: "small mute" }, r.posts, " posts · ", r.avg_likes, " likes")))))) : h("p", { class: "mute small" }, "No published posts with metrics yet.");
+  };
+  const root = h("div", null, pageHead("Insights", "What worked, per program: formats, platforms, posting hours and the posts that led. The planner reads the same numbers.",
+    h("div", { class: "tabs", style: "margin:0" }, [7, 30, 90].map((n) => h("button", { class: n === days ? "active" : "", onclick: () => (location.hash = `#/insights/${n}`) }, `${n} days`)))),
+    h("div", { class: "desk" }, h("div", { class: "stat-list" },
+      stat(d.totals.published, "Posts published"), stat(d.totals.views, "Views"), stat(d.totals.likes, "Likes"), stat(d.totals.comments, "Comments"),
+      stat(d.qa.PASS || 0, "Passed the quality check"), stat((d.qa.REVIEW || 0) + (d.qa.REJECT || 0), "Held or set aside", d.qa.REJECT ? "amber" : ""))));
+  for (const p of d.programs) root.append(...[
+    h("h2", null, p.program.name, " ", h("span", { class: "small mute", style: "font-family:var(--sans);font-weight:400" }, nice(p.program.type), " · ", p.posts, " posts")),
+    h("div", { class: "grid2", style: "align-items:start" },
+      h("div", { class: "panel" }, h("h3", null, "By format"), bars(p.byType, (r) => nice(r.key)), h("h3", { style: "margin-top:12px" }, "By platform"), bars(p.byPlatform, (r) => r.key)),
+      h("div", { class: "panel" }, h("h3", null, `By hour (${p.timezone})`), bars(p.byHour, (r) => `${String(r.key).padStart(2, "0")}:00`))),
+    p.top.length ? h("div", { class: "panel" }, h("h3", null, "Best posts"), h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, p.top.map((x) => h("tr", null,
+      h("td", null, h("a", { href: "#", onclick: (e) => { e.preventDefault(); openItem(x.id); } }, x.headline || "(untitled)"), h("span", { class: "sub" }, nice(x.content_type), " · ", x.platform, " · ", fmtDate(x.published_at))),
+      h("td", { class: "small" }, x.views, " views · ", x.likes, " likes · ", x.comments, " comments"))))))) : null].filter(Boolean));
+  return root;
+};
 
 // ---------------------------------------------------------------- sources
 pages.sources = async (sub) => {
@@ -448,7 +710,8 @@ pages.sources = async (sub) => {
   const configs = await get("/api/adapter-configs");
   const ingestKeys = configs.filter((c) => c.stage === "INGEST" && yes(c.enabled)).map((c) => [c.key, `${c.label} (${c.key})`]);
   const root = h("div", null,
-    pageHead("Sources", "Feeds the engine polls for new headlines and videos. Each new item is routed to every program linked to the source.",
+    pageHead("Sources", "Feeds the engine polls for new headlines and videos. Articles go to the news desk, which groups the same story across outlets; videos go to video programs.",
+      h("button", { class: "btn", onclick: () => catalogDialog(programs) }, "Bangladesh catalog"),
       h("button", { class: "btn primary", onclick: () => sourceDialog(null, ingestKeys, programs, brands) }, "New source")));
   if (!sources.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No sources yet"), "Add an RSS feed, a NewsAPI query, a YouTube channel — or the mock feed for testing."));
   else root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
@@ -467,7 +730,19 @@ pages.sources = async (sub) => {
         h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete source?", `Delete "${s.name}" and its inbox items?`, () => run(() => del(`/api/sources/${s.id}`), "Deleted").then(route)) }, "Delete"))))))));
   return root;
 };
-const SOURCE_HINTS = { rss: '{"url": "https://example.com/feed.xml"}', newsapi: '{"q": "Bangladesh", "language": "en"}', youtube_api: '{"channelId": "UC...", "q": "search terms"}', ytdlp_list: '{"url": "https://www.youtube.com/@channel/videos", "limit": 20}', ingest_mock: "{}" };
+async function catalogDialog(programs) {
+  const cat = await get("/api/source-catalog");
+  const group = (title, rows) => rows.length ? [h("h3", { style: "margin-top:12px" }, title), h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, rows.map((e) => h("tr", null,
+    h("td", null, e.name, h("span", { class: "sub mono" }, e.adapter, e.config.site ? ` · ${e.config.site}` : e.config.url ? ` · ${e.config.url.replace(/^https?:\/\//, "").slice(0, 40)}` : e.config.channel_id ? ` · ${e.config.channel_id}` : e.config.query ? ` · "${e.config.query}"` : "")),
+    h("td", { class: "small" }, e.installed ? h("span", null, h("span", { class: "tag green" }, "in use"), e.lastError ? h("span", { class: "sub", style: "color:var(--red)" }, e.lastError.slice(0, 60)) : e.lastPolledAt ? h("span", { class: "sub" }, "polled ", ago(e.lastPolledAt)) : null) : h("span", { class: "tag" }, "not added")),
+    h("td", { class: "small" }, (e.programs || []).join(", ")),
+    h("td", null, linkPicker(programs.filter((p) => !(e.programs || []).includes(p.display_name)).map((p) => ({ id: p.id, name: p.display_name })), (id) => run(() => post("/api/source-catalog/install", { keys: [e.key], nicheIds: [id] }), "Source linked").then(() => catalogDialog(programs)), "Add to program")))))))] : [];
+  modal("Bangladesh source catalog", h("div", null,
+    h("p", { class: "muted small", style: "margin:0" }, "Verified sources. Outlets whose own feeds are blocked are reached through Google News. A new Bangladesh program is linked to the ones in its language automatically."),
+    group("English news", cat.filter((e) => e.kind === "ARTICLE" && e.language === "en")), group("বাংলা সংবাদ", cat.filter((e) => e.kind === "ARTICLE" && e.language === "bn")),
+    group("TV news channels (video)", cat.filter((e) => e.kind === "VIDEO"))), { wide: true });
+}
+const SOURCE_HINTS = { google_news: '{"query": "Bangladesh cricket", "language": "en"}', youtube_rss: '{"channel_id": "UC..."}', sitemap: '{"url": "https://example.com/news-sitemap.xml"}', rss: '{"url": "https://example.com/feed.xml"}', newsapi: '{"q": "Bangladesh", "language": "en"}', youtube_api: '{"channelId": "UC...", "q": "search terms"}', ytdlp_list: '{"url": "https://www.youtube.com/@channel/videos", "limit": 20}', ingest_mock: "{}" };
 function sourceDialog(s, ingestKeys, programs, brands) {
   const cfg = area("config", JSON.stringify(s?.config || {}, null, 2), { "data-json": "obj", class: "mono" });
   const adapter = select("adapterKey", ingestKeys, s?.adapter_key || "rss", { onchange: (e) => { if (!s && SOURCE_HINTS[e.target.value]) cfg.value = SOURCE_HINTS[e.target.value]; } });
@@ -677,7 +952,13 @@ pages.settings = async () => {
   const cap = num(null, val("budget.daily_cap_usd", 5), { step: "0.5", min: 0, style: "max-width:140px" });
   const thr = num(null, val("repurpose.view_threshold", 500), { min: 0, style: "max-width:140px" });
   const hrs = num(null, val("storage.cleanup_after_publish_hours", 48), { min: 1, style: "max-width:120px" });
-  const known = ["queues.enabled", "publishing.global_pause", "budget.daily_cap_usd", "ingest.enabled", "repurpose.view_threshold", "storage.cleanup_enabled", "storage.cleanup_after_publish_hours"];
+  const known = ["queues.enabled", "publishing.global_pause", "budget.daily_cap_usd", "ingest.enabled", "repurpose.view_threshold", "storage.cleanup_enabled", "storage.cleanup_after_publish_hours",
+    "qa.enabled", "qa.auto_fix", "qa.min_score", "desk.enabled", "planner.enabled", "style.auto_refine", "llm.default_fallbacks", "image.default_fallbacks"];
+  const minScore = num(null, val("qa.min_score", 0.75), { step: "0.05", min: 0, max: 1, style: "max-width:120px" });
+  const tgChat = text(null, val("alerts.telegram_chat_id", "") || "", { placeholder: "chat id, e.g. 123456789", style: "max-width:220px" });
+  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1");
+  const fb = text(null, (val("llm.default_fallbacks", []) || []).join(", "), { placeholder: "e.g. openai_live, anthropic_live", style: "max-width:360px" });
+  const toggle = (key, def, on, off) => h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val(key, def) ? on : off), h("button", { class: "btn sm", onclick: () => save(key, !val(key, def)) }, val(key, def) ? "Turn off" : "Turn on"));
   const other = Object.entries(s).filter(([k]) => !known.includes(k));
   return h("div", null, pageHead("Settings", "Global switches. Program-level behaviour lives on each program."),
     h("div", { class: "panel" }, h("h3", null, "Publishing"),
@@ -686,6 +967,18 @@ pages.settings = async () => {
     h("div", { class: "panel" }, h("h3", null, "Ingestion"),
       h("div", { class: "row" }, h("span", { class: "grow" }, val("ingest.enabled", true) ? "Sources are polled on their schedules." : "Automatic polling is off. You can still poll manually."),
         h("button", { class: "btn", onclick: () => save("ingest.enabled", !val("ingest.enabled", true)) }, val("ingest.enabled", true) ? "Stop automatic polling" : "Start automatic polling"))),
+    h("div", { class: "panel" }, h("h3", null, "Automation"),
+      toggle("desk.enabled", true, "News desk: articles are grouped into stories across outlets before writing.", "News desk is off: every new article is written on its own."),
+      toggle("qa.enabled", true, "Quality check runs on every draft (programs can override).", "Quality check is off — automatic programs publish unchecked."),
+      toggle("qa.auto_fix", true, "Flagged drafts are revised once from the report before a person sees them.", "Flagged drafts go straight to Review."),
+      toggle("planner.enabled", true, "The planner proposes ideas once a day per program.", "The daily planner is off."),
+      toggle("style.auto_refine", true, "House styles learn from reviewers' edits and the best-performing posts.", "House styles only change by hand."),
+      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Pass score for the quality check (0-1)"), minScore, h("button", { class: "btn sm", onclick: () => save("qa.min_score", Number(minScore.value)) }, "Save")),
+      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Backup writers when a program has none (adapter keys)"), fb, h("button", { class: "btn sm", onclick: () => save("llm.default_fallbacks", fb.value.split(",").map((x) => x.trim()).filter(Boolean)) }, "Save"))),
+    h("div", { class: "panel" }, h("h3", null, "Alerts on Telegram"),
+      h("p", { class: "muted small", style: "margin:0 0 8px" }, "1. Create a bot with @BotFather and add its token on the API keys page (provider Telegram) or as TELEGRAM_BOT_TOKEN on Render. 2. Send your bot a message, then open api.telegram.org/bot<token>/getUpdates to find your chat id. 3. Paste it here."),
+      h("div", { class: "row" }, tgChat, h("button", { class: "btn sm", onclick: () => save("alerts.telegram_chat_id", tgChat.value.trim() || null) }, "Save"),
+        h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post("/api/notifications/test"); toast(r.telegram ? "Test alert sent to Telegram" : "Saved in the dashboard only — Telegram isn't configured yet", !r.telegram); }) }, "Send a test alert"))),
     h("div", { class: "panel" }, h("h3", null, "Daily spend cap"),
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "When today's provider spend reaches this, generation pauses until tomorrow. Spent today: ", usd(stats?.spentTodayUsd), ". Set 0 for no cap."),
       h("div", { class: "row" }, h("span", null, "$"), cap, h("button", { class: "btn", onclick: () => save("budget.daily_cap_usd", Number(cap.value)) }, "Save cap"))),
