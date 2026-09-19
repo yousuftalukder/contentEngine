@@ -2534,6 +2534,8 @@ async function deferForQuota(job, payload, quota, msg) {
     return true;
   }
   await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=$3, attempts=GREATEST(attempts-1,0), locked_by=NULL WHERE id=$1`, [job.id, msg, back.toISOString()]);
+  // The item is not being written after all: say it is queued again, so the dashboard doesn't count it as in progress.
+  if (item && ["DRAFTING", "FETCHING_DATA", "RENDERING"].includes(item.status)) await q(`UPDATE content_items SET status='QUEUED' WHERE id=$1`, [item.id]);
   log(`quota: ${job.type} ${job.id} waits until ${back.toISOString()} (${quota.kind})`);
   return true;
 }
@@ -2687,6 +2689,34 @@ async function upgradeExistingPrograms() {
   }
   await putSetting("upgrade.catalog_v1", true);
 }
+// A program keeps the adapters it was created with, which go stale: a voice whose provider never got a key would fail the
+// first reel the program is asked for, and rendering stays on ffmpeg after the studio arrives. This repairs what cannot
+// work on this deployment and takes the studio when it is there. Deliberate choices that do work — including mocks — stay.
+const IMPL_PROVIDER = { anthropic: "anthropic", gemini: "gemini", openai: "openai", gemini_image: "gemini", openai_image: "openai", elevenlabs: "elevenlabs", openai_tts: "openai", gemini_tts: "gemini", gemini_embed: "gemini", gemini_transcribe: "gemini", whisper_api: "openai" };
+async function adapterUsable(key) {
+  const row = await one(`SELECT impl FROM adapter_configs WHERE key=$1 AND enabled::int=1`, [key]);
+  if (!row) return false;
+  const provider = IMPL_PROVIDER[row.impl];
+  return provider ? (await credentialsFor(provider)).length > 0 : true;                    // mocks and local tools need no key
+}
+async function upgradeAdapters() {
+  if (await setting("upgrade.adapters_v2", false)) return;
+  const d = await smartAdapterDefaults(), changed = [];
+  for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
+    const fix = {};
+    for (const [col, want] of [["script_adapter", d.scriptAdapter], ["image_adapter", d.imageAdapter], ["voice_adapter", d.voiceAdapter], ["embed_adapter", d.embedAdapter], ["transcript_adapter", d.transcriptAdapter]])
+      if (n[col] && n[col] !== want && !/_mock$/.test(want) && !(await adapterUsable(n[col]))) fix[col] = want;
+    if (n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
+    if (!Object.keys(fix).length) continue;
+    await q(`UPDATE niches SET ${Object.keys(fix).map((k, i) => `${k} = $${i + 2}`).join(", ")} WHERE id = $1`, [n.id, ...Object.values(fix)]);
+    changed.push(`${n.display_name}: ${Object.entries(fix).map(([k, v]) => `${k.replace("_adapter", "")} → ${v}`).join(", ")}`);
+  }
+  if (changed.length) {
+    log(`upgrade: adapters repaired — ${changed.join(" | ")}`);
+    await notify("upgrade", "Programs moved onto the keys and tools this deployment has", `${changed.join("\n")}\n\nChange any of them on the program's Edit screen.`, { level: "info", key: "upgrade:adapters_v2", cooldownHours: 720 }).catch(() => {});
+  }
+  await putSetting("upgrade.adapters_v2", true);
+}
 
 // Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
 // ledger and story clusters are pruned once nothing refers to them, bulky fields (article text, embeddings) are dropped
@@ -2710,7 +2740,7 @@ function startWorkers() {
   every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
   every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
   every(15 * 60000, sweepHealth);
-  upgradeExistingPrograms().catch((e) => warn("upgrade", e.message));
+  upgradeExistingPrograms().then(upgradeAdapters).catch((e) => warn("upgrade", e.message));
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
@@ -2972,6 +3002,7 @@ app.get("/api/setup-status", async (ctx) => {
   const programs = await one(`SELECT COUNT(*)::int AS n FROM niches WHERE is_active::int = 1`);
   const live = await q(`SELECT c.* FROM channels c WHERE c.is_active::int = 1 AND COALESCE(c.publisher_adapter, '') <> 'publish_mock' AND c.platform <> 'PORTAL'`);
   let liveReady = 0; for (const c of live) { const needs = c.platform === "YOUTUBE" ? "youtube_oauth" : "meta"; if (c.credential_id || (needs === "meta" ? ENV.META_ACCESS_TOKEN : ENV.YOUTUBE_REFRESH_TOKEN)) liveReady++; }
+  const freeTier = await one(`SELECT 1 AS x FROM notifications WHERE kind = 'quota' AND title ILIKE '%free tier%' AND created_at > now() - interval '48 hours' LIMIT 1`);
   const items = [
     { key: "ai", ok: gem || oai || ant, title: "An AI key", detail: gem ? "Gemini is set" : oai ? "OpenAI is set" : ant ? "Anthropic is set" : "Add a Gemini key (API keys page, or GEMINI_API_KEY on Render)", link: "#/keys" },
     { key: "password", ok: !!ENV.DASHBOARD_PASSWORD, title: "Dashboard password", detail: ENV.DASHBOARD_PASSWORD ? "Set" : "Set DASHBOARD_PASSWORD on Render — the dashboard is open to anyone", link: null },
@@ -2981,6 +3012,8 @@ app.get("/api/setup-status", async (ctx) => {
     { key: "brand", ok: kit.n > 0, title: "A brand kit", detail: kit.n ? "Set" : "Give a brand its logo and colours — every photocard and video uses them", link: "#/brands" },
     { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
     { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
+    { key: "billing", ok: !freeTier, title: "An AI key with billing", detail: freeTier ? "This key ran out of free-tier requests in the last two days — a free key allows about 20 a day per model and no pictures. Enable billing on it (Google AI Studio → Billing)" : "No free-tier limit hit recently", link: "#/keys" },
+    { key: "budget", ok: Number(await setting("budget.daily_cap_usd", 0)) > 0, title: "A daily spend cap", detail: Number(await setting("budget.daily_cap_usd", 0)) > 0 ? `$${await setting("budget.daily_cap_usd", 0)} a day` : "Set one in Settings so a busy news day cannot run up a bill", link: "#/settings" },
     { key: "alerts", ok: !!(await telegramTarget().catch(() => null)), title: "Alerts on your phone", detail: "Telegram bot token + chat id (Settings → Alerts)", link: "#/settings" },
     { key: "studio", ok: studioInstalled(), title: "Video studio", detail: studioInstalled() ? `Installed. Renders run where the video lane runs and need ${STUDIO_MIN_MEMORY_MB} MB (this instance: ${memoryLimitMb()} MB)` : "Installed by the Docker image (reels and explainers)", link: null },
   ];
