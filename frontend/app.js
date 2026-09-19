@@ -166,7 +166,7 @@ const pages = {};
 
 // ---------------------------------------------------------------- overview
 pages.overview = async () => {
-  const [programs, sources, channels, alerts] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => [])]);
+  const [programs, sources, channels, alerts, setup] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null)]);
   const it = stats?.items || {}, as = stats?.assets || {};
   const pending = it.PENDING_REVIEW || 0;
   const seeded = programs.length > 0;
@@ -204,7 +204,10 @@ pages.overview = async () => {
       } }, h("span", { class: "dot" }), l))),
       stats?.globalPause ? h("p", { style: "margin:12px 0 0;color:var(--amber)" }, "Publishing is globally paused (Settings). Approved items will wait.") : null),
 
-    h("h2", null, "Getting the first item through"),
+    setup ? h("h2", null, "Setup ", h("span", { class: `tag ${setup.done === setup.total ? "green" : "amber"}` }, `${setup.done} of ${setup.total}`)) : null,
+    setup ? h("div", { class: "panel" }, h("ol", { class: "steps" }, setup.items.map((s) => step(s.ok, h("span", null, h("b", { style: "font-weight:500" }, s.title), " — ", s.link && !s.ok ? h("a", { href: s.link }, s.detail) : s.detail))))) : null,
+
+    h("h2", null, "Try it with mock data"),
     h("div", { class: "panel" },
       h("ol", { class: "steps" },
         step(seeded, h("span", null, "Create the starter setup: a demo brand, a mock news feed, the “Bangladesh News” program and a mock Facebook channel. ",
@@ -431,8 +434,19 @@ function linkPicker(options, onPick, label) {
   const s = h("select", { style: "width:auto;padding:2px 6px;font-size:12px", onchange: (e) => { if (e.target.value) onPick(e.target.value); } }, h("option", { value: "" }, label + "…"), options.map((o) => h("option", { value: o.id }, o.name)));
   return s;
 }
+// One-pick starting points for new programs: they fill the form; everything stays editable.
+const PRESETS = {
+  bn_photocards: { label: "Bangla news — photocards", key: "bn_news", displayName: "বাংলা খবর", contentType: "NEWS_STATIC", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 20, maxItemsPerDay: 48, tone: "দ্রুত, নির্ভুল ও নিরপেক্ষ", _deskGap: 15 },
+  bn_reels: { label: "Bangla news — reels", key: "bn_reels", displayName: "খবর রিল", contentType: "NEWS_REEL", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 30, maxItemsPerDay: 12, _orientation: "9:16", _deskMinSources: 2, _deskGap: 60 },
+  en_photocards: { label: "English news — photocards", key: "en_news", displayName: "Bangladesh News", contentType: "NEWS_STATIC", language: "en", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 20, maxItemsPerDay: 36, tone: "clear, factual, fast", _deskGap: 20 },
+  tv_clips: { label: "TV news — clip reels (reuse)", key: "tv_clips", displayName: "TV Clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 10, _orientation: "9:16", _verticalLayout: "blurpad" },
+  tv_voiceover: { label: "TV news — voice-over reels", key: "tv_voiceover", displayName: "News in 60 seconds", contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 8, _orientation: "9:16", _verticalLayout: "blurpad" },
+  reaction_long: { label: "Reaction videos — long-form", key: "reactions", displayName: "Reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 2, _orientation: "16:9" },
+  explainers: { label: "Animated explainers of big stories", key: "explainers", displayName: "Explained", contentType: "ANIMATED_EXPLAINER", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 2, _orientation: "16:9", _explainerMinutes: 4, _deskMinSources: 3, _deskGap: 240 },
+  facts_series: { label: "Facts videos — daily, planner-driven", key: "facts", displayName: "Facts", contentType: "IMAGE_SLIDESHOW", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 60, maxItemsPerDay: 3, _orientation: "9:16", _apTopics: 1, autoSources: false },
+};
 async function programDialog(p, brands, sources, adapters, styles, done) {
-  const a = adapters || {}, uploads = await get("/api/uploads").catch(() => []);
+  const a = adapters || {}, uploads = await get("/api/uploads").catch(() => []); let preset = null;
   const opt = (keys, cur) => select(null, [["", "(default)"], ...(keys || []).map((k) => [k, k])], cur || "");
   const f = h("div", null,
     h("div", { class: "grid2" },
@@ -463,7 +477,15 @@ async function programDialog(p, brands, sources, adapters, styles, done) {
     automationFields(p?.method_config || {}),
     p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name])), "Leave empty for a Bangladesh program: it starts with the verified sources for its language (TV channels for video programs)."),
   );
+  if (!p) {
+    const pick = select(null, [["", "Start from a preset…"], ...Object.entries(PRESETS).map(([k, x]) => [k, x.label])], "", { onchange: (e) => {
+      preset = PRESETS[e.target.value]; if (!preset) return;
+      for (const [k, val] of Object.entries(preset)) { const el = f.querySelector(`[name="${k}"]`); if (!el) continue; if (el.type === "checkbox") el.checked = !!val; else el.value = val; }
+    } });
+    f.prepend(field("Preset", pick, "Fills the form for a common kind of program — adjust anything before creating it."));
+  }
   formDialog(p ? "Edit program" : "New program", f, async (v) => {
+    if (preset?.autoSources === false) v.autoSources = false;
     v.methodConfig = readAutomation(v, readVideo(v, p?.method_config || {}));
     for (const k of Object.keys(v)) if (v[k] === "" && k !== "tone") delete v[k];
     if (v.sourceIds) v.sourceIds = Array.from(f.querySelector("[name=sourceIds]").selectedOptions).map((o) => o.value);

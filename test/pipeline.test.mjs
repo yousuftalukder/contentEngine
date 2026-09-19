@@ -14,6 +14,9 @@ test("boot: schema applies cleanly, every table has RLS, functions have a pinned
   for (const f of fns) assert.deepEqual(f.proconfig, ["search_path=public"], `${f.proname} search_path`);
   const health = await eng.api("GET", "/health");
   assert.equal(health.ok, true);
+  const setup = await eng.api("GET", "/api/setup-status");
+  assert.equal(setup.total, setup.items.length);
+  assert.equal(setup.items.find((i) => i.key === "storage").ok, false, "local disk is not production storage");
 });
 
 test("news pipeline: poll source -> draft lands in review -> approve -> published to channel and portal", async () => {

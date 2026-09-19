@@ -2722,6 +2722,29 @@ app.patch("/api/sources/:id", async (ctx) => json(ctx, 200, rowJson(await patchR
 app.delete("/api/sources/:id", async (ctx) => { await q(`DELETE FROM sources WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/sources/:id/poll", async (ctx) => { const jobId = await enqueue("INGEST_SOURCE", { sourceId: ctx.params.id }, { queue: "ingest", dedupeKey: `ingest:${ctx.params.id}`, priority: 10, maxAttempts: 1 }); json(ctx, 202, { jobId }); });
 app.post("/api/sources/:id/preview", async (ctx) => { const s = await one(`SELECT * FROM sources WHERE id=$1`, [ctx.params.id]); if (!s) throw new ApiError(404, null, "Source not found"); const ing = await resolve("INGEST", s.adapter_key); json(ctx, 200, (await ing.fetchItems(s)).slice(0, 10)); });
+// ---- setup checklist: what still stands between this install and running on its own
+app.get("/api/setup-status", async (ctx) => {
+  const has = async (p) => (await credentialsFor(p)).length > 0;
+  const [gem, oai, ant] = await Promise.all([has("gemini"), has("openai"), has("anthropic")]);
+  const storage = (await storageBackend()).name;
+  const kit = await one(`SELECT COUNT(*)::int AS n FROM brands WHERE brand_kit ? 'logo_url' OR brand_kit ? 'primary_color'`);
+  const programs = await one(`SELECT COUNT(*)::int AS n FROM niches WHERE is_active::int = 1`);
+  const live = await q(`SELECT c.* FROM channels c WHERE c.is_active::int = 1 AND COALESCE(c.publisher_adapter, '') <> 'publish_mock' AND c.platform <> 'PORTAL'`);
+  let liveReady = 0; for (const c of live) { const needs = c.platform === "YOUTUBE" ? "youtube_oauth" : "meta"; if (c.credential_id || (needs === "meta" ? ENV.META_ACCESS_TOKEN : ENV.YOUTUBE_REFRESH_TOKEN)) liveReady++; }
+  const items = [
+    { key: "ai", ok: gem || oai || ant, title: "An AI key", detail: gem ? "Gemini is set" : oai ? "OpenAI is set" : ant ? "Anthropic is set" : "Add a Gemini key (API keys page, or GEMINI_API_KEY on Render)", link: "#/keys" },
+    { key: "password", ok: !!ENV.DASHBOARD_PASSWORD, title: "Dashboard password", detail: ENV.DASHBOARD_PASSWORD ? "Set" : "Set DASHBOARD_PASSWORD on Render — the dashboard is open to anyone", link: null },
+    { key: "vault", ok: vaultReady(), title: "Key vault", detail: vaultReady() ? "On" : "Set SECRETS_KEY on Render to store keys from the dashboard", link: null },
+    { key: "storage", ok: storage !== "local", title: "Media storage", detail: storage !== "local" ? `Using ${storage}` : "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on Render (local disk is wiped on deploy and isn't shared with the video worker)", link: "#/settings" },
+    { key: "public_url", ok: !!ENV.PUBLIC_BASE_URL, title: "Public URL", detail: ENV.PUBLIC_BASE_URL || "Set PUBLIC_BASE_URL to this service's address (portal links)", link: null },
+    { key: "brand", ok: kit.n > 0, title: "A brand kit", detail: kit.n ? "Set" : "Give a brand its logo and colours — every photocard and video uses them", link: "#/brands" },
+    { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
+    { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
+    { key: "alerts", ok: !!(await telegramTarget().catch(() => null)), title: "Alerts on your phone", detail: "Telegram bot token + chat id (Settings → Alerts)", link: "#/settings" },
+    { key: "studio", ok: studioReady(), title: "Video studio", detail: studioReady() ? "Installed" : "Installed by the Docker image (reels and explainers)", link: null },
+  ];
+  json(ctx, 200, { items, done: items.filter((i) => i.ok).length, total: items.length });
+});
 // ---- alerts
 app.get("/api/notifications", async (ctx) => json(ctx, 200, await q(`SELECT * FROM notifications ORDER BY created_at DESC LIMIT ${Math.min(200, Number(ctx.query.get("limit")) || 50)}`)));
 app.post("/api/notifications/read-all", async (ctx) => { await q(`UPDATE notifications SET read_at = now() WHERE read_at IS NULL`); json(ctx, 200, { ok: true }); });
