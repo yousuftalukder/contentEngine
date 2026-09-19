@@ -84,8 +84,13 @@ for photocards and video; the studio needs `npm install` in `studio/` (it downlo
 
 ```bash
 npm test                    # boots the real server against an in-process Postgres (PGlite) and drives every pipeline
+npm run rehearse            # a full cycle against today's live Bangladeshi feeds, no keys, publishing nowhere real
 cd studio && npm run studio # Remotion Studio: preview and tweak the reel and explainer designs
 ```
+
+`npm run rehearse` is how to tell whether the outlets are still serving their feeds and whether stories from different
+outlets still land in one cluster — the things a test suite cannot answer. It prints what each source returned, the
+clusters with the outlets behind them, and the draft the desk chose to write.
 
 ## Deploy on Render
 

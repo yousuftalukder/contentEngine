@@ -680,7 +680,11 @@ impl("INGEST", "google_news", { label: "Google News (search / edition, no key)",
       const title = outlet && it.title.endsWith(` - ${outlet}`) ? it.title.slice(0, -(outlet.length + 3)).trim() : it.title;
       // Google also indexes outlets' tag and section pages ("tech companies", "Tokyo Olympics"): real headlines are longer.
       if (!title || GN_NOISE.test(title) || title.split(/\s+/).filter(Boolean).length < 4) continue;
-      out.push({ ...it, title, summary: "", raw: { outlet, via: "google_news" } });
+      // Google names the outlet, but sometimes only as a hostname ("today.thefinancialexpress.com.bd"), which would end
+      // up in a photocard's source credit. For a single-outlet source the name on the source is the one a reader knows;
+      // a mixed query feed keeps whatever Google said, since every item is a different outlet.
+      const named = outlet && !/^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(outlet) ? outlet : c.site ? source.name : outlet;
+      out.push({ ...it, title, summary: "", raw: { outlet: named, via: "google_news" } });
     }
     return out.slice(0, c.limit || 40);
   } }) });
