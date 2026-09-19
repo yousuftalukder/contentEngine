@@ -17,14 +17,14 @@
 
 import http from "node:http";
 import { readFile, writeFile, mkdir, unlink, rm } from "node:fs/promises";
-import { existsSync, createWriteStream } from "node:fs";
+import { existsSync, createWriteStream, readFileSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { tmpdir, totalmem } from "node:os";
 import pg from "pg";
 
 // === 1. config & utils ================================================
@@ -1217,10 +1217,21 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
 // local files; render.mjs stages them into the bundle. The "remotion" RENDER adapter uses the studio for made videos and
 // ffmpeg for everything built from footage (clips, per-channel conversion).
 const STUDIO_DIR = join(__dirname, "studio");
-const studioReady = () => existsSync(join(STUDIO_DIR, "render.mjs")) && existsSync(join(STUDIO_DIR, "node_modules", "@remotion", "renderer"));
+// The container's real memory limit (cgroup v2 / v1), not the host's: headless Chrome needs room, and on a 512 MB instance
+// a render would take the whole service down with it. Below STUDIO_MIN_MEMORY_MB the studio is treated as unavailable.
+function memoryLimitMb() {
+  for (const f of ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
+    try { const v = readFileSync(f, "utf8").trim(); if (v && v !== "max" && Number(v) < 2 ** 50) return Math.round(Number(v) / 2 ** 20); } catch {}
+  }
+  return Math.round(totalmem() / 2 ** 20);
+}
+const STUDIO_MIN_MEMORY_MB = Number(ENV.STUDIO_MIN_MEMORY_MB) || 1400;
+const studioInstalled = () => existsSync(join(STUDIO_DIR, "render.mjs")) && existsSync(join(STUDIO_DIR, "node_modules", "@remotion", "renderer"));
+const studioReady = () => studioInstalled() && memoryLimitMb() >= STUDIO_MIN_MEMORY_MB;
 const STUDIO_FPS = 30;
 async function studioRender(composition, props, { kind = "video", ext = "mp4", timeoutMs = 90 * 60000 } = {}) {
-  if (!studioReady()) throw new Error("The video studio is not installed here (studio/node_modules is missing). The Docker image installs it; locally run `npm install` in studio/.");
+  if (!studioInstalled()) throw new Error("The video studio is not installed here (studio/node_modules is missing). The Docker image installs it; locally run `npm install` in studio/.");
+  if (!studioReady()) throw new Error(`This instance has ${memoryLimitMb()} MB of memory; the video studio needs ${STUDIO_MIN_MEMORY_MB} MB. Run the video lane on a bigger instance (the render.yaml worker is 2 GB).`);
   const propsPath = tmpPath("json"), out = tmpPath(ext);
   await writeFile(propsPath, JSON.stringify(props));
   try { await exec(process.execPath, [join(STUDIO_DIR, "render.mjs"), propsPath, out, composition, kind], { timeoutMs }); return out; }
@@ -2548,7 +2559,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
@@ -2681,7 +2692,8 @@ async function smartAdapterDefaults() {
     embedAdapter: gem ? "gemini_embed" : "embed_mock",
     voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
     transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
-    renderAdapter: studioReady() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",
+    // "remotion" falls back to ffmpeg by itself when the rendering instance lacks the memory, so it's safe to pick here.
+    renderAdapter: studioInstalled() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",
   };
 }
 app.post("/api/niches", async (ctx) => {
@@ -2763,7 +2775,7 @@ app.get("/api/setup-status", async (ctx) => {
     { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
     { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
     { key: "alerts", ok: !!(await telegramTarget().catch(() => null)), title: "Alerts on your phone", detail: "Telegram bot token + chat id (Settings → Alerts)", link: "#/settings" },
-    { key: "studio", ok: studioReady(), title: "Video studio", detail: studioReady() ? "Installed" : "Installed by the Docker image (reels and explainers)", link: null },
+    { key: "studio", ok: studioInstalled(), title: "Video studio", detail: studioInstalled() ? `Installed. Renders run where the video lane runs and need ${STUDIO_MIN_MEMORY_MB} MB (this instance: ${memoryLimitMb()} MB)` : "Installed by the Docker image (reels and explainers)", link: null },
   ];
   json(ctx, 200, { items, done: items.filter((i) => i.ok).length, total: items.length });
 });
