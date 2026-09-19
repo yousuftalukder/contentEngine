@@ -328,6 +328,29 @@ async function r2Request(method, path, body = null, contentType = null) {
   if (!res.ok && !(method === "DELETE" && res.status === 404)) throw new ApiError(res.status, await res.text().catch(() => ""), `R2 ${method} ${path} -> ${res.status}`);
   return res;
 }
+// Supabase Storage. The bucket is made on the first upload so setting the two env vars is all it takes; a bucket that
+// already exists is used as it is, and a private one is reported rather than quietly opened — platforms fetch media by
+// URL, so a private bucket means every post is published without its picture.
+const supaUrl = () => String(ENV.SUPABASE_URL || "").replace(/\/+$/, "");
+const supaBucket = () => ENV.SUPABASE_BUCKET || "media";
+const supaAuth = () => ({ Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, apikey: ENV.SUPABASE_SERVICE_ROLE_KEY });
+let supabaseBucketChecked = false;
+async function ensureSupabaseBucket() {
+  if (supabaseBucketChecked) return;
+  const bucket = supaBucket(), headers = { ...supaAuth(), "Content-Type": "application/json" };
+  let existing = null;
+  try { existing = await fetchJson(`${supaUrl()}/storage/v1/bucket/${bucket}`, { headers }); }
+  catch (e) { if (e.status !== 404) throw e; }
+  if (!existing) {
+    await fetchJson(`${supaUrl()}/storage/v1/bucket`, { method: "POST", headers, body: JSON.stringify({ id: bucket, name: bucket, public: true }) })
+      .catch((e) => { if (!/already exists|Duplicate/i.test(typeof e.body === "string" ? e.body : JSON.stringify(e.body || e.message))) throw e; });
+    log(`supabase storage: created public bucket "${bucket}"`);
+  } else if (existing.public === false) {
+    warn(`supabase bucket "${bucket}" is private — media URLs will not open`);
+    await notify("storage", `The Supabase bucket "${bucket}" is private`, "Facebook, Instagram and YouTube fetch media by URL, so posts will go out without their picture or video. Make the bucket public: Supabase → Storage → the bucket → Settings → Public.", { level: "error", key: "storage:private-bucket", cooldownHours: 24 }).catch(() => {});
+  }
+  supabaseBucketChecked = true;
+}
 const STORAGE = {
   r2: {
     // Not "available" without public_url: platforms fetch files by URL, so a bucket with no public address is useless
@@ -339,9 +362,9 @@ const STORAGE = {
   },
   supabase: {
     name: "supabase", available: async () => !!(ENV.SUPABASE_URL && ENV.SUPABASE_SERVICE_ROLE_KEY),
-    publicBase: async () => `${ENV.SUPABASE_URL}/storage/v1/object/public/${ENV.SUPABASE_BUCKET || "media"}`,
-    put: async (path, bytes, ct) => { const bucket = ENV.SUPABASE_BUCKET || "media"; await fetchJson(`${ENV.SUPABASE_URL}/storage/v1/object/${bucket}/${path}`, { method: "POST", body: bytes, headers: { Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, "Content-Type": ct, "x-upsert": "true" } }); return `${await STORAGE.supabase.publicBase()}/${path}`; },
-    del: async (path) => { await fetchJson(`${ENV.SUPABASE_URL}/storage/v1/object/${ENV.SUPABASE_BUCKET || "media"}`, { method: "DELETE", headers: { Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: [path] }) }).catch((e) => { if (e.status !== 404) throw e; }); },
+    publicBase: async () => `${supaUrl()}/storage/v1/object/public/${supaBucket()}`,
+    put: async (path, bytes, ct) => { await ensureSupabaseBucket(); await fetchJson(`${supaUrl()}/storage/v1/object/${supaBucket()}/${path}`, { method: "POST", body: bytes, headers: { ...supaAuth(), "Content-Type": ct, "x-upsert": "true" } }); return `${await STORAGE.supabase.publicBase()}/${path}`; },
+    del: async (path) => { await fetchJson(`${supaUrl()}/storage/v1/object/${supaBucket()}`, { method: "DELETE", headers: { ...supaAuth(), "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: [path] }) }).catch((e) => { if (e.status !== 404) throw e; }); },
   },
   local: {
     name: "local", available: async () => true,
@@ -3121,5 +3144,11 @@ app.post("/api/seed", async (ctx) => {
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
   await recoverAbandonedWork();
   if (!ENV.DASHBOARD_PASSWORD) warn("DASHBOARD_PASSWORD is not set — the dashboard and API are OPEN. Fine locally, never on Render.");
-  server.listen(PORT, async () => { log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, lanes: ${LANES.join(",") || "none"}, sweeps: ${RUN_SWEEPS}, storage: ${(await storageBackend()).name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`); startWorkers(); });
+  server.listen(PORT, async () => {
+    const storage = await storageBackend();
+    log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, lanes: ${LANES.join(",") || "none"}, sweeps: ${RUN_SWEEPS}, storage: ${storage.name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`);
+    // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
+    if (storage.name === "supabase") ensureSupabaseBucket().catch((e) => warn("supabase storage:", e.message.slice(0, 200)));
+    startWorkers();
+  });
 })().catch((e) => { console.error("boot failed:", e); process.exit(1); });
