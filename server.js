@@ -1484,10 +1484,18 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
     const r = await fetchJson(loc, { method: "PUT", headers: { "Content-Type": "video/mp4", "Content-Length": String(bytes.length) }, body: bytes });
     // Custom thumbnails need a verified channel; a refusal is logged, never fatal to the upload.
     if (thumbnailUrl && !isShort) { try { const t = await toTmpFile(thumbnailUrl, "jpg"); const tb = await readFile(t); await cleanup(t); await fetchJson(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${r.id}&uploadType=media`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "image/jpeg", "Content-Length": String(tb.length) }, body: tb }); } catch (e) { warn(`YouTube thumbnail for ${r.id}: ${e.message.slice(0, 200)}`); } }
-    return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts" : "watch?v="}${r.id}` };
+    return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts/" : "watch?v="}${r.id}` };
   },
-  async metrics({ asset }) {
-    return withKey("youtube", async (key) => { const r = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?${form({ part: "statistics", id: asset.external_id, key })}`); const s = r.items?.[0]?.statistics || {}; return { views: Number(s.viewCount || 0), likes: Number(s.likeCount || 0), comments: Number(s.commentCount || 0), units: 1 }; }, ctx.pin);
+  async metrics({ channel, asset }) {
+    const read = async (params, opts = {}) => {
+      const r = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?${form({ part: "statistics", id: asset.external_id, ...params })}`, opts);
+      const s = r.items?.[0]?.statistics || {};
+      return { views: Number(s.viewCount || 0), likes: Number(s.likeCount || 0), comments: Number(s.commentCount || 0), units: 1 };
+    };
+    // A data-API key if there is one; otherwise the channel's own OAuth token, which reads its videos' statistics too —
+    // uploading should not also require a second key just to count views.
+    if ((await credentialsFor("youtube", ctx.pin)).length) return withKey("youtube", (key) => read({ key }), ctx.pin);
+    return read({}, { headers: { Authorization: `Bearer ${await youtubeAccessToken(channel, cfg)}` } });
   } }) });
 
 // === 7. dedup / router / scheduler / review helpers ===================
@@ -2215,7 +2223,7 @@ async function pollMetrics(assetId) {
   const publisher = await resolve("PUBLISH", channel.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[channel.platform] || "publish_mock");
   if (!publisher.metrics) return;
   const m = await publisher.metrics({ channel, asset });
-  await q(`INSERT INTO performance_metrics (id, asset_id, views, likes, comments) VALUES ($1,$2,$3,$4,$5)`, [newId(), assetId, m.views || 0, m.likes || 0, m.comments || 0]);
+  await q(`INSERT INTO performance_metrics (id, asset_id, views, likes, comments, shares) VALUES ($1,$2,$3,$4,$5,$6)`, [newId(), assetId, m.views || 0, m.likes || 0, m.comments || 0, m.shares || 0]);
   await q(`UPDATE content_assets SET last_metrics=$2::jsonb WHERE id=$1`, [assetId, JSON.stringify({ ...m, at: nowIso() })]);
   await checkAndRepurpose(assetId);
 }
