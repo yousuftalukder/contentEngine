@@ -19,3 +19,22 @@ jobs:
       - run: npm ci
       - run: node --check server.js
       - run: npm test
+
+  # The exact image Render builds: headless Chrome, its libraries, fonts, the studio bundle — proven by rendering in it.
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the production image
+        run: docker build -t content-engine:ci .
+      - name: Render a news reel and an explainer frame inside the image
+        run: |
+          docker run --rm content-engine:ci sh -c 'cd studio && echo "{}" > /tmp/p.json \
+            && node render.mjs /tmp/p.json /tmp/reel.mp4 NewsReel video \
+            && node render.mjs /tmp/p.json /tmp/explainer.png Explainer still \
+            && ffprobe -v error -show_entries stream=codec_name,width,height -of csv=p=0 /tmp/reel.mp4 && ls -la /tmp/explainer.png'
+      - name: Bangla photocard text with complex shaping inside the image
+        run: |
+          docker run --rm content-engine:ci sh -c 'printf "[Script Info]\nScriptType: v4.00+\nPlayResX: 800\nPlayResY: 200\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: H,Noto Sans Bengali,48,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,20,20,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:05.00,H,,0,0,0,,সিলেটে বন্যা পরিস্থিতির অবনতি\n" > /tmp/t.ass \
+            && ffmpeg -hide_banner -loglevel error -y -f lavfi -i color=c=0x0b3d91:s=800x200:d=1 -vf "ass=filename=/tmp/t.ass:shaping=complex" -frames:v 1 /tmp/t.png && ls -la /tmp/t.png && fc-list | grep -c "Noto Sans Bengali"'
