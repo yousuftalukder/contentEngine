@@ -165,6 +165,30 @@ CREATE TABLE IF NOT EXISTS source_items (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_source_items_status ON source_items(status, created_at);
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS weight      REAL NOT NULL DEFAULT 1;   -- outlet importance in news-desk ranking
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS language    TEXT;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS catalog_key TEXT;                      -- set when created from the built-in catalog
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_catalog_key ON sources(catalog_key) WHERE catalog_key IS NOT NULL;
+
+-- NEWS DESK: one row per real-world story, grouping every outlet that reports it (server.js section 7c).
+CREATE TABLE IF NOT EXISTS story_clusters (
+  id            TEXT PRIMARY KEY,
+  title         TEXT NOT NULL,
+  embedding     TEXT,                                -- running mean of members' trimmed embeddings (JSON array)
+  outlets       JSONB NOT NULL DEFAULT '[]'::jsonb,  -- [{name, weight}]
+  weight_sum    REAL NOT NULL DEFAULT 0,
+  item_count    INTEGER NOT NULL DEFAULT 0,
+  source_count  INTEGER NOT NULL DEFAULT 0,
+  published_at  TIMESTAMPTZ,                         -- earliest publication time among members
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_story_clusters_seen ON story_clusters(last_seen_at DESC);
+ALTER TABLE source_items ADD COLUMN IF NOT EXISTS cluster_id TEXT;
+ALTER TABLE source_items ADD COLUMN IF NOT EXISTS embedding  TEXT;
+CREATE INDEX IF NOT EXISTS idx_source_items_cluster ON source_items(cluster_id);
 
 -- ---------------------------------------------------------------------
 -- STATE / HISTORY LAYER
@@ -203,6 +227,8 @@ ALTER TABLE content_items ADD COLUMN IF NOT EXISTS auto_approved       INTEGER N
 ALTER TABLE content_items ADD COLUMN IF NOT EXISTS review_deadline_at  TIMESTAMPTZ;
 ALTER TABLE content_items ADD COLUMN IF NOT EXISTS scheduled_for       TIMESTAMPTZ;
 ALTER TABLE content_items ADD COLUMN IF NOT EXISTS generation_cost_usd REAL NOT NULL DEFAULT 0;
+ALTER TABLE content_items ADD COLUMN IF NOT EXISTS cluster_id          TEXT;   -- news-desk story this item covers
+CREATE INDEX IF NOT EXISTS idx_content_items_cluster ON content_items(cluster_id, niche_id);
 CREATE INDEX IF NOT EXISTS idx_content_items_niche_series_status ON content_items(niche_id, series_id, status);
 CREATE INDEX IF NOT EXISTS idx_content_items_status ON content_items(status, created_at);
 
@@ -434,7 +460,7 @@ DECLARE t TEXT;
 BEGIN
   FOR t IN SELECT unnest(ARRAY['brands','niches','channels','series','style_profiles','sources',
                                'content_items','content_assets','portal_articles','video_candidates',
-                               'jobs','api_credentials','settings','adapter_configs']) LOOP
+                               'jobs','api_credentials','settings','adapter_configs','story_clusters']) LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_' || t || '_updated_at') THEN
       EXECUTE format('CREATE TRIGGER trg_%I_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()', t, t);
     END IF;
@@ -492,6 +518,9 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'newsapi',          'INGEST',     'newsapi',          'NewsAPI (dev-only tier)',        '{}'),
   (gen_random_uuid()::text, 'youtube_api',      'INGEST',     'youtube_api',      'YouTube Data API search',        '{}'),
   (gen_random_uuid()::text, 'ytdlp_list',       'INGEST',     'ytdlp_list',       'yt-dlp listing (YouTube/Twitch/FB/any)', '{}'),
+  (gen_random_uuid()::text, 'google_news',      'INGEST',     'google_news',      'Google News search / edition (no key)', '{}'),
+  (gen_random_uuid()::text, 'youtube_rss',      'INGEST',     'youtube_rss',      'YouTube channel feed (no key)',  '{}'),
+  (gen_random_uuid()::text, 'sitemap',          'INGEST',     'sitemap',          'News sitemap',                   '{}'),
   (gen_random_uuid()::text, 'ytdlp',            'DOWNLOAD',   'ytdlp',            'yt-dlp downloader',              '{}'),
   (gen_random_uuid()::text, 'download_mock',    'DOWNLOAD',   'download_mock',    'Mock downloader',                '{}'),
   (gen_random_uuid()::text, 'transcribe_mock',  'TRANSCRIBE', 'transcribe_mock',  'Mock transcript',                '{}'),
@@ -510,6 +539,7 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'gemini_image',     'IMAGE',      'gemini_image',     'Gemini image generation',        '{}'),
   (gen_random_uuid()::text, 'tts_mock',         'VOICE',      'tts_mock',         'Mock TTS (silent audio)',        '{}'),
   (gen_random_uuid()::text, 'elevenlabs',       'VOICE',      'elevenlabs',       'ElevenLabs TTS',                 '{}'),
+  (gen_random_uuid()::text, 'gemini_tts',       'VOICE',      'gemini_tts',       'Gemini TTS (Bangla + English)',  '{}'),
   (gen_random_uuid()::text, 'render_mock',      'RENDER',     'render_mock',      'Mock renderer',                  '{}'),
   (gen_random_uuid()::text, 'ffmpeg',           'RENDER',     'ffmpeg',           'ffmpeg renderer',                '{}'),
   (gen_random_uuid()::text, 'publish_mock',     'PUBLISH',    'publish_mock',     'Mock publisher',                 '{}'),

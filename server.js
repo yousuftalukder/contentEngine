@@ -42,6 +42,8 @@ const DEFAULTS = {
   // Tried in order when the main model is overloaded (503) or unknown (404). Comma-separated; "" disables.
   GEMINI_FALLBACK_MODELS: (ENV.GEMINI_FALLBACK_MODELS ?? "gemini-flash-lite-latest").split(",").map((s) => s.trim()).filter(Boolean),
   GEMINI_IMAGE_MODEL: ENV.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image",
+  GEMINI_TTS_MODELS: (ENV.GEMINI_TTS_MODELS ?? "gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts").split(",").map((s) => s.trim()).filter(Boolean),
+  GEMINI_TTS_VOICE: ENV.GEMINI_TTS_VOICE || "Kore",
   GEMINI_EMBED_MODEL: ENV.GEMINI_EMBED_MODEL || "gemini-embedding-001",
   ELEVENLABS_MODEL: ENV.ELEVENLABS_MODEL || "eleven_multilingual_v2",
   ELEVENLABS_VOICE: ENV.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM",
@@ -558,12 +560,71 @@ function parseFeed(xml) {
   return items;
 }
 impl("INGEST", "ingest_mock", { label: "Mock feed", create: () => ({
-  async fetchItems(source) { const n = Date.now(); return [0, 1].map((i) => ({ external_id: `mock-${n}-${i}`, url: `https://example.com/story/${n}-${i}`, title: `Mock story ${n % 1000}-${i} from ${source.name}`, summary: "A deterministic mock story used to exercise the pipeline without any keys.", published_at: nowIso(), kind: "ARTICLE" })); } }) });
+  async fetchItems(source) {
+    // config.items = [{title, url, summary?}] makes the feed return exactly those (tests); otherwise two fresh mock stories.
+    const fixed = P(source.config)?.items; if (Array.isArray(fixed)) return fixed.map((x) => ({ external_id: x.url, summary: "", published_at: nowIso(), kind: "ARTICLE", ...x }));
+    const n = Date.now(); return [0, 1].map((i) => ({ external_id: `mock-${n}-${i}`, url: `https://example.com/story/${n}-${i}`, title: `Mock story ${n % 1000}-${i} from ${source.name}`, summary: "A deterministic mock story used to exercise the pipeline without any keys.", published_at: nowIso(), kind: "ARTICLE" })); } }) });
+// Several Bangladeshi outlets answer 403 to non-browser user agents; feeds are public, so a browser UA is used.
+const FEED_UA = ENV.FEED_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36";
+async function fetchFeed(url) {
+  const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(25000), headers: { "user-agent": FEED_UA, accept: "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8" } });
+  if (!res.ok) throw new ApiError(res.status, null, `Feed ${url.split("?")[0]} -> ${res.status}`);
+  return res.text();
+}
 impl("INGEST", "rss", { label: "RSS / Atom", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 30 } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
     const url = cfg.url || P(source.config)?.url; if (!url) throw new Error("RSS source needs config.url");
-    const res = await fetch(url, { headers: { "user-agent": "ContentEngine/1.0 (+rss)" } }); if (!res.ok) throw new Error(`Feed ${url} -> ${res.status}`);
-    return parseFeed(await res.text()).slice(0, cfg.limit || P(source.config)?.limit || 30);
+    return parseFeed(await fetchFeed(url)).slice(0, cfg.limit || P(source.config)?.limit || 30);
+  } }) });
+// Google News needs no key and reaches outlets whose own feeds are blocked (Cloudflare) or missing: a search ("query"
+// and/or "site") or an edition's top stories. Titles arrive as "Headline - Outlet"; the outlet is split off. Links are
+// Google redirect URLs, so the article text usually comes from other outlets in the same story cluster (news desk).
+const GN_NOISE = /e-?paper|ইপেপার|আর্কাইভ|\barchive\b|video gallery|photo gallery|today'?s'? paper|todays'? paper|^[\s\-–|]*$/i;
+function googleNewsUrl(c) {
+  const bn = /^bn/i.test(c.language || c.hl || ""); const gl = c.gl || "BD";
+  const hl = c.hl || (bn ? "bn" : "en-BD"), ceid = c.ceid || `${gl}:${bn ? "bn" : "en"}`;
+  if (!c.query && !c.site) return `https://news.google.com/rss?${form({ hl, gl, ceid })}`;
+  const q = [c.query, c.site ? `site:${c.site}` : null, c.when === "" ? null : `when:${c.when || "1d"}`].filter(Boolean).join(" ");
+  return `https://news.google.com/rss/search?${form({ q, hl, gl, ceid })}`;
+}
+impl("INGEST", "google_news", { label: "Google News (search / edition, no key)", configSchema: { query: { type: "string" }, site: { type: "string" }, language: { type: "string", default: "en" }, when: { type: "string", default: "1d" }, limit: { type: "number", default: 40 } }, create: (cfg) => ({
+  async fetchItems(source) {
+    const c = { ...cfg, ...(P(source.config) || {}) }; const out = [];
+    for (const m of (await fetchFeed(googleNewsUrl(c))).matchAll(/<item\b[\s\S]*?<\/item>/gi)) {
+      const [it] = parseFeed(m[0]); if (!it) continue;
+      const outlet = decodeXml((m[0].match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [])[1] || "").trim();
+      const title = outlet && it.title.endsWith(` - ${outlet}`) ? it.title.slice(0, -(outlet.length + 3)).trim() : it.title;
+      if (!title || GN_NOISE.test(title)) continue;
+      out.push({ ...it, title, summary: "", raw: { outlet, via: "google_news" } });
+    }
+    return out.slice(0, c.limit || 40);
+  } }) });
+// A YouTube channel's public feed (latest 15 uploads, no key). Duration is unknown until download; views are included.
+impl("INGEST", "youtube_rss", { label: "YouTube channel feed (no key)", configSchema: { channel_id: { type: "string", required: true }, limit: { type: "number", default: 15 } }, create: (cfg) => ({
+  async fetchItems(source) {
+    const c = { ...cfg, ...(P(source.config) || {}) }; if (!c.channel_id) throw new Error("youtube_rss source needs config.channel_id (UC…)");
+    const xml = await fetchFeed(`https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(c.channel_id)}`);
+    const channel = decodeXml((xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/) || [])[1] || "").trim();
+    const tag = (b, t) => decodeXml((b.match(new RegExp(`<${t}(?:\\s[^>]*)?>([\\s\\S]*?)</${t}>`)) || [])[1] || "").trim();
+    return [...xml.matchAll(/<entry>[\s\S]*?<\/entry>/g)].map(({ 0: b }) => {
+      const id = tag(b, "yt:videoId"); if (!id) return null; const published = tag(b, "published");
+      return { external_id: id, url: `https://www.youtube.com/watch?v=${id}`, title: tag(b, "title"), summary: tag(b, "media:description").slice(0, 2000), kind: "VIDEO", platform: "YOUTUBE", license: "STANDARD",
+        published_at: published && !isNaN(Date.parse(published)) ? new Date(published).toISOString() : null, thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+        views: Number((b.match(/<media:statistics views="(\d+)"/) || [])[1] || 0), raw: { channel } };
+    }).filter((x) => x && x.title).slice(0, c.limit || 15);
+  } }) });
+// Google News sitemaps (<news:title>, <news:publication_date>) for outlets without a usable RSS feed. {yyyy} {mm} {dd}
+// in the URL are replaced with today's date (UTC) for sitemaps split by day.
+impl("INGEST", "sitemap", { label: "News sitemap", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 40 } }, create: (cfg) => ({
+  async fetchItems(source) {
+    const c = { ...cfg, ...(P(source.config) || {}) }; if (!c.url) throw new Error("sitemap source needs config.url");
+    const d = new Date().toISOString(); const url = c.url.replace("{yyyy}", d.slice(0, 4)).replace("{mm}", d.slice(5, 7)).replace("{dd}", d.slice(8, 10));
+    const tag = (b, t) => decodeXml(((b.match(new RegExp(`<${t}(?:\\s[^>]*)?>([\\s\\S]*?)</${t}>`, "i")) || [])[1] || "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")).trim();
+    const items = [...(await fetchFeed(url)).matchAll(/<url>[\s\S]*?<\/url>/gi)].map(({ 0: b }) => {
+      const loc = tag(b, "loc"), title = stripHtml(tag(b, "news:title")), date = tag(b, "news:publication_date") || tag(b, "lastmod");
+      return loc && title ? { external_id: loc, url: loc, title, summary: "", kind: "ARTICLE", thumbnail: tag(b, "image:loc") || null, published_at: date && !isNaN(Date.parse(date)) ? new Date(date).toISOString() : null } : null;
+    }).filter(Boolean);
+    return items.sort((a, b) => Date.parse(b.published_at || 0) - Date.parse(a.published_at || 0)).slice(0, c.limit || 40);
   } }) });
 impl("INGEST", "newsapi", { label: "NewsAPI", configSchema: { country: { type: "string" }, category: { type: "string" }, query: { type: "string" }, language: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
@@ -812,13 +873,54 @@ impl("VOICE", "openai_tts", { label: "OpenAI TTS", configSchema: { voice: { type
     }, ctx.pin);
   } }) });
 
+// Gemini native TTS: uses the Gemini key the rest of the pipeline already has and speaks Bangla (bn-BD) as well as English.
+// Returns raw 24 kHz PCM, converted to MP3 here. Long scripts are split at sentence ends and joined.
+impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSchema: { voice: { type: "string", default: DEFAULTS.GEMINI_TTS_VOICE }, model: { type: "string", default: DEFAULTS.GEMINI_TTS_MODELS[0] }, style: { type: "string" } }, create: (cfg, ctx = {}) => ({
+  async synthesize({ script, voiceId, contentItemId }) {
+    const voice = voiceId || cfg.voice || DEFAULTS.GEMINI_TTS_VOICE;
+    const models = [cfg.model, ...DEFAULTS.GEMINI_TTS_MODELS];
+    const parts = []; let cur = "";
+    for (const s of String(script).split(/(?<=[.!?।])\s+/)) { if ((cur + " " + s).length > 2800 && cur) { parts.push(cur.trim()); cur = s; } else cur += " " + s; } if (cur.trim()) parts.push(cur.trim());
+    return withKey("gemini", async (key) => {
+      const files = [];
+      try {
+        for (const p of parts) {
+          const text = cfg.style ? `${cfg.style}: ${p}` : p;
+          const body = await withModelFallback(models, (m) => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+            body: JSON.stringify({ contents: [{ parts: [{ text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }) }));
+          const d = (body.candidates?.[0]?.content?.parts || []).find((x) => x.inlineData || x.inline_data); if (!d) throw new Error("Gemini TTS returned no audio");
+          const inl = d.inlineData || d.inline_data; const rate = Number((/rate=(\d+)/.exec(inl.mimeType || inl.mime_type || "") || [])[1]) || 24000;
+          const pcm = tmpPath("pcm"), mp3 = tmpPath("mp3"); await writeFile(pcm, Buffer.from(inl.data, "base64"));
+          await exec("ffmpeg", ["-y", "-f", "s16le", "-ar", String(rate), "-ac", "1", "-i", pcm, "-b:a", "128k", mp3]); await cleanup(pcm); files.push(mp3);
+        }
+        let f = files[0];
+        if (files.length > 1) { const list = tmpPath("txt"); await writeFile(list, files.map((x) => `file '${x.replace(/\\/g, "/")}'`).join("\n")); f = tmpPath("mp3"); await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", f]); await cleanup(list); }
+        const dur = await ffprobeDuration(f);
+        const url = await storeLocal(f, `audio/${newId()}.mp3`, "audio/mpeg"); await cleanup(f);
+        const media = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur || script.length / 15, meta: { voice, provider: "gemini", chars: script.length } });
+        return { ...media, units: 1, cost: (dur || 0) * 25 * 10 / 1e6 };
+      } finally { await cleanup(...files); }
+    }, ctx.pin);
+  } }) });
+
 // ---- 6i. Embeddings (stage EMBED). embed(text) -> number[] | null
-impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { return null; } }) });
+// embedMany(texts, {dimensions, task}) -> (number[] | null)[] — batched for the news desk, which embeds every new headline.
+impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { return null; }, async embedMany(texts) { return texts.map(() => null); } }) });
 impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg, ctx = {}) => ({
   async embed(text) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL;
     const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
     return r.v;
+  },
+  async embedMany(texts, { dimensions = 256, task = "CLUSTERING" } = {}) {
+    const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL; const out = [];
+    for (let i = 0; i < texts.length; i += 100) {
+      const chunk = texts.slice(i, i + 100);
+      const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({ requests: chunk.map((t) => ({ model: `models/${model}`, content: { parts: [{ text: String(t).slice(0, 2000) }] }, taskType: task, outputDimensionality: dimensions })) }) })); return { v: (b.embeddings || []).map((e) => e.values || null), units: 1, cost: 0 }; }, ctx.pin);
+      out.push(...chunk.map((_, j) => r.v[j] || null));
+    }
+    return out;
   } }) });
 
 // ---- 6j. Render (stage RENDER). ffmpeg helpers + renderForChannel({item, media, channel, niche}) -> {url, kind}
@@ -986,7 +1088,8 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
   } }) });
 
 // === 7. dedup / router / scheduler / review helpers ===================
-const tokenize = (t) => new Set(String(t).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2));
+// \p{M} keeps combining marks: Bangla vowel signs (া ি ে …) are marks, and stripping them shredded every Bangla word.
+const tokenize = (t) => new Set(String(t).toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2));
 function jaccard(a, b) { const A = tokenize(a), B = tokenize(b); if (!A.size || !B.size) return 0; let n = 0; for (const t of A) if (B.has(t)) n++; return n / (A.size + B.size - n); }
 function cosine(a, b) { let d = 0, x = 0, y = 0; for (let i = 0; i < Math.min(a.length, b.length); i++) { d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i]; } return x && y ? d / Math.sqrt(x * y) : 0; }
 async function checkDuplicate(text, niche, seriesId = null, excludeId = null) {
@@ -1053,6 +1156,150 @@ async function routeSourceItem(item) {
   }
   await q(`UPDATE source_items SET status = $2 WHERE id = $1`, [item.id, routed ? "ROUTED" : "IGNORED"]);
   return routed;
+}
+
+// ---- 7b. Source catalog. Bangladeshi sources verified live on 2026-09-19. Outlets whose own feeds are blocked or missing
+// are reached through Google News (site search). A new program with country Bangladesh gets the entries in its language
+// linked automatically (video programs get the TV channels); anything else can be added from the Sources page.
+const gn = (key, name, language, site, weight = 1) => ({ key, name, language, adapter: "google_news", config: { site, language }, weight, poll: 20 });
+const rss = (key, name, language, url, weight = 1) => ({ key, name, language, adapter: "rss", config: { url }, weight, poll: 10 });
+const ytc = (key, name, channel_id, weight = 1) => ({ key, name, language: "bn", adapter: "youtube_rss", config: { channel_id }, weight, poll: 15, kind: "VIDEO" });
+const SOURCE_CATALOG = [
+  rss("bd-en-dailystar", "The Daily Star", "en", "https://www.thedailystar.net/news/bangladesh/rss.xml", 1.2),
+  rss("bd-en-prothomalo", "Prothom Alo English", "en", "https://en.prothomalo.com/feed/", 1.1),
+  rss("bd-en-dhakatribune", "Dhaka Tribune", "en", "https://www.dhakatribune.com/feed/", 1),
+  rss("bd-en-tbs", "The Business Standard", "en", "https://www.tbsnews.net/top-news/rss.xml", 1),
+  gn("bd-en-bdnews24", "bdnews24.com", "en", "bdnews24.com", 1.1),
+  gn("bd-en-fe", "The Financial Express", "en", "thefinancialexpress.com.bd", 0.9),
+  gn("bd-en-newage", "New Age", "en", "newagebd.net", 0.9),
+  gn("bd-en-unb", "UNB", "en", "unb.com.bd", 0.8),
+  gn("bd-en-bss", "BSS (state news agency)", "en", "bssnews.net", 0.8),
+  { key: "bd-en-gnews", name: "Google News: Bangladesh", language: "en", adapter: "google_news", config: { query: "Bangladesh", language: "en" }, weight: 0.7, poll: 20 },
+  rss("bd-bn-prothomalo", "প্রথম আলো", "bn", "https://www.prothomalo.com/feed/", 1.3),
+  rss("bd-bn-bbc", "বিবিসি বাংলা", "bn", "https://feeds.bbci.co.uk/bengali/rss.xml", 1.2),
+  rss("bd-bn-banglatribune", "বাংলা ট্রিবিউন", "bn", "https://www.banglatribune.com/feed/", 1),
+  rss("bd-bn-dhakapost", "ঢাকা পোস্ট", "bn", "https://www.dhakapost.com/rss/rss.xml", 0.9),
+  rss("bd-bn-dw", "ডয়চে ভেলে বাংলা", "bn", "https://rss.dw.com/xml/rss-ben-all", 0.9),
+  rss("bd-bn-risingbd", "রাইজিংবিডি", "bn", "https://www.risingbd.com/rss/rss.xml", 0.8),
+  gn("bd-bn-bdnews24", "বিডিনিউজ টোয়েন্টিফোর", "bn", "bangla.bdnews24.com", 1.1),
+  gn("bd-bn-kalerkantho", "কালের কণ্ঠ", "bn", "kalerkantho.com", 1),
+  gn("bd-bn-samakal", "সমকাল", "bn", "samakal.com", 1),
+  gn("bd-bn-jugantor", "যুগান্তর", "bn", "jugantor.com", 1),
+  gn("bd-bn-ittefaq", "ইত্তেফাক", "bn", "ittefaq.com.bd", 1),
+  gn("bd-bn-jagonews24", "জাগো নিউজ", "bn", "jagonews24.com", 0.9),
+  gn("bd-bn-kalbela", "কালবেলা", "bn", "kalbela.com", 0.9),
+  gn("bd-bn-bdpratidin", "বাংলাদেশ প্রতিদিন", "bn", "bd-pratidin.com", 0.9),
+  { key: "bd-bn-gnews", name: "Google News: বাংলাদেশ", language: "bn", adapter: "google_news", config: { query: "বাংলাদেশ", language: "bn" }, weight: 0.7, poll: 20 },
+  ytc("bd-tv-somoy", "SOMOY TV", "UCxHoBXkY88Tb8z1Ssj6CWsQ"),
+  ytc("bd-tv-jamuna", "Jamuna TV", "UCN6sm8iHiPd0cnoUardDAnw"),
+  ytc("bd-tv-channel24", "Channel 24", "UCHLqIOMPk20w-6cFgkA90jw"),
+  ytc("bd-tv-ekattor", "Ekattor TV", "UCtqvtAVmad5zywaziN6CbfA"),
+  ytc("bd-tv-independent", "Independent Television", "UCATUkaOHwO9EP_W87zCiPbA"),
+  ytc("bd-tv-atn", "ATN News", "UC9Rgo0CrNyd7OWliLekqqGA", 0.9),
+  ytc("bd-tv-ntv", "NTV News", "UCUDQdVsKssximyFwg4IxnOQ", 0.9),
+  ytc("bd-tv-channeli", "Channel i News", "UC8NcXMG3A3f2aFQyGTpSNww", 0.9),
+  ytc("bd-tv-dbc", "DBC NEWS", "UCUvXoiDEKI8VZJrr58g4VAw", 0.8),
+  ytc("bd-tv-rtv", "Rtv News", "UC2P5Fd5g41Gtdqf0Uzh8Qaw", 0.8),
+].map((e) => ({ country: "Bangladesh", kind: "ARTICLE", ...e }));
+// Catalog entries a program should start with: same country, its language, articles or TV depending on the program type.
+function catalogFor(niche) {
+  if (!/bangladesh|^bd$/i.test(niche.country || "")) return [];
+  const video = VIDEO_TYPES.has(niche.content_type);
+  return SOURCE_CATALOG.filter((e) => (video ? e.kind === "VIDEO" : e.kind === "ARTICLE" && e.language === (niche.language || "en").slice(0, 2)));
+}
+// Creates catalog sources that don't exist yet (one shared row per catalog key) and links them to the given programs.
+async function installCatalogSources(entries, nicheIds = []) {
+  const ids = [];
+  for (const e of entries) {
+    let s = await one(`SELECT id FROM sources WHERE catalog_key = $1`, [e.key]);
+    if (!s) {
+      await q(`INSERT INTO sources (id, name, kind, adapter_key, config, poll_interval_minutes, weight, catalog_key, language) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,
+        [newId(), e.name, e.kind, e.adapter, JSON.stringify(e.config), e.poll || 15, e.weight || 1, e.key, e.language]);
+      s = await one(`SELECT id FROM sources WHERE catalog_key = $1`, [e.key]);
+    }
+    ids.push(s.id);
+    for (const n of nicheIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), n, s.id]);
+  }
+  return ids;
+}
+
+// ---- 7c. News desk. New articles are grouped into story clusters across outlets and languages (embeddings when a
+// program has an embedding adapter, word overlap otherwise). A sweep hands each program its best uncovered stories —
+// ranked by how many outlets carry them, outlet weight and freshness — and the writer then gets every outlet's version,
+// so a story is written once, from several sources, instead of once per outlet from one.
+const DESK_TYPES = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO"]);
+// Per program (method_config.desk): min_sources = outlets required; settle_minutes = wait for more outlets unless already
+// corroborated; max_age_hours = oldest publication date taken; per_sweep / min_gap_minutes = pacing.
+const deskCfg = (niche) => ({ min_sources: 1, settle_minutes: 5, max_age_hours: 12, per_sweep: 2, min_gap_minutes: 10, ...((P(niche.method_config) || {}).desk || {}) });
+const trimVec = (v, n = 256) => (Array.isArray(v) ? v.slice(0, n).map((x) => Math.round(x * 1e4) / 1e4) : null);
+async function deskEmbedder() {
+  const key = await setting("desk.embed_adapter", null) || (await one(`SELECT embed_adapter AS k, COUNT(*) AS n FROM niches WHERE is_active::int = 1 AND embed_adapter <> 'embed_mock' GROUP BY embed_adapter ORDER BY n DESC LIMIT 1`))?.k;
+  if (!key) return null;
+  try { const a = await resolve("EMBED", key); return a.embedMany ? a : null; } catch { return null; }
+}
+async function clusterItems(items, source) {
+  const threshold = Number(await setting("desk.similarity", 0.84)), overlap = Number(await setting("desk.word_overlap", 0.5));
+  let vecs = items.map(() => null);
+  const emb = await deskEmbedder();
+  if (emb) { try { vecs = await emb.embedMany(items.map((i) => `${i.title}. ${String(i.summary || "").slice(0, 300)}`)); } catch (e) { warn("desk embedding failed, clustering by word overlap:", e.message); } }
+  const open = (await q(`SELECT id, title, embedding, outlets, weight_sum, item_count, published_at FROM story_clusters WHERE last_seen_at > now() - interval '36 hours' ORDER BY last_seen_at DESC LIMIT 800`))
+    .map((c) => ({ ...c, vec: P(c.embedding), outlets: P(c.outlets) || [] }));
+  const outlet = (it) => (it.raw?.outlet || source.name);
+  for (const [i, it] of items.entries()) {
+    const v = trimVec(vecs[i]);
+    let best = null, bestScore = 0;
+    for (const c of open) {
+      const s = v && Array.isArray(c.vec) ? cosine(v, c.vec) : jaccard(it.title, c.title) * (threshold / overlap);
+      if (s > bestScore) { best = c; bestScore = s; }
+    }
+    const name = outlet(it), weight = Number(source.weight) || 1;
+    if (best && bestScore >= threshold) {
+      const known = best.outlets.some((o) => o.name === name);
+      if (!known) { best.outlets.push({ name, weight }); best.weight_sum = Number(best.weight_sum) + weight; }
+      best.item_count = Number(best.item_count) + 1;
+      if (v && Array.isArray(best.vec)) best.vec = trimVec(best.vec.map((x, k) => (x * (best.item_count - 1) + (v[k] || 0)) / best.item_count));
+      const pub = it.published_at && (!best.published_at || new Date(it.published_at) < new Date(best.published_at)) ? it.published_at : best.published_at;
+      best.published_at = pub;
+      await q(`UPDATE story_clusters SET item_count=$2, source_count=$3, outlets=$4::jsonb, weight_sum=$5, embedding=$6, published_at=$7, last_seen_at=now(), title = CASE WHEN $8 THEN $9 ELSE title END WHERE id=$1`,
+        [best.id, best.item_count, best.outlets.length, JSON.stringify(best.outlets), best.weight_sum, best.vec ? JSON.stringify(best.vec) : null, pub, !known && weight > Math.max(...best.outlets.filter((o) => o.name !== name).map((o) => o.weight)), it.title]);
+      await q(`UPDATE source_items SET cluster_id=$2, embedding=$3, status='CLUSTERED' WHERE id=$1`, [it.id, best.id, v ? JSON.stringify(v) : null]);
+    } else {
+      const c = { id: newId(), title: it.title, vec: v, outlets: [{ name, weight }], weight_sum: weight, item_count: 1, published_at: it.published_at || null };
+      await q(`INSERT INTO story_clusters (id, title, embedding, outlets, weight_sum, item_count, source_count, published_at) VALUES ($1,$2,$3,$4::jsonb,$5,1,1,$6)`, [c.id, c.title, v ? JSON.stringify(v) : null, JSON.stringify(c.outlets), weight, c.published_at]);
+      await q(`UPDATE source_items SET cluster_id=$2, embedding=$3, status='CLUSTERED' WHERE id=$1`, [it.id, c.id, v ? JSON.stringify(v) : null]);
+      open.unshift(c);
+    }
+  }
+}
+let deskTimer = null;
+const deskSoon = () => { if (!deskTimer) deskTimer = setTimeout(() => { deskTimer = null; sweepNewsDesk().catch((e) => warn("news desk", e.message)); }, 1000); };
+async function sweepNewsDesk() {
+  if (!(await setting("desk.enabled", true))) return;
+  const programs = (await q(`SELECT * FROM niches WHERE is_active::int = 1 ORDER BY priority DESC`)).filter((n) => DESK_TYPES.has(n.content_type));
+  for (const niche of programs) {
+    const cfg = deskCfg(niche);
+    if (!(await underDailyCap(niche))) continue;
+    const last = await one(`SELECT max(created_at) AS t FROM content_items WHERE niche_id = $1 AND cluster_id IS NOT NULL`, [niche.id]);
+    if (last?.t && Date.now() - new Date(last.t).getTime() < cfg.min_gap_minutes * 60000) continue;
+    const rows = await q(`SELECT c.*, LEAST(c.weight_sum, 6) * exp(-extract(epoch FROM now() - c.first_seen_at) / 64800.0) AS score FROM story_clusters c
+      WHERE COALESCE(c.published_at, c.first_seen_at) > now() - ($2 || ' hours')::interval AND c.source_count >= $3
+        AND (c.source_count >= 2 OR c.first_seen_at < now() - ($4 || ' minutes')::interval)
+        AND EXISTS (SELECT 1 FROM source_items si JOIN niche_sources ns ON ns.source_id = si.source_id WHERE si.cluster_id = c.id AND ns.niche_id = $1)
+        AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.niche_id = $1 AND ci.cluster_id = c.id)
+      ORDER BY score DESC LIMIT 40`, [niche.id, String(cfg.max_age_hours), cfg.min_sources, String(cfg.settle_minutes)]);
+    let taken = 0;
+    for (const c of rows) {
+      if (taken >= cfg.per_sweep || !(await underDailyCap(niche))) break;
+      // The lead version comes from the program's own sources, preferring its language and the heaviest outlet.
+      const rep = await one(`SELECT si.* FROM source_items si JOIN sources s ON s.id = si.source_id JOIN niche_sources ns ON ns.source_id = si.source_id AND ns.niche_id = $2
+        WHERE si.cluster_id = $1 ORDER BY COALESCE(s.language = $3, false) DESC, s.weight DESC, si.created_at ASC LIMIT 1`, [c.id, niche.id, (niche.language || "en").slice(0, 2)]);
+      if (!rep || !passesFilters({ title: c.title, summary: rep.summary, published_at: c.published_at }, niche)) continue;
+      const itemId = await createQueuedItem(niche, { sourceItemId: rep.id, clusterId: c.id, topic: rep.title, sourceDataRef: { provider: "news_desk", url: rep.url, title: rep.title, summary: rep.summary, published_at: rep.published_at, outlets: (P(c.outlets) || []).map((o) => o.name) } });
+      await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: niche.priority, contentItemId: itemId });
+      await q(`UPDATE source_items SET status = 'ROUTED' WHERE id = $1`, [rep.id]);
+      taken++;
+    }
+  }
 }
 // Posting scheduler: earliest time satisfying windows, min gap and max posts/day.
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -1132,10 +1379,10 @@ async function finishGeneration(itemId, niche) {
 }
 
 // === 8. orchestrator ===================================================
-async function createQueuedItem(niche, { sourceItemId = null, seriesId = null, topic = "", sourceDataRef = null, contentType = null, candidateId = null, clipId = null, status = "QUEUED" }) {
+async function createQueuedItem(niche, { sourceItemId = null, seriesId = null, topic = "", sourceDataRef = null, contentType = null, candidateId = null, clipId = null, clusterId = null, status = "QUEUED" }) {
   const id = newId();
-  await q(`INSERT INTO content_items (id, niche_id, series_id, source_item_id, video_candidate_id, clip_id, content_type, status, topic, source_data_ref, niche_profile_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-    [id, niche.id, seriesId, sourceItemId, candidateId, clipId, contentType || niche.content_type, status, topic, J(sourceDataRef), J({ niche, capturedAt: nowIso() })]);
+  await q(`INSERT INTO content_items (id, niche_id, series_id, source_item_id, video_candidate_id, clip_id, cluster_id, content_type, status, topic, source_data_ref, niche_profile_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [id, niche.id, seriesId, sourceItemId, candidateId, clipId, clusterId, contentType || niche.content_type, status, topic, J(sourceDataRef), J({ niche, capturedAt: nowIso() })]);
   return id;
 }
 async function setItem(id, fields) {
@@ -1165,16 +1412,43 @@ async function articleText(sourceItem) {
   const raw = P(sourceItem.raw) || {};
   if (typeof raw.article_text === "string") return raw.article_text;                       // cached (may be "" = tried, nothing usable)
   if (!(await setting("ingest.fetch_article_text", true)) || !/^https?:/.test(sourceItem.url || "")) return "";
+  if (/^https?:\/\/news\.google\.com\//.test(sourceItem.url)) return "";                   // redirect page, no article text
   let text = "";
   try {
-    const res = await fetch(sourceItem.url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "user-agent": "Mozilla/5.0 (compatible; ContentEngine/1.0; +article-fetch)", accept: "text/html,*/*" } });
+    const res = await fetch(sourceItem.url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "user-agent": FEED_UA, accept: "text/html,*/*" } });
     if (res.ok && /html/i.test(res.headers.get("content-type") || "")) text = extractArticleText((await res.text()).slice(0, 1.5e6));
   } catch (e) { warn(`article fetch ${sourceItem.url}: ${e.message.slice(0, 120)}`); }
   await q(`UPDATE source_items SET raw = COALESCE(raw, '{}'::jsonb) || $2::jsonb WHERE id = $1`, [sourceItem.id, JSON.stringify({ article_text: text })]).catch(() => {});
   return text;
 }
-// Resolve the raw material for a text item: a routed source_item, or a legacy TOPIC adapter pull.
+// A news-desk item's material: up to four outlets' versions of the story (the program's lead source first), each with
+// its article text when the outlet's page can be read.
+async function clusterMaterial(item) {
+  const rows = await q(`SELECT si.*, s.name AS source_name, s.weight FROM source_items si JOIN sources s ON s.id = si.source_id WHERE si.cluster_id = $1 ORDER BY (si.id = $2) DESC, s.weight DESC, si.created_at ASC LIMIT 16`, [item.cluster_id, item.source_item_id || ""]);
+  if (!rows.length) return null;
+  const versions = [], seen = new Set();
+  for (const r of rows) {
+    const outlet = P(r.raw)?.outlet || r.source_name; if (seen.has(outlet)) continue; seen.add(outlet);
+    versions.push({ outlet, title: r.title, summary: r.summary || "", text: r.kind === "ARTICLE" ? await articleText(r) : "", url: r.url, published_at: r.published_at });
+    if (versions.length >= 4) break;
+  }
+  const lead = versions[0];
+  return { title: lead.title, summary: lead.summary, text: lead.text, url: lead.url, published_at: lead.published_at, raw: { outlets: versions.map((v) => v.outlet) }, versions };
+}
+// The material as prompt text. Several outlets' versions are each clipped so the total stays near ARTICLE_TEXT_MAX, and
+// the writer is told how to treat agreement and conflict between them.
+function materialBlock(m) {
+  const vs = m.versions?.length ? m.versions : [{ outlet: null, title: m.title, summary: m.summary, text: m.text, url: m.url }];
+  const per = Math.max(1200, Math.floor(ARTICLE_TEXT_MAX / vs.length));
+  const body = vs.map((v, i) => `--- Source ${i + 1}${v.outlet ? `: ${v.outlet}` : ""}${v.url ? ` (${v.url})` : ""}\nHeadline: ${v.title}\n${v.summary ? `Summary: ${v.summary}\n` : ""}${v.text ? `Text:\n"""\n${v.text.slice(0, per)}\n"""\n` : "(headline and summary only)\n"}`).join("\n");
+  return `SOURCE MATERIAL — ${vs.length} source${vs.length > 1 ? "s" : ""} reporting this story\n${body}\n`
+    + (vs.length > 1 ? "Use only facts the sources state. Prefer facts several sources agree on; where they differ (numbers, names, times) use the most careful wording or say that reports differ. Never merge details from different incidents.\n" : "")
+    + (vs.some((v) => v.text) ? "" : "Only headlines/summaries are available — write ONLY what they support and keep it short rather than padding it.\n");
+}
+const richMaterial = (m) => (m.versions?.length ? m.versions.some((v) => v.text) : !!m.text);
+// Resolve the raw material for a text item: a news-desk story cluster, a routed source_item, or a legacy TOPIC adapter pull.
 async function materialFor(item, niche) {
+  if (item.cluster_id) { const m = await clusterMaterial(item); if (m) return m; }
   if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); const text = s.kind === "ARTICLE" ? await articleText(s) : ""; return { title: s.title, summary: s.summary, text, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, raw: P(s.raw) }; }
   const src = P(item.source_data_ref); if (item.topic && src && src.provider !== "topic_adapter_pending") return { title: item.topic, summary: src.description || src.summary || "", url: src.url || null, raw: src };
   const past = (await q(`SELECT topic FROM content_items WHERE niche_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 100`, [niche.id, item.id])).map((r) => r.topic);
@@ -1193,7 +1467,7 @@ async function generateStatic(item, niche, style) {
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
     system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style)}`,
-    prompt: `SOURCE MATERIAL\nTitle: ${m.title}\nSummary: ${m.summary || "(none)"}\nURL: ${m.url || "(none)"}\n${m.text ? `Full text of the source article:\n"""\n${m.text}\n"""\n` : "(Only the summary above is available — write ONLY what it supports; keep the article short rather than padding it.)\n"}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${m.text ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line source credit\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
+    prompt: `${materialBlock(m)}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${richMaterial(m) ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line credit naming the source outlet(s)\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
     mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
   await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: d.captions || {}, hashtags: Array.isArray(d.hashtags) ? d.hashtags : [], image_prompt: d.image_prompt || null });
@@ -1208,7 +1482,7 @@ async function generateLongPost(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts with sources. Never fabricate a citation.",
-    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""} ${m.url || ""}${m.text ? `\nSource article text:\n${m.text.slice(0, 3000)}` : ""}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
+    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
     mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
   await addCost(item.id, research.cost);
   const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
@@ -1229,7 +1503,7 @@ async function generateSlideshowVideo(item, niche, style) {
   const slides = mc.slides || (long ? 12 : 10);
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 2500,
     system: `You write ${long ? "researched long-form YouTube video scripts" : "punchy 60-90 second facts videos"} for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Every sentence must be spoken narration — no stage directions.`,
-    prompt: `Topic: ${m.title}\nContext: ${m.summary || ""}${m.text ? `\nSource article text:\n${m.text.slice(0, 3000)}` : ""}\nWrite a script split into exactly ${slides} sections. Return JSON: {"title": "video title", "sections": [{"narration": "spoken text for this section", "image_prompt": "what the viewer sees, no text"}], "description": "YouTube description", "hashtags": ["..."]}`,
+    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nWrite a script split into exactly ${slides} sections. Return JSON: {"title": "video title", "sections": [{"narration": "spoken text for this section", "image_prompt": "what the viewer sees, no text"}], "description": "YouTube description", "hashtags": ["..."]}`,
     mock: { title: m.title, sections: Array.from({ length: Math.min(slides, 4) }, (_, i) => ({ narration: `Mock narration section ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["facts"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = d.sections || [];
   const script = sections.map((s) => s.narration).join("\n\n");
@@ -1399,15 +1673,19 @@ const HANDLERS = {
     const source = await one(`SELECT * FROM sources WHERE id=$1`, [sourceId]); if (!source || !flag(source.is_active)) return { skipped: true };
     try {
       const ing = await resolve("INGEST", source.adapter_key || "rss"); const items = await ing.fetchItems(source); let added = 0, routed = 0;
+      const desk = await setting("desk.enabled", true), toCluster = [];
       for (const it of items) {
         const hash = sha(it.url); const id = newId();
         const ins = await q(`INSERT INTO source_items (id, source_id, external_id, url, url_hash, title, summary, published_at, thumbnail_url, kind, raw) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT (url_hash) DO NOTHING RETURNING id`,
           [id, sourceId, it.external_id || null, it.url, hash, it.title.slice(0, 500), it.summary || null, it.published_at || null, it.thumbnail || null, it.kind || "ARTICLE", JSON.stringify({ ...(it.raw || {}), duration: it.duration, views: it.views, platform: it.platform, license: it.license })]);
         if (!ins.length) continue; added++;
-        routed += await routeSourceItem({ ...it, id, source_id: sourceId });
+        // Articles go to the news desk (clustered, then picked per program); videos are routed to video programs directly.
+        if (desk && (it.kind || "ARTICLE") === "ARTICLE") toCluster.push({ ...it, id, source_id: sourceId });
+        else routed += await routeSourceItem({ ...it, id, source_id: sourceId });
       }
+      if (toCluster.length) { await clusterItems(toCluster, source); deskSoon(); }
       await q(`UPDATE sources SET last_polled_at=now(), last_error=NULL WHERE id=$1`, [sourceId]);
-      return { fetched: items.length, added, routed };
+      return { fetched: items.length, added, routed, clustered: toCluster.length };
     } catch (e) { await q(`UPDATE sources SET last_polled_at=now(), last_error=$2 WHERE id=$1`, [sourceId, String(e.message).slice(0, 800)]); throw e; }
   },
   async GENERATE_CONTENT({ itemId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return runGeneration(itemId); },
@@ -1481,12 +1759,27 @@ async function recoverAbandonedWork() {
   const r2 = await q(`UPDATE content_items ci SET status='FAILED', rejection_note='Recovered at boot: generation was interrupted (process restarted). Regenerate to retry.' WHERE status IN ('FETCHING_DATA','DRAFTING','RENDERING') AND updated_at < now() - interval '90 minutes' AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.content_item_id = ci.id AND j.status IN ('PENDING','RUNNING')) RETURNING id`);
   if (r1.length || r2.length) log(`recovered ${r1.length} jobs, failed ${r2.length} stuck items`);
 }
+// Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
+// ledger and story clusters are pruned once nothing refers to them, bulky fields (article text, embeddings) are dropped
+// after a few days, and finished jobs are cleared. Content items, media rows and metrics are never pruned.
+async function sweepRetention() {
+  const days = String(Number(await setting("retention.source_items_days", 14)) || 14);
+  const a = await q(`DELETE FROM source_items si WHERE si.created_at < now() - ($1 || ' days')::interval
+    AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.source_item_id = si.id) AND NOT EXISTS (SELECT 1 FROM video_candidates vc WHERE vc.source_item_id = si.id) RETURNING id`, [days]);
+  await q(`UPDATE source_items SET raw = raw - 'article_text', embedding = NULL WHERE created_at < now() - interval '3 days' AND (embedding IS NOT NULL OR raw ? 'article_text')`);
+  const b = await q(`DELETE FROM story_clusters c WHERE c.last_seen_at < now() - interval '7 days' AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.cluster_id = c.id) RETURNING id`);
+  await q(`UPDATE story_clusters SET embedding = NULL WHERE last_seen_at < now() - interval '3 days' AND embedding IS NOT NULL`);
+  const c = await q(`DELETE FROM jobs WHERE (status = 'SUCCEEDED' AND finished_at < now() - interval '7 days') OR (status = 'FAILED' AND finished_at < now() - interval '30 days') RETURNING id`);
+  await q(`UPDATE content_items SET topic_embedding = NULL WHERE created_at < now() - interval '60 days' AND topic_embedding IS NOT NULL`);
+  if (a.length || b.length || c.length) log(`retention: removed ${a.length} old source items, ${b.length} story clusters, ${c.length} finished jobs`);
+}
 function startWorkers() {
   if (!LANES.length) { warn("LANES is set but names no known lane — this process serves HTTP only"); return; }
   for (const qn of LANES) workerLoop(qn);
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
-  every(60000, sweepDueSources); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
+  every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
+  every(6 * 3600000, sweepRetention);
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
@@ -1620,12 +1913,30 @@ const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visu
   downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", embedAdapter: "embed_adapter" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
+// Adapters a new program starts with when the request doesn't name them: the live ones whose provider has a key (vault or
+// env), mocks otherwise — so "create a program" yields real output without visiting the Adapters page.
+async function smartAdapterDefaults() {
+  const has = async (p) => (await credentialsFor(p)).length > 0;
+  const [gem, oai, ant, el] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("elevenlabs")]);
+  const ffmpeg = await exec("ffmpeg", ["-version"], { timeoutMs: 10000 }).then(() => true).catch(() => false);
+  return {
+    scriptAdapter: gem ? "gemini_live" : oai ? "openai_live" : ant ? "anthropic_live" : "llm_mock",
+    scriptAdapterFallbacks: [gem && "gemini_live", oai && "openai_live", ant && "anthropic_live"].filter(Boolean).slice(1),
+    imageAdapter: gem ? "gemini_image" : oai ? "openai_image" : "image_mock",
+    embedAdapter: gem ? "gemini_embed" : "embed_mock",
+    voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
+    transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
+    renderAdapter: ffmpeg ? "ffmpeg" : "render_mock",
+  };
+}
 app.post("/api/niches", async (ctx) => {
-  const b = ctx.body; for (const r of ["brandId", "key", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
+  const b = { ...(ctx.body.useMocks ? {} : await smartAdapterDefaults()), ...ctx.body }; for (const r of ["brandId", "key", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
   const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter) VALUES ($1,$2,$3,$4,$5,$6)`, [id, b.brandId, b.key, b.displayName, b.tone || "", b.topicSourceAdapter || "newsapi_mock"]);
   const rest = { ...b }; delete rest.brandId; delete rest.key; delete rest.displayName; delete rest.tone; delete rest.topicSourceAdapter;
   const row = Object.keys(rest).some((k) => k in NICHE_MAP) ? await patchRow("niches", id, rest, NICHE_MAP) : await one(`SELECT * FROM niches WHERE id=$1`, [id]);
   if (Array.isArray(b.sourceIds)) for (const s of b.sourceIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, s]);
+  // A Bangladesh program with no sources picked gets the catalog's sources for its language (or the TV channels).
+  if (b.autoSources !== false && !(b.sourceIds || []).length) await installCatalogSources(catalogFor(row), [id]);
   json(ctx, 201, rowJson(row, NICHE_JSON));
 });
 app.post("/api/programs", async (ctx) => { ctx.req.url = "/api/niches"; const r = app.routes.find((x) => x.method === "POST" && x.re.test("/api/niches")); return r.handler(ctx); });
@@ -1659,6 +1970,25 @@ app.patch("/api/sources/:id", async (ctx) => json(ctx, 200, rowJson(await patchR
 app.delete("/api/sources/:id", async (ctx) => { await q(`DELETE FROM sources WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/sources/:id/poll", async (ctx) => { const jobId = await enqueue("INGEST_SOURCE", { sourceId: ctx.params.id }, { queue: "ingest", dedupeKey: `ingest:${ctx.params.id}`, priority: 10, maxAttempts: 1 }); json(ctx, 202, { jobId }); });
 app.post("/api/sources/:id/preview", async (ctx) => { const s = await one(`SELECT * FROM sources WHERE id=$1`, [ctx.params.id]); if (!s) throw new ApiError(404, null, "Source not found"); const ing = await resolve("INGEST", s.adapter_key); json(ctx, 200, (await ing.fetchItems(s)).slice(0, 10)); });
+// ---- source catalog + news desk
+app.get("/api/source-catalog", async (ctx) => {
+  const rows = await q(`SELECT s.catalog_key, s.id, s.is_active, s.last_polled_at, s.last_error, (SELECT json_agg(n.display_name) FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id WHERE ns.source_id = s.id) AS programs FROM sources s WHERE s.catalog_key IS NOT NULL`);
+  const by = Object.fromEntries(rows.map((r) => [r.catalog_key, r]));
+  json(ctx, 200, SOURCE_CATALOG.map((e) => ({ ...e, installed: !!by[e.key], sourceId: by[e.key]?.id || null, programs: by[e.key]?.programs || [], lastPolledAt: by[e.key]?.last_polled_at || null, lastError: by[e.key]?.last_error || null })));
+});
+app.post("/api/source-catalog/install", async (ctx) => {
+  const keys = new Set(ctx.body.keys || []); const entries = SOURCE_CATALOG.filter((e) => keys.has(e.key));
+  if (!entries.length) throw new ApiError(400, null, "keys must name catalog entries");
+  json(ctx, 200, { sourceIds: await installCatalogSources(entries, ctx.body.nicheIds || []) });
+});
+app.get("/api/desk", async (ctx) => {
+  const hours = String(Math.min(72, Number(ctx.query.get("hours")) || 24));
+  json(ctx, 200, await q(`SELECT c.id, c.title, c.outlets, c.source_count, c.item_count, c.published_at, c.first_seen_at, c.last_seen_at,
+      LEAST(c.weight_sum, 6) * exp(-extract(epoch FROM now() - c.first_seen_at) / 64800.0) AS score,
+      (SELECT json_agg(json_build_object('program', n.display_name, 'itemId', ci.id, 'status', ci.status)) FROM content_items ci JOIN niches n ON n.id = ci.niche_id WHERE ci.cluster_id = c.id) AS coverage
+    FROM story_clusters c WHERE c.last_seen_at > now() - ($1 || ' hours')::interval ORDER BY score DESC LIMIT 150`, [hours]));
+});
+app.post("/api/desk/run", async (ctx) => { await sweepNewsDesk(); json(ctx, 200, { ok: true }); });
 app.get("/api/source-items", async (ctx) => { const s = ctx.query.get("sourceId"), st = ctx.query.get("status"); json(ctx, 200, await q(`SELECT si.*, s.name AS source_name FROM source_items si JOIN sources s ON s.id=si.source_id WHERE ($1::text IS NULL OR si.source_id=$1) AND ($2::text IS NULL OR si.status=$2) ORDER BY si.created_at DESC LIMIT 200`, [s, st])); });
 app.post("/api/source-items/:id/route", async (ctx) => { const it = await one(`SELECT * FROM source_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); const raw = P(it.raw) || {}; const n = await routeSourceItem({ ...it, thumbnail: it.thumbnail_url, duration: raw.duration, views: raw.views, platform: raw.platform, license: raw.license }); json(ctx, 200, { routed: n }); });
 // ---- video candidates & clips
@@ -1709,7 +2039,8 @@ app.post("/api/jobs/:id/retry", async (ctx) => { await q(`UPDATE jobs SET status
 // ---- seed (safe to call repeatedly)
 app.post("/api/seed", async (ctx) => {
   let brand = await one(`SELECT * FROM brands WHERE name=$1`, ["Demo Media Co"]); if (!brand) { const id = newId(); await q(`INSERT INTO brands (id, name, description) VALUES ($1,$2,$3)`, [id, "Demo Media Co", "Starter brand"]); brand = await one(`SELECT * FROM brands WHERE id=$1`, [id]); }
-  let niche = await one(`SELECT * FROM niches WHERE brand_id=$1 AND key=$2`, [brand.id, "bd_news"]); if (!niche) { const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter, content_type, country, language, publish_to_portal, approval_mode) VALUES ($1,$2,'bd_news','Bangladesh News','clear, factual, click-worthy','newsapi_mock','NEWS_STATIC','Bangladesh','en',1,'MANUAL')`, [id, brand.id]); niche = await one(`SELECT * FROM niches WHERE id=$1`, [id]); }
+  let niche = await one(`SELECT * FROM niches WHERE brand_id=$1 AND key=$2`, [brand.id, "bd_news"]); if (!niche) { const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter, content_type, country, language, publish_to_portal, approval_mode) VALUES ($1,$2,'bd_news','Bangladesh News','clear, factual, click-worthy','newsapi_mock','NEWS_STATIC','Bangladesh','en',1,'MANUAL')`, [id, brand.id]);
+    await q(`UPDATE niches SET method_config = '{"desk": {"settle_minutes": 0, "min_gap_minutes": 0}}'::jsonb WHERE id = $1`, [id]); niche = await one(`SELECT * FROM niches WHERE id=$1`, [id]); }
   let source = await one(`SELECT * FROM sources WHERE name=$1`, ["Mock BD feed"]); if (!source) { const id = newId(); await q(`INSERT INTO sources (id, brand_id, name, kind, adapter_key, config, poll_interval_minutes) VALUES ($1,$2,'Mock BD feed','MOCK','ingest_mock','{}',60)`, [id, brand.id]); source = await one(`SELECT * FROM sources WHERE id=$1`, [id]); }
   await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), niche.id, source.id]);
   let ch = await one(`SELECT * FROM channels WHERE brand_id=$1 AND key=$2`, [brand.id, "fb_main"]); if (!ch) { const id = newId(); await q(`INSERT INTO channels (id, brand_id, key, display_name, platform, format, publisher_adapter, max_posts_per_day, min_gap_minutes) VALUES ($1,$2,'fb_main','Main Facebook Page','FACEBOOK','STATIC_IMAGE_CAPTION','publish_mock',12,30)`, [id, brand.id]); ch = await one(`SELECT * FROM channels WHERE id=$1`, [id]); }
