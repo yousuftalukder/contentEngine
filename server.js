@@ -18,6 +18,8 @@
 import http from "node:http";
 import { readFile, writeFile, mkdir, unlink, rm } from "node:fs/promises";
 import { existsSync, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { dirname, join, extname } from "node:path";
@@ -683,6 +685,19 @@ impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "st
     return { path, duration: await ffprobeDuration(path) };
   } }) });
 
+// A direct file: an http(s) link to a video (your uploads, a CDN, a partner's link) streamed to disk, or a local path.
+impl("DOWNLOAD", "direct", { label: "Direct link / uploaded file", create: () => ({
+  async download(url) {
+    await mkdir(TMP, { recursive: true });
+    const out = join(TMP, `${randomUUID()}${extname(String(url).split("?")[0]) || ".mp4"}`);
+    if (/^https?:/.test(url)) {
+      const res = await fetch(url, { redirect: "follow" }); if (!res.ok || !res.body) throw new ApiError(res.status, null, `download ${url.split("?")[0]} -> ${res.status}`);
+      await pipeline(Readable.fromWeb(res.body), createWriteStream(out));
+    } else if (existsSync(url)) await writeFile(out, await readFile(url));
+    else throw new Error(`Not a URL or an existing file: ${url}`);
+    return { path: out, duration: await ffprobeDuration(out) };
+  } }) });
+
 // ---- 6e. Transcribe (stage TRANSCRIBE). transcribe({path, language}) -> {segments:[{start,end,text}], text}
 const joinSegments = (segs) => segs.map((s) => s.text).join(" ");
 impl("TRANSCRIBE", "transcribe_mock", { label: "Mock", create: () => ({
@@ -1022,14 +1037,63 @@ async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1
   const f = tmpPath("ass"); await writeFile(f, ass); return f;
 }
 const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
+// Landscape footage in a vertical frame without cropping: the whole picture (TV chyrons included) over a blurred fill.
+const VF_VERTICAL_BLURPAD = "split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:4,eq=brightness=-0.18[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=0:(H-h)/2,setsar=1";
 const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black";
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"];
-async function cutClip(input, start, end, { vertical = true, ass = null } = {}) {
-  const vf = [vertical ? VF_VERTICAL : VF_LANDSCAPE];
+async function cutClip(input, start, end, { vertical = true, ass = null, layout = "crop" } = {}) {
+  const vf = [vertical ? (layout === "blurpad" ? VF_VERTICAL_BLURPAD : VF_VERTICAL) : VF_LANDSCAPE];
   if (ass) vf.push(assVf(ass));
   const out = tmpPath("mp4");
   await exec("ffmpeg", ["-y", "-ss", String(start), "-t", String(Math.max(1, end - start)), "-i", input, "-vf", vf.join(","), ...X264, out]);
   return out;
+}
+const hasAudio = async (file) => { try { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", file]); return out.trim().length > 0; } catch { return false; } };
+// Last pass on every footage video: the brand logo in a corner and loudness normalised for social platforms (-14 LUFS).
+async function brandFinish(file, niche, { vertical = true } = {}) {
+  const { brand } = await studioBrand(niche); const out = tmpPath("mp4"), audio = await hasAudio(file);
+  const logoW = Math.round((vertical ? 1080 : 1920) * (vertical ? 0.2 : 0.12)), margin = vertical ? 48 : 40;
+  try {
+    const args = ["-y", "-i", file, ...(brand.logo ? ["-i", brand.logo] : [])];
+    const fc = brand.logo ? `[1:v]scale=${logoW}:-1,format=rgba,colorchannelmixer=aa=0.88[lg];[0:v][lg]overlay=${margin}:${margin}[v]` : "[0:v]null[v]";
+    await exec("ffmpeg", [...args, "-filter_complex", fc + (audio ? ";[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a]" : ""), "-map", "[v]", ...(audio ? ["-map", "[a]"] : []), ...X264, out]);
+    await cleanup(file); return out;
+  } catch (e) { warn(`brand finish skipped: ${e.message.slice(0, 160)}`); await cleanup(out); return file; }
+  finally { await cleanup(brand.logo, brand.fontUrl); }
+}
+// Long-form reaction: the source plays in segments with the reactor picture-in-picture; between them the video pauses on a
+// blurred still while the commentary is spoken, the reactor large beside the frozen frame, with captions. Without a
+// reactor clip the "unique video" is the commentary's own waveform beside the brand logo. Segments share one format and
+// are joined without re-encoding. beats: [{type:"play", start, end} | {type:"comment", text, audio:{url, duration_seconds}}]
+async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
+  const W = 1920, H = 1080, FMT = ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"];
+  const { brand } = await studioBrand(niche); const reactor = reactorUrl ? await toTmpFile(reactorUrl, "mp4") : null;
+  const accent = (brand.accent || "#ffc400").replace("#", "0x"), srcAudio = await hasAudio(sourcePath), segs = [], temp = [];
+  try {
+    let lastT = 0;
+    for (const [i, b] of beats.entries()) {
+      const seg = tmpPath("mp4"); segs.push(seg);
+      if (b.type === "play") {
+        const dur = Math.max(1, b.end - b.start); lastT = b.end;
+        const inputs = ["-ss", String(b.start), "-t", String(dur), "-i", sourcePath, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : []), ...(srcAudio ? [] : ["-f", "lavfi", "-t", String(dur), "-i", "anullsrc=r=48000:cl=stereo"])];
+        const fc = `[0:v]${VF_LANDSCAPE},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=520:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-40:H-h-40:shortest=1[v]` : ";[m]null[v]");
+        const aIn = srcAudio ? "0:a" : `${reactor ? 2 : 1}:a`;
+        await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", aIn, "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
+      } else {
+        const vo = await toTmpFile(b.audio.url, "mp3"), dur = (await ffprobeDuration(vo)) || b.audio.duration_seconds || 5, still = tmpPath("jpg"); temp.push(vo, still);
+        await exec("ffmpeg", ["-y", "-ss", String(Math.max(0, lastT - 0.1)), "-i", sourcePath, "-frames:v", "1", "-q:v", "2", still]);
+        const ass = await writeCaptionsAss([{ start: 0, end: dur, text: b.text }], 0, dur, { width: W, height: H, accent: brand.accent }); temp.push(ass);
+        const side = reactor ? `[1:v]scale=700:-2,fps=30,setsar=1,pad=iw+10:ih+10:5:5:color=${accent}[r]` : `[2:a]showwaves=s=700x300:mode=cline:colors=${accent}:rate=30,format=yuva420p[r]`;
+        const fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:3,eq=brightness=-0.3[bg];[0:v]scale=1040:-2[fz];[bg][fz]overlay=70:(H-h)/2[a];${side};[a][r]overlay=W-w-80:(H-h)/2[b];[b]${assVf(ass)},fps=30,format=yuv420p[v]`;
+        const inputs = ["-loop", "1", "-t", String(dur), "-i", still, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : ["-f", "lavfi", "-i", "color=c=black:s=16x16"]), "-i", vo];
+        await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", "2:a", "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
+      }
+    }
+    const list = tmpPath("txt"), joined = tmpPath("mp4"); temp.push(list);
+    await writeFile(list, segs.map((s) => `file '${s.replace(/\\/g, "/")}'`).join("\n"));
+    await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", "-movflags", "+faststart", joined], { timeoutMs: 30 * 60000 });
+    return joined;
+  } finally { await cleanup(reactor, brand.logo, brand.fontUrl, ...segs, ...temp); }
 }
 async function publishRender(file, contentItemId, meta = {}) {
   const dur = await ffprobeDuration(file);
@@ -1055,11 +1119,15 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     return { url, kind: "VIDEO" };
   },
   async renderClip({ clip, sourcePath, transcript, niche, contentItemId, extras = {} }) {
-    const c = methodCfg(niche); const vertical = c.orientation !== "16:9";
+    const c = methodCfg(niche); const vertical = c.orientation !== "16:9" && niche.production_method !== "REACTION_LONG", layout = c.vertical_layout || "crop";
     const segs = c.captions === false ? [] : transcript.segments;
-    const assFor = (v, withHook = true, s = segs) => writeCaptionsAss(s, clip.start, clip.end, { width: v ? 1080 : 1920, height: v ? 1920 : 1080, hook: withHook ? clip.hook : null });
+    const assFor = (v, withHook = true, s = segs, start = clip.start, end = clip.end) => writeCaptionsAss(s, start, end, { width: v ? 1080 : 1920, height: v ? 1920 : 1080, hook: withHook ? clip.hook : null });
     const caps = []; let file;
     switch (niche.production_method || "PODCAST_HIGHLIGHT") {
+      case "REACTION_LONG": {
+        if (!extras.beats?.length) throw new Error("REACTION_LONG render needs extras.beats (the planned play/comment timeline)");
+        file = await renderReactionLong({ beats: extras.beats, sourcePath, niche, reactorUrl: c.reactor_url || extras.reactorUrl || null }); break;
+      }
       case "REACTION_OVERLAY": {
         const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false, ass: caps[caps.push(await assFor(false, false)) - 1] });
         const ovUrl = c.overlay_video_url; if (!ovUrl) throw new Error("REACTION_OVERLAY needs method_config.overlay_video_url (your own reaction clip)");
@@ -1071,10 +1139,16 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         await cleanup(main, ov); break;
       }
       case "VOICEOVER": {
-        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical, ass: caps[caps.push(await assFor(vertical, true, [])) - 1] });
+        // Our narration over the clip: the cut covers the whole narration, captions follow the new words, and the original
+        // sound stays underneath at a low level instead of being dropped.
         if (!extras.audio?.url) throw new Error("VOICEOVER render needs extras.audio");
-        const a = await toTmpFile(extras.audio.url, "mp3"); file = tmpPath("mp4");
-        await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", file]); await cleanup(main, a); break;
+        const a = await toTmpFile(extras.audio.url, "mp3"); const nd = (await ffprobeDuration(a)) || extras.audio.duration_seconds || clip.end - clip.start;
+        const end = Math.max(clip.end, clip.start + nd + 0.3);
+        const main = await cutClip(sourcePath, clip.start, end, { vertical, layout, ass: caps[caps.push(await assFor(vertical, true, c.captions === false ? [] : [{ start: clip.start, end: clip.start + nd, text: extras.script || "" }], clip.start, end)) - 1] });
+        file = tmpPath("mp4");
+        if (await hasAudio(main)) await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-filter_complex", "[0:a]volume=0.12[bg];[1:a]volume=1.0[vo];[bg][vo]amix=inputs=2:duration=longest:dropout_transition=0[a]", "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-t", String(nd + 0.3), file]);
+        else await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", file]);
+        await cleanup(main, a); break;
       }
       case "MOVIE_RECAP": {
         // extras.scenes = [{start,end}], extras.audio = narration. Concat scenes, put narration on top.
@@ -1084,9 +1158,10 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? VF_VERTICAL : VF_LANDSCAPE}[v]`;
         await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
       }
-      default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, ass: caps[caps.push(await assFor(vertical)) - 1] });
+      default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical)) - 1] });
     }
     await cleanup(...caps);
+    if (c.brand_finish !== false) file = await brandFinish(file, niche, { vertical });
     return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
   },
   // durations (seconds per picture) follow the narration section by section; without them the pictures share it equally.
@@ -1811,7 +1886,8 @@ async function processCandidate(candidateId) {
     await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments })]);
   }
   let clips;
-  if (niche.content_type === "MOVIE_RECAP") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole film" }];
+  // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
+  if (niche.content_type === "MOVIE_RECAP" || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
   else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand })); clips = clips.slice(0, methodCfg(niche).clips_per_video); }
   if (!clips.length) throw new Error("no clip-worthy moments found");
   for (const cl of clips) {
@@ -1841,9 +1917,31 @@ async function renderClipItem(itemId, clipId) {
     await addCost(itemId, r.cost); const d = r.data || {};
     script = recap ? (d.beats || []).map((b) => b.narration).join(" ") : d.narration || script;
     const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, audio.cost);
-    extras.audio = audio;
+    extras.audio = audio; extras.script = script;
     if (recap && d.beats?.length) { const total = d.beats.reduce((s, b) => s + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)), 0) || 1; const k = (audio.duration_seconds || total) / total; extras.scenes = d.beats.map((b) => ({ start: Number(b.start) || 0, end: (Number(b.start) || 0) + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)) * k })); }
     await setItem(itemId, { headline: d.title || clip.title, script, voice_asset_url: audio.url, hashtags: d.hashtags || [] });
+  }
+  if (niche.production_method === "REACTION_LONG") {
+    // Plan the reaction: which parts of the source play, and what we say between them (at least ~30% commentary, so the
+    // video is our own work rather than a re-upload). Each comment is voiced separately and timed by its measured audio.
+    const mcfg = methodCfg(niche), maxPlay = Number(mcfg.max_play_minutes) || 6;
+    const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 110000);
+    const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 5000,
+      system: `You host a reaction and commentary show for "${niche.display_name}". Language of the commentary: ${niche.language || "en"}. Tone: ${niche.tone || "sharp, fair, engaging"}.${styleBlock(style)} You react with context, analysis and opinion clearly framed as opinion; you never invent facts about the video.`,
+      prompt: `Source video: "${cand.title}" (${Math.round((cand.duration_seconds || c.end) / 60)} min)\nTimestamped transcript:\n${lines}\n\nPlan a reaction video: alternate "play" segments of the source (each 15-90 s, ${maxPlay} min of source at most in total, in order) with "comment" segments where we pause and talk (1-4 spoken sentences each). Open with a comment that hooks the viewer, end with a comment giving the verdict and a call to action. Commentary must be at least 30% of the total runtime. Mark 3+ chapters.\nJSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "chapter": "optional chapter name"}, {"type": "play", "start": seconds, "end": seconds, "chapter": "optional"}], "description": "YouTube description", "hashtags": ["..."]}`,
+      mock: { title: `Reacting to ${cand.title}`, beats: [{ type: "comment", text: `Let's watch ${cand.title}.`, chapter: "Intro" }, { type: "play", start: 0, end: Math.min(20, c.end), chapter: "The clip" }, { type: "comment", text: "That is our take.", chapter: "Verdict" }], description: `Our reaction to ${cand.title}`, hashtags: ["reaction"] } }));
+    await addCost(itemId, r.cost); const d = r.data || {};
+    const beats = (d.beats || []).filter((b) => (b.type === "comment" && b.text) || (b.type === "play" && Number(b.end) > Number(b.start))).map((b) => (b.type === "play" ? { ...b, start: clamp(Number(b.start), 0, c.end), end: clamp(Number(b.end), 0, c.end) } : b));
+    if (!beats.some((b) => b.type === "play") || !beats.some((b) => b.type === "comment")) throw new Error("The reaction plan needs both play and comment segments");
+    const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); let at = 0; const chapters = [];
+    for (const b of beats) {
+      if (b.type === "comment") { b.audio = await voice.synthesize({ script: b.text, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, b.audio.cost); }
+      if (b.chapter) chapters.push(`${Math.floor(at / 60)}:${String(Math.floor(at % 60)).padStart(2, "0")} ${b.chapter}`);
+      at += b.type === "play" ? b.end - b.start : Number(b.audio?.duration_seconds) || 5;
+    }
+    if (chapters.length && !chapters[0].startsWith("0:00 ")) chapters.unshift("0:00 Intro");
+    extras.beats = beats; script = beats.filter((b) => b.type === "comment").map((b) => b.text).join("\n\n");
+    await setItem(itemId, { headline: d.title || clip.title, script, summary: d.description || "", hashtags: d.hashtags || [], captions: { youtube: [d.description || "", chapters.length >= 3 ? `\n${chapters.join("\n")}` : ""].join("\n").trim(), default: d.description || d.title || "" } });
   }
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
   const video = await renderer.renderClip({ clip: c, sourcePath: cand.local_path, transcript, niche, contentItemId: itemId, extras });
@@ -1853,7 +1951,9 @@ async function renderClipItem(itemId, clipId) {
     prompt: `Clip title: ${c.title}\nHook: ${c.hook}\nWhat is said: ${script.slice(0, 1500)}\nSource: ${cand.title}\nReturn JSON: {"headline": "video title max 90 chars", "captions": {"facebook": "...", "instagram": "...", "youtube": "description with credit to the source"}, "hashtags": ["..."]}`,
     mock: { headline: c.title, captions: { facebook: c.hook || c.title, instagram: c.hook || c.title, youtube: `Clip from ${cand.title}` }, hashtags: ["shorts"] } }));
   await addCost(itemId, cap.cost); const cd = cap.data || {};
-  await setItem(itemId, { hero_media_id: video.id, headline: cd.headline || c.title, captions: cd.captions || {}, hashtags: cd.hashtags || [], summary: c.hook || "" });
+  // A long reaction already has its title and a YouTube description with chapters from its plan; keep those.
+  const planned = niche.production_method === "REACTION_LONG" ? await one(`SELECT headline, captions, summary FROM content_items WHERE id=$1`, [itemId]) : null;
+  await setItem(itemId, { hero_media_id: video.id, headline: planned?.headline || cd.headline || c.title, captions: { ...(cd.captions || {}), ...(planned ? { youtube: P(planned.captions)?.youtube } : {}) }, hashtags: cd.hashtags || [], summary: planned?.summary || c.hook || "" });
   await finishGeneration(itemId, niche);
 }
 // ---- 8e. entry point for every text/slideshow item

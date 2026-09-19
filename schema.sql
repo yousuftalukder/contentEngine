@@ -575,6 +575,7 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'sitemap',          'INGEST',     'sitemap',          'News sitemap',                   '{}'),
   (gen_random_uuid()::text, 'ytdlp',            'DOWNLOAD',   'ytdlp',            'yt-dlp downloader',              '{}'),
   (gen_random_uuid()::text, 'download_mock',    'DOWNLOAD',   'download_mock',    'Mock downloader',                '{}'),
+  (gen_random_uuid()::text, 'direct',           'DOWNLOAD',   'direct',           'Direct link / uploaded file',    '{}'),
   (gen_random_uuid()::text, 'transcribe_mock',  'TRANSCRIBE', 'transcribe_mock',  'Mock transcript',                '{}'),
   (gen_random_uuid()::text, 'gemini_transcribe','TRANSCRIBE', 'gemini_transcribe','Gemini audio transcription',     '{}'),
   (gen_random_uuid()::text, 'whisper_local',    'TRANSCRIBE', 'whisper_local',    'Whisper CLI (local, heavy)',     '{}'),
