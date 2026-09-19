@@ -76,6 +76,7 @@ const slugify = (s) => String(s).toLowerCase().normalize("NFKD").replace(/[^\w\s
 const stripHtml = (s) => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 const decodeXml = (s) => String(s || "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, "&");
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const nice = (s) => String(s || "").replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
 const tmpPath = (ext) => join(TMP, `${randomUUID()}.${ext}`);
 // Which worker lanes this process runs. Default: all. Split for production: web service LANES=ingest,text,image,publish,metrics
 // and a Render Background Worker with LANES=video (ffmpeg/yt-dlp memory stays away from the dashboard). The periodic sweeps
@@ -446,12 +447,15 @@ function listAdapterKeys(rows) {
 // ---- 6a. LLM (stage SCRIPT). Contract: complete({system, prompt, json, mock, maxTokens, grounding}) -> {text, data, cost}
 // fail_first/fail_status make an instance fail its first N calls — used by tests to exercise retries and fallbacks.
 const mockFailures = new Map();
-impl("SCRIPT", "llm_mock", { label: "Mock LLM", configSchema: { fail_first: { type: "number", default: 0 }, fail_status: { type: "number", default: 503 } }, create: (cfg, ctx = {}) => ({
-  async complete({ prompt, json, mock }) {
+// respond = [{match, json}] returns json for calls whose system+prompt contains match (tests script the QA verdict etc.).
+impl("SCRIPT", "llm_mock", { label: "Mock LLM", configSchema: { fail_first: { type: "number", default: 0 }, fail_status: { type: "number", default: 503 }, respond: { type: "array" } }, create: (cfg, ctx = {}) => ({
+  async complete({ system, prompt, json, mock }) {
     if (cfg.fail_first) {
       const n = (mockFailures.get(ctx.key) || 0) + 1; mockFailures.set(ctx.key, n);
       if (n <= cfg.fail_first) throw new ApiError(cfg.fail_status || 503, null, `mock ${cfg.fail_status || 503}: simulated failure ${n} of ${cfg.fail_first}`);
     }
+    const rule = (cfg.respond || []).find((r) => `${system || ""}\n${prompt}`.includes(r.match));
+    if (rule) return { text: JSON.stringify(rule.json), data: rule.json, cost: 0 };
     if (json) return { text: JSON.stringify(mock ?? {}), data: mock ?? {}, cost: 0 };
     return { text: `[mock] ${String(prompt).slice(0, 160)}`, data: null, cost: 0 };
   } }) });
@@ -850,7 +854,11 @@ async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}, comp
     try {
       const card = (compose.specs.layout || (compose.specs.kit ? "photocard" : "overlay")) === "photocard";
       const out = card ? await composePhotocard(inp, compose.headline, compose.specs) : await composeHeadline(inp, compose.headline, compose.specs);
-      j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; meta = { ...meta, overlay: card ? "photocard" : true }; await cleanup(out);
+      // The clean picture is kept (IMAGE_BASE) so the card can be redrawn when the headline is edited.
+      const base = await recordMedia({ contentItemId, kind: "IMAGE_BASE", url: await storeFile(`images/${newId()}-base.jpg`, j.bytes, "image/jpeg"), mime: "image/jpeg", meta: { purpose: "card background" } });
+      j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; await cleanup(out);
+      const { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale } = compose.specs;
+      meta = { ...meta, overlay: card ? "photocard" : true, base_media_id: base.id, compose_specs: { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale } };
       if (card) dims = { width: compose.specs.width || 1080, height: compose.specs.height || 1080 };
     }
     catch (e) { warn(`headline overlay skipped: ${e.message.slice(0, 160)}`); }
@@ -1201,6 +1209,7 @@ async function underDailyCap(niche) {
   return r.n < niche.max_items_per_day;
 }
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
+const CONTENT_TYPE_SET = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", ...VIDEO_TYPES]);
 const queueFor = (contentType) => VIDEO_TYPES.has(contentType) || contentType === "IMAGE_SLIDESHOW" || contentType === "LONG_FORM_VIDEO" ? "video" : "text";
 function scoreCandidate(item, niche) {
   const c = methodCfg(niche); let s = 0.35; const reasons = [];
@@ -1451,11 +1460,19 @@ async function approveItem(itemId, { auto = false, scheduledFor = null } = {}) {
   await sweepDueAssets();
   return one(`SELECT * FROM content_items WHERE id = $1`, [itemId]);
 }
-async function rejectItem(itemId, note) { return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, note || "Rejected by reviewer"]); }
+async function rejectItem(itemId, note) {
+  const row = await one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, note || "Rejected by reviewer"]);
+  if (row && note) await logStyleFeedback(row, "REJECT", [{ note }]).catch((e) => warn("style feedback", e.message));
+  return row;
+}
+// Every draft passes the quality gate. MANUAL: always waits for a person (the report is shown in Review). AUTO: a clean
+// draft publishes, a flagged one waits, a REJECT is set aside. AUTO_AFTER_WINDOW: only a clean draft gets the countdown.
 async function finishGeneration(itemId, niche) {
   const mode = niche.approval_mode || "MANUAL";
-  if (mode === "AUTO") { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
-  const deadline = mode === "AUTO_AFTER_WINDOW" ? new Date(Date.now() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;
+  const qa = await qualityGate(itemId, niche), clean = qa.status === "PASS" || qa.status === "SKIPPED";
+  if (mode === "AUTO" && qa.status === "REJECT") return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, `Quality gate: ${qa.report?.summary || "flagged as unsafe to publish"}`]);
+  if (mode === "AUTO" && clean) { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
+  const deadline = mode === "AUTO_AFTER_WINDOW" && clean ? new Date(Date.now() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;
   return one(`UPDATE content_items SET status='PENDING_REVIEW', review_deadline_at=$2 WHERE id=$1 RETURNING *`, [itemId, deadline]);
 }
 
@@ -1561,7 +1578,7 @@ async function generateStatic(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
-    system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style)}`,
+    system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style)}${item._series || ""}`,
     prompt: `${materialBlock(m)}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${richMaterial(m) ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line credit naming the source outlet(s)\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
     mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
@@ -1583,7 +1600,7 @@ async function generateLongPost(item, niche, style) {
   const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
   await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify(cites), research.model || "mock"]);
   const post = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
-    system: `You write long-form Facebook posts for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Use ONLY the research notes as facts.`,
+    system: `You write long-form Facebook posts for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Use ONLY the research notes as facts.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nReturn JSON: {"headline": "first line hook", "post": "the full 250-600 word post with paragraph breaks", "hashtags": ["..."], "image_prompt": "visual for a cover image"}`,
     mock: { headline: m.title, post: `${m.title}\n\n${notes.map((n) => n.fact).join("\n\n")}`, hashtags: ["longpost"], image_prompt: `Cover for ${m.title}` } }));
   await addCost(item.id, post.cost); const d = post.data || {};
@@ -1597,7 +1614,7 @@ async function generateSlideshowVideo(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
   const slides = mc.slides || (long ? 12 : 10);
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 2500,
-    system: `You write ${long ? "researched long-form YouTube video scripts" : "punchy 60-90 second facts videos"} for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Every sentence must be spoken narration — no stage directions.`,
+    system: `You write ${long ? "researched long-form YouTube video scripts" : "punchy 60-90 second facts videos"} for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Every sentence must be spoken narration — no stage directions.${item._series || ""}`,
     prompt: `Topic: ${m.title}\n${materialBlock(m)}\nWrite a script split into exactly ${slides} sections. Return JSON: {"title": "video title", "sections": [{"narration": "spoken text for this section", "image_prompt": "what the viewer sees, no text"}], "description": "YouTube description", "hashtags": ["..."]}`,
     mock: { title: m.title, sections: Array.from({ length: Math.min(slides, 4) }, (_, i) => ({ narration: `Mock narration section ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["facts"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = d.sections || [];
@@ -1681,7 +1698,8 @@ async function runGeneration(itemId) {
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   await setItem(itemId, { status: "FETCHING_DATA", rejection_note: null });
   const type = item.content_type || niche.content_type || "NICHE_STATIC";
-  if (item.series_id && item.episode_number == null) { const s = await one(`SELECT episode_counter FROM series WHERE id=$1`, [item.series_id]); if (s) await setItem(itemId, { episode_number: s.episode_counter + 1 }); }
+  if (item.series_id && item.episode_number == null) { const s = await one(`SELECT episode_counter FROM series WHERE id=$1`, [item.series_id]); if (s) { await setItem(itemId, { episode_number: s.episode_counter + 1 }); item.episode_number = s.episode_counter + 1; } }
+  item._series = await seriesBlock(item);
   if (type === "LONG_POST") await generateLongPost(item, niche, style);
   else if (type === "IMAGE_SLIDESHOW" || type === "LONG_FORM_VIDEO") await generateSlideshowVideo(item, niche, style);
   else await generateStatic(item, niche, style);
@@ -1755,6 +1773,246 @@ async function checkAndRepurpose(assetId) {
   return one(`SELECT * FROM content_items WHERE id=$1`, [id]);
 }
 
+// ---- 8h. Quality gate. Every draft is checked by the LLM against its own source material before it can publish:
+// claims the sources don't support, a headline more alarming or certain than the facts, legal and safety risks
+// (defamation, communal or political incitement, graphic detail, minors), and language. The verdict is computed from the
+// findings as well as taken from the model, whichever is stricter. PASS lets automatic programs publish; a REVIEW draft
+// is revised once from the report and re-checked (auto_fix); what is still not clean waits for a person.
+async function qaCfg(niche) {
+  const own = (P(niche.method_config) || {}).qa || {};
+  return { enabled: own.enabled ?? (await setting("qa.enabled", true)), min_score: Number(own.min_score ?? (await setting("qa.min_score", 0.75))), auto_fix: own.auto_fix ?? (await setting("qa.auto_fix", true)) };
+}
+function draftText(item) {
+  const caps = P(item.captions) || {};
+  return [`Headline: ${item.headline || item.topic}`, item.summary && `Summary: ${item.summary}`, item.body && `Body:\n${stripHtml(item.body).slice(0, 6000)}`,
+    item.script && !item.body && `Script:\n${String(item.script).slice(0, 6000)}`, Object.keys(caps).length && `Captions:\n${Object.entries(caps).map(([k, v]) => `- ${k}: ${v}`).join("\n")}`].filter(Boolean).join("\n");
+}
+// The facts a draft may use: its story cluster / source article, a clip's transcript, a long post's research notes, or
+// (for planner and manual topics) only what was given — never a fresh topic pull.
+async function qaMaterial(item, niche) {
+  if (item.clip_id) { const c = await one(`SELECT title, transcript_text FROM clips WHERE id=$1`, [item.clip_id]); return { title: c?.title || item.topic, summary: "", text: c?.transcript_text || "", url: P(item.source_data_ref)?.url || null }; }
+  const src = P(item.source_data_ref) || {};
+  const m = item.cluster_id || item.source_item_id ? await materialFor(item, niche) : { title: item.topic, summary: src.summary || src.description || "", text: "", url: src.url || null };
+  const notes = await one(`SELECT notes FROM research_notes WHERE content_item_id=$1 ORDER BY created_at DESC LIMIT 1`, [item.id]);
+  if (notes && (P(notes.notes) || []).length) {
+    const versions = m.versions?.length ? [...m.versions] : [{ outlet: "Source", title: m.title, summary: m.summary, text: m.text, url: m.url }];
+    versions.push({ outlet: "Research notes", title: m.title, summary: "", text: (P(notes.notes) || []).map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n") });
+    return { ...m, versions };
+  }
+  return m;
+}
+async function runQa(itemId, niche) {
+  const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]);
+  const m = await qaMaterial(item, niche), lang = niche.language || "en", cfg = await qaCfg(niche);
+  const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500,
+    system: `You are the standards editor of "${niche.display_name}"${niche.country ? ` (${niche.country})` : ""}. Before anything is published you check it against its sources and for legal and safety risks. Be specific and strict, and do not rewrite the draft. Answer in English JSON even when the draft is in another language.${style ? `\nHouse style the draft should follow:${styleBlock(style)}` : ""}`,
+    prompt: `${materialBlock(m)}\nDRAFT (language: ${lang})\n${draftText(item)}\n\nCheck:\n1. Facts: list each claim in the draft the sources do not support (numbers, names, places, dates, quotes, causes, blame). Rewording is fine; new facts are not.\n2. Headline: accurate, and not more alarming or certain than the sources?\n3. Safety: defamation (wrongdoing attributed to a named person as fact without attribution), religious, communal or political incitement, graphic detail of violence or suicide, identifying minors or victims of sexual violence, health or financial claims, rumour presented as fact.\n4. Language: natural, correct ${lang}.\nReturn JSON: {"fact_issues": ["..."], "headline_ok": true, "headline_issue": "", "safety_flags": [{"type": "...", "severity": "low|medium|high", "detail": "..."}], "language_issues": ["..."], "score": 0.0, "verdict": "PASS|REVIEW|REJECT", "summary": "one sentence"}`,
+    mock: { fact_issues: [], headline_ok: true, safety_flags: [], language_issues: [], score: 0.95, verdict: "PASS", summary: "mock review: no issues" } }));
+  await addCost(itemId, r.cost);
+  const d = r.data || {}, flags = (Array.isArray(d.safety_flags) ? d.safety_flags : []).filter((f) => f && f.type), facts = (Array.isArray(d.fact_issues) ? d.fact_issues : []).filter(Boolean);
+  let status = flags.some((f) => /high/i.test(f.severity)) ? "REJECT"
+    : facts.length || d.headline_ok === false || flags.some((f) => /medium/i.test(f.severity)) || !(Number(d.score) >= cfg.min_score) ? "REVIEW" : "PASS";
+  const rank = { PASS: 0, REVIEW: 1, REJECT: 2 }, said = String(d.verdict || "").toUpperCase();
+  if (rank[said] > rank[status]) status = said;
+  const report = { summary: d.summary || "", score: Number(d.score) || 0, fact_issues: facts, headline_ok: d.headline_ok !== false, headline_issue: d.headline_issue || "", safety_flags: flags, language_issues: (d.language_issues || []).filter(Boolean), verdict: status, model: r.model || null, checked_at: nowIso() };
+  await q(`UPDATE content_items SET qa_status=$2, qa_score=$3, qa_report=$4::jsonb WHERE id=$1`, [itemId, status, report.score, JSON.stringify(report)]);
+  return { status, report };
+}
+async function reviseFromQa(itemId, niche, report) {
+  const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const m = await qaMaterial(item, niche);
+  const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
+  const notes = [...report.fact_issues.map((x) => `- Not supported by the sources: ${x}`), report.headline_ok ? null : `- Headline: ${report.headline_issue}`, ...report.language_issues.map((x) => `- Language: ${x}`), ...report.safety_flags.map((f) => `- ${f.type} (${f.severity}): ${f.detail}`)].filter(Boolean);
+  if (!notes.length) return false;
+  const caps = P(item.captions) || {};
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 4000,
+    system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone || "clear"}.${styleBlock(style)} Fix exactly what the standards editor flagged, keep everything else, and never add a fact the sources do not state.`,
+    prompt: `${materialBlock(m)}\nCURRENT DRAFT\n${draftText(item)}\n\nSTANDARDS EDITOR'S NOTES\n${notes.join("\n")}\n\nReturn JSON with the corrected fields: {"headline": "...", "summary": "..."${item.body ? ', "body": "... (same HTML format)"' : ""}${Object.keys(caps).length ? `, "captions": {${Object.keys(caps).map((k) => `"${k}": "..."`).join(", ")}}` : ""}}`,
+    mock: {} }));
+  await addCost(itemId, r.cost); const d = r.data || {}, upd = {};
+  for (const k of ["headline", "summary", "body", "captions"]) if (d[k] && (k !== "body" || item.body)) upd[k] = d[k];
+  if (!Object.keys(upd).length) return false;
+  await setItem(itemId, upd);
+  if (upd.headline && upd.headline !== item.headline) await recomposeCard(itemId).catch((e) => warn(`card recompose ${itemId}: ${e.message}`));
+  return true;
+}
+async function qualityGate(itemId, niche) {
+  const cfg = await qaCfg(niche); if (!cfg.enabled) return { status: "SKIPPED" };
+  try {
+    let qa = await runQa(itemId, niche);
+    if (qa.status === "REVIEW" && cfg.auto_fix && (await reviseFromQa(itemId, niche, qa.report))) {
+      qa = await runQa(itemId, niche);
+      await q(`UPDATE content_items SET qa_report = qa_report || '{"revised": true}'::jsonb WHERE id=$1`, [itemId]);
+    }
+    return qa;
+  } catch (e) {
+    warn(`quality gate ${itemId}: ${e.message}`);
+    await q(`UPDATE content_items SET qa_status='REVIEW', qa_report=$2::jsonb WHERE id=$1`, [itemId, JSON.stringify({ verdict: "REVIEW", summary: `The quality check could not run (${e.message.slice(0, 200)}) — review by hand.` })]);
+    return { status: "REVIEW" };
+  }
+}
+// Photocards carry the headline, so a changed headline (QA fix, reviewer edit) redraws the card from the stored picture.
+async function recomposeCard(itemId) {
+  const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); if (!item?.hero_media_id) return null;
+  const hero = await one(`SELECT * FROM media_assets WHERE id=$1`, [item.hero_media_id]); const meta = P(hero?.meta) || {};
+  if (!meta.base_media_id || !meta.overlay || !meta.compose_specs) return null;
+  const base = await one(`SELECT * FROM media_assets WHERE id=$1 AND deleted_at IS NULL`, [meta.base_media_id]); if (!base) return null;
+  const file = await toTmpFile(base.url, "jpg");
+  try {
+    const out = meta.overlay === "photocard" ? await composePhotocard(file, item.headline || item.topic, meta.compose_specs) : await composeHeadline(file, item.headline || item.topic, meta.compose_specs);
+    const url = await storeLocal(out, `images/${newId()}.jpg`, "image/jpeg"); await cleanup(out);
+    const media = await recordMedia({ contentItemId: itemId, kind: "IMAGE", url, mime: "image/jpeg", width: hero.width, height: hero.height, meta: { ...meta, recomposed_at: nowIso() } });
+    await setItem(itemId, { hero_media_id: media.id }); return media;
+  } finally { await cleanup(file); }
+}
+
+// ---- 8i. House style. A profile per brand + program is written by the LLM from the brand, the program and optional
+// sample posts. Reviewers' edits and rejection notes are logged as feedback; a refinement pass folds them — and the
+// program's best-performing posts — back into the rules and examples, keeping earlier versions in history.
+const pseudoNiche = async (brand) => { const d = await smartAdapterDefaults(); return { display_name: brand.name, language: "en", script_adapter: d.scriptAdapter, script_adapter_fallbacks: JSON.stringify(d.scriptAdapterFallbacks) }; };
+const asText = (v, sep = "\n") => (Array.isArray(v) ? v.join(sep) : String(v ?? ""));
+async function generateStyle({ brandId, nicheId = null, samples = "", name = null, apply = false }) {
+  const brand = await one(`SELECT * FROM brands WHERE id=$1`, [brandId]); if (!brand) throw new ApiError(404, null, "Brand not found");
+  const niche = nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [nicheId]) : null;
+  const lang = (niche?.language || "en").slice(0, 2), kit = P(brand.brand_kit) || {};
+  const r = await llmFor(niche || (await pseudoNiche(brand)), (llm) => llm.complete({ json: true, maxTokens: 2500,
+    system: "You write house style guides for news and social-media brands. Your guides are concrete, short and directly usable by a writer.",
+    prompt: `Brand: ${brand.name}${brand.description ? ` — ${brand.description}` : ""}${kit.handle ? ` (${kit.handle})` : ""}\n${niche ? `Program: ${niche.display_name} — ${nice(niche.content_type)} in ${lang}${niche.country ? ` for ${niche.country}` : ""}. Requested tone: ${niche.tone || "(none)"}.\n` : ""}Platforms: Facebook, Instagram, YouTube.\n${samples ? `The brand's own posts, showing its voice:\n"""\n${String(samples).slice(0, 6000)}\n"""\n` : ""}${lang === "bn" ? "For Bangla: standard written Bangla (প্রমিত বাংলা), Bangla digits, no Banglish, names spelled as the major Bangladeshi outlets spell them.\n" : ""}Write the style guide. Return JSON: {"name": "short name", "tone": "one line", "rules": "10-14 short bullet rules: headlines, sentence length, attribution, numbers and dates, sensitive topics, emoji, per-platform captions", "examples": "3 short example posts in this style${lang === "bn" ? ", in Bangla" : ""}", "banned_terms": ["..."], "cta": "one short call to action", "hashtags": ["3-6 brand hashtags"]}`,
+    mock: { name: `${brand.name} house style`, tone: niche?.tone || "clear, factual", rules: "- Lead with the news.\n- Attribute every claim to its source.", examples: "", banned_terms: [], cta: "", hashtags: [] } }));
+  const d = r.data || {}, id = newId();
+  await q(`INSERT INTO style_profiles (id, brand_id, niche_id, name, language, tone, rules, examples, banned_terms, cta, hashtags, generated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11::jsonb,1)`,
+    [id, brand.id, niche?.id || null, name || d.name || `${brand.name} — ${niche?.display_name || "house style"}`, lang, d.tone || "", asText(d.rules), asText(d.examples, "\n\n"), JSON.stringify(d.banned_terms || []), d.cta || "", JSON.stringify(d.hashtags || [])]);
+  if (niche && (apply || !niche.style_profile_id)) await q(`UPDATE niches SET style_profile_id=$2 WHERE id=$1`, [niche.id, id]);
+  return one(`SELECT * FROM style_profiles WHERE id=$1`, [id]);
+}
+async function logStyleFeedback(item, kind, fields) {
+  const niche = await one(`SELECT id, style_profile_id FROM niches WHERE id=$1`, [item.niche_id]); if (!niche?.style_profile_id) return;
+  for (const f of fields) await q(`INSERT INTO style_feedback (id, style_profile_id, niche_id, content_item_id, kind, field, old_text, new_text, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [newId(), niche.style_profile_id, niche.id, item.id, kind, f.field || null, f.old ?? null, f.new ?? null, f.note ?? null]);
+}
+async function refineStyle(profileId) {
+  const p = await one(`SELECT * FROM style_profiles WHERE id=$1`, [profileId]); if (!p) return null;
+  const fb = await q(`SELECT * FROM style_feedback WHERE style_profile_id=$1 AND used_at IS NULL ORDER BY created_at DESC LIMIT 40`, [profileId]);
+  const top = p.niche_id ? await q(`SELECT ci.headline, MAX(COALESCE((a.last_metrics->>'views')::int, 0)) AS views, MAX(COALESCE((a.last_metrics->>'likes')::int, 0)) AS likes FROM content_items ci JOIN content_assets a ON a.content_item_id = ci.id
+    WHERE ci.niche_id = $1 AND a.status = 'PUBLISHED' AND a.published_at > now() - interval '30 days' GROUP BY ci.id
+    ORDER BY MAX(COALESCE((a.last_metrics->>'views')::int, 0)) + 10 * MAX(COALESCE((a.last_metrics->>'likes')::int, 0)) DESC LIMIT 5`, [p.niche_id]) : [];
+  if (!fb.length && !top.length) return null;
+  const niche = p.niche_id ? await one(`SELECT * FROM niches WHERE id=$1`, [p.niche_id]) : await pseudoNiche(await one(`SELECT * FROM brands WHERE id=$1`, [p.brand_id]) || { name: p.name });
+  const clip = (s) => String(s || "").replace(/\s+/g, " ").slice(0, 300);
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 2500,
+    system: "You maintain a brand's house style guide. Update it from evidence: keep what works, change what the editors corrected, and keep it short.",
+    prompt: `CURRENT GUIDE\nTone: ${p.tone}\nRules:\n${p.rules}\nExamples:\n${p.examples}\nBanned terms: ${(P(p.banned_terms) || []).join(", ")}\nCall to action: ${p.cta}\n\nEDITOR CORRECTIONS (AI draft -> what the editor changed it to)\n${fb.filter((f) => f.kind === "EDIT").map((f) => `[${f.field}] "${clip(f.old_text)}" -> "${clip(f.new_text)}"`).join("\n") || "(none)"}\n\nREJECTED DRAFTS (editor's reason)\n${fb.filter((f) => f.kind === "REJECT").map((f) => `- ${clip(f.note)}`).join("\n") || "(none)"}\n\nBEST-PERFORMING POSTS (last 30 days)\n${top.map((t) => `- "${t.headline}" (${t.views} views, ${t.likes} likes)`).join("\n") || "(none)"}\n\nReturn the full updated guide as JSON: {"tone": "...", "rules": "...", "examples": "...", "banned_terms": ["..."], "cta": "...", "changes": "one line: what changed and why"}`,
+    mock: { tone: p.tone, rules: p.rules, examples: p.examples, banned_terms: P(p.banned_terms) || [], cta: p.cta, changes: "mock refinement" } }));
+  const d = r.data || {};
+  const history = [...(P(p.history) || []), { at: nowIso(), tone: p.tone, rules: p.rules, examples: p.examples, banned_terms: P(p.banned_terms) || [], cta: p.cta, changes: d.changes || "" }].slice(-10);
+  await q(`UPDATE style_profiles SET tone=$2, rules=$3, examples=$4, banned_terms=$5::jsonb, cta=$6, history=$7::jsonb, refined_at=now() WHERE id=$1`,
+    [p.id, d.tone || p.tone, asText(d.rules) || p.rules, asText(d.examples, "\n\n") || p.examples, JSON.stringify(d.banned_terms || P(p.banned_terms) || []), d.cta ?? p.cta, JSON.stringify(history)]);
+  if (fb.length) await q(`UPDATE style_feedback SET used_at = now() WHERE id = ANY($1)`, [fb.map((f) => f.id)]);
+  return { changes: d.changes || "" };
+}
+async function sweepStyleRefinement() {
+  if (!(await setting("style.auto_refine", true))) return;
+  const due = await q(`SELECT sp.id FROM style_profiles sp WHERE (SELECT COUNT(*) FROM style_feedback f WHERE f.style_profile_id = sp.id AND f.used_at IS NULL) >= 5 AND (sp.refined_at IS NULL OR sp.refined_at < now() - interval '1 day') LIMIT 5`);
+  for (const s of due) await enqueue("STYLE_REFINE", { profileId: s.id }, { queue: "text", dedupeKey: `style:${s.id}`, maxAttempts: 2 });
+}
+
+// ---- 8j. Planner and series. Daily per active program (and on demand) the LLM reads the program's recent output with
+// its performance, its series and the desk's uncovered trending stories, and proposes ideas: topics, next episodes, new
+// series, format and timing changes. method_config.autopilot = {topics_per_day: N} accepts the best topic ideas itself.
+// Series with auto_generate get their next episode every cadence_days, written with the earlier episodes as context.
+async function programStats(niche, days = 30) {
+  const posts = await q(`SELECT ci.id, ci.headline, ci.content_type, ci.series_id, a.published_at, c.platform,
+      COALESCE((a.last_metrics->>'views')::int, 0) AS views, COALESCE((a.last_metrics->>'likes')::int, 0) AS likes, COALESCE((a.last_metrics->>'comments')::int, 0) AS comments
+    FROM content_items ci JOIN content_assets a ON a.content_item_id = ci.id JOIN channels c ON c.id = a.channel_id
+    WHERE ci.niche_id = $1 AND a.status = 'PUBLISHED' AND a.published_at > now() - ($2 || ' days')::interval ORDER BY a.published_at DESC LIMIT 300`, [niche.id, String(days)]);
+  const group = (key) => Object.values(posts.reduce((acc, p) => { const k = key(p); const g = (acc[k] ||= { key: k, posts: 0, views: 0, likes: 0, comments: 0 }); g.posts++; g.views += p.views; g.likes += p.likes; g.comments += p.comments; return acc; }, {}))
+    .map((g) => ({ ...g, avg_views: Math.round(g.views / g.posts), avg_likes: +(g.likes / g.posts).toFixed(1) })).sort((a, b) => b.avg_views - a.avg_views);
+  const tz = /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC";
+  const hour = (p) => Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(new Date(p.published_at)));
+  const score = (p) => p.views + 10 * p.likes + 20 * p.comments;
+  return { posts: posts.length, timezone: tz, byType: group((p) => p.content_type), byPlatform: group((p) => p.platform), byHour: group(hour).sort((a, b) => a.key - b.key),
+    top: [...posts].sort((a, b) => score(b) - score(a)).slice(0, 8), bottom: [...posts].sort((a, b) => score(a) - score(b)).slice(0, 5) };
+}
+async function planProgram(nicheId) {
+  const niche = await one(`SELECT * FROM niches WHERE id=$1`, [nicheId]); if (!niche) return null;
+  const brand = await one(`SELECT * FROM brands WHERE id=$1`, [niche.brand_id]);
+  const st = await programStats(niche);
+  const series = await q(`SELECT s.id, s.key, s.display_name, s.premise, s.episode_counter, (SELECT json_agg(x) FROM (SELECT headline, episode_number FROM content_items WHERE series_id = s.id ORDER BY created_at DESC LIMIT 5) x) AS recent FROM series s WHERE s.niche_id = $1 AND s.is_active::int = 1`, [nicheId]);
+  const trending = DESK_TYPES.has(niche.content_type) ? await q(`SELECT c.title, c.source_count FROM story_clusters c WHERE c.last_seen_at > now() - interval '24 hours' AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.cluster_id = c.id AND ci.niche_id = $1) ORDER BY c.weight_sum DESC LIMIT 15`, [nicheId]) : [];
+  const recent = await q(`SELECT COALESCE(headline, topic) AS t FROM content_items WHERE niche_id=$1 AND status NOT IN ('FAILED','REJECTED') ORDER BY created_at DESC LIMIT 40`, [nicheId]);
+  const line = (g) => `${g.key}: ${g.posts} posts, avg ${g.avg_views} views / ${g.avg_likes} likes`;
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
+    system: `You are the content strategist for "${niche.display_name}" (${brand?.name || "brand"}): ${nice(niche.content_type)} in ${niche.language || "en"} for ${niche.country || "a general audience"}. You propose specific, publishable ideas grounded in the data given. Topics are written in ${niche.language || "en"}.`,
+    prompt: `PERFORMANCE, last 30 days (${st.posts} published posts)\nBy format:\n${st.byType.map(line).join("\n") || "(no data yet)"}\nBy platform:\n${st.byPlatform.map(line).join("\n") || "(no data yet)"}\nBy hour (${st.timezone}):\n${st.byHour.map(line).join("\n") || "(no data yet)"}\nBest posts:\n${st.top.map((p) => `- ${p.headline} (${p.views} views, ${p.likes} likes)`).join("\n") || "(none)"}\nWeakest posts:\n${st.bottom.map((p) => `- ${p.headline} (${p.views} views)`).join("\n") || "(none)"}\n\nSERIES\n${series.map((s) => `- ${s.key} "${s.display_name}" (${s.episode_counter} episodes). Premise: ${s.premise || "-"}. Latest: ${(s.recent || []).map((x) => x.headline).join(" | ")}`).join("\n") || "(none)"}\n\nTRENDING STORIES NOT YET COVERED\n${trending.map((t) => `- ${t.title} (${t.source_count} outlets)`).join("\n") || "(none)"}\n\nRECENTLY COVERED (do not repeat)\n${recent.map((x) => `- ${x.t}`).join("\n") || "(none)"}\n\nPropose up to 8 ideas. JSON: {"ideas": [{"kind": "TOPIC|SERIES_EPISODE|NEW_SERIES|FORMAT|TIMING", "title": "...", "rationale": "why, citing the data above", "topic": "TOPIC/SERIES_EPISODE: the exact topic to write", "summary": "what the piece should cover", "series_key": "SERIES_EPISODE: existing series key", "series_name": "NEW_SERIES: name", "premise": "NEW_SERIES: premise", "cadence_days": 7, "content_type": "optional format for this piece", "score": 0.0}]}`,
+    mock: { ideas: [{ kind: "TOPIC", title: `Explainer for ${niche.display_name}`, rationale: "mock planner idea", topic: `What to know this week: ${niche.display_name}`, summary: "", score: 0.6 }] } }));
+  const ideas = (Array.isArray(r.data) ? r.data : r.data?.ideas || []).filter((x) => x && x.title && ["TOPIC", "SERIES_EPISODE", "NEW_SERIES", "FORMAT", "TIMING", "NEW_PROGRAM"].includes(String(x.kind).toUpperCase()));
+  const made = [];
+  for (const x of ideas.slice(0, 8)) {
+    const dup = await one(`SELECT id FROM suggestions WHERE niche_id=$1 AND lower(title)=lower($2) AND created_at > now() - interval '14 days'`, [nicheId, x.title]); if (dup) continue;
+    const s = series.find((y) => y.key === x.series_key);
+    const id = newId(); await q(`INSERT INTO suggestions (id, brand_id, niche_id, series_id, kind, title, rationale, payload, score) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`,
+      [id, niche.brand_id, nicheId, s?.id || null, String(x.kind).toUpperCase(), String(x.title).slice(0, 300), x.rationale || "", JSON.stringify(x), clamp(Number(x.score) || 0.5, 0, 1)]);
+    made.push(id);
+  }
+  const ap = (P(niche.method_config) || {}).autopilot;
+  if (ap?.topics_per_day) {
+    const today = await one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE niche_id=$1 AND status='ACCEPTED' AND acted_at >= CURRENT_DATE AND payload->>'autopilot' = 'true'`, [nicheId]);
+    const pick = await q(`SELECT id FROM suggestions WHERE niche_id=$1 AND status='NEW' AND kind IN ('TOPIC','SERIES_EPISODE') AND score >= $2 ORDER BY score DESC LIMIT $3`, [nicheId, Number(ap.min_score ?? 0.5), Math.max(0, ap.topics_per_day - today.n)]);
+    for (const p of pick) { await q(`UPDATE suggestions SET payload = payload || '{"autopilot": true}'::jsonb WHERE id=$1`, [p.id]); await acceptSuggestion(p.id); }
+  }
+  return { created: made.length, cost: r.cost || 0 };
+}
+async function acceptSuggestion(id) {
+  const s = await one(`SELECT * FROM suggestions WHERE id=$1`, [id]); if (!s) throw new ApiError(404, null, "Suggestion not found");
+  if (s.status === "ACCEPTED") return { suggestion: s };
+  const niche = await one(`SELECT * FROM niches WHERE id=$1`, [s.niche_id]); const p = P(s.payload) || {}; const out = {};
+  if (s.kind === "TOPIC" || s.kind === "SERIES_EPISODE") {
+    const seriesId = s.series_id || (p.series_key ? (await one(`SELECT id FROM series WHERE niche_id=$1 AND key=$2`, [niche.id, p.series_key]))?.id : null) || null;
+    const type = p.content_type && CONTENT_TYPE_SET.has(p.content_type) && !VIDEO_TYPES.has(p.content_type) ? p.content_type : null;
+    out.itemId = await createQueuedItem(niche, { seriesId, contentType: type, topic: p.topic || s.title, sourceDataRef: { provider: "planner", summary: p.summary || s.rationale || "", suggestionId: s.id } });
+    await enqueue("GENERATE_CONTENT", { itemId: out.itemId }, { queue: queueFor(type || niche.content_type), priority: 3, contentItemId: out.itemId });
+  } else if (s.kind === "NEW_SERIES") {
+    out.seriesId = newId();
+    await q(`INSERT INTO series (id, niche_id, key, display_name, premise, cadence_days, auto_generate, next_due_at) VALUES ($1,$2,$3,$4,$5,$6,1,now()) ON CONFLICT (niche_id, key) DO NOTHING`,
+      [out.seriesId, niche.id, slugify(p.series_name || s.title).slice(0, 40), p.series_name || s.title, p.premise || s.rationale || "", Number(p.cadence_days) || 7]);
+  }
+  await q(`UPDATE suggestions SET status='ACCEPTED', acted_at=now(), content_item_id=$2 WHERE id=$1`, [id, out.itemId || null]);
+  return { suggestion: await one(`SELECT * FROM suggestions WHERE id=$1`, [id]), ...out };
+}
+async function sweepPlanner() {
+  if (!(await setting("planner.enabled", true))) return;
+  const due = await q(`SELECT n.id FROM niches n WHERE n.is_active::int = 1 AND NOT EXISTS (SELECT 1 FROM suggestions s WHERE s.niche_id = n.id AND s.created_at > now() - interval '23 hours')
+    AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'PLAN_PROGRAM' AND j.dedupe_key = 'plan:' || n.id AND j.created_at > now() - interval '23 hours') LIMIT 10`);
+  for (const n of due) await enqueue("PLAN_PROGRAM", { nicheId: n.id }, { queue: "text", dedupeKey: `plan:${n.id}`, maxAttempts: 2 });
+}
+// The series' premise and latest episodes, for every prompt that writes an episode.
+async function seriesBlock(item) {
+  if (!item.series_id) return "";
+  const s = await one(`SELECT * FROM series WHERE id=$1`, [item.series_id]); if (!s) return "";
+  const eps = await q(`SELECT episode_number, headline, left(summary, 240) AS summary FROM content_items WHERE series_id=$1 AND id <> $2 AND status NOT IN ('FAILED','REJECTED') ORDER BY created_at DESC LIMIT 6`, [s.id, item.id]);
+  return `\nSERIES: this is episode ${item.episode_number || s.episode_counter + 1} of "${s.display_name}".${s.premise ? ` Premise: ${s.premise}.` : ""}${eps.length ? `\nEarlier episodes (newest first):\n${eps.map((e) => `- Ep ${e.episode_number ?? "?"}: ${e.headline} — ${e.summary || ""}`).join("\n")}\nContinue the series: build on earlier episodes where natural and never repeat one.` : ""}`;
+}
+async function sweepSeries() {
+  const due = await q(`SELECT s.id, s.cadence_days FROM series s JOIN niches n ON n.id = s.niche_id WHERE s.auto_generate::int = 1 AND s.is_active::int = 1 AND n.is_active::int = 1 AND (s.next_due_at IS NULL OR s.next_due_at <= now()) LIMIT 10`);
+  for (const s of due) {
+    await q(`UPDATE series SET next_due_at = now() + ($2 || ' days')::interval WHERE id = $1`, [s.id, String(Number(s.cadence_days) || 7)]);
+    await enqueue("SERIES_NEXT", { seriesId: s.id }, { queue: "text", dedupeKey: `series:${s.id}`, maxAttempts: 3 });
+  }
+}
+async function nextEpisode(seriesId) {
+  const s = await one(`SELECT * FROM series WHERE id=$1`, [seriesId]); if (!s) return null;
+  const niche = await one(`SELECT * FROM niches WHERE id=$1`, [s.niche_id]);
+  const eps = await q(`SELECT episode_number, headline, left(summary, 240) AS summary FROM content_items WHERE series_id=$1 AND status NOT IN ('FAILED','REJECTED') ORDER BY created_at DESC LIMIT 8`, [s.id]);
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 800,
+    system: `You plan the episodes of the series "${s.display_name}" for "${niche.display_name}". Language: ${niche.language || "en"}.`,
+    prompt: `Premise: ${s.premise || "(none)"}\nEpisodes so far (newest first):\n${eps.map((e) => `- Ep ${e.episode_number ?? "?"}: ${e.headline} — ${e.summary || ""}`).join("\n") || "(none yet: plan the first episode)"}\n\nPropose the next episode. It continues naturally and repeats none of the above. JSON: {"topic": "...", "summary": "what it covers"}`,
+    mock: { topic: `${s.display_name}: episode ${s.episode_counter + 1}`, summary: "" } }));
+  const d = r.data || {};
+  const itemId = await createQueuedItem(niche, { seriesId: s.id, topic: d.topic || `${s.display_name} ${s.episode_counter + 1}`, sourceDataRef: { provider: "series", summary: d.summary || "" } });
+  await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: 2, contentItemId: itemId });
+  return { itemId };
+}
+
 // === 9. worker lanes =====================================================
 const QUEUES = ALL_QUEUES;
 async function enqueue(type, payload, { queue = "text", priority = 0, runAfter = null, contentItemId = null, dedupeKey = null, maxAttempts = 3 } = {}) {
@@ -1789,12 +2047,16 @@ const HANDLERS = {
   async RENDER_CLIP({ itemId, clipId }) { return renderClipItem(itemId, clipId); },
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
   async POLL_METRICS({ assetId }) { return pollMetrics(assetId); },
+  async STYLE_GENERATE({ brandId, nicheId, samples }) { const s = await generateStyle({ brandId, nicheId, samples }); return { styleProfileId: s.id }; },
+  async STYLE_REFINE({ profileId }) { return refineStyle(profileId); },
+  async PLAN_PROGRAM({ nicheId }) { return planProgram(nicheId); },
+  async SERIES_NEXT({ seriesId }) { return nextEpisode(seriesId); },
 };
 // Seconds until the next attempt, or null to give up. Transient failures (overloaded model, rate limit, network) back
 // off exponentially — 1, 2, 4 … 32 min, about an hour in all — for jobs that are safe to repeat. Publishing keeps its
 // own small attempt count so a slow platform cannot cause double posts. Permanent failures stop at once.
 const TRANSIENT_MAX_ATTEMPTS = Number(ENV.TRANSIENT_MAX_ATTEMPTS) || 7;
-const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "RENDER_CLIP", "POLL_METRICS"]);
+const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "RENDER_CLIP", "POLL_METRICS", "STYLE_GENERATE", "STYLE_REFINE", "PLAN_PROGRAM", "SERIES_NEXT"]);
 function retryDelay(job, e) {
   if (isPermanent(e)) return null;
   const transient = isTransient(e);
@@ -1874,7 +2136,7 @@ function startWorkers() {
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
   every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
-  every(6 * 3600000, sweepRetention);
+  every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
@@ -2064,6 +2326,8 @@ app.post("/api/niches", async (ctx) => {
   if (Array.isArray(b.sourceIds)) for (const s of b.sourceIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, s]);
   // A Bangladesh program with no sources picked gets the catalog's sources for its language (or the TV channels).
   if (b.autoSources !== false && !(b.sourceIds || []).length) await installCatalogSources(catalogFor(row), [id]);
+  // No style picked: the LLM writes one for this brand + program in the background.
+  if (b.autoStyle !== false && !b.styleProfileId) await enqueue("STYLE_GENERATE", { brandId: row.brand_id, nicheId: id }, { queue: "text", priority: 8, dedupeKey: `style-gen:${id}` });
   json(ctx, 201, rowJson(row, NICHE_JSON));
 });
 app.post("/api/programs", async (ctx) => { ctx.req.url = "/api/niches"; const r = app.routes.find((x) => x.method === "POST" && x.re.test("/api/niches")); return r.handler(ctx); });
@@ -2083,8 +2347,25 @@ app.delete("/api/channels/:id/niches/:nicheId", async (ctx) => { await q(`DELETE
 app.post("/api/channels/:id/test-publish", async (ctx) => { const ch = await one(`SELECT * FROM channels WHERE id=$1`, [ctx.params.id]); if (!ch) throw new ApiError(404, null, "Channel not found"); const pub = await resolve("PUBLISH", ch.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[ch.platform] || "publish_mock"); if (ch.platform !== "FACEBOOK" || pub.impl !== "meta_graph") return json(ctx, 200, { ok: true, note: `resolved publisher ${pub.key}; only Facebook text test-posts are supported here` }); json(ctx, 200, await pub.publish({ channel: ch, mediaKind: "TEXT", caption: ctx.body.message || "Content Engine connection test", title: "test" })); });
 // ---- series
 app.get("/api/series", async (ctx) => { const n = ctx.query.get("nicheId"); json(ctx, 200, n ? await q(`SELECT * FROM series WHERE niche_id=$1 ORDER BY created_at DESC`, [n]) : await q(`SELECT * FROM series ORDER BY created_at DESC`)); });
-app.post("/api/series", async (ctx) => { const b = ctx.body; if (!b.nicheId || !b.key || !b.displayName) throw new ApiError(400, null, "nicheId, key, displayName are required"); const id = newId(); await q(`INSERT INTO series (id, niche_id, key, display_name) VALUES ($1,$2,$3,$4)`, [id, b.nicheId, b.key, b.displayName]); json(ctx, 201, await one(`SELECT * FROM series WHERE id=$1`, [id])); });
-app.patch("/api/series/:id", async (ctx) => json(ctx, 200, await patchRow("series", ctx.params.id, ctx.body, { displayName: "display_name", isActive: "is_active", episodeCounter: "episode_counter" })));
+const SERIES_MAP = { displayName: "display_name", isActive: "is_active", episodeCounter: "episode_counter", premise: "premise", cadenceDays: "cadence_days", autoGenerate: "auto_generate", nextDueAt: "next_due_at" };
+app.post("/api/series", async (ctx) => { const b = ctx.body; if (!b.nicheId || !b.key || !b.displayName) throw new ApiError(400, null, "nicheId, key, displayName are required"); const id = newId(); await q(`INSERT INTO series (id, niche_id, key, display_name) VALUES ($1,$2,$3,$4)`, [id, b.nicheId, b.key, b.displayName]); const rest = { ...b }; for (const k of ["nicheId", "key", "displayName"]) delete rest[k]; json(ctx, 201, Object.keys(rest).some((k) => k in SERIES_MAP) ? await patchRow("series", id, rest, SERIES_MAP) : await one(`SELECT * FROM series WHERE id=$1`, [id])); });
+app.patch("/api/series/:id", async (ctx) => json(ctx, 200, await patchRow("series", ctx.params.id, ctx.body, SERIES_MAP)));
+app.post("/api/series/:id/next", async (ctx) => json(ctx, 202, await nextEpisode(ctx.params.id)));
+// ---- style generation, planner, insights
+app.post("/api/style-profiles/generate", async (ctx) => { const b = ctx.body; if (!b.brandId) throw new ApiError(400, null, "brandId is required"); json(ctx, 201, rowJson(await generateStyle({ brandId: b.brandId, nicheId: b.nicheId || null, samples: b.samples || "", name: b.name || null, apply: !!b.apply }), ["banned_terms", "hashtags", "history"])); });
+app.post("/api/style-profiles/:id/refine", async (ctx) => json(ctx, 200, (await refineStyle(ctx.params.id)) || { changes: null, note: "Nothing to learn from yet: no edits, rejections or published posts with metrics." }));
+app.get("/api/suggestions", async (ctx) => { const n = ctx.query.get("nicheId"), st = ctx.query.get("status") || "NEW"; json(ctx, 200, (await q(`SELECT s.*, n.display_name AS program_name FROM suggestions s LEFT JOIN niches n ON n.id = s.niche_id WHERE ($1::text IS NULL OR s.niche_id=$1) AND ($2 = 'ALL' OR s.status=$2) ORDER BY s.created_at DESC, s.score DESC LIMIT 200`, [n, st])).map((r) => rowJson(r, ["payload"]))); });
+app.post("/api/suggestions/:id/accept", async (ctx) => json(ctx, 200, await acceptSuggestion(ctx.params.id)));
+app.post("/api/suggestions/:id/dismiss", async (ctx) => json(ctx, 200, await one(`UPDATE suggestions SET status='DISMISSED', acted_at=now() WHERE id=$1 RETURNING *`, [ctx.params.id])));
+app.post("/api/programs/:id/plan", async (ctx) => json(ctx, 200, await planProgram(ctx.params.id)));
+app.get("/api/insights", async (ctx) => {
+  const nicheId = ctx.query.get("nicheId"), days = Math.min(180, Number(ctx.query.get("days")) || 30);
+  const niches = nicheId ? [await one(`SELECT * FROM niches WHERE id=$1`, [nicheId])].filter(Boolean) : await q(`SELECT * FROM niches WHERE is_active::int = 1 ORDER BY priority DESC`);
+  const programs = []; for (const n of niches) programs.push({ program: { id: n.id, name: n.display_name, type: n.content_type }, ...(await programStats(n, days)) });
+  const totals = await one(`SELECT COUNT(*)::int AS published, COALESCE(SUM((last_metrics->>'views')::int), 0)::int AS views, COALESCE(SUM((last_metrics->>'likes')::int), 0)::int AS likes, COALESCE(SUM((last_metrics->>'comments')::int), 0)::int AS comments FROM content_assets WHERE status = 'PUBLISHED' AND published_at > now() - ($1 || ' days')::interval`, [String(days)]);
+  const qa = await q(`SELECT qa_status, COUNT(*)::int AS n FROM content_items WHERE created_at > now() - ($1 || ' days')::interval AND qa_status IS NOT NULL GROUP BY qa_status`, [String(days)]);
+  json(ctx, 200, { days, totals, qa: Object.fromEntries(qa.map((r) => [r.qa_status, r.n])), programs });
+});
 // ---- style profiles
 app.get("/api/style-profiles", async (ctx) => json(ctx, 200, (await q(`SELECT * FROM style_profiles ORDER BY name`)).map((r) => rowJson(r, ["banned_terms", "hashtags"]))));
 app.post("/api/style-profiles", async (ctx) => { const b = ctx.body; if (!b.name) throw new ApiError(400, null, "name is required"); const id = newId(); await q(`INSERT INTO style_profiles (id, brand_id, name, language, tone, rules, examples, banned_terms, cta, hashtags) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb)`, [id, b.brandId || null, b.name, b.language || "en", b.tone || "", b.rules || "", b.examples || "", JSON.stringify(b.bannedTerms || []), b.cta || "", JSON.stringify(b.hashtags || [])]); json(ctx, 201, rowJson(await one(`SELECT * FROM style_profiles WHERE id=$1`, [id]), ["banned_terms", "hashtags"])); });
@@ -2151,7 +2432,17 @@ app.post("/api/generate", async (ctx) => {
 app.post("/api/content-items/:id/approve", async (ctx) => { if (rateLimited(`appr:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many approve requests"); json(ctx, 200, await itemWithMedia(await approveItem(ctx.params.id, { scheduledFor: ctx.body.scheduledFor || null }))); });
 app.post("/api/content-items/:id/reject", async (ctx) => json(ctx, 200, await rejectItem(ctx.params.id, ctx.body.note)));
 app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); if (VIDEO_TYPES.has(it.content_type) && part === "all") { await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: "video", contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : queueFor(it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
-app.patch("/api/content-items/:id", async (ctx) => { const b = ctx.body; const map = { script: "script", headline: "headline", summary: "summary", body: "body", captions: "captions", hashtags: "hashtags", imagePrompt: "image_prompt", scheduledFor: "scheduled_for", heroMediaId: "hero_media_id" }; const row = await patchRow("content_items", ctx.params.id, b, map); json(ctx, 200, await itemWithMedia(row)); });
+// Reviewer edits to an AI draft are logged as style feedback, and a changed headline redraws the photocard.
+app.patch("/api/content-items/:id", async (ctx) => {
+  const b = ctx.body; const map = { script: "script", headline: "headline", summary: "summary", body: "body", captions: "captions", hashtags: "hashtags", imagePrompt: "image_prompt", scheduledFor: "scheduled_for", heroMediaId: "hero_media_id" };
+  const before = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!before) throw new ApiError(404, null, "Not found");
+  let row = await patchRow("content_items", ctx.params.id, b, map);
+  const txt = (v) => (v && typeof v === "object" ? JSON.stringify(v) : String(v ?? ""));
+  const changed = ["headline", "summary", "body", "script", "captions"].filter((f) => f in b && txt(P(b[f]) ?? b[f]) !== txt(P(before[f]) ?? before[f]));
+  if (changed.length && before.status === "PENDING_REVIEW") await logStyleFeedback(before, "EDIT", changed.map((f) => ({ field: f, old: txt(P(before[f]) ?? before[f]).slice(0, 4000), new: txt(P(b[f]) ?? b[f]).slice(0, 4000) }))).catch((e) => warn("style feedback", e.message));
+  if (changed.includes("headline") && !("heroMediaId" in b)) { if (await recomposeCard(row.id).catch((e) => warn(`card recompose: ${e.message}`))) row = await one(`SELECT * FROM content_items WHERE id=$1`, [row.id]); }
+  json(ctx, 200, await itemWithMedia(row));
+});
 app.delete("/api/content-items/:id", async (ctx) => { await q(`DELETE FROM content_items WHERE id=$1 AND status IN ('FAILED','REJECTED')`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/content-items/:id/publish-now", async (ctx) => { await q(`UPDATE content_assets SET scheduled_for=now(), status='PENDING', error_message=NULL WHERE content_item_id=$1 AND status IN ('PENDING','FAILED')`, [ctx.params.id]); await sweepDueAssets(); json(ctx, 202, { ok: true }); });
 // ---- assets / performance

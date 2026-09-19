@@ -233,6 +233,53 @@ ALTER TABLE content_items ADD COLUMN IF NOT EXISTS scheduled_for       TIMESTAMP
 ALTER TABLE content_items ADD COLUMN IF NOT EXISTS generation_cost_usd REAL NOT NULL DEFAULT 0;
 ALTER TABLE content_items ADD COLUMN IF NOT EXISTS cluster_id          TEXT;   -- news-desk story this item covers
 CREATE INDEX IF NOT EXISTS idx_content_items_cluster ON content_items(cluster_id, niche_id);
+-- Quality gate (server.js 8h): PASS | REVIEW | REJECT, 0-1 score, the full report.
+ALTER TABLE content_items ADD COLUMN IF NOT EXISTS qa_status           TEXT;
+ALTER TABLE content_items ADD COLUMN IF NOT EXISTS qa_score            REAL;
+ALTER TABLE content_items ADD COLUMN IF NOT EXISTS qa_report           JSONB;
+
+-- Style learning (server.js 8i): reviewer edits, rejection notes and top posts feed periodic style refinement.
+ALTER TABLE style_profiles ADD COLUMN IF NOT EXISTS niche_id   TEXT;
+ALTER TABLE style_profiles ADD COLUMN IF NOT EXISTS generated  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE style_profiles ADD COLUMN IF NOT EXISTS history    JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE style_profiles ADD COLUMN IF NOT EXISTS refined_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS style_feedback (
+  id               TEXT PRIMARY KEY,
+  style_profile_id TEXT,
+  niche_id         TEXT,
+  content_item_id  TEXT,
+  kind             TEXT NOT NULL,        -- EDIT | REJECT
+  field            TEXT,
+  old_text         TEXT,
+  new_text         TEXT,
+  note             TEXT,
+  used_at          TIMESTAMPTZ,          -- set once a refinement has consumed it
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_style_feedback_profile ON style_feedback(style_profile_id, used_at);
+
+-- Planner (server.js 8j): ideas from past performance, trending stories and series history.
+CREATE TABLE IF NOT EXISTS suggestions (
+  id              TEXT PRIMARY KEY,
+  brand_id        TEXT,
+  niche_id        TEXT,
+  series_id       TEXT,
+  kind            TEXT NOT NULL,         -- TOPIC | SERIES_EPISODE | NEW_SERIES | FORMAT | TIMING | NEW_PROGRAM
+  title           TEXT NOT NULL,
+  rationale       TEXT,
+  payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  score           REAL NOT NULL DEFAULT 0,
+  status          TEXT NOT NULL DEFAULT 'NEW',   -- NEW | ACCEPTED | DISMISSED
+  content_item_id TEXT,
+  acted_at        TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_suggestions_niche ON suggestions(niche_id, status, created_at DESC);
+ALTER TABLE series ADD COLUMN IF NOT EXISTS premise       TEXT;
+ALTER TABLE series ADD COLUMN IF NOT EXISTS cadence_days  REAL;
+ALTER TABLE series ADD COLUMN IF NOT EXISTS next_due_at   TIMESTAMPTZ;
+ALTER TABLE series ADD COLUMN IF NOT EXISTS auto_generate INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_content_items_niche_series_status ON content_items(niche_id, series_id, status);
 CREATE INDEX IF NOT EXISTS idx_content_items_status ON content_items(status, created_at);
 
@@ -357,6 +404,7 @@ CREATE TABLE IF NOT EXISTS performance_metrics (
   captured_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_perf_asset_time ON performance_metrics(asset_id, captured_at);
+ALTER TABLE performance_metrics ADD COLUMN IF NOT EXISTS shares INTEGER DEFAULT 0;
 
 -- ---------------------------------------------------------------------
 -- JOB QUEUE (DB-backed, one lane per queue, claimed with SKIP LOCKED)
@@ -464,7 +512,7 @@ DECLARE t TEXT;
 BEGIN
   FOR t IN SELECT unnest(ARRAY['brands','niches','channels','series','style_profiles','sources',
                                'content_items','content_assets','portal_articles','video_candidates',
-                               'jobs','api_credentials','settings','adapter_configs','story_clusters']) LOOP
+                               'jobs','api_credentials','settings','adapter_configs','story_clusters','suggestions']) LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_' || t || '_updated_at') THEN
       EXECUTE format('CREATE TRIGGER trg_%I_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()', t, t);
     END IF;
