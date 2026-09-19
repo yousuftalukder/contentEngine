@@ -17,7 +17,7 @@
 
 import http from "node:http";
 import { readFile, writeFile, mkdir, unlink, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, createWriteStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { dirname, join, extname } from "node:path";
@@ -768,6 +768,9 @@ function svgCard(headline, specs) {
 // or image_specs.overlay=false for no text at all.
 const OVERLAY_FONT = ENV.OVERLAY_FONT || "Noto Sans Bengali";
 const assEsc = (t) => String(t || "").replace(/[\r\n]+/g, " ").replace(/[{}\\]/g, "").trim();
+// A file path as a filtergraph option value: quoted so the graph parser passes it through, colon escaped for the option
+// parser (Windows drive letters), forward slashes throughout.
+const ffPath = (p) => `'${String(p).replace(/\\/g, "/").replace(/'/g, "").replace(/:/g, "\\:")}'`;
 const assColor = (hex, alpha = "00") => { const m = /^#?([0-9a-f]{6})$/i.exec(hex || ""); if (!m) return `&H${alpha}FFFFFF`; const h = m[1]; return `&H${alpha}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`.toUpperCase(); };
 async function imageDims(file) { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file]); const [w, h] = out.trim().split(",").map(Number); return { width: w || 1080, height: h || 1080 }; }
 async function composeHeadline(inPath, headline, specs = {}) {
@@ -777,9 +780,60 @@ async function composeHeadline(inPath, headline, specs = {}) {
   const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${Math.round(h * 0.7)})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
   const band = [0.58, 0.68, 0.78].map((y, i) => `drawbox=x=0:y=ih*${y}:w=iw:h=ih:color=black@${0.18 + i * 0.16}:t=fill`).join(",");
-  try { await exec("ffmpeg", ["-y", "-i", inPath, "-vf", `${band},subtitles=${assPath.replace(/\\/g, "/").replace(/:/g, "\\:")}`, "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
+  try { await exec("ffmpeg", ["-y", "-i", inPath, "-vf", `${band},${assVf(assPath)}`, "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
   finally { await cleanup(assPath); }
 }
+// ---- Photocard: the standard Bangladeshi news-page post. Picture on top, a panel in the brand colour holding the headline,
+// an accent rule, the brand logo, the date (Bangla digits for Bangla cards) and the source credit. Also libass for text.
+// Brand kit (brands.brand_kit): logo_url, primary_color, accent_color, text_color, font, fonts_url, handle, image_ratio,
+// logo_scale, credit_sources. image_specs.layout on a program: "photocard" (default) | "overlay" (text over the photo).
+function cardDate(lang, tz = "Asia/Dhaka") {
+  try { return new Intl.DateTimeFormat(lang === "bn" ? "bn-BD" : "en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: tz }).format(new Date()); }
+  catch { return new Date().toISOString().slice(0, 10); }
+}
+// Largest font size (from base down) at which the text, wrapped at an estimated glyph width, fits the box.
+function fitFontSize(text, width, height, base, glyph) {
+  let size = base;
+  for (; size > base * 0.5; size -= 2) { const perLine = Math.max(6, Math.floor(width / (size * glyph))); if (Math.ceil(String(text).length / perLine) * size * 1.3 <= height) break; }
+  return Math.round(size);
+}
+// A brand's custom fonts (fonts_url: a .ttf/.otf, or several comma-separated) are fetched once into a per-process fonts dir.
+const fontsDirCache = new Map();
+async function brandFontsDir(kit) {
+  if (!kit?.fonts_url) return null;
+  if (fontsDirCache.has(kit.fonts_url)) return fontsDirCache.get(kit.fonts_url);
+  const dir = join(TMP, "fonts", sha(kit.fonts_url).slice(0, 12)); await mkdir(dir, { recursive: true });
+  for (const u of String(kit.fonts_url).split(",").map((s) => s.trim()).filter(Boolean)) { try { await writeFile(join(dir, u.split("/").pop().split("?")[0] || "font.ttf"), await fetchBytes(u)); } catch (e) { warn(`brand font ${u}: ${e.message}`); } }
+  fontsDirCache.set(kit.fonts_url, dir); return dir;
+}
+async function composePhotocard(inPath, headline, specs = {}) {
+  const kit = specs.kit || {}, meta = specs.card_meta || {};
+  const W = specs.width || 1080, H = specs.height || 1080, split = Math.round(H * (kit.image_ratio || 0.6)), m = Math.round(W * 0.055);
+  const bn = /[ঀ-৿]/.test(headline), font = kit.font || OVERLAY_FONT;
+  const metaSize = Math.round(H * 0.024), metaBand = Math.round(metaSize * 2.6);
+  const size = fitFontSize(headline, W - 2 * m, H - split - metaBand - Math.round(m * 1.2), Math.round(H * 0.068), bn ? 0.54 : 0.5);
+  const fg = assColor(kit.text_color || "#ffffff"), dim = assColor(kit.text_color || "#ffffff", "50"), acc = assColor(kit.accent_color || "#ffc400");
+  const hex = (c, d) => (/^#?[0-9a-f]{6}$/i.test(c || "") ? c : d).replace("#", "0x");
+  const metaLine = [meta.date, meta.credit].filter(Boolean).join("   •   ");
+  const style = (name, sz, col, bold, align, mv) => `Style: ${name},${font},${sz},${col},${col},&H00000000,&H00000000,${bold ? -1 : 0},0,0,0,100,100,0,0,1,0,0,${align},${m},${m},${mv},1`;
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${W}\nPlayResY: ${H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n`
+    + [style("Head", size, fg, true, 7, split + Math.round(m * 0.8)), style("Meta", metaSize, dim, false, 1, Math.round(metaSize * 0.9)), style("Handle", metaSize, acc, true, 3, Math.round(metaSize * 0.9))].join("\n")
+    + `\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`
+    + (metaLine ? `Dialogue: 0,0:00:00.00,0:00:10.00,Meta,,0,0,0,,${assEsc(metaLine)}\n` : "") + (kit.handle ? `Dialogue: 0,0:00:00.00,0:00:10.00,Handle,,0,0,0,,${assEsc(kit.handle)}\n` : "");
+  const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
+  let logo = null; if (kit.logo_url) { try { logo = await toTmpFile(kit.logo_url, "png"); } catch (e) { warn(`brand logo: ${e.message}`); } }
+  const fontsDir = await brandFontsDir(kit);
+  let fc = `color=c=${hex(kit.primary_color, "#b3121f")}:s=${W}x${H}:d=1[bg];[0:v]scale=${W}:${split}:force_original_aspect_ratio=increase,crop=${W}:${split},setsar=1[img];[bg][img]overlay=0:0[b0];`
+    + `[b0]drawbox=x=0:y=${split}:w=${W}:h=${Math.max(4, Math.round(H * 0.008))}:color=${hex(kit.accent_color, "#ffc400")}@1:t=fill[b1]`;
+  let last = "b1";
+  if (logo) { fc += `;[1:v]scale=${Math.round(W * (kit.logo_scale || 0.17))}:-1[lg];[${last}][lg]overlay=${m}:${m}[b2]`; last = "b2"; }
+  fc += `;[${last}]${assVf(assPath, fontsDir)}[out]`;
+  try { await exec("ffmpeg", ["-y", "-i", inPath, ...(logo ? ["-i", logo] : []), "-filter_complex", fc, "-map", "[out]", "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
+  finally { await cleanup(assPath, logo); }
+}
+// Gemini's supported aspect ratio closest to w:h — the picture area of a photocard is wider than the card.
+const IMAGE_RATIOS = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
+const nearestRatio = (w, h) => IMAGE_RATIOS.map((r) => [r, Math.abs(Math.log((Number(r.split(":")[0]) / Number(r.split(":")[1])) / (w / h)))]).sort((a, b) => a[1] - b[1])[0][0];
 // Instagram accepts JPEG only and Facebook prefers it; every generated raster image is stored as JPEG. SVG (mock) stays SVG
 // unless this ffmpeg build can rasterise it. Falls back to the original bytes if conversion fails.
 async function toJpeg(bytes, mime, quality = 3) {
@@ -793,7 +847,12 @@ async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}, comp
   let j = await toJpeg(bytes, mime);
   if (compose?.headline && compose.specs?.render_text !== true && compose.specs?.overlay !== false && j.mime === "image/jpeg") {
     const inp = tmpPath("jpg"); await writeFile(inp, j.bytes);
-    try { const out = await composeHeadline(inp, compose.headline, compose.specs); j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; meta = { ...meta, overlay: true }; await cleanup(out); }
+    try {
+      const card = (compose.specs.layout || (compose.specs.kit ? "photocard" : "overlay")) === "photocard";
+      const out = card ? await composePhotocard(inp, compose.headline, compose.specs) : await composeHeadline(inp, compose.headline, compose.specs);
+      j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; meta = { ...meta, overlay: card ? "photocard" : true }; await cleanup(out);
+      if (card) dims = { width: compose.specs.width || 1080, height: compose.specs.height || 1080 };
+    }
     catch (e) { warn(`headline overlay skipped: ${e.message.slice(0, 160)}`); }
     finally { await cleanup(inp); }
   }
@@ -924,20 +983,41 @@ impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { mode
   } }) });
 
 // ---- 6j. Render (stage RENDER). ffmpeg helpers + renderForChannel({item, media, channel, niche}) -> {url, kind}
-const srtTime = (s) => { const ms = Math.round(s * 1000); const h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60, sec = Math.floor(ms / 1000) % 60; return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")},${String(ms % 1000).padStart(3, "0")}`; };
-async function writeSrt(segments, start, end) {
-  const inRange = segments.filter((s) => s.end > start && s.start < end);
-  const body = inRange.map((s, i) => `${i + 1}\n${srtTime(Math.max(0, s.start - start))} --> ${srtTime(Math.min(end, s.end) - start)}\n${s.text.replace(/\n/g, " ")}\n`).join("\n");
-  const f = tmpPath("srt"); await writeFile(f, body || "1\n00:00:00,000 --> 00:00:01,000\n \n"); return f;
+// Burned-in text is always an ASS file drawn by the `ass` filter with complex shaping: ffmpeg's `subtitles` filter and
+// drawtext use simple shaping, which scrambles Bangla (vowel signs and conjuncts render in the wrong place).
+const assTime = (s) => { const cs = Math.max(0, Math.round(s * 100)); return `${Math.floor(cs / 360000)}:${String(Math.floor(cs / 6000) % 60).padStart(2, "0")}:${String(Math.floor(cs / 100) % 60).padStart(2, "0")}.${String(cs % 100).padStart(2, "0")}`; };
+const assVf = (file, fontsDir = null) => `ass=filename=${ffPath(file)}:shaping=complex${fontsDir ? `:fontsdir=${ffPath(fontsDir)}` : ""}`;
+const ASS_FORMAT = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding";
+// Captions for [start, end] of a timed transcript, shifted to 0 and cut into short phrases (a few words, timed by character
+// count). Karaoke colours each word as it is spoken. An optional hook sits in a box at the top for the first four seconds.
+async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1920, hook = null, font = OVERLAY_FONT, karaoke = true, accent = "#ffd400" } = {}) {
+  const vertical = height > width, size = Math.round(height * (vertical ? 0.04 : 0.052)), maxWords = vertical ? 4 : 8, events = [];
+  const weight = (w) => w.length + 1;
+  for (const s of (segments || []).filter((x) => x.end > start && x.start < end)) {
+    const s0 = Math.max(s.start, start) - start, s1 = Math.min(s.end, end) - start; if (s1 - s0 < 0.2) continue;
+    const words = String(s.text || "").trim().split(/\s+/).filter(Boolean); if (!words.length) continue;
+    const total = words.reduce((n, w) => n + weight(w), 0); let t = s0;
+    for (let i = 0; i < words.length; i += maxWords) {
+      const chunk = words.slice(i, i + maxWords), cw = chunk.reduce((n, w) => n + weight(w), 0), d = ((s1 - s0) * cw) / total;
+      const text = karaoke ? chunk.map((w) => `{\\k${Math.max(1, Math.round((d * 100 * weight(w)) / cw))}}${assEsc(w)}`).join(" ") : assEsc(chunk.join(" "));
+      events.push(`Dialogue: 0,${assTime(t)},${assTime(t + d)},Cap,,0,0,0,,${text}`); t += d;
+    }
+  }
+  if (hook) events.push(`Dialogue: 1,${assTime(0)},${assTime(Math.min(4, Math.max(1, end - start)))},Hook,,0,0,0,,${assEsc(hook).slice(0, 90)}`);
+  const white = assColor("#ffffff"), mx = Math.round(width * 0.07);
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n${ASS_FORMAT}\n`
+    // Karaoke: SecondaryColour = not yet spoken, PrimaryColour = spoken.
+    + `Style: Cap,${font},${size},${karaoke ? assColor(accent) : white},${white},&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(size * 0.09))},${Math.round(size * 0.05)},2,${mx},${mx},${Math.round(height * (vertical ? 0.22 : 0.07))},1\n`
+    + `Style: Hook,${font},${Math.round(size * 1.05)},${white},${white},&H70000000,&H70000000,-1,0,0,0,100,100,0,0,3,${Math.round(size * 0.3)},0,8,${mx},${mx},${Math.round(height * (vertical ? 0.12 : 0.06))},1\n`
+    + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
+  const f = tmpPath("ass"); await writeFile(f, ass); return f;
 }
 const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
 const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black";
-const captionsVf = (srt, marginV = 190) => `subtitles=${srt.replace(/\\/g, "/").replace(/:/g, "\\:")}:force_style='FontName=${OVERLAY_FONT},FontSize=17,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=${marginV}'`;
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"];
-async function cutClip(input, start, end, { vertical = true, srt = null, hook = null } = {}) {
+async function cutClip(input, start, end, { vertical = true, ass = null } = {}) {
   const vf = [vertical ? VF_VERTICAL : VF_LANDSCAPE];
-  if (hook) vf.push(`drawtext=text='${hook.replace(/[':\\]/g, " ").slice(0, 60)}':fontsize=54:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=${vertical ? 260 : 60}:enable='lt(t,4)'`);
-  if (srt) vf.push(captionsVf(srt, vertical ? 190 : 40));
+  if (ass) vf.push(assVf(ass));
   const out = tmpPath("mp4");
   await exec("ffmpeg", ["-y", "-ss", String(start), "-t", String(Math.max(1, end - start)), "-i", input, "-vf", vf.join(","), ...X264, out]);
   return out;
@@ -967,11 +1047,12 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
   },
   async renderClip({ clip, sourcePath, transcript, niche, contentItemId, extras = {} }) {
     const c = methodCfg(niche); const vertical = c.orientation !== "16:9";
-    const srt = c.captions === false ? null : await writeSrt(transcript.segments, clip.start, clip.end);
-    let file;
+    const segs = c.captions === false ? [] : transcript.segments;
+    const assFor = (v, withHook = true, s = segs) => writeCaptionsAss(s, clip.start, clip.end, { width: v ? 1080 : 1920, height: v ? 1920 : 1080, hook: withHook ? clip.hook : null });
+    const caps = []; let file;
     switch (niche.production_method || "PODCAST_HIGHLIGHT") {
       case "REACTION_OVERLAY": {
-        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false, srt });
+        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false, ass: caps[caps.push(await assFor(false, false)) - 1] });
         const ovUrl = c.overlay_video_url; if (!ovUrl) throw new Error("REACTION_OVERLAY needs method_config.overlay_video_url (your own reaction clip)");
         const ov = await toTmpFile(ovUrl, "mp4"); file = tmpPath("mp4");
         const box = "scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=black";
@@ -981,7 +1062,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         await cleanup(main, ov); break;
       }
       case "VOICEOVER": {
-        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical, srt: null, hook: clip.hook });
+        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical, ass: caps[caps.push(await assFor(vertical, true, [])) - 1] });
         if (!extras.audio?.url) throw new Error("VOICEOVER render needs extras.audio");
         const a = await toTmpFile(extras.audio.url, "mp3"); file = tmpPath("mp4");
         await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", file]); await cleanup(main, a); break;
@@ -994,9 +1075,9 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? VF_VERTICAL : VF_LANDSCAPE}[v]`;
         await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
       }
-      default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, srt, hook: clip.hook });
+      default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, ass: caps[caps.push(await assFor(vertical)) - 1] });
     }
-    await cleanup(srt);
+    await cleanup(...caps);
     return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
   },
   async renderSlideshow({ images, audio, contentItemId, orientation = "9:16", captions = [] }) {
@@ -1007,10 +1088,10 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     const list = tmpPath("txt"); await writeFile(list, files.map((f) => `file '${f}'\nduration ${per.toFixed(3)}`).join("\n") + `\nfile '${files.at(-1)}'\n`);
     const [w, h] = orientation === "16:9" ? [1920, 1080] : [1080, 1920];
     const vf = [`scale=${w}:${h}:force_original_aspect_ratio=increase`, `crop=${w}:${h}`, `zoompan=z='min(zoom+0.0008,1.12)':d=${Math.round(per * 30)}:s=${w}x${h}:fps=30`, "format=yuv420p"];
-    let srt = null; if (captions.length) { srt = await writeSrt(captions, 0, dur); vf.push(captionsVf(srt, orientation === "16:9" ? 40 : 190)); }
+    let ass = null; if (captions.length) { ass = await writeCaptionsAss(captions, 0, dur, { width: w, height: h }); vf.push(assVf(ass)); }
     const out = tmpPath("mp4");
     await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, "-vf", vf.join(","), "-r", "30", "-t", String(dur), ...X264, out]);
-    await cleanup(list, a, srt, ...files);
+    await cleanup(list, a, ass, ...files);
     return publishRender(out, contentItemId, { method: "SLIDESHOW", orientation, slides: images.length });
   },
 }) });
@@ -1394,6 +1475,20 @@ function styleBlock(style) {
   if (!style) return "";
   return `\nWRITING STYLE "${style.name}": tone: ${style.tone}. Rules: ${style.rules}. ${style.examples ? `Examples of the voice:\n${style.examples}\n` : ""}${(P(style.banned_terms) || []).length ? `Never use these words/phrases: ${(P(style.banned_terms) || []).join(", ")}.` : ""} ${style.cta ? `End with this call to action: ${style.cta}.` : ""} ${(P(style.hashtags) || []).length ? `Always include hashtags: ${(P(style.hashtags) || []).join(" ")}.` : ""}`;
 }
+// Specs for a text item's hero picture: photocard layout with the brand kit and a date / source-credit line, overridden by
+// the program's image_specs. News pictures default to illustration: a realistic "photo" of a real event would mislead.
+async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
+  const brand = await one(`SELECT name, brand_kit FROM brands WHERE id = $1`, [niche.brand_id]);
+  const kit = P(brand?.brand_kit) || {}, own = P(niche.image_specs) || {}, lang = (niche.language || "en").slice(0, 2);
+  const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", kit, ...own };
+  if (specs.layout === "photocard") {
+    const outlets = [...new Set((m.versions?.length ? m.versions.map((v) => v.outlet) : [m.raw?.outlet]).filter(Boolean))].slice(0, 2);
+    specs.card_meta = { date: cardDate(lang, /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC"), credit: kit.credit_sources === false || !outlets.length ? null : `${lang === "bn" ? "সূত্র" : "Source"}: ${outlets.join(", ")}` };
+    specs.aspect_ratio = own.aspect_ratio || nearestRatio(specs.width, Math.round(specs.height * (kit.image_ratio || 0.6)));
+  }
+  if (!own.style && niche.content_type === "NEWS_STATIC") specs.style = "Editorial illustration in a modern digital-painting style: rich colour, dramatic light, clearly an illustration rather than a photograph, no identifiable real people, no text.";
+  return specs;
+}
 const llmFor = async (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks"), fn);
 const imageFor = async (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks"), fn);
 
@@ -1471,7 +1566,7 @@ async function generateStatic(item, niche, style) {
     mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
   await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: d.captions || {}, hashtags: Array.isArray(d.hashtags) ? d.hashtags : [], image_prompt: d.image_prompt || null });
-  const specs = { width: 1080, height: 1080, brand: niche.display_name, ...(P(niche.image_specs) || {}) };
+  const specs = await cardSpecs(niche, m);
   const img = await imageFor(niche, (ia) => ia.generate({ prompt: d.image_prompt, headline: d.headline || m.title, specs, contentItemId: item.id }));
   await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id });
 }
@@ -1596,7 +1691,7 @@ async function runGeneration(itemId) {
 async function regenerate(itemId, part) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
-  if (part === "image") { const img = await imageFor(niche, (ia) => ia.generate({ prompt: item.image_prompt, headline: item.headline || item.topic, specs: { width: 1080, height: 1080, brand: niche.display_name, ...(P(niche.image_specs) || {}) }, contentItemId: itemId })); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
+  if (part === "image") { const specs = await cardSpecs(niche, { versions: (P(item.source_data_ref)?.outlets || []).map((outlet) => ({ outlet })) }); const img = await imageFor(niche, (ia) => ia.generate({ prompt: item.image_prompt, headline: item.headline || item.topic, specs, contentItemId: itemId })); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
   if (part === "all") { await setItem(itemId, { headline: null, summary: null, body: null, hero_media_id: null }); return runGeneration(itemId); }
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500, system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)}`,
     prompt: `Current headline: ${item.headline}\nSummary: ${item.summary}\nBody: ${(item.body || "").slice(0, 3000)}\n\nRewrite ONLY the ${part} to be stronger, keeping the facts identical. Return JSON: ${part === "headline" ? '{"headline": "..."}' : part === "captions" ? '{"captions": {"facebook": "...", "instagram": "...", "x": "...", "linkedin": "..."}, "hashtags": ["..."]}' : '{"body": "..."}'}`,
@@ -1818,7 +1913,8 @@ const server = http.createServer(async (req, res) => {
       return send(res, 404, { error: "Not found", path: pathname });
     }
     const groups = match.re.exec(pathname).slice(1); const params = {}; match.names.forEach((n, i) => (params[n] = groups[i]));
-    const body = ["POST", "PATCH", "PUT"].includes(req.method) ? await readBody(req) : {};
+    const streamed = req.method === "POST" && pathname === "/api/uploads"; // the handler reads the raw body itself
+    const body = !streamed && ["POST", "PATCH", "PUT"].includes(req.method) ? await readBody(req) : {};
     const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress;
     await match.handler({ req, res, params, query: url.searchParams, body, ip });
   } catch (e) { const status = e instanceof ApiError ? e.status : 500; if (status >= 500) warn(`${req.method} ${pathname}:`, e.message); send(res, status, { error: String(e.message || e) }); }
@@ -1903,8 +1999,39 @@ app.delete("/api/adapter-configs/:id", async (ctx) => { await q(`DELETE FROM ada
 app.post("/api/adapter-configs/:key/test", async (ctx) => { const row = (await instances(true)).find((r) => r.key === ctx.params.key); if (!row) throw new ApiError(404, null, "Unknown adapter key"); const a = await resolve(row.stage, row.key); let result; if (row.stage === "SCRIPT") result = await a.complete({ prompt: "Reply with the single word OK.", mock: {} }); else if (row.stage === "INGEST") result = { items: (await a.fetchItems({ name: "test", config: ctx.body.config || row.config })).slice(0, 3) }; else if (row.stage === "EMBED") result = { dims: (await a.embed("test"))?.length ?? null }; else result = { ok: true, note: "resolved; run it through a program to test end-to-end" }; json(ctx, 200, result); });
 // ---- brands
 app.get("/api/brands", async (ctx) => json(ctx, 200, await q(`SELECT * FROM brands ORDER BY created_at DESC`)));
-app.post("/api/brands", async (ctx) => { if (!ctx.body.name) throw new ApiError(400, null, "name is required"); const id = newId(); await q(`INSERT INTO brands (id, name, description) VALUES ($1,$2,$3)`, [id, ctx.body.name, ctx.body.description ?? null]); json(ctx, 201, await one(`SELECT * FROM brands WHERE id=$1`, [id])); });
-app.patch("/api/brands/:id", async (ctx) => json(ctx, 200, await patchRow("brands", ctx.params.id, ctx.body, { name: "name", description: "description" })));
+app.post("/api/brands", async (ctx) => { if (!ctx.body.name) throw new ApiError(400, null, "name is required"); const id = newId(); await q(`INSERT INTO brands (id, name, description, brand_kit) VALUES ($1,$2,$3,$4::jsonb)`, [id, ctx.body.name, ctx.body.description ?? null, JSON.stringify(ctx.body.brandKit || {})]); json(ctx, 201, await one(`SELECT * FROM brands WHERE id=$1`, [id])); });
+app.patch("/api/brands/:id", async (ctx) => json(ctx, 200, await patchRow("brands", ctx.params.id, ctx.body, { name: "name", description: "description", brandKit: "brand_kit" })));
+// Photocard preview for a brand kit (and optional headline) without generating content: renders a card from a neutral
+// gradient so the kit's colours, logo and font can be checked on the Brands page.
+app.post("/api/brands/:id/preview-card", async (ctx) => {
+  const brand = await one(`SELECT * FROM brands WHERE id=$1`, [ctx.params.id]); if (!brand) throw new ApiError(404, null, "Brand not found");
+  const kit = { ...(P(brand.brand_kit) || {}), ...(ctx.body.brandKit || {}) }, lang = ctx.body.language || "bn";
+  const bg = tmpPath("jpg"); await exec("ffmpeg", ["-y", "-f", "lavfi", "-i", "gradients=s=1080x720:c0=0x1d2b4f:c1=0x6a7fb5:x0=0:y0=0:x1=1080:y1=720:d=1", "-frames:v", "1", bg]);
+  try {
+    const out = await composePhotocard(bg, ctx.body.headline || (lang === "bn" ? "সিলেটে বন্যা পরিস্থিতির অবনতি, নদীর পানি বিপৎসীমার ওপরে" : "Flood worsens in Sylhet as rivers cross the danger mark"),
+      { width: 1080, height: 1080, kit, card_meta: { date: cardDate(lang), credit: `${lang === "bn" ? "সূত্র" : "Source"}: ${lang === "bn" ? "প্রথম আলো" : "The Daily Star"}` } });
+    const url = await storeLocal(out, `previews/${brand.id}.jpg`, "image/jpeg"); await cleanup(out);
+    json(ctx, 200, { url: `${url}?t=${Date.now()}` });
+  } finally { await cleanup(bg); }
+});
+// ---- uploads (logos, fonts, music beds, reactor clips): raw body streamed to storage, recorded as an UPLOAD media row.
+const UPLOAD_MAX_BYTES = Number(ENV.UPLOAD_MAX_MB || 300) * 1024 * 1024;
+app.post("/api/uploads", async (ctx) => {
+  const name = String(ctx.query.get("name") || "upload.bin").replace(/[^\w.\-]+/g, "_").slice(-80), purpose = String(ctx.query.get("purpose") || "other");
+  const ct = ctx.req.headers["content-type"] || "application/octet-stream", file = tmpPath(extname(name).slice(1) || "bin");
+  await new Promise((resolve, reject) => {
+    let n = 0; const ws = createWriteStream(file);
+    ctx.req.on("data", (c) => { n += c.length; if (n > UPLOAD_MAX_BYTES) { ctx.req.destroy(); ws.destroy(); reject(new ApiError(413, null, `Upload exceeds ${UPLOAD_MAX_BYTES >> 20} MB`)); } });
+    ctx.req.pipe(ws); ws.on("finish", resolve); ws.on("error", reject); ctx.req.on("error", reject);
+  });
+  try {
+    const url = await storeLocal(file, `uploads/${purpose}/${newId()}-${name}`, ct);
+    const kind = /^video\//.test(ct) ? "VIDEO" : /^audio\//.test(ct) ? "AUDIO" : /^image\//.test(ct) ? "IMAGE" : "FILE";
+    json(ctx, 201, await recordMedia({ kind: "UPLOAD", url, mime: ct, duration: kind === "VIDEO" || kind === "AUDIO" ? await ffprobeDuration(file) : null, meta: { name, purpose, media: kind } }));
+  } finally { await cleanup(file); }
+});
+app.get("/api/uploads", async (ctx) => { const p = ctx.query.get("purpose"); json(ctx, 200, await q(`SELECT * FROM media_assets WHERE kind = 'UPLOAD' AND deleted_at IS NULL AND ($1::text IS NULL OR meta->>'purpose' = $1) ORDER BY created_at DESC LIMIT 200`, [p])); });
+app.delete("/api/uploads/:id", async (ctx) => { const m = await one(`SELECT * FROM media_assets WHERE id=$1 AND kind='UPLOAD'`, [ctx.params.id]); if (m) { await deleteStored(m.url).catch(() => {}); await q(`UPDATE media_assets SET deleted_at = now() WHERE id=$1`, [m.id]); } json(ctx, 200, { ok: true }); });
 app.delete("/api/brands/:id", async (ctx) => { const dep = await one(`SELECT (SELECT COUNT(*) FROM niches WHERE brand_id=$1)::int + (SELECT COUNT(*) FROM channels WHERE brand_id=$1)::int AS n`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, "Brand still has programs or channels"); await q(`DELETE FROM brands WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 // ---- niches (programs)
 const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks"];

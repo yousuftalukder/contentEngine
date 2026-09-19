@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS brands (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Brand kit: logo_url, primary_color, accent_color, text_color, font, fonts_url, handle, website, credit_sources,
+-- image_ratio, logo_scale, music_urls, intro_url, outro_url, voice (used by photocards, videos and animations).
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS brand_kit JSONB NOT NULL DEFAULT '{}'::jsonb;
+
 -- A "program" in the dashboard = a row in niches.
 CREATE TABLE IF NOT EXISTS niches (
   id                   TEXT PRIMARY KEY,
