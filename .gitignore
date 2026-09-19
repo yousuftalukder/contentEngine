@@ -1,0 +1,7 @@
+node_modules/
+# local media written by the "local" storage backend and by tests
+data/
+.env
+.env.*
+!.env.example
+*.log

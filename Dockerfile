@@ -11,8 +11,8 @@ RUN apt-get update \
  && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY server.js schema.sql ./
 COPY frontend ./frontend
 ENV NODE_ENV=production PORT=4000 WORK_DIR=/tmp

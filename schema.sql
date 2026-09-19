@@ -369,7 +369,7 @@ RETURNS SETOF jobs AS $$
       LIMIT 1
       FOR UPDATE SKIP LOCKED)
   RETURNING *;
-$$ LANGUAGE sql;
+$$ LANGUAGE sql SET search_path = public;
 
 -- ---------------------------------------------------------------------
 -- CREDENTIALS / USAGE / SETTINGS / ADAPTER INSTANCES
@@ -427,7 +427,7 @@ CREATE TABLE IF NOT EXISTS adapter_configs (
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
 BEGIN NEW.updated_at = now(); RETURN NEW; END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = public;
 
 DO $$
 DECLARE t TEXT;
@@ -442,11 +442,18 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------
--- RLS for the public portal (anon key may only read published articles + media)
+-- RLS on every table: Supabase's REST API exposes the public schema to the anon and
+-- authenticated roles, and with RLS on and no policy they get no rows.
 -- The backend connects as the table owner, which bypasses RLS.
+-- The public portal's read policies (published articles + media) follow.
 -- ---------------------------------------------------------------------
-ALTER TABLE portal_articles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE media_assets   ENABLE ROW LEVEL SECURITY;
+DO $$
+DECLARE t TEXT;
+BEGIN
+  FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND NOT rowsecurity LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+  END LOOP;
+END $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='portal_articles' AND policyname='portal_public_read') THEN

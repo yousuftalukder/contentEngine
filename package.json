@@ -4,13 +4,20 @@
   "private": true,
   "type": "module",
   "description": "Content Engine — single-file automated content-operations backend (sources → generate → review → schedule → publish → metrics).",
-  "engines": { "node": ">=20.0.0" },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "migrate": "node server.js --migrate"
+    "migrate": "node server.js --migrate",
+    "test": "node --test --test-concurrency=1 \"test/*.test.mjs\""
   },
   "dependencies": {
     "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@electric-sql/pglite-socket": "^0.2.11"
   }
 }

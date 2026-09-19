@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Video tools (same packages as the Dockerfile)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fontconfig fonts-noto-core fonts-dejavu-core
+      - run: npm ci
+      - run: node --check server.js
+      - run: npm test

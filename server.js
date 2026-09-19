@@ -39,6 +39,8 @@ const LOCK_TIMEOUT_MIN = Number(ENV.JOB_LOCK_TIMEOUT_MINUTES) || 45;
 const DEFAULTS = {
   ANTHROPIC_MODEL: ENV.ANTHROPIC_MODEL || "claude-sonnet-5",
   GEMINI_MODEL: ENV.GEMINI_MODEL || "gemini-flash-latest",
+  // Tried in order when the main model is overloaded (503) or unknown (404). Comma-separated; "" disables.
+  GEMINI_FALLBACK_MODELS: (ENV.GEMINI_FALLBACK_MODELS ?? "gemini-flash-lite-latest").split(",").map((s) => s.trim()).filter(Boolean),
   GEMINI_IMAGE_MODEL: ENV.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image",
   GEMINI_EMBED_MODEL: ENV.GEMINI_EMBED_MODEL || "gemini-embedding-001",
   ELEVENLABS_MODEL: ENV.ELEVENLABS_MODEL || "eleven_multilingual_v2",
@@ -107,6 +109,31 @@ async function fetchBytes(url, opts = {}) {
   const res = await fetch(url, opts);
   if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => ""), `${url.split("?")[0]} -> ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
+}
+// Error classes drive retries. Transient = likely to work later (rate limit, overloaded model, 5xx, network) → retried
+// with backoff. Permanent = retrying cannot help (bad request, auth, missing key, duplicate) → fail now.
+// e.transient (true/false) set by a caller overrides the guess.
+const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
+const TRANSIENT_TEXT = /UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|try again later|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|timed out/i;
+const PERMANENT_STATUS = new Set([400, 401, 404, 405, 409, 410, 413, 422]);
+const PERMANENT_TEXT = /Dedup:|disabled|No API key|needs |cannot publish|credit balance|not registered|Unknown \w+ adapter/i;
+function isTransient(e) {
+  if (!e) return false;
+  if (typeof e.transient === "boolean") return e.transient;
+  const status = Number(e.status), msg = String(e.message || e);
+  if (status === 403) return /quota|limit|exhausted/i.test(msg + JSON.stringify(e.body || ""));
+  return TRANSIENT_STATUS.has(status) || (!PERMANENT_STATUS.has(status) && TRANSIENT_TEXT.test(msg));
+}
+function isPermanent(e) {
+  if (!e || isTransient(e)) return false;
+  return PERMANENT_STATUS.has(Number(e.status)) || Number(e.status) === 403 || PERMANENT_TEXT.test(String(e.message || e));
+}
+// Short in-call retry for transient failures. 429 is left to withKey, which rotates to the next key instead.
+async function retryTransient(fn, { tries = 3, baseMs = 1500 } = {}) {
+  for (let i = 1; ; i++) {
+    try { return await fn(); }
+    catch (e) { if (i >= tries || e.status === 429 || !isTransient(e)) throw e; await sleep(baseMs * i); }
+  }
 }
 const form = (obj) => new URLSearchParams(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : String(v)]));
 
@@ -388,16 +415,24 @@ async function resolve(stage, key) {
   a.key = key; a.impl = implId;
   return a;
 }
-// Try primary then fallbacks; fn(adapter) is attempted per adapter.
+// Try primary then fallbacks; fn(adapter) is attempted per adapter. When several fail, the error lists all of them and
+// stays retryable if any failure was transient — a fallback's missing key must not turn a temporary outage of the
+// primary into a permanent failure.
 async function withFallbacks(stage, primary, fallbacks, fn) {
-  const keys = [primary, ...(P(fallbacks) || [])].filter(Boolean);
-  let last;
+  const keys = [...new Set([primary, ...(P(fallbacks) || [])].filter(Boolean))];
+  const errors = [];
   for (const k of keys) {
-    let a; try { a = await resolve(stage, k); } catch (e) { last = e; continue; }
-    try { return await fn(a); } catch (e) { last = e; warn(`${stage} adapter ${k} failed: ${e.message}`); }
+    let a; try { a = await resolve(stage, k); } catch (e) { errors.push([k, e]); continue; }
+    try { return await fn(a); } catch (e) { errors.push([k, e]); warn(`${stage} adapter ${k} failed: ${e.message}`); }
   }
-  throw last || new Error(`No ${stage} adapter available`);
+  if (!errors.length) throw new Error(`No ${stage} adapter available`);
+  if (errors.length === 1) throw errors[0][1];
+  const e = new Error(errors.map(([k, x]) => `${k}: ${x.message}`).join(" | "));
+  e.status = errors[0][1].status; e.transient = errors.some(([, x]) => isTransient(x));
+  throw e;
 }
+// A program without its own fallback list uses the global one (Settings → llm.default_fallbacks / image.default_fallbacks).
+async function fallbacksFor(own, settingKey) { const list = P(own) || []; return list.length ? list : (await setting(settingKey, [])) || []; }
 function listAdapterKeys(rows) {
   const by = (stage) => rows.filter((r) => r.stage === stage && flag(r.enabled)).map((r) => r.key);
   return { topicSources: by("TOPIC"), scriptAdapters: by("SCRIPT"), voiceAdapters: by("VOICE"), renderAdapters: by("RENDER"),
@@ -407,8 +442,14 @@ function listAdapterKeys(rows) {
 
 // === 6. adapter impls ==================================================
 // ---- 6a. LLM (stage SCRIPT). Contract: complete({system, prompt, json, mock, maxTokens, grounding}) -> {text, data, cost}
-impl("SCRIPT", "llm_mock", { label: "Mock LLM", create: () => ({
+// fail_first/fail_status make an instance fail its first N calls — used by tests to exercise retries and fallbacks.
+const mockFailures = new Map();
+impl("SCRIPT", "llm_mock", { label: "Mock LLM", configSchema: { fail_first: { type: "number", default: 0 }, fail_status: { type: "number", default: 503 } }, create: (cfg, ctx = {}) => ({
   async complete({ prompt, json, mock }) {
+    if (cfg.fail_first) {
+      const n = (mockFailures.get(ctx.key) || 0) + 1; mockFailures.set(ctx.key, n);
+      if (n <= cfg.fail_first) throw new ApiError(cfg.fail_status || 503, null, `mock ${cfg.fail_status || 503}: simulated failure ${n} of ${cfg.fail_first}`);
+    }
     if (json) return { text: JSON.stringify(mock ?? {}), data: mock ?? {}, cost: 0 };
     return { text: `[mock] ${String(prompt).slice(0, 160)}`, data: null, cost: 0 };
   } }) });
@@ -416,18 +457,34 @@ impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: 
   async complete({ system, prompt, json = false, maxTokens = 2500 }) {
     const model = cfg.model || DEFAULTS.ANTHROPIC_MODEL;
     return withKey("anthropic", async (key) => {
-      const body = await fetchJson("https://api.anthropic.com/v1/messages", {
+      const body = await retryTransient(() => fetchJson("https://api.anthropic.com/v1/messages", {
         method: "POST", headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
         body: JSON.stringify({ model, max_tokens: maxTokens, system: system || undefined, messages: [{ role: "user", content: prompt + (json ? "\n\nRespond with ONLY valid JSON, no prose, no code fences." : "") }] }),
-      });
+      }));
       const text = (body.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
       const u = body.usage || {};
       return { text, data: json ? extractJson(text) : null, cost: tokenCost(model, u.input_tokens, u.output_tokens), model, units: 1 };
     }, ctx.pin);
   } }) });
-impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, grounding: { type: "boolean", default: false } }, create: (cfg, ctx = {}) => ({
+// Runs call(model) on the main model, then on each fallback model while the failure is an overload (503/5xx) or an
+// unknown model id (404). A 429 or a permanent error is thrown straight away (withKey rotates keys on 429).
+async function withModelFallback(models, call) {
+  let last, lastTransient;
+  for (const model of [...new Set(models.filter(Boolean))]) {
+    try { return await retryTransient(() => call(model)); }
+    catch (e) {
+      last = e;
+      if (e.status === 429) throw e;
+      if (isTransient(e)) { lastTransient = e; warn(`model ${model} unavailable (${e.status || e.message.slice(0, 60)}), trying the next one`); continue; }
+      if (e.status === 404) continue;
+      throw e;
+    }
+  }
+  throw lastTransient || last;
+}
+impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, fallback_models: { type: "array", default: DEFAULTS.GEMINI_FALLBACK_MODELS }, grounding: { type: "boolean", default: false } }, create: (cfg, ctx = {}) => ({
   async complete({ system, prompt, json = false, maxTokens = 4000, grounding = false }) {
-    const model = cfg.model || DEFAULTS.GEMINI_MODEL;
+    const models = [cfg.model || DEFAULTS.GEMINI_MODEL, ...(Array.isArray(cfg.fallback_models) ? cfg.fallback_models : DEFAULTS.GEMINI_FALLBACK_MODELS)];
     const useSearch = grounding || cfg.grounding;
     return withKey("gemini", async (key) => {
       const req = {
@@ -436,8 +493,8 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
         generationConfig: { maxOutputTokens: maxTokens, responseMimeType: json && !useSearch ? "application/json" : undefined },
         tools: useSearch ? [{ google_search: {} }] : undefined,
       };
-      const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-        method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(req) });
+      const { model, body } = await withModelFallback(models, async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+        method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(req) }) }));
       const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
       const u = body.usageMetadata || {};
       const cites = (body.candidates?.[0]?.groundingMetadata?.groundingChunks || []).map((c) => c.web?.uri).filter(Boolean);
@@ -452,7 +509,7 @@ impl("SCRIPT", "openai", { label: "OpenAI (GPT)", configSchema: { model: { type:
       messages.push({ role: "user", content: prompt + (json ? "\n\nRespond with ONLY valid JSON." : "") });
       const req = { model, messages, max_completion_tokens: maxTokens, response_format: json ? { type: "json_object" } : undefined };
       if (!/^(o\d|gpt-5)/.test(model) && cfg.temperature != null) req.temperature = Number(cfg.temperature);
-      const body = await fetchJson("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(req) });
+      const body = await retryTransient(() => fetchJson("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(req) }));
       const text = body.choices?.[0]?.message?.content || ""; const u = body.usage || {};
       let data = null; if (json) { data = extractJson(text); if (data && !Array.isArray(data) && Object.keys(data).length === 1 && Array.isArray(Object.values(data)[0])) data = Object.values(data)[0]; }
       return { text, data, cost: tokenCost(model, u.prompt_tokens, u.completion_tokens), model, units: 1 };
@@ -626,7 +683,7 @@ impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSch
     const c = methodCfg(niche);
     const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 120000);
     // config.llm lets clipping run on a different SCRIPT instance (e.g. "openai_live") than the program's writer.
-    const primary = cfg.llm || niche.script_adapter, fallbacks = cfg.llm ? (cfg.llm_fallbacks || []) : niche.script_adapter_fallbacks;
+    const primary = cfg.llm || niche.script_adapter, fallbacks = cfg.llm ? (cfg.llm_fallbacks || []) : await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks");
     const r = await withFallbacks("SCRIPT", primary, fallbacks, (llm) => llm.complete({ json: true, maxTokens: 3000,
       system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}. Tone: ${niche.tone || "engaging"}.`,
       prompt: `Video: "${candidate.title}"\nTimestamped transcript:\n${lines}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why"}]`,
@@ -692,8 +749,8 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
     const ar = specs.aspect_ratio || (specs.height > specs.width ? "9:16" : specs.width > specs.height ? "16:9" : "1:1");
     const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === true ? `Render this headline as bold, legible overlay text: "${headline}".` : "Do not render any text, letters, captions or logos anywhere in the image; leave the lower third visually calm."} Aspect ratio ${ar}.`;
     return withKey("gemini", async (key) => {
-      const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) });
+      const body = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) }));
       const part = (body.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData || p.inline_data);
       if (!part) throw new Error("Gemini returned no image (blocked by safety, or wrong model id?)");
       const d = part.inlineData || part.inline_data; const mime = d.mimeType || d.mime_type || "image/png";
@@ -760,7 +817,7 @@ impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { re
 impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg, ctx = {}) => ({
   async embed(text) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL;
-    const r = await withKey("gemini", async (key) => { const b = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) }); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
+    const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
     return r.v;
   } }) });
 
@@ -1090,8 +1147,8 @@ function styleBlock(style) {
   if (!style) return "";
   return `\nWRITING STYLE "${style.name}": tone: ${style.tone}. Rules: ${style.rules}. ${style.examples ? `Examples of the voice:\n${style.examples}\n` : ""}${(P(style.banned_terms) || []).length ? `Never use these words/phrases: ${(P(style.banned_terms) || []).join(", ")}.` : ""} ${style.cta ? `End with this call to action: ${style.cta}.` : ""} ${(P(style.hashtags) || []).length ? `Always include hashtags: ${(P(style.hashtags) || []).join(" ")}.` : ""}`;
 }
-const llmFor = (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, niche.script_adapter_fallbacks, fn);
-const imageFor = (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", niche.image_adapter_fallbacks, fn);
+const llmFor = async (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks"), fn);
+const imageFor = async (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks"), fn);
 
 // Fetch the source page of an article and keep its main text, so the writer works from the real story instead of
 // the one-line RSS summary. Readability-lite: drop scripts/nav/etc, prefer <article>, keep substantial <p> blocks.
@@ -1360,6 +1417,18 @@ const HANDLERS = {
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
   async POLL_METRICS({ assetId }) { return pollMetrics(assetId); },
 };
+// Seconds until the next attempt, or null to give up. Transient failures (overloaded model, rate limit, network) back
+// off exponentially — 1, 2, 4 … 32 min, about an hour in all — for jobs that are safe to repeat. Publishing keeps its
+// own small attempt count so a slow platform cannot cause double posts. Permanent failures stop at once.
+const TRANSIENT_MAX_ATTEMPTS = Number(ENV.TRANSIENT_MAX_ATTEMPTS) || 7;
+const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "RENDER_CLIP", "POLL_METRICS"]);
+function retryDelay(job, e) {
+  if (isPermanent(e)) return null;
+  const transient = isTransient(e);
+  const max = transient && PATIENT_JOBS.has(job.type) ? Math.max(job.max_attempts || 3, TRANSIENT_MAX_ATTEMPTS) : (job.max_attempts || 3);
+  if (job.attempts >= max) return null;
+  return transient ? Math.min(60 * 2 ** Math.max(0, job.attempts - 1), 3600) : 30 * job.attempts;
+}
 async function deferJob(job, minutes) { await q(`UPDATE jobs SET status='PENDING', run_after=now() + ($2 || ' minutes')::interval, attempts=attempts-1, locked_by=NULL WHERE id=$1`, [job.id, String(minutes)]); job._deferred = true; }
 async function runJob(job) {
   const h = HANDLERS[job.type]; const payload = P(job.payload) || {};
@@ -1369,9 +1438,9 @@ async function runJob(job) {
     if (job._deferred) return;
     await q(`UPDATE jobs SET status='SUCCEEDED', result=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, J(result ?? null)?.slice(0, 5000) ?? null]);
   } catch (e) {
-    const msg = String(e?.message || e).slice(0, 1500); const retry = job.attempts < (job.max_attempts || 3) && !/Dedup:|disabled|No API key|needs |cannot publish/i.test(msg);
-    warn(`job ${job.type} ${job.id} failed (attempt ${job.attempts}): ${msg}`);
-    if (retry) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE id=$1`, [job.id, msg, String(30 * job.attempts)]);
+    const msg = String(e?.message || e).slice(0, 1500); const delay = retryDelay(job, e);
+    warn(`job ${job.type} ${job.id} failed (attempt ${job.attempts}${delay != null ? `, retrying in ${delay}s` : ", giving up"}): ${msg}`);
+    if (delay != null) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE id=$1`, [job.id, msg, String(delay)]);
     else {
       await q(`UPDATE jobs SET status='FAILED', error_message=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, msg]);
       const itemId = job.content_item_id || payload.itemId; if (itemId) await q(`UPDATE content_items SET status='FAILED', rejection_note=$2 WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED','REJECTED')`, [itemId, msg]);
