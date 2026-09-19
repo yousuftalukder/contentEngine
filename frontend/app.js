@@ -195,7 +195,7 @@ pages.overview = async () => {
 
     h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
     h("div", { class: "panel" }, alerts.length ? [
-      alerts.map((a) => h("div", { class: "row", style: `padding:6px 0;border-bottom:1px solid var(--ink-3);opacity:${a.read_at ? 0.6 : 1}` },
+      alerts.map((a) => h("div", { class: "row", style: `padding:8px 0;border-bottom:1px solid var(--ink-3);align-items:flex-start;opacity:${a.read_at ? 0.6 : 1}` },
         h("span", { class: `tag ${{ error: "red", warn: "amber", info: "green" }[a.level] || ""}` }, a.level), h("div", { class: "grow" }, h("b", { style: "font-weight:500" }, a.title), a.body ? h("span", { class: "sub", style: "white-space:pre-wrap" }, a.body.slice(0, 400)) : null), h("span", { class: "small mute" }, ago(a.created_at)))),
       h("div", { class: "row", style: "margin-top:10px" }, h("button", { class: "btn sm", onclick: () => run(() => post("/api/notifications/read-all"), "Marked as read").then(route) }, "Mark all read"), h("a", { class: "small", href: "#/settings" }, "Send alerts to Telegram"))]
       : h("p", { class: "muted", style: "margin:0" }, "No alerts. Problems you need to act on — a rejected or unpaid AI key, a failing feed, an expired publishing token, the budget cap — show up here and, if you connect Telegram, on your phone.")),
