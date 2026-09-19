@@ -188,6 +188,11 @@ pages.overview = async () => {
         stat((it.FAILED || 0) + (as.FAILED || 0), "Failed", (it.FAILED || as.FAILED) ? "red" : ""),
         stat(stats?.activeSources ?? 0, "Active sources"))),
 
+    (stats?.quotaPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber)" },
+      h("b", { style: "font-weight:500" }, "Waiting for the AI quota to reset"),
+      stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free key allows about 20 requests a day per model — enable billing on it to lift the cap.")) : null,
+
     h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
     h("div", { class: "panel" }, alerts.length ? [
       alerts.map((a) => h("div", { class: "row", style: `padding:6px 0;border-bottom:1px solid var(--ink-3);opacity:${a.read_at ? 0.6 : 1}` },
@@ -287,6 +292,7 @@ function proofView(it, onDone) {
     field("Headline", headline),
     heroEl,
     hero ? h("div", { class: "row small mute", style: "margin:-6px 0 10px" }, h("span", null, hero.kind, hero.width ? ` ${hero.width}×${hero.height}` : "", hero.duration_seconds ? ` ${Math.round(hero.duration_seconds)}s` : ""), h("a", { href: hero.url, target: "_blank" }, "Open"), !isVideo ? h("button", { class: "btn link sm", onclick: () => regen("image") }, "Regenerate image") : null) : null,
+    hero?.meta?.fallback ? h("p", { class: "small", style: "margin:-6px 0 10px;color:var(--amber)" }, "Text card — no picture could be made: ", hero.meta.fallback.slice(0, 160)) : null,
     field("Summary", summary),
     body ? field(it.body != null ? "Article / post body" : "Script", body) : null,
     imgPrompt ? field("Image prompt", imgPrompt, "Edit and regenerate the image to get a different visual.") : null,

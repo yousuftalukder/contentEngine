@@ -62,6 +62,15 @@ chapters), and the built-in portal. Per-channel posting windows, minimum gaps an
 **Alerts.** An AI account out of credit, a rejected key, an expired publishing token, a failing source, the budget cap, a
 stalled pipeline, a growing review queue — on the dashboard and on Telegram, plus a 21:00 daily digest.
 
+**When a provider says no.** Quotas are handled as waiting, not failing. A per-model limit falls through to the next model
+(quotas count per model, so the fallback list multiplies what a free key can do); a per-minute limit waits the delay the API
+names; a daily one parks the job until the reset — without spending a retry — and the program stops taking new stories until
+then, so the queue can't fill with work that cannot run. News that would be stale by the reset is dropped rather than posted
+late, and one alert says what to do. If no picture can be made at all (no image key, a plan with no image quota), the post
+still goes out as a **text card**: the brand's colours, logo, label, headline, date and source credit, redrawn if the
+headline is edited. A free Gemini key allows roughly 20 requests a day per model and no pictures — enable billing on it for
+the engine to run at full speed.
+
 ## Run it locally
 
 ```bash
