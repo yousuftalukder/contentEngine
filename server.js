@@ -1389,7 +1389,9 @@ async function narrateParts(niche, parts, contentItemId) {
 impl("RENDER", "remotion", { label: "Studio (Remotion) for made videos, ffmpeg for footage", create: (cfg, ctx) => {
   const ff = IMPLS.RENDER.ffmpeg.create(cfg, ctx);
   return {
-    renderForChannel: (a) => ff.renderForChannel(a), renderClip: (a) => ff.renderClip(a),
+    // Everything the studio does not draw itself stays with ffmpeg — including the slideshow this falls back to when
+    // the instance is too small for Chromium, which is what makes picking "remotion" safe on any size of machine.
+    renderForChannel: (a) => ff.renderForChannel(a), renderClip: (a) => ff.renderClip(a), renderSlideshow: (a) => ff.renderSlideshow(a),
     // sections: [{image: url, narration, seconds}], audio: media row; returns a VIDEO media row.
     async renderReel({ sections, audio, niche, headline, kicker, credit, orientation = "9:16", contentItemId }) {
       const vertical = orientation !== "16:9", { brand, music } = await studioBrand(niche), locals = [];
