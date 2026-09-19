@@ -44,12 +44,12 @@ const DEFAULTS = {
   // Tried in order when the main model is overloaded (503) or unknown (404). Comma-separated; "" disables.
   GEMINI_FALLBACK_MODELS: (ENV.GEMINI_FALLBACK_MODELS ?? "gemini-flash-lite-latest").split(",").map((s) => s.trim()).filter(Boolean),
   GEMINI_IMAGE_MODEL: ENV.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image",
-  GEMINI_TTS_MODELS: (ENV.GEMINI_TTS_MODELS ?? "gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts").split(",").map((s) => s.trim()).filter(Boolean),
+  GEMINI_TTS_MODELS: (ENV.GEMINI_TTS_MODELS ?? "gemini-2.5-flash-preview-tts,gemini-2.5-flash-tts,gemini-2.5-pro-preview-tts").split(",").map((s) => s.trim()).filter(Boolean),
   GEMINI_TTS_VOICE: ENV.GEMINI_TTS_VOICE || "Kore",
   GEMINI_EMBED_MODEL: ENV.GEMINI_EMBED_MODEL || "gemini-embedding-001",
   ELEVENLABS_MODEL: ENV.ELEVENLABS_MODEL || "eleven_multilingual_v2",
   ELEVENLABS_VOICE: ENV.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM",
-  META_API_VERSION: ENV.META_API_VERSION || "v21.0",
+  META_API_VERSION: ENV.META_API_VERSION || "v23.0",
   OPENAI_MODEL: ENV.OPENAI_MODEL || "gpt-4o-mini",
   OPENAI_TTS_MODEL: ENV.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
   OPENAI_TTS_VOICE: ENV.OPENAI_TTS_VOICE || "alloy",
@@ -490,6 +490,28 @@ async function withModelFallback(models, call) {
   }
   throw lastTransient || last;
 }
+// Gemini model ids get renamed and retired. When every configured id of a kind answers 404, the account's live model list
+// (cached 6 h) supplies the closest replacements of the same kind, so a retirement doesn't stop the pipeline.
+const geminiCatalog = { at: 0, list: [] };
+const GEMINI_KINDS = { text: (n) => /^gemini-.*(flash|pro)/.test(n) && !/image|tts|audio|live|embedding|vision|thinking-exp/.test(n), image: (n) => /image/.test(n) && /^gemini/.test(n), tts: (n) => /tts/.test(n) };
+async function geminiReplacements(key, kind, tried) {
+  if (Date.now() - geminiCatalog.at > 6 * 3600e3 || !geminiCatalog.list.length) {
+    const r = await fetchJson("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": key } });
+    geminiCatalog.list = (r.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => m.name.replace(/^models\//, "")); geminiCatalog.at = Date.now();
+  }
+  // Prefer "latest" aliases, then the highest version; flash before pro for text (cost), as configured defaults do.
+  return geminiCatalog.list.filter((n) => GEMINI_KINDS[kind](n) && !tried.includes(n))
+    .sort((a, b) => Number(/latest/.test(b)) - Number(/latest/.test(a)) || Number(/lite/.test(a)) - Number(/lite/.test(b)) || Number(/flash/.test(b)) - Number(/flash/.test(a)) || b.localeCompare(a, undefined, { numeric: true })).slice(0, 3);
+}
+async function withGeminiModels(key, kind, models, call) {
+  try { return await withModelFallback(models, call); }
+  catch (e) {
+    if (e.status !== 404) throw e;
+    const alt = await geminiReplacements(key, kind, models).catch(() => []); if (!alt.length) throw e;
+    warn(`Gemini ${kind} model(s) ${models.join(", ")} not found; trying ${alt.join(", ")}`);
+    return withModelFallback(alt, call);
+  }
+}
 impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, fallback_models: { type: "array", default: DEFAULTS.GEMINI_FALLBACK_MODELS }, grounding: { type: "boolean", default: false } }, create: (cfg, ctx = {}) => ({
   async complete({ system, prompt, json = false, maxTokens = 4000, grounding = false }) {
     const models = [cfg.model || DEFAULTS.GEMINI_MODEL, ...(Array.isArray(cfg.fallback_models) ? cfg.fallback_models : DEFAULTS.GEMINI_FALLBACK_MODELS)];
@@ -501,7 +523,7 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
         generationConfig: { maxOutputTokens: maxTokens, responseMimeType: json && !useSearch ? "application/json" : undefined },
         tools: useSearch ? [{ google_search: {} }] : undefined,
       };
-      const { model, body } = await withModelFallback(models, async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+      const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
         method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(req) }) }));
       const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
       const u = body.usageMetadata || {};
@@ -893,12 +915,12 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
     const ar = specs.aspect_ratio || (specs.height > specs.width ? "9:16" : specs.width > specs.height ? "16:9" : "1:1");
     const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === true ? `Render this headline as bold, legible overlay text: "${headline}".` : "Do not render any text, letters, captions or logos anywhere in the image; leave the lower third visually calm."} Aspect ratio ${ar}.`;
     return withKey("gemini", async (key) => {
-      const body = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) }));
+      const { model: used, body } = await withGeminiModels(key, "image", [model], async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) }) }));
       const part = (body.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData || p.inline_data);
       if (!part) throw new Error("Gemini returned no image (blocked by safety, or wrong model id?)");
       const d = part.inlineData || part.inline_data; const mime = d.mimeType || d.mime_type || "image/png";
-      const media = await storeImage(Buffer.from(d.data, "base64"), mime, contentItemId, { model, prompt: full }, {}, { headline, specs });
+      const media = await storeImage(Buffer.from(d.data, "base64"), mime, contentItemId, { model: used, prompt: full }, {}, { headline, specs });
       return { ...media, cost: IMAGE_PRICE_USD, units: 1 };
     }, ctx.pin);
   } }) });
@@ -969,7 +991,7 @@ impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSche
       try {
         for (const p of parts) {
           const text = cfg.style ? `${cfg.style}: ${p}` : p;
-          const body = await withModelFallback(models, (m) => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+          const body = await withGeminiModels(key, "tts", models.filter(Boolean), (m) => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
             body: JSON.stringify({ contents: [{ parts: [{ text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }) }));
           const d = (body.candidates?.[0]?.content?.parts || []).find((x) => x.inlineData || x.inline_data); if (!d) throw new Error("Gemini TTS returned no audio");
           const inl = d.inlineData || d.inline_data; const rate = Number((/rate=(\d+)/.exec(inl.mimeType || inl.mime_type || "") || [])[1]) || 24000;
