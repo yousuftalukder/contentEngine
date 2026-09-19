@@ -1459,6 +1459,18 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
       }
       throw new Error(`meta_graph cannot publish to ${channel.platform}`);
     },
+    // Read-only connection check: is there a token, does it open the account the channel names, and is it the right
+    // kind of token and id? Answered at setup instead of at the first post, where it would cost a real story.
+    async check({ channel }) {
+      const token = await metaToken(channel, cfg), acct = channel.platform_account_id, notes = [];
+      if (!acct) return { ok: false, error: `This channel has no ${channel.platform === "INSTAGRAM" ? "Instagram user ID" : "Facebook Page ID"} — add it on the channel (Edit → account id).` };
+      const ig = channel.platform === "INSTAGRAM";
+      const account = await fetchJson(`${base}/${acct}?${form({ fields: ig ? "id,username,name" : "id,name", access_token: token })}`);
+      if (ig && !account.username) notes.push("That id opens a Facebook Page, not an Instagram account — Instagram needs the IG user id from the Page's linked account.");
+      const me = await fetchJson(`${base}/me?${form({ fields: "id,name", access_token: token })}`).catch(() => null);
+      if (!ig && me && me.id !== String(acct)) notes.push(`This is a token for "${me.name}", not for the Page itself. Posting is more reliable with a Page access token.`);
+      return { ok: true, account: { id: account.id, name: account.username || account.name }, notes };
+    },
     async metrics({ channel, asset }) {
       const token = await metaToken(channel, cfg);
       if (channel.platform === "INSTAGRAM") { const r = await fetchJson(`${base}/${asset.external_id}?${form({ fields: "like_count,comments_count", access_token: token })}`); return { views: 0, likes: r.like_count, comments: r.comments_count }; }
@@ -1487,6 +1499,14 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
     // Custom thumbnails need a verified channel; a refusal is logged, never fatal to the upload.
     if (thumbnailUrl && !isShort) { try { const t = await toTmpFile(thumbnailUrl, "jpg"); const tb = await readFile(t); await cleanup(t); await fetchJson(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${r.id}&uploadType=media`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "image/jpeg", "Content-Length": String(tb.length) }, body: tb }); } catch (e) { warn(`YouTube thumbnail for ${r.id}: ${e.message.slice(0, 200)}`); } }
     return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts/" : "watch?v="}${r.id}` };
+  },
+  // Read-only: the refresh token still works and names the channel it will upload to.
+  async check({ channel }) {
+    const token = await youtubeAccessToken(channel, cfg);
+    const r = await fetchJson("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", { headers: { Authorization: `Bearer ${token}` } });
+    const ch = r.items?.[0];
+    if (!ch) return { ok: false, error: "The OAuth token works but owns no YouTube channel — authorise with the Google account that owns the channel." };
+    return { ok: true, account: { id: ch.id, name: ch.snippet?.title }, notes: [] };
   },
   async metrics({ channel, asset }) {
     const read = async (params, opts = {}) => {
@@ -3002,6 +3022,15 @@ app.patch("/api/channels/:id", async (ctx) => json(ctx, 200, rowJson(await patch
 app.delete("/api/channels/:id", async (ctx) => { const dep = await one(`SELECT COUNT(*)::int AS n FROM content_assets WHERE channel_id=$1`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, "Channel has publish history — deactivate instead"); await q(`DELETE FROM channels WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/channels/:id/niches/:nicheId", async (ctx) => { await q(`INSERT INTO channel_niches (id, channel_id, niche_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), ctx.params.id, ctx.params.nicheId]); json(ctx, 200, { ok: true }); });
 app.delete("/api/channels/:id/niches/:nicheId", async (ctx) => { await q(`DELETE FROM channel_niches WHERE channel_id=$1 AND niche_id=$2`, [ctx.params.id, ctx.params.nicheId]); json(ctx, 200, { ok: true }); });
+// Read-only connection check. Publishing to a real account fails for dull reasons — a token for the wrong thing, an id
+// from the wrong place — and this says which, before a story is spent finding out.
+app.post("/api/channels/:id/check", async (ctx) => {
+  const ch = await one(`SELECT * FROM channels WHERE id=$1`, [ctx.params.id]); if (!ch) throw new ApiError(404, null, "Channel not found");
+  const pub = await resolve("PUBLISH", ch.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[ch.platform] || "publish_mock");
+  if (!pub.check) return json(ctx, 200, { ok: true, notes: [`${pub.key} publishes nowhere real, so there is nothing to check.`] });
+  try { json(ctx, 200, await pub.check({ channel: ch })); }
+  catch (e) { json(ctx, 200, { ok: false, error: String(e.message).slice(0, 500) }); }
+});
 app.post("/api/channels/:id/test-publish", async (ctx) => { const ch = await one(`SELECT * FROM channels WHERE id=$1`, [ctx.params.id]); if (!ch) throw new ApiError(404, null, "Channel not found"); const pub = await resolve("PUBLISH", ch.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[ch.platform] || "publish_mock"); if (ch.platform !== "FACEBOOK" || pub.impl !== "meta_graph") return json(ctx, 200, { ok: true, note: `resolved publisher ${pub.key}; only Facebook text test-posts are supported here` }); json(ctx, 200, await pub.publish({ channel: ch, mediaKind: "TEXT", caption: ctx.body.message || "Content Engine connection test", title: "test" })); });
 // ---- series
 app.get("/api/series", async (ctx) => { const n = ctx.query.get("nicheId"); json(ctx, 200, n ? await q(`SELECT * FROM series WHERE niche_id=$1 ORDER BY created_at DESC`, [n]) : await q(`SELECT * FROM series ORDER BY created_at DESC`)); });

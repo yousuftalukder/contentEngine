@@ -820,7 +820,12 @@ pages.channels = async () => {
       h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · token ", c.credential_id ? h("span", { class: "tag green" }, creds.find((k) => k.id === c.credential_id)?.label || "linked") : h("span", { class: "tag" }, "env default"), " · up to ", c.max_posts_per_day ?? "∞", "/day, ", c.min_gap_minutes ?? 0, " min apart · ", c.timezone),
       h("div", { class: "small", style: "margin-top:4px" }, "Programs: ", (c.niches || []).length ? c.niches.map((n) => n.display_name).join(", ") : h("span", { class: "mute" }, "none — subscribe from Programs"))),
     h("div", { class: "right row" },
-      h("button", { class: "btn sm", onclick: () => run(async () => jsonDialog("Test publish result", await post(`/api/channels/${c.id}/test-publish`, { message: "Content Engine connection test" }))) }, "Test"),
+      h("button", { class: "btn sm", onclick: () => run(async () => {
+        const r = await post(`/api/channels/${c.id}/check`, {});
+        jsonDialog(r.ok ? `Connected${r.account ? ` to ${r.account.name}` : ""}` : "Cannot connect", r);
+      }) }, "Check"),
+      h("button", { class: "btn sm", onclick: () => confirmModal("Publish a test post?", `This puts a real post on ${c.display_name}. Delete it on the platform afterwards.`,
+        () => run(async () => jsonDialog("Test publish result", await post(`/api/channels/${c.id}/test-publish`, { message: "Content Engine connection test" })))) }, "Test post"),
       h("button", { class: "btn sm", onclick: () => channelDialog(c, brands, programs, publishers, creds) }, "Edit"),
       h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/channels/${c.id}`, { isActive: !yes(c.is_active) }), "Saved").then(route) }, yes(c.is_active) ? "Pause" : "Activate"),
       h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete channel?", "Only works if nothing was ever published to it.", () => run(() => del(`/api/channels/${c.id}`), "Deleted").then(route)) }, "Delete")))));
