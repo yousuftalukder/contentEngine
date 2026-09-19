@@ -520,6 +520,7 @@ async function withModelFallback(models, call) {
   // The error the caller should act on: an ordinary outage (retry soon) before a quota that resets soonest, before a
   // limit no reset will lift; all 404s → the last 404, so the caller can look for renamed models.
   const wait = (x) => quotaWait(x)?.seconds;
+  if (!errs.length) throw new Error("No model is configured for this adapter");
   throw errs.find((x) => isTransient(x) && !quotaWait(x)) || errs.filter(wait).sort((a, b) => wait(a) - wait(b))[0] || errs.find(isTransient) || errs[errs.length - 1];
 }
 // Gemini model ids get renamed and retired. When every configured id of a kind answers 404, the account's live model list
@@ -2519,7 +2520,9 @@ async function deferJob(job, minutes) { await q(`UPDATE jobs SET status='PENDING
 // does not fill with work that cannot run. A news story that would be stale by the time the quota returns is dropped.
 const QUOTA_MAX_WAIT_DAYS = Number(ENV.QUOTA_MAX_WAIT_DAYS) || 3;
 async function deferForQuota(job, payload, quota, msg) {
-  if ((Date.now() - new Date(job.created_at).getTime()) / 86400e3 > QUOTA_MAX_WAIT_DAYS) return false;
+  // Waiting has a limit: a job that has been bouncing off a per-minute limit for hours, or off a daily one for days, is
+  // not really waiting for a quota — it goes back to the ordinary backoff, and fails and alerts like anything else.
+  if (Date.now() - new Date(job.created_at).getTime() > (quota.kind === "minute" ? 2 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3)) return false;
   const itemId = job.content_item_id || payload.itemId || null;
   const item = itemId ? await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]) : null;
   const niche = item || payload.nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [item?.niche_id || payload.nicheId]) : null;
