@@ -1089,21 +1089,99 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     await cleanup(...caps);
     return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
   },
-  async renderSlideshow({ images, audio, contentItemId, orientation = "9:16", captions = [] }) {
+  // durations (seconds per picture) follow the narration section by section; without them the pictures share it equally.
+  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [] }) {
     if (!images.length) throw new Error("slideshow needs at least one image");
     const a = await toTmpFile(audio.url, "mp3"); const dur = (await ffprobeDuration(a)) || audio.duration_seconds || images.length * 4;
-    const per = dur / images.length; const files = [];
-    for (const im of images) files.push(await toTmpFile(im.url));
-    const list = tmpPath("txt"); await writeFile(list, files.map((f) => `file '${f}'\nduration ${per.toFixed(3)}`).join("\n") + `\nfile '${files.at(-1)}'\n`);
+    const per = durations?.length === images.length ? durations.map((x) => Math.max(0.5, Number(x) || 0)) : images.map(() => dur / images.length);
     const [w, h] = orientation === "16:9" ? [1920, 1080] : [1080, 1920];
-    const vf = [`scale=${w}:${h}:force_original_aspect_ratio=increase`, `crop=${w}:${h}`, `zoompan=z='min(zoom+0.0008,1.12)':d=${Math.round(per * 30)}:s=${w}x${h}:fps=30`, "format=yuv420p"];
-    let ass = null; if (captions.length) { ass = await writeCaptionsAss(captions, 0, dur, { width: w, height: h }); vf.push(assVf(ass)); }
-    const out = tmpPath("mp4");
-    await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, "-vf", vf.join(","), "-r", "30", "-t", String(dur), ...X264, out]);
-    await cleanup(list, a, ass, ...files);
-    return publishRender(out, contentItemId, { method: "SLIDESHOW", orientation, slides: images.length });
+    // One Ken Burns segment per picture, exactly as long as its narration, zooming in and out alternately; then joined.
+    const segs = [], files = [];
+    try {
+      for (const [i, im] of images.entries()) {
+        const f = await toTmpFile(im.url); files.push(f); const frames = Math.max(15, Math.round(per[i] * 30)), seg = tmpPath("mp4");
+        const z = i % 2 ? `if(eq(on,0),1.12,max(zoom-0.0008,1.0))` : `min(zoom+0.0008,1.12)`;
+        await exec("ffmpeg", ["-y", "-i", f, "-vf", `scale=${Math.round(w * 1.25)}:${Math.round(h * 1.25)}:force_original_aspect_ratio=increase,crop=${Math.round(w * 1.25)}:${Math.round(h * 1.25)},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,format=yuv420p`,
+          "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+        segs.push(seg);
+      }
+      const list = tmpPath("txt"); await writeFile(list, segs.map((s) => `file '${s.replace(/\\/g, "/")}'`).join("\n"));
+      let ass = null; if (captions.length) ass = await writeCaptionsAss(captions, 0, dur, { width: w, height: h });
+      const out = tmpPath("mp4");
+      try { await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, ...(ass ? ["-vf", assVf(ass)] : []), "-map", "0:v", "-map", "1:a", "-shortest", ...X264, out]); }
+      finally { await cleanup(list, ass); }
+      return publishRender(out, contentItemId, { method: "SLIDESHOW", orientation, slides: images.length });
+    } finally { await cleanup(a, ...files, ...segs); }
   },
 }) });
+
+// ---- 6j2. Studio (Remotion). News reels and animated explainers are rendered by studio/render.mjs in a child process,
+// so Chromium's memory and any crash stay out of the engine. Pictures, narration, music, logo and font are handed over as
+// local files; render.mjs stages them into the bundle. The "remotion" RENDER adapter uses the studio for made videos and
+// ffmpeg for everything built from footage (clips, per-channel conversion).
+const STUDIO_DIR = join(__dirname, "studio");
+const studioReady = () => existsSync(join(STUDIO_DIR, "render.mjs")) && existsSync(join(STUDIO_DIR, "node_modules", "@remotion", "renderer"));
+const STUDIO_FPS = 30;
+async function studioRender(composition, props, { kind = "video", ext = "mp4", timeoutMs = 90 * 60000 } = {}) {
+  if (!studioReady()) throw new Error("The video studio is not installed here (studio/node_modules is missing). The Docker image installs it; locally run `npm install` in studio/.");
+  const propsPath = tmpPath("json"), out = tmpPath(ext);
+  await writeFile(propsPath, JSON.stringify(props));
+  try { await exec(process.execPath, [join(STUDIO_DIR, "render.mjs"), propsPath, out, composition, kind], { timeoutMs }); return out; }
+  finally { await cleanup(propsPath); }
+}
+// The brand kit as the studio's brand, with logo, font and a music bed fetched to local files for the render.
+async function studioBrand(niche) {
+  const b = await one(`SELECT name, brand_kit FROM brands WHERE id=$1`, [niche.brand_id]); const k = P(b?.brand_kit) || {}, mc = methodCfg(niche);
+  const local = async (url, ext) => { if (!url) return undefined; try { return await toTmpFile(url, ext); } catch (e) { warn(`brand asset ${url}: ${e.message}`); return undefined; } };
+  const fontUrl = String(k.fonts_url || "").split(",")[0].trim();
+  const musicList = mc.music === false || mc.music === "none" ? [] : [].concat(mc.music || k.music_urls || []).filter(Boolean);
+  const brand = { name: k.display_name || b?.name || niche.display_name, primary: k.primary_color || "#b3121f", accent: k.accent_color || "#ffc400", text: k.text_color || "#ffffff",
+    handle: k.handle || undefined, logo: await local(k.logo_url), font: fontUrl ? k.font || "BrandFont" : undefined, fontUrl: fontUrl ? await local(fontUrl, extname(fontUrl.split("?")[0]).slice(1) || "ttf") : undefined };
+  return { brand, music: musicList.length ? await local(musicList[Math.floor(Math.random() * musicList.length)], "mp3") : undefined };
+}
+// Word timings for captions: the words spread over the part's measured duration by character count.
+function wordTimings(text, frames, offset = 0) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean), total = words.reduce((n, w) => n + w.length + 1, 0) || 1; let t = offset;
+  return words.map((w) => { const d = (frames * (w.length + 1)) / total, o = { text: w, from: Math.round(t), to: Math.round(t + d) }; t += d; return o; });
+}
+// Narration spoken part by part, so each part's duration is measured rather than guessed, then joined into one track.
+async function narrateParts(niche, parts, contentItemId) {
+  const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); const made = []; let cost = 0;
+  for (const text of parts) { const a = await voice.synthesize({ script: text, voiceId: niche.voice_id, contentItemId }); cost += a.cost || 0; made.push(a); }
+  if (made.some((a) => !a.url || a.url.startsWith("mock://"))) {
+    const durations = made.map((a) => Number(a.duration_seconds) || 2);
+    return { audio: { url: made[0]?.url || null, duration_seconds: durations.reduce((x, y) => x + y, 0), mock: true }, durations, cost };
+  }
+  const files = []; for (const a of made) files.push(await toTmpFile(a.url, "mp3"));
+  const durations = []; for (const [i, f] of files.entries()) durations.push((await ffprobeDuration(f)) || Number(made[i].duration_seconds) || 2);
+  const list = tmpPath("txt"), joined = tmpPath("mp3");
+  await writeFile(list, files.map((f) => `file '${f.replace(/\\/g, "/")}'`).join("\n"));
+  try { await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c:a", "libmp3lame", "-b:a", "160k", joined]); }
+  finally { await cleanup(list, ...files); }
+  const url = await storeLocal(joined, `audio/${newId()}.mp3`, "audio/mpeg"); const total = await ffprobeDuration(joined); await cleanup(joined);
+  const audio = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: total, meta: { parts: parts.length, voice: niche.voice_adapter } });
+  return { audio, durations, cost };
+}
+impl("RENDER", "remotion", { label: "Studio (Remotion) for made videos, ffmpeg for footage", create: (cfg, ctx) => {
+  const ff = IMPLS.RENDER.ffmpeg.create(cfg, ctx);
+  return {
+    renderForChannel: (a) => ff.renderForChannel(a), renderClip: (a) => ff.renderClip(a),
+    // sections: [{image: url, narration, seconds}], audio: media row; returns a VIDEO media row.
+    async renderReel({ sections, audio, niche, headline, kicker, credit, orientation = "9:16", contentItemId }) {
+      const vertical = orientation !== "16:9", { brand, music } = await studioBrand(niche), locals = [];
+      try {
+        const props = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: (niche.language || "en").slice(0, 2), brand, headline, kicker, credit, music, outroFrames: Math.round(2.5 * STUDIO_FPS), sections: [] };
+        props.audio = audio?.url && !audio.mock ? locals[locals.push(await toTmpFile(audio.url, "mp3")) - 1] : undefined;
+        for (const s of sections) {
+          const frames = Math.max(STUDIO_FPS, Math.round(s.seconds * STUDIO_FPS));
+          props.sections.push({ image: locals[locals.push(await toTmpFile(s.image)) - 1], durationInFrames: frames, narration: s.narration, words: wordTimings(s.narration, frames) });
+        }
+        const out = await studioRender("NewsReel", props);
+        return publishRender(out, contentItemId, { method: "STUDIO_REEL", orientation, sections: sections.length });
+      } finally { await cleanup(...locals, brand.logo, brand.fontUrl, music); }
+    },
+  };
+} });
 
 // ---- 6k. Publish (stage PUBLISH). publish({channel, mediaUrl, mediaKind, caption, title, hashtags}) -> {publishedUrl, externalId}
 const PLATFORM_DEFAULT_PUBLISHER = { FACEBOOK: "meta_graph", INSTAGRAM: "meta_graph", YOUTUBE: "youtube_upload" };
@@ -1162,7 +1240,7 @@ async function youtubeAccessToken(channel, cfg) {
   return t.access_token;
 }
 impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { privacy: { type: "string", default: "public" }, category_id: { type: "string", default: "22" } }, create: (cfg, ctx = {}) => ({
-  async publish({ channel, mediaUrl, mediaKind, caption, title, hashtags = [] }) {
+  async publish({ channel, mediaUrl, mediaKind, caption, title, hashtags = [], thumbnailUrl = null }) {
     if (mediaKind !== "VIDEO") throw new Error(`YouTube channel needs a VIDEO asset (got ${mediaKind})`);
     const token = await youtubeAccessToken(channel, cfg); const pc = P(channel.platform_config) || {};
     const file = await toTmpFile(mediaUrl, "mp4"); const bytes = await readFile(file); await cleanup(file);
@@ -1171,6 +1249,8 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
     const start = await fetch("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": String(bytes.length) }, body: JSON.stringify(meta) });
     const loc = start.headers.get("location"); if (!loc) throw new ApiError(start.status, await start.text(), "YouTube resumable start failed");
     const r = await fetchJson(loc, { method: "PUT", headers: { "Content-Type": "video/mp4", "Content-Length": String(bytes.length) }, body: bytes });
+    // Custom thumbnails need a verified channel; a refusal is logged, never fatal to the upload.
+    if (thumbnailUrl && !isShort) { try { const t = await toTmpFile(thumbnailUrl, "jpg"); const tb = await readFile(t); await cleanup(t); await fetchJson(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${r.id}&uploadType=media`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "image/jpeg", "Content-Length": String(tb.length) }, body: tb }); } catch (e) { warn(`YouTube thumbnail for ${r.id}: ${e.message.slice(0, 200)}`); } }
     return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts" : "watch?v="}${r.id}` };
   },
   async metrics({ asset }) {
@@ -1210,8 +1290,10 @@ async function underDailyCap(niche) {
   return r.n < niche.max_items_per_day;
 }
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
-const CONTENT_TYPE_SET = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", ...VIDEO_TYPES]);
-const queueFor = (contentType) => VIDEO_TYPES.has(contentType) || contentType === "IMAGE_SLIDESHOW" || contentType === "LONG_FORM_VIDEO" ? "video" : "text";
+// Made videos (narrated reels, explainers) are written from articles like text posts but rendered on the video lane.
+const MADE_VIDEO_TYPES = new Set(["IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "NEWS_REEL", "ANIMATED_EXPLAINER"]);
+const CONTENT_TYPE_SET = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", ...MADE_VIDEO_TYPES, ...VIDEO_TYPES]);
+const queueFor = (contentType) => VIDEO_TYPES.has(contentType) || MADE_VIDEO_TYPES.has(contentType) ? "video" : "text";
 function scoreCandidate(item, niche) {
   const c = methodCfg(niche); let s = 0.35; const reasons = [];
   if (item.views) { const v = Math.min(1, Math.log10(item.views + 1) / 6.5); s += 0.3 * v; reasons.push(`views ${item.views}`); }
@@ -1318,7 +1400,7 @@ async function installCatalogSources(entries, nicheIds = []) {
 // program has an embedding adapter, word overlap otherwise). A sweep hands each program its best uncovered stories —
 // ranked by how many outlets carry them, outlet weight and freshness — and the writer then gets every outlet's version,
 // so a story is written once, from several sources, instead of once per outlet from one.
-const DESK_TYPES = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO"]);
+const DESK_TYPES = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", ...MADE_VIDEO_TYPES]);
 // Per program (method_config.desk): min_sources = outlets required; settle_minutes = wait for more outlets unless already
 // corroborated; max_age_hours = oldest publication date taken; per_sweep / min_gap_minutes = pacing.
 const deskCfg = (niche) => ({ min_sources: 1, settle_minutes: 5, max_age_hours: 12, per_sweep: 2, min_gap_minutes: 10, ...((P(niche.method_config) || {}).desk || {}) });
@@ -1608,29 +1690,111 @@ async function generateLongPost(item, niche, style) {
   await setItem(item.id, { headline: d.headline || m.title, body: d.post || "", summary: (d.post || "").slice(0, 280), captions: { facebook: d.post || "", default: d.post || "" }, hashtags: d.hashtags || [], image_prompt: d.image_prompt || null });
   if ((P(niche.method_config) || {}).cover_image !== false) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: d.image_prompt, headline: d.headline || m.title, specs: { width: 1200, height: 630, brand: niche.display_name, ...(P(niche.image_specs) || {}) }, contentItemId: item.id })); await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id }); }
 }
-// ---- 8c. IMAGE_SLIDESHOW / LONG_FORM_VIDEO (GENERATIVE): script → images → TTS → ffmpeg
-async function generateSlideshowVideo(item, niche, style) {
-  const m = await materialFor(item, niche); const long = item.content_type === "LONG_FORM_VIDEO"; const mc = methodCfg(niche);
+// ---- 8c. Narrated reels: NEWS_REEL (a story in 35-60 s), IMAGE_SLIDESHOW (facts video), LONG_FORM_VIDEO (researched,
+// 16:9). Script in sections → one picture per section → narration per section (measured) → the studio renders a branded
+// reel with karaoke captions; without the studio, ffmpeg renders a slideshow with the same per-section timing.
+const REEL_SPEC = {
+  NEWS_REEL: { sections: 6, words: "1-2 short spoken sentences", system: "You turn a news story into a 35-60 second vertical news reel. Open with the news in the first sentence, then the key facts, then what happens next. Facts only from the sources." },
+  IMAGE_SLIDESHOW: { sections: 8, words: "2-3 spoken sentences", system: "You write punchy 60-90 second facts videos." },
+  LONG_FORM_VIDEO: { sections: 12, words: "4-6 spoken sentences", system: "You write researched long-form YouTube video scripts." },
+};
+async function generateReel(item, niche, style) {
+  const m = await materialFor(item, niche); const type = item.content_type || niche.content_type, spec = REEL_SPEC[type] || REEL_SPEC.IMAGE_SLIDESHOW, mc = methodCfg(niche);
+  const long = type === "LONG_FORM_VIDEO", orientation = long ? "16:9" : mc.orientation || "9:16", vertical = orientation !== "16:9", lang = niche.language || "en";
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
-  const slides = mc.slides || (long ? 12 : 10);
-  const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 2500,
-    system: `You write ${long ? "researched long-form YouTube video scripts" : "punchy 60-90 second facts videos"} for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)} Every sentence must be spoken narration — no stage directions.${item._series || ""}`,
-    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nWrite a script split into exactly ${slides} sections. Return JSON: {"title": "video title", "sections": [{"narration": "spoken text for this section", "image_prompt": "what the viewer sees, no text"}], "description": "YouTube description", "hashtags": ["..."]}`,
-    mock: { title: m.title, sections: Array.from({ length: Math.min(slides, 4) }, (_, i) => ({ narration: `Mock narration section ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["facts"] } }));
-  await addCost(item.id, r.cost); const d = r.data || {}; const sections = d.sections || [];
-  const script = sections.map((s) => s.narration).join("\n\n");
-  await setItem(item.id, { headline: d.title || m.title, script, summary: d.description || "", captions: { default: d.description || m.title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
+  const count = mc.slides || spec.sections;
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
+    system: `${spec.system} Channel: "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear"}.${styleBlock(style)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
+    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces"}], "description": "post caption / video description", "hashtags": ["..."]}`,
+    mock: { title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
+  await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
+  if (!sections.length) throw new Error("The script came back without sections");
+  const title = d.title || m.title, script = sections.map((s) => s.narration).join("\n\n");
+  await setItem(item.id, { headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
+  const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
   const images = [];
-  for (const s of sections) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: s.image_prompt, headline: d.title || m.title, specs: { width: long ? 1920 : 1080, height: long ? 1080 : 1920, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}) }, contentItemId: item.id })); await addCost(item.id, img.cost); images.push(img); }
-  const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock");
-  const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: item.id }); await addCost(item.id, audio.cost);
-  await setItem(item.id, { voice_asset_url: audio.url, status: "RENDERING" });
-  // rough per-section captions from narration length
-  const totalChars = script.length || 1; let t = 0; const captions = sections.map((s) => { const d2 = (s.narration.length / totalChars) * (audio.duration_seconds || 30); const c = { start: t, end: t + d2, text: s.narration.slice(0, 90) }; t += d2; return c; });
+  for (const s of sections) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: s.image_prompt, headline: title, specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}), style: style2 }, contentItemId: item.id })); await addCost(item.id, img.cost); images.push(img); }
+  const narr = await narrateParts(niche, sections.map((s) => s.narration), item.id); await addCost(item.id, narr.cost);
+  await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
-  const video = await renderer.renderSlideshow({ images, audio, contentItemId: item.id, orientation: long ? "16:9" : mc.orientation || "9:16", captions: mc.captions === false ? [] : captions });
+  const outlets = (m.versions || []).map((v) => v.outlet).filter(Boolean).slice(0, 2);
+  const credit = outlets.length ? `${lang.startsWith("bn") ? "সূত্র" : "Source"}: ${outlets.join(", ")}` : undefined;
+  let video;
+  if (renderer.renderReel && studioReady() && !narr.audio.mock) {
+    video = await renderer.renderReel({ niche, headline: title, kicker: d.kicker, credit, orientation, contentItemId: item.id, audio: narr.audio,
+      sections: sections.map((s, i) => ({ image: images[i].url, narration: s.narration, seconds: narr.durations[i] + 0.15 })) });
+  } else {
+    let t = 0; const captions = sections.map((s, i) => { const c = { start: t, end: t + narr.durations[i], text: s.narration }; t += narr.durations[i]; return c; });
+    video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation, captions: mc.captions === false ? [] : captions });
+  }
   await setItem(item.id, { hero_media_id: video.id });
+}
+
+// ---- 8c2. ANIMATED_EXPLAINER (the animation blueprint). Research → a scene plan in six fixed layouts → narration per
+// scene (measured) → element cues from the narration → the studio renders it; plus a thumbnail and YouTube chapters.
+const EXPLAINER_LAYOUTS = {
+  TitleCard: '{"title": "...", "subtitle": "..."} — an opener or a section title; parts: [one line]',
+  BulletReveal: '{"heading": "...", "bullets": ["3-5 short bullets"]} — parts: one narration line per bullet, in order',
+  IconGrid: '{"heading": "...", "items": [{"icon": "<icon>", "label": "1-3 words"}]} — 2-6 items; parts: one line per item',
+  Comparison: '{"heading": "...", "left": {"title": "...", "points": ["..."]}, "right": {"title": "...", "points": ["..."]}} — parts: [left, right]',
+  DataChart: '{"heading": "...", "kind": "bar|line", "unit": "...", "data": [{"label": "...", "value": 0}]} — ONLY numbers stated in the research; parts: [one line]',
+  FullQuote: '{"quote": "...", "attribution": "..."} — a real quote from the research only; parts: [one line]',
+};
+const EXPLAINER_ICONS = "train-front bus car plane ship bike zap battery sun cloud-rain droplets flame leaf tree-pine factory building-2 house landmark school hospital stethoscope pill heart-pulse users user baby graduation-cap briefcase banknote coins wallet piggy-bank chart-line chart-column trending-up trending-down scale gavel shield shield-check lock key globe map map-pin flag vote megaphone newspaper tv radio smartphone laptop wifi cpu server database cloud rocket lightbulb target clock calendar timer search check x alert-triangle info wheat fish shopping-cart package truck anchor mountain waves";
+function sceneParts(s) { const parts = (Array.isArray(s.parts) ? s.parts : [s.parts]).map((x) => String(x || "").trim()).filter(Boolean); return { intro: String(s.intro || "").trim(), parts: parts.length ? parts : [String(s.narration || s.data?.title || "").trim()].filter(Boolean) }; }
+async function generateExplainer(item, niche, style) {
+  const m = await materialFor(item, niche); const mc = methodCfg(niche), lang = niche.language || "en";
+  const orientation = mc.orientation === "9:16" ? "9:16" : "16:9", vertical = orientation === "9:16", minutes = Number(mc.explainer_minutes) || 3;
+  const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
+  const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
+    system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
+    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
+    mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
+  await addCost(item.id, research.cost);
+  const notes = research.data?.notes || [];
+  await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), research.model || "mock"]);
+  const sceneCount = Math.max(4, Math.round(minutes * 3.5));
+  const plan = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
+    system: `You script animated explainer videos for "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
+    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(EXPLAINER_LAYOUTS).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\nStart with a TitleCard; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
+    mock: { title: m.title, description: `About ${m.title}`, hashtags: ["explained"], scenes: [
+      { layout: "TitleCard", chapter: "Intro", data: { title: m.title, subtitle: "Explained" }, parts: [`Here is ${m.title}, explained.`] },
+      { layout: "BulletReveal", chapter: "Key points", data: { heading: "Key points", bullets: ["First", "Second"] }, parts: ["The first point.", "The second point."] },
+      { layout: "FullQuote", chapter: "Wrap-up", data: { quote: "Mock quote", attribution: "Mock" }, parts: ["That is the story."] }] } }));
+  await addCost(item.id, plan.cost);
+  const p = plan.data || {}; const scenes = (p.scenes || []).filter((s) => s && EXPLAINER_LAYOUTS[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
+  if (!scenes.length) throw new Error("The explainer plan came back without usable scenes");
+  const texts = scenes.map((s) => [s.intro, ...s.parts].filter(Boolean).join(" "));
+  const title = p.title || m.title;
+  await setItem(item.id, { headline: title, script: texts.join("\n\n"), summary: p.description || "", hashtags: p.hashtags || [] });
+  const narr = await narrateParts(niche, texts, item.id); await addCost(item.id, narr.cost);
+  await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
+  // Cue i = when part i starts being spoken; chapters for the description from the cumulative scene times.
+  let at = 0; const chapters = [];
+  const built = scenes.map((s, i) => {
+    const frames = Math.max(STUDIO_FPS * 2, Math.round((narr.durations[i] + 0.35) * STUDIO_FPS)), weight = (x) => x.length + 1;
+    const total = weight(s.intro) * (s.intro ? 1 : 0) + s.parts.reduce((n, x) => n + weight(x), 0) || 1; let pos = s.intro ? weight(s.intro) : 0;
+    const cues = s.parts.map((x) => { const c = Math.round((pos / total) * frames * 0.97); pos += weight(x); return c; });
+    if (s.chapter) chapters.push(`${Math.floor(at / 60)}:${String(Math.floor(at % 60)).padStart(2, "0")} ${s.chapter}`);
+    at += frames / STUDIO_FPS;
+    return { layout: s.layout, chapter: s.chapter || undefined, transition: i % 3 === 1 ? "slide" : "fade", data: s.data, durationInFrames: frames, cues, words: wordTimings(texts[i], frames) };
+  });
+  if (chapters.length && !chapters[0].startsWith("0:00 ")) chapters.unshift(`0:00 ${lang.startsWith("bn") ? "শুরু" : "Intro"}`);
+  const description = [p.description || "", chapters.length >= 3 ? `\n${chapters.join("\n")}` : ""].join("\n").trim();
+  await setItem(item.id, { captions: { youtube: description, default: p.description || title, facebook: p.description || title } });
+  if (narr.audio.mock || !studioReady()) throw new Error("ANIMATED_EXPLAINER needs the video studio and a real voice adapter (the studio renders the animation)");
+  const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(narr.audio.url, "mp3");
+  const props = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), brand, title, audio: audioFile, music, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built };
+  try {
+    const out = await studioRender("Explainer", props);
+    const video = await publishRender(out, item.id, { method: "EXPLAINER", orientation, scenes: built.length });
+    try { const png = await studioRender("Explainer", { ...props, stillFrame: Math.min(45, built[0].durationInFrames - 1) }, { kind: "still", ext: "png" }); const bytes = await readFile(png); await cleanup(png);
+      const j = await toJpeg(bytes, "image/png"); await recordMedia({ contentItemId: item.id, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: props.width, height: props.height, meta: { purpose: "youtube thumbnail" } }); }
+    catch (e) { warn(`explainer thumbnail: ${e.message.slice(0, 160)}`); }
+    await setItem(item.id, { hero_media_id: video.id });
+  } finally { await cleanup(audioFile, brand.logo, brand.fontUrl, music); }
 }
 // ---- 8d. Video candidate: download → transcribe → pick clips → one content_item per clip → RENDER_CLIP jobs
 async function processCandidate(candidateId) {
@@ -1702,7 +1866,8 @@ async function runGeneration(itemId) {
   if (item.series_id && item.episode_number == null) { const s = await one(`SELECT episode_counter FROM series WHERE id=$1`, [item.series_id]); if (s) { await setItem(itemId, { episode_number: s.episode_counter + 1 }); item.episode_number = s.episode_counter + 1; } }
   item._series = await seriesBlock(item);
   if (type === "LONG_POST") await generateLongPost(item, niche, style);
-  else if (type === "IMAGE_SLIDESHOW" || type === "LONG_FORM_VIDEO") await generateSlideshowVideo(item, niche, style);
+  else if (type === "ANIMATED_EXPLAINER") await generateExplainer(item, niche, style);
+  else if (MADE_VIDEO_TYPES.has(type)) await generateReel(item, niche, style);
   else await generateStatic(item, niche, style);
   return finishGeneration(itemId, niche);
 }
@@ -1734,7 +1899,8 @@ async function publishAsset(assetId) {
     const pubKey = channel.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[channel.platform] || "publish_mock";
     const publisher = await resolve("PUBLISH", pubKey);
     await q(`UPDATE content_assets SET status='PUBLISHING' WHERE id=$1`, [assetId]);
-    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption: asset.caption || renderCaption(item, channel, null), title: item.headline || item.topic, hashtags: P(item.hashtags) || [] });
+    const thumb = await one(`SELECT url FROM media_assets WHERE content_item_id=$1 AND kind='THUMBNAIL' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`, [item.id]);
+    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption: asset.caption || renderCaption(item, channel, null), title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
     await q(`UPDATE content_assets SET status='PUBLISHED', published_url=$2, external_id=$3, published_at=now(), error_message=NULL WHERE id=$1`, [assetId, res.publishedUrl, res.externalId]);
     await q(`UPDATE channels SET last_published_at=now() WHERE id=$1`, [channel.id]);
   } catch (e) {
@@ -2187,7 +2353,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
@@ -2319,7 +2485,7 @@ async function smartAdapterDefaults() {
     embedAdapter: gem ? "gemini_embed" : "embed_mock",
     voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
     transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
-    renderAdapter: ffmpeg ? "ffmpeg" : "render_mock",
+    renderAdapter: studioReady() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",
   };
 }
 app.post("/api/niches", async (ctx) => {

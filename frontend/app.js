@@ -76,8 +76,9 @@ const STATUS_COLOR = {
 };
 const tag = (s) => h("span", { class: "tag " + (STATUS_COLOR[s] || "") }, nice(s));
 
-const CONTENT_TYPES = ["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"];
+const CONTENT_TYPES = ["NEWS_STATIC", "NEWS_REEL", "NICHE_STATIC", "LONG_POST", "IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "ANIMATED_EXPLAINER", "PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"];
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
+const MADE_VIDEO_TYPES = new Set(["IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "NEWS_REEL", "ANIMATED_EXPLAINER"]);
 const PLATFORMS = ["FACEBOOK", "INSTAGRAM", "YOUTUBE", "PORTAL"];
 const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Text-only post"], ["SHORT_FORM_VOICEOVER", "Short vertical video (Reels / Shorts)"], ["LONG_FORM_VIDEO", "Long landscape video"]];
 let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
@@ -237,7 +238,7 @@ pages.review = async (sub) => {
 };
 
 function proofView(it, onDone) {
-  const isVideo = VIDEO_TYPES.has(it.content_type) || it.content_type === "IMAGE_SLIDESHOW" || it.content_type === "LONG_FORM_VIDEO";
+  const isVideo = VIDEO_TYPES.has(it.content_type) || MADE_VIDEO_TYPES.has(it.content_type);
   const caps = it.captions || {};
   const hero = it.hero_media;
   const heroEl = !hero ? null

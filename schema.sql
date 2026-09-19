@@ -594,6 +594,7 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'gemini_tts',       'VOICE',      'gemini_tts',       'Gemini TTS (Bangla + English)',  '{}'),
   (gen_random_uuid()::text, 'render_mock',      'RENDER',     'render_mock',      'Mock renderer',                  '{}'),
   (gen_random_uuid()::text, 'ffmpeg',           'RENDER',     'ffmpeg',           'ffmpeg renderer',                '{}'),
+  (gen_random_uuid()::text, 'remotion',         'RENDER',     'remotion',         'Studio (Remotion) + ffmpeg',     '{}'),
   (gen_random_uuid()::text, 'publish_mock',     'PUBLISH',    'publish_mock',     'Mock publisher',                 '{}'),
   (gen_random_uuid()::text, 'meta_graph',       'PUBLISH',    'meta_graph',       'Facebook Page + Instagram (Graph API)', '{}'),
   (gen_random_uuid()::text, 'youtube_upload',   'PUBLISH',    'youtube_upload',   'YouTube Data API upload',        '{}'),
