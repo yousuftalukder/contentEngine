@@ -120,7 +120,7 @@ function jsonDialog(title, obj) { modal(title, h("div", null, h("pre", null, JSO
 
 // ---------------------------------------------------------------- shell
 const PAGES = [
-  ["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"], ["insights", "Insights"],
+  ["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"], ["insights", "Insights"],
   ["programs", "Programs"], ["brands", "Brands"], ["sources", "Sources"], ["candidates", "Video candidates"], ["channels", "Channels"],
   ["adapters", "Adapters"], ["keys", "API keys"], ["settings", "Settings"],
 ];
@@ -619,6 +619,29 @@ function brandKitPanel(b, music = []) {
       h("button", { class: "btn danger right", onclick: () => confirmModal("Delete brand?", "Only works when it has no programs or channels.", () => run(() => del(`/api/brands/${b.id}`), "Deleted").then(route)) }, "Delete"))),
     preview));
 }
+
+// ---------------------------------------------------------------- schedule
+pages.schedule = async () => {
+  const s = await get("/api/schedule");
+  const thumb = (r) => r.hero_url ? (r.hero_kind === "VIDEO" ? h("span", { class: "tag blue" }, "video") : h("img", { src: r.hero_url, alt: "", style: "width:54px;height:54px;object-fit:cover;border-radius:4px" })) : h("span", { class: "tag" }, "text");
+  const root = h("div", null, pageHead("Schedule", "Approved posts waiting for their slot, per channel's posting windows, gaps and daily limits — and what went out in the last 48 hours.",
+    h("button", { class: "btn", onclick: () => route() }, "Refresh")));
+  root.appendChild(h("h2", null, "Coming up"));
+  root.appendChild(!s.upcoming.length ? h("div", { class: "empty" }, h("b", null, "Nothing scheduled"), "Approved items get a slot on every channel subscribed to their program.") :
+    h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, s.upcoming.map((r) => h("tr", null,
+      h("td", { style: "width:64px" }, thumb(r)),
+      h("td", null, h("a", { href: "#", onclick: (e) => { e.preventDefault(); openItem(r.item_id); } }, r.headline || "(untitled)"), h("span", { class: "sub" }, nice(r.content_type))),
+      h("td", { class: "small" }, r.channel, h("span", { class: "sub" }, r.platform)),
+      h("td", { class: "small" }, r.scheduled_for ? fmtDate(r.scheduled_for) : "now", h("span", { class: "sub" }, r.scheduled_for && new Date(r.scheduled_for) > Date.now() ? `in ${Math.round((new Date(r.scheduled_for) - Date.now()) / 60000)} min` : "")),
+      h("td", null, tag(r.status))))))));
+  root.appendChild(h("h2", null, "Last 48 hours"));
+  root.appendChild(!s.recent.length ? h("p", { class: "mute" }, "Nothing published yet.") :
+    h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, s.recent.map((r) => h("tr", null,
+      h("td", null, r.headline || "(untitled)"), h("td", { class: "small" }, r.channel, h("span", { class: "sub" }, r.platform)),
+      h("td", null, tag(r.status), r.error_message ? h("span", { class: "sub", style: "color:var(--red)" }, r.error_message.slice(0, 140)) : null),
+      h("td", { class: "small" }, r.published_url ? h("a", { href: r.published_url, target: "_blank", rel: "noopener" }, "View") : "", r.published_at ? h("span", { class: "sub" }, ago(r.published_at)) : null)))))));
+  return root;
+};
 
 // ---------------------------------------------------------------- ideas (planner suggestions)
 const KIND_COLOR = { TOPIC: "blue", SERIES_EPISODE: "violet", NEW_SERIES: "violet", FORMAT: "amber", TIMING: "amber", NEW_PROGRAM: "green" };

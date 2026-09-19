@@ -2765,6 +2765,15 @@ app.patch("/api/sources/:id", async (ctx) => json(ctx, 200, rowJson(await patchR
 app.delete("/api/sources/:id", async (ctx) => { await q(`DELETE FROM sources WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/sources/:id/poll", async (ctx) => { const jobId = await enqueue("INGEST_SOURCE", { sourceId: ctx.params.id }, { queue: "ingest", dedupeKey: `ingest:${ctx.params.id}`, priority: 10, maxAttempts: 1 }); json(ctx, 202, { jobId }); });
 app.post("/api/sources/:id/preview", async (ctx) => { const s = await one(`SELECT * FROM sources WHERE id=$1`, [ctx.params.id]); if (!s) throw new ApiError(404, null, "Source not found"); const ing = await resolve("INGEST", s.adapter_key); json(ctx, 200, (await ing.fetchItems(s)).slice(0, 10)); });
+// ---- schedule: what goes out where and when (next days), and what just went out
+app.get("/api/schedule", async (ctx) => json(ctx, 200, {
+  upcoming: await q(`SELECT a.id, a.status, a.scheduled_for, c.display_name AS channel, c.platform, ci.id AS item_id, COALESCE(ci.headline, ci.topic) AS headline, ci.content_type, m.url AS hero_url, m.kind AS hero_kind
+    FROM content_assets a JOIN channels c ON c.id = a.channel_id JOIN content_items ci ON ci.id = a.content_item_id LEFT JOIN media_assets m ON m.id = ci.hero_media_id
+    WHERE a.status IN ('PENDING','RENDERING','RENDERED','PUBLISHING') ORDER BY a.scheduled_for NULLS FIRST LIMIT 200`),
+  recent: await q(`SELECT a.id, a.status, a.published_at, a.published_url, a.error_message, c.display_name AS channel, c.platform, ci.id AS item_id, COALESCE(ci.headline, ci.topic) AS headline
+    FROM content_assets a JOIN channels c ON c.id = a.channel_id JOIN content_items ci ON ci.id = a.content_item_id
+    WHERE a.status IN ('PUBLISHED','FAILED') AND a.updated_at > now() - interval '48 hours' ORDER BY a.updated_at DESC LIMIT 100`),
+}));
 // ---- setup checklist: what still stands between this install and running on its own
 app.get("/api/setup-status", async (ctx) => {
   const has = async (p) => (await credentialsFor(p)).length > 0;

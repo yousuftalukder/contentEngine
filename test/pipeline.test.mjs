@@ -32,6 +32,8 @@ test("news pipeline: poll source -> draft lands in review -> approve -> publishe
   assert.equal(done.assets[0].status, "PUBLISHED");
   assert.match(done.assets[0].published_url, /^mock:\/\/published\/facebook\//);
   assert.ok(done.portal_url, "portal article created");
+  const sched = await eng.api("GET", "/api/schedule");
+  assert.ok(sched.recent.some((r) => r.item_id === draft.id && r.status === "PUBLISHED"), "the post shows in the schedule's recent list");
   const res = await fetch(done.portal_url.replace(/^https?:\/\/[^/]+/, eng.base));
   assert.equal(res.status, 200);
 });
