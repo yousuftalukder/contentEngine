@@ -598,7 +598,8 @@ impl("INGEST", "google_news", { label: "Google News (search / edition, no key)",
       const [it] = parseFeed(m[0]); if (!it) continue;
       const outlet = decodeXml((m[0].match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [])[1] || "").trim();
       const title = outlet && it.title.endsWith(` - ${outlet}`) ? it.title.slice(0, -(outlet.length + 3)).trim() : it.title;
-      if (!title || GN_NOISE.test(title)) continue;
+      // Google also indexes outlets' tag and section pages ("tech companies", "Tokyo Olympics"): real headlines are longer.
+      if (!title || GN_NOISE.test(title) || title.split(/\s+/).filter(Boolean).length < 4) continue;
       out.push({ ...it, title, summary: "", raw: { outlet, via: "google_news" } });
     }
     return out.slice(0, c.limit || 40);
@@ -2027,7 +2028,10 @@ const HANDLERS = {
     try {
       const ing = await resolve("INGEST", source.adapter_key || "rss"); const items = await ing.fetchItems(source); let added = 0, routed = 0;
       const desk = await setting("desk.enabled", true), toCluster = [];
+      const maxAgeMs = Number(await setting("ingest.max_age_hours", 72)) * 3600e3;
       for (const it of items) {
+        // Stale articles (feeds that never rotate, indexed archive pages) are not taken in at all; old videos still are.
+        if ((it.kind || "ARTICLE") === "ARTICLE" && it.published_at && Date.now() - Date.parse(it.published_at) > maxAgeMs) continue;
         const hash = sha(it.url); const id = newId();
         const ins = await q(`INSERT INTO source_items (id, source_id, external_id, url, url_hash, title, summary, published_at, thumbnail_url, kind, raw) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT (url_hash) DO NOTHING RETURNING id`,
           [id, sourceId, it.external_id || null, it.url, hash, it.title.slice(0, 500), it.summary || null, it.published_at || null, it.thumbnail || null, it.kind || "ARTICLE", JSON.stringify({ ...(it.raw || {}), duration: it.duration, views: it.views, platform: it.platform, license: it.license })]);
@@ -2187,8 +2191,8 @@ app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
-  const [items, assets, cand, srcs] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
+  const [items, assets, cand, srcs, ideas] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`)]);
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
 });
 // ---- storage
 app.get("/api/storage", async (ctx) => {
