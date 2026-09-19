@@ -1317,6 +1317,15 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
       const token = await metaToken(channel, cfg); const acct = channel.platform_account_id; if (!acct) throw new Error("channel.platform_account_id (Page ID / IG user ID) is required");
       if (mediaUrl?.startsWith("mock://")) throw new Error("Cannot publish a mock:// media URL to a real platform — switch the program's image/render adapter to a live one");
       if (channel.platform === "FACEBOOK") {
+        // Vertical short videos go out as Reels (start → hosted-file upload → finish), which reach far more people than
+        // page videos; everything else is a normal page video.
+        if (mediaKind === "VIDEO" && channel.format === "SHORT_FORM_VOICEOVER") {
+          const s = await post(`${acct}/video_reels`, { upload_phase: "start", access_token: token });
+          const up = await fetchJson(`https://rupload.facebook.com/video-upload/${cfg.api_version || DEFAULTS.META_API_VERSION}/${s.video_id}`, { method: "POST", headers: { Authorization: `OAuth ${token}`, file_url: mediaUrl } });
+          if (up.success === false) throw new Error(`Facebook Reel upload failed: ${JSON.stringify(up).slice(0, 300)}`);
+          await post(`${acct}/video_reels`, { upload_phase: "finish", video_id: s.video_id, video_state: "PUBLISHED", description: caption, title, access_token: token });
+          return { externalId: s.video_id, publishedUrl: `https://www.facebook.com/reel/${s.video_id}` };
+        }
         if (mediaKind === "VIDEO") { const r = await post(`${acct}/videos`, { file_url: mediaUrl, description: caption, title, access_token: token }); return { externalId: r.id, publishedUrl: `https://www.facebook.com/${r.id}` }; }
         if (mediaKind === "IMAGE") { const r = await post(`${acct}/photos`, { url: mediaUrl, message: caption, access_token: token }); return { externalId: r.post_id || r.id, publishedUrl: `https://www.facebook.com/${r.post_id || r.id}` }; }
         const r = await post(`${acct}/feed`, { message: caption, access_token: token }); return { externalId: r.id, publishedUrl: `https://www.facebook.com/${r.id}` };
