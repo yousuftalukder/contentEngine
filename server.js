@@ -211,7 +211,7 @@ const secretHint = (s) => { const t = String(s || "").trim(); return t.length > 
 const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
 const parseSecret = (provider, raw) => (MULTI_FIELD_PROVIDERS[provider] && raw ? (P(raw) || {}) : raw);
 
-const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
+const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN" };
 const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2"];
 // Resolve the usable secret of one credential row: vault first, then the named env var.
 function credSecret(r) {
@@ -454,7 +454,7 @@ impl("SCRIPT", "llm_mock", { label: "Mock LLM", configSchema: { fail_first: { ty
   async complete({ system, prompt, json, mock }) {
     if (cfg.fail_first) {
       const n = (mockFailures.get(ctx.key) || 0) + 1; mockFailures.set(ctx.key, n);
-      if (n <= cfg.fail_first) throw new ApiError(cfg.fail_status || 503, null, `mock ${cfg.fail_status || 503}: simulated failure ${n} of ${cfg.fail_first}`);
+      if (n <= cfg.fail_first) throw new ApiError(cfg.fail_status || 503, null, cfg.fail_message || `mock ${cfg.fail_status || 503}: simulated failure ${n} of ${cfg.fail_first}`);
     }
     const rule = (cfg.respond || []).find((r) => `${system || ""}\n${prompt}`.includes(r.match));
     if (rule) return { text: JSON.stringify(rule.json), data: rule.json, cost: 0 };
@@ -2347,6 +2347,7 @@ async function runJob(job) {
     warn(`job ${job.type} ${job.id} failed (attempt ${job.attempts}${delay != null ? `, retrying in ${delay}s` : ", giving up"}): ${msg}`);
     if (delay != null) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE id=$1`, [job.id, msg, String(delay)]);
     else {
+      await alertOnFailure(job, msg).catch((err) => warn("alert", err.message));
       await q(`UPDATE jobs SET status='FAILED', error_message=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, msg]);
       const itemId = job.content_item_id || payload.itemId; if (itemId) await q(`UPDATE content_items SET status='FAILED', rejection_note=$2 WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED','REJECTED')`, [itemId, msg]);
       if (payload.candidateId) await q(`UPDATE video_candidates SET status='FAILED', error_message=$2 WHERE id=$1`, [payload.candidateId, msg]);
@@ -2386,6 +2387,76 @@ async function recoverAbandonedWork() {
   const r2 = await q(`UPDATE content_items ci SET status='FAILED', rejection_note='Recovered at boot: generation was interrupted (process restarted). Regenerate to retry.' WHERE status IN ('FETCHING_DATA','DRAFTING','RENDERING') AND updated_at < now() - interval '90 minutes' AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.content_item_id = ci.id AND j.status IN ('PENDING','RUNNING')) RETURNING id`);
   if (r1.length || r2.length) log(`recovered ${r1.length} jobs, failed ${r2.length} stuck items`);
 }
+// ---- 9b. Alerts. Problems a person has to act on — an AI key rejected or out of credit, a feed that keeps failing, an
+// expired publishing token, the budget cap, a stalled pipeline, a growing review queue — are recorded for the dashboard and
+// sent to Telegram when a bot token (TELEGRAM_BOT_TOKEN or a "telegram" key) and a chat id (TELEGRAM_CHAT_ID or setting
+// alerts.telegram_chat_id) are set. An alert is not repeated within its cooldown. The engine cannot report being asleep:
+// an external uptime monitor on /health covers that.
+async function telegramTarget() {
+  const token = ENV.TELEGRAM_BOT_TOKEN || (await credentialsFor("telegram"))[0]?.secret, chat = ENV.TELEGRAM_CHAT_ID || (await setting("alerts.telegram_chat_id", null));
+  return token && chat ? { token, chat: String(chat) } : null;
+}
+async function notify(kind, title, body = "", { level = "warn", key = null, cooldownHours = 6 } = {}) {
+  const dedupe = key || `${kind}:${sha(title).slice(0, 16)}`;
+  if (await one(`SELECT id FROM notifications WHERE dedupe_key=$1 AND created_at > now() - ($2 || ' hours')::interval`, [dedupe, String(cooldownHours)])) return false;
+  const id = newId();
+  await q(`INSERT INTO notifications (id, kind, level, title, body, dedupe_key) VALUES ($1,$2,$3,$4,$5,$6)`, [id, kind, level, String(title).slice(0, 300), String(body || "").slice(0, 3000), dedupe]);
+  const tg = await telegramTarget().catch(() => null);
+  if (tg) {
+    const icon = { error: "🔴", warn: "🟠", info: "🟢" }[level] || "🟠";
+    try { await fetchJson(`https://api.telegram.org/bot${tg.token}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: tg.chat, text: `${icon} ${title}${body ? `\n\n${body}` : ""}`.slice(0, 4000), disable_web_page_preview: true }) }); await q(`UPDATE notifications SET delivered=1 WHERE id=$1`, [id]); }
+    catch (e) { warn("telegram alert failed:", e.message.slice(0, 160)); }
+  }
+  return true;
+}
+// Which provider an error message is about, from the API host it names.
+const PROVIDER_HOSTS = [["api.anthropic.com", "Anthropic"], ["generativelanguage.googleapis.com", "Gemini"], ["api.openai.com", "OpenAI"], ["api.elevenlabs.io", "ElevenLabs"], ["graph.facebook.com", "Meta (Facebook/Instagram)"], ["googleapis.com/upload/youtube", "YouTube"], ["oauth2.googleapis.com", "YouTube OAuth"], ["newsapi.org", "NewsAPI"]];
+// Called when a job gives up: failures a person must fix (billing, keys, tokens) become alerts.
+async function alertOnFailure(job, msg) {
+  const provider = PROVIDER_HOSTS.find(([h]) => msg.includes(h))?.[1] || (msg.match(/No API key for "(\w+)"/) || [])[1] || "an API";
+  const rule = [
+    [/credit balance|billing|insufficient_quota|exceeded your current quota|payment/i, `${provider} account is out of credit`, "Top it up, or switch the program to another writer (Programs → Edit → Script / LLM)."],
+    [/No API key/i, `No key for ${provider}`, "Add it on the API keys page or set the env var on Render."],
+    [/API key not valid|invalid[_ ]api[_ ]key|Incorrect API key|\b401\b|PERMISSION_DENIED|Unauthorized/i, `${provider} rejected the key`, "Check the key on the API keys page (Test button)."],
+    [/access token|OAuthException|Session has expired|\(#190\)|invalid_grant/i, `${provider} publishing token expired or was revoked`, "Create a new token and update the channel's key."],
+  ].find(([re]) => re.test(msg));
+  if (rule) await notify("provider", rule[1], `${rule[2]}\n\nLast error (${job.type}): ${msg.slice(0, 400)}`, { level: "error", key: `provider:${rule[1]}`, cooldownHours: 6 });
+}
+async function sweepHealth() {
+  const tz = "Asia/Dhaka", hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(new Date()));
+  for (const s of await q(`SELECT s.name, s.last_error FROM sources s WHERE s.is_active::int = 1 AND s.last_error IS NOT NULL AND s.last_polled_at > now() - interval '2 hours'
+      AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.source_id = s.id) AND NOT EXISTS (SELECT 1 FROM source_items si WHERE si.source_id = s.id AND si.created_at > now() - interval '24 hours')`))
+    await notify("source", `Source "${s.name}" keeps failing`, s.last_error.slice(0, 500), { key: `source:${s.name}`, cooldownHours: 24 });
+  const cap = Number(await setting("budget.daily_cap_usd", 0));
+  if (cap && (await spentTodayUsd()) >= cap) await notify("budget", `Daily budget of $${cap} reached`, "Generation is paused until tomorrow (Settings → Daily spend cap).", { key: `budget:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 24 });
+  const gen = await one(`SELECT COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed, COUNT(*)::int AS total, (array_agg(left(error_message, 300) ORDER BY finished_at DESC) FILTER (WHERE status = 'FAILED'))[1] AS last FROM jobs WHERE type IN ('GENERATE_CONTENT','RENDER_CLIP','PROCESS_CANDIDATE') AND finished_at > now() - interval '2 hours'`);
+  if (gen.total >= 5 && gen.failed / gen.total > 0.5) await notify("failures", `${gen.failed} of ${gen.total} generation jobs failed in 2 hours`, `Most recent error: ${gen.last || "?"}`, { key: "failures", cooldownHours: 4 });
+  const active = await one(`SELECT COUNT(*)::int AS n FROM niches n WHERE n.is_active::int = 1 AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.niche_id = n.id)`);
+  const recent = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE created_at > now() - interval '6 hours'`);
+  if (active.n && !recent.n && hour >= 9 && hour <= 23 && (await setting("ingest.enabled", true))) await notify("stalled", "No new content in 6 hours", "Sources may be failing, the desk may be off, or every story was filtered out. Check Sources and the News desk.", { key: "stalled", cooldownHours: 12 });
+  const backlog = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE status = 'PENDING_REVIEW' AND created_at < now() - interval '12 hours'`);
+  if (backlog.n >= 30) await notify("review", `${backlog.n} drafts have waited over 12 hours in Review`, "Approve them, or let clean drafts publish on their own (Programs → Review: auto-approve after a window).", { key: "review", cooldownHours: 24 });
+  // Daily digest at 21:00 Dhaka time.
+  if (hour === 21) {
+    const d = await one(`SELECT (SELECT COUNT(*)::int FROM content_assets WHERE status='PUBLISHED' AND published_at > now() - interval '24 hours') AS published,
+      (SELECT COUNT(*)::int FROM content_items WHERE created_at > now() - interval '24 hours') AS made, (SELECT COUNT(*)::int FROM content_items WHERE status='FAILED' AND updated_at > now() - interval '24 hours') AS failed,
+      (SELECT COUNT(*)::int FROM content_items WHERE status='PENDING_REVIEW') AS waiting`);
+    const top = await one(`SELECT ci.headline, (a.last_metrics->>'views')::int AS views FROM content_assets a JOIN content_items ci ON ci.id = a.content_item_id WHERE a.published_at > now() - interval '48 hours' AND a.last_metrics IS NOT NULL ORDER BY (a.last_metrics->>'views')::int DESC NULLS LAST LIMIT 1`);
+    await notify("digest", `Today: ${d.published} posts published, ${d.made} made`, `${d.failed} failed · ${d.waiting} waiting in Review · spent $${(await spentTodayUsd()).toFixed(2)}${top ? `\nTop post: ${top.headline} (${top.views} views)` : ""}`, { level: "info", key: `digest:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 20 });
+  }
+}
+// Programs created before the source catalog existed get its sources (and a house style) once.
+async function upgradeExistingPrograms() {
+  if (await setting("upgrade.catalog_v1", false)) return;
+  for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
+    const linked = await one(`SELECT 1 AS x FROM niche_sources ns JOIN sources s ON s.id = ns.source_id WHERE ns.niche_id = $1 AND s.catalog_key IS NOT NULL LIMIT 1`, [n.id]);
+    const entries = linked ? [] : catalogFor(n);
+    if (entries.length) { await installCatalogSources(entries, [n.id]); log(`upgrade: linked ${entries.length} catalog sources to "${n.display_name}"`); }
+    if (!n.style_profile_id && n.script_adapter !== "llm_mock") await enqueue("STYLE_GENERATE", { brandId: n.brand_id, nicheId: n.id }, { queue: "text", dedupeKey: `style-gen:${n.id}` });
+  }
+  await putSetting("upgrade.catalog_v1", true);
+}
+
 // Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
 // ledger and story clusters are pruned once nothing refers to them, bulky fields (article text, embeddings) are dropped
 // after a few days, and finished jobs are cleared. Content items, media rows and metrics are never pruned.
@@ -2407,6 +2478,8 @@ function startWorkers() {
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
   every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
   every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
+  every(15 * 60000, sweepHealth);
+  upgradeExistingPrograms().catch((e) => warn("upgrade", e.message));
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
@@ -2457,8 +2530,8 @@ app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
-  const [items, assets, cand, srcs, ideas] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
+  const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
 });
 // ---- storage
 app.get("/api/storage", async (ctx) => {
@@ -2517,6 +2590,7 @@ app.post("/api/credentials/:id/test", async (ctx) => {
     youtube: () => fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=id&chart=mostPopular&maxResults=1&key=${encodeURIComponent(c.secret)}`),
     meta: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/me?${form({ fields: "id,name", access_token: c.secret })}`),
     youtube_oauth: () => fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: c.secret.client_id, client_secret: c.secret.client_secret, refresh_token: c.secret.refresh_token, grant_type: "refresh_token" }) }).then((t) => ({ token_type: t.token_type, expires_in: t.expires_in })),
+    telegram: () => fetchJson(`https://api.telegram.org/bot${c.secret}/getMe`).then((r) => ({ bot: r.result?.username })),
     r2: async () => { const cfg = await r2Config(); if (!cfg) throw new Error("R2 fields incomplete"); await r2Request("PUT", "healthcheck.txt", Buffer.from("ok"), "text/plain"); await r2Request("DELETE", "healthcheck.txt"); return { bucket: cfg.bucket, public_url: cfg.public_url || "(none — set public_url so platforms can fetch files)" }; },
   };
   try { const r = await tests[c.provider](); json(ctx, 200, { ok: true, provider: c.provider, result: typeof r === "object" && r ? Object.fromEntries(Object.entries(r).slice(0, 4).map(([k, v]) => [k, typeof v === "string" ? v.slice(0, 80) : Array.isArray(v) ? `${v.length} item(s)` : v])) : r }); }
@@ -2648,6 +2722,10 @@ app.patch("/api/sources/:id", async (ctx) => json(ctx, 200, rowJson(await patchR
 app.delete("/api/sources/:id", async (ctx) => { await q(`DELETE FROM sources WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/sources/:id/poll", async (ctx) => { const jobId = await enqueue("INGEST_SOURCE", { sourceId: ctx.params.id }, { queue: "ingest", dedupeKey: `ingest:${ctx.params.id}`, priority: 10, maxAttempts: 1 }); json(ctx, 202, { jobId }); });
 app.post("/api/sources/:id/preview", async (ctx) => { const s = await one(`SELECT * FROM sources WHERE id=$1`, [ctx.params.id]); if (!s) throw new ApiError(404, null, "Source not found"); const ing = await resolve("INGEST", s.adapter_key); json(ctx, 200, (await ing.fetchItems(s)).slice(0, 10)); });
+// ---- alerts
+app.get("/api/notifications", async (ctx) => json(ctx, 200, await q(`SELECT * FROM notifications ORDER BY created_at DESC LIMIT ${Math.min(200, Number(ctx.query.get("limit")) || 50)}`)));
+app.post("/api/notifications/read-all", async (ctx) => { await q(`UPDATE notifications SET read_at = now() WHERE read_at IS NULL`); json(ctx, 200, { ok: true }); });
+app.post("/api/notifications/test", async (ctx) => { const tg = await telegramTarget(); await notify("test", "Test alert from Content Engine", tg ? "Alerts reach this chat." : "Telegram is not configured: this alert is only in the dashboard.", { level: "info", key: `test:${newId()}` }); json(ctx, 200, { telegram: !!tg }); });
 // ---- source catalog + news desk
 app.get("/api/source-catalog", async (ctx) => {
   const rows = await q(`SELECT s.catalog_key, s.id, s.is_active, s.last_polled_at, s.last_error, (SELECT json_agg(n.display_name) FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id WHERE ns.source_id = s.id) AS programs FROM sources s WHERE s.catalog_key IS NOT NULL`);

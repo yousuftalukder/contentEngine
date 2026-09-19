@@ -31,6 +31,16 @@ test("a transient failure with no fallback is retried later instead of failing",
   assert.notEqual((await eng.api("GET", `/api/content-items/${item.id}`)).status, "FAILED");
 });
 
+test("an unpaid provider account raises one clear alert, not one per failed job", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_no_credit", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 1000, fail_status: 400, fail_message: 'POST https://api.anthropic.com/v1/messages -> 400: {"type":"error","error":{"message":"Your credit balance is too low to access the Anthropic API."}}' } });
+  const p = await program("no_credit", { scriptAdapter: "llm_no_credit" });
+  const a = await generate(p, "Story one"), b = await generate(p, "Story two");
+  for (const it of [a, b]) await waitFor(async () => (await jobFor(it.id))?.status === "FAILED", { what: "job failed" });
+  const alerts = (await eng.api("GET", "/api/notifications")).filter((n) => /Anthropic account is out of credit/.test(n.title));
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].level, "error");
+});
+
 test("a permanent failure fails the job at once", async () => {
   const p = await program("permanent", { scriptAdapter: "llm_bad_request" });
   const item = await generate(p, "Bad request story");

@@ -84,8 +84,8 @@ const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Tex
 let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
 let PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
 let MULTI_FIELD = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
-const PROVIDER_LABEL = { anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
-const PROVIDER_HELP = { meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
+const PROVIDER_LABEL = { telegram: "Telegram bot (alerts)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
+const PROVIDER_HELP = { telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
 const password = (name, extra = {}) => h("input", { type: "password", name, autocomplete: "new-password", spellcheck: false, ...extra });
 
 // form field builders
@@ -166,7 +166,7 @@ const pages = {};
 
 // ---------------------------------------------------------------- overview
 pages.overview = async () => {
-  const [programs, sources, channels] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels")]);
+  const [programs, sources, channels, alerts] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => [])]);
   const it = stats?.items || {}, as = stats?.assets || {};
   const pending = it.PENDING_REVIEW || 0;
   const seeded = programs.length > 0;
@@ -187,6 +187,13 @@ pages.overview = async () => {
         stat(as.PUBLISHED || 0, "Published"),
         stat((it.FAILED || 0) + (as.FAILED || 0), "Failed", (it.FAILED || as.FAILED) ? "red" : ""),
         stat(stats?.activeSources ?? 0, "Active sources"))),
+
+    h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
+    h("div", { class: "panel" }, alerts.length ? [
+      alerts.map((a) => h("div", { class: "row", style: `padding:6px 0;border-bottom:1px solid var(--ink-3);opacity:${a.read_at ? 0.6 : 1}` },
+        h("span", { class: `tag ${{ error: "red", warn: "amber", info: "green" }[a.level] || ""}` }, a.level), h("div", { class: "grow" }, h("b", { style: "font-weight:500" }, a.title), a.body ? h("span", { class: "sub", style: "white-space:pre-wrap" }, a.body.slice(0, 400)) : null), h("span", { class: "small mute" }, ago(a.created_at)))),
+      h("div", { class: "row", style: "margin-top:10px" }, h("button", { class: "btn sm", onclick: () => run(() => post("/api/notifications/read-all"), "Marked as read").then(route) }, "Mark all read"), h("a", { class: "small", href: "#/settings" }, "Send alerts to Telegram"))]
+      : h("p", { class: "muted", style: "margin:0" }, "No alerts. Problems you need to act on — a rejected or unpaid AI key, a failing feed, an expired publishing token, the budget cap — show up here and, if you connect Telegram, on your phone.")),
 
     h("h2", null, "Worker lanes"),
     h("div", { class: "panel" },
@@ -863,6 +870,8 @@ pages.settings = async () => {
   const known = ["queues.enabled", "publishing.global_pause", "budget.daily_cap_usd", "ingest.enabled", "repurpose.view_threshold", "storage.cleanup_enabled", "storage.cleanup_after_publish_hours",
     "qa.enabled", "qa.auto_fix", "qa.min_score", "desk.enabled", "planner.enabled", "style.auto_refine", "llm.default_fallbacks", "image.default_fallbacks"];
   const minScore = num(null, val("qa.min_score", 0.75), { step: "0.05", min: 0, max: 1, style: "max-width:120px" });
+  const tgChat = text(null, val("alerts.telegram_chat_id", "") || "", { placeholder: "chat id, e.g. 123456789", style: "max-width:220px" });
+  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1");
   const fb = text(null, (val("llm.default_fallbacks", []) || []).join(", "), { placeholder: "e.g. openai_live, anthropic_live", style: "max-width:360px" });
   const toggle = (key, def, on, off) => h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val(key, def) ? on : off), h("button", { class: "btn sm", onclick: () => save(key, !val(key, def)) }, val(key, def) ? "Turn off" : "Turn on"));
   const other = Object.entries(s).filter(([k]) => !known.includes(k));
@@ -881,6 +890,10 @@ pages.settings = async () => {
       toggle("style.auto_refine", true, "House styles learn from reviewers' edits and the best-performing posts.", "House styles only change by hand."),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Pass score for the quality check (0-1)"), minScore, h("button", { class: "btn sm", onclick: () => save("qa.min_score", Number(minScore.value)) }, "Save")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Backup writers when a program has none (adapter keys)"), fb, h("button", { class: "btn sm", onclick: () => save("llm.default_fallbacks", fb.value.split(",").map((x) => x.trim()).filter(Boolean)) }, "Save"))),
+    h("div", { class: "panel" }, h("h3", null, "Alerts on Telegram"),
+      h("p", { class: "muted small", style: "margin:0 0 8px" }, "1. Create a bot with @BotFather and add its token on the API keys page (provider Telegram) or as TELEGRAM_BOT_TOKEN on Render. 2. Send your bot a message, then open api.telegram.org/bot<token>/getUpdates to find your chat id. 3. Paste it here."),
+      h("div", { class: "row" }, tgChat, h("button", { class: "btn sm", onclick: () => save("alerts.telegram_chat_id", tgChat.value.trim() || null) }, "Save"),
+        h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post("/api/notifications/test"); toast(r.telegram ? "Test alert sent to Telegram" : "Saved in the dashboard only — Telegram isn't configured yet", !r.telegram); }) }, "Send a test alert"))),
     h("div", { class: "panel" }, h("h3", null, "Daily spend cap"),
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "When today's provider spend reaches this, generation pauses until tomorrow. Spent today: ", usd(stats?.spentTodayUsd), ". Set 0 for no cap."),
       h("div", { class: "row" }, h("span", null, "$"), cap, h("button", { class: "btn", onclick: () => save("budget.daily_cap_usd", Number(cap.value)) }, "Save cap"))),

@@ -276,6 +276,21 @@ CREATE TABLE IF NOT EXISTS suggestions (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_suggestions_niche ON suggestions(niche_id, status, created_at DESC);
+
+-- Alerts (server.js 9b): problems a person must act on, shown in the dashboard and sent to Telegram when configured.
+CREATE TABLE IF NOT EXISTS notifications (
+  id         TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  level      TEXT NOT NULL DEFAULT 'warn',   -- info | warn | error
+  title      TEXT NOT NULL,
+  body       TEXT,
+  dedupe_key TEXT,
+  delivered  INTEGER NOT NULL DEFAULT 0,
+  read_at    TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(dedupe_key, created_at DESC);
 ALTER TABLE series ADD COLUMN IF NOT EXISTS premise       TEXT;
 ALTER TABLE series ADD COLUMN IF NOT EXISTS cadence_days  REAL;
 ALTER TABLE series ADD COLUMN IF NOT EXISTS next_due_at   TIMESTAMPTZ;
