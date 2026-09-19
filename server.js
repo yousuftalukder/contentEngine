@@ -1580,8 +1580,10 @@ const rss = (key, name, language, url, weight = 1) => ({ key, name, language, ad
 const ytc = (key, name, channel_id, weight = 1) => ({ key, name, language: "bn", adapter: "youtube_rss", config: { channel_id }, weight, poll: 15, kind: "VIDEO" });
 const SOURCE_CATALOG = [
   rss("bd-en-dailystar", "The Daily Star", "en", "https://www.thedailystar.net/news/bangladesh/rss.xml", 1.2),
-  rss("bd-en-prothomalo", "Prothom Alo English", "en", "https://en.prothomalo.com/feed/", 1.1),
-  rss("bd-en-dhakatribune", "Dhaka Tribune", "en", "https://www.dhakatribune.com/feed/", 1),
+  // Prothom Alo's English feed is served empty, and Dhaka Tribune's answers 403 to datacenter IPs (it opens fine from a
+  // home connection, which is why it looked healthy when the catalog was built). Both are read through Google News.
+  gn("bd-en-prothomalo", "Prothom Alo English", "en", "en.prothomalo.com", 1.1),
+  gn("bd-en-dhakatribune", "Dhaka Tribune", "en", "dhakatribune.com", 1),
   rss("bd-en-tbs", "The Business Standard", "en", "https://www.tbsnews.net/top-news/rss.xml", 1),
   gn("bd-en-bdnews24", "bdnews24.com", "en", "bdnews24.com", 1.1),
   gn("bd-en-fe", "The Financial Express", "en", "thefinancialexpress.com.bd", 0.9),
@@ -2723,6 +2725,20 @@ async function upgradeExistingPrograms() {
   }
   await putSetting("upgrade.catalog_v1", true);
 }
+// Catalog entries get corrected as outlets change — a feed starts refusing datacenter IPs, another is served empty. A
+// source that came from the catalog follows the correction instead of failing quietly until someone reads the logs.
+// Sources a person added themselves have no catalog_key and are never touched. Bump CATALOG_VERSION to roll out a fix.
+const CATALOG_VERSION = 2;
+async function syncCatalogSources() {
+  if (Number(await setting("upgrade.catalog_sync", 0)) >= CATALOG_VERSION) return;
+  for (const e of SOURCE_CATALOG) {
+    const row = await one(`SELECT * FROM sources WHERE catalog_key = $1`, [e.key]);
+    if (!row || (row.adapter_key === e.adapter && JSON.stringify(P(row.config) || {}) === JSON.stringify(e.config))) continue;
+    await q(`UPDATE sources SET adapter_key = $2, config = $3::jsonb, poll_interval_minutes = $4, last_error = NULL WHERE id = $1`, [row.id, e.adapter, JSON.stringify(e.config), e.poll || row.poll_interval_minutes]);
+    log(`catalog: "${row.name}" now reads through ${e.adapter}`);
+  }
+  await putSetting("upgrade.catalog_sync", CATALOG_VERSION);
+}
 // A program keeps the adapters it was created with, which go stale: a voice whose provider never got a key would fail the
 // first reel the program is asked for, and rendering stays on ffmpeg after the studio arrives. This repairs what cannot
 // work on this deployment and takes the studio when it is there. Deliberate choices that do work — including mocks — stay.
@@ -2774,7 +2790,7 @@ function startWorkers() {
   every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
   every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
   every(15 * 60000, sweepHealth);
-  upgradeExistingPrograms().then(upgradeAdapters).catch((e) => warn("upgrade", e.message));
+  upgradeExistingPrograms().then(upgradeAdapters).then(syncCatalogSources).catch((e) => warn("upgrade", e.message));
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
