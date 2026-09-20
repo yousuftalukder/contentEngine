@@ -846,8 +846,40 @@ impl("INGEST", "ytdlp_list", { label: "yt-dlp listing (any site)", configSchema:
   } }) });
 
 // ---- 6d. Download (stage DOWNLOAD). download(url) -> {path, duration}
+const hhmmss = (s) => { const n = Math.max(0, Math.floor(Number(s) || 0)); return `${String(Math.floor(n / 3600)).padStart(2, "0")}:${String(Math.floor(n / 60) % 60).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}`; };
+const ytdlpCommon = (cfg) => ["--no-playlist", "--no-warnings", ...(ENV.YTDLP_COOKIES_FILE ? ["--cookies", ENV.YTDLP_COOKIES_FILE] : []), ...(cfg?.max_minutes ? ["--match-filter", `duration<=${cfg.max_minutes * 60}`] : [])];
 impl("DOWNLOAD", "download_mock", { label: "Mock", create: () => ({ async download() { return { path: null, duration: 600, mock: true }; } }) });
+// Four ways to take a video, in increasing cost, because the expensive one is almost never the one needed:
+//   probe(url)               — title, duration, thumbnail. Downloads nothing, takes about three seconds.
+//   audio(url)               — the soundtrack only. A ten-minute video is about five megabytes and fourteen seconds.
+//   section(url, start, end) — only that range of video, cut exactly.
+//   download(url)            — the whole thing, for the few methods that genuinely play across a long video.
+// Finding the good moment needs only the audio; cutting the reel needs only the moment. Downloading a two-hour video
+// to publish forty seconds of it is the difference between this running on a small instance and not running at all.
 impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "string", default: "bv*[height<=1080]+ba/b[height<=1080]/b" }, max_minutes: { type: "number", default: 180 } }, create: (cfg, ctx = {}) => ({
+  async probe(url) {
+    const { out } = await exec("yt-dlp", [...ytdlpCommon(cfg), "--skip-download", "--print", "%(duration)s|%(title)s|%(thumbnail)s", url], { timeoutMs: 120000 });
+    const [duration, title, thumbnail] = String(out).trim().split(/\r?\n/)[0].split("|");
+    return { duration: Number(duration) || null, title: title && title !== "NA" ? title : null, thumbnail: thumbnail && thumbnail !== "NA" ? thumbnail : null };
+  },
+  async audio(url) {
+    await mkdir(TMP, { recursive: true });
+    const base = join(TMP, randomUUID());
+    await exec("yt-dlp", [...ytdlpCommon(cfg), "-f", "ba/bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "9", "-o", `${base}.%(ext)s`, url], { timeoutMs: 25 * 60000 });
+    if (!existsSync(`${base}.mp3`)) throw new Error("yt-dlp produced no audio for this link");
+    return { path: `${base}.mp3`, duration: await ffprobeDuration(`${base}.mp3`) };
+  },
+  async section(url, start, end) {
+    await mkdir(TMP, { recursive: true });
+    const base = join(TMP, randomUUID());
+    // --force-keyframes-at-cuts re-encodes the edges so the range is exactly the range; without it a cut lands on
+    // whatever keyframe happens to be nearby, which on a long video can be seconds out.
+    await exec("yt-dlp", [...ytdlpCommon(cfg), "-f", cfg.format || "bv*[height<=1080]+ba/b[height<=1080]/b", "--merge-output-format", "mp4",
+      "--download-sections", `*${hhmmss(start)}-${hhmmss(end)}`, "--force-keyframes-at-cuts", "-o", `${base}.%(ext)s`, url], { timeoutMs: 30 * 60000 });
+    const path = ["mp4", "mkv", "webm"].map((e) => `${base}.${e}`).find((p) => existsSync(p));
+    if (!path) throw new Error(`yt-dlp produced no file for ${hhmmss(start)}–${hhmmss(end)} of this link`);
+    return { path, duration: await ffprobeDuration(path) };
+  },
   async download(url) {
     await mkdir(TMP, { recursive: true });
     const base = join(TMP, randomUUID());
@@ -2752,14 +2784,23 @@ async function processCandidate(candidateId) {
   const niche = await one(`SELECT * FROM niches WHERE id = $1`, [cand.niche_id]); if (!niche) throw new Error("candidate has no program");
   await q(`UPDATE video_candidates SET status='PROCESSING', error_message=NULL WHERE id=$1`, [candidateId]);
   const dl = await resolve("DOWNLOAD", niche.download_adapter || "ytdlp");
-  const file = cand.local_path && existsSync(cand.local_path) ? { path: cand.local_path, duration: cand.duration_seconds } : await dl.download(cand.source_url);
-  await q(`UPDATE video_candidates SET local_path=$2, duration_seconds=COALESCE($3, duration_seconds) WHERE id=$1`, [candidateId, file.path, file.duration || null]);
+  // Choosing the moment is done on the soundtrack. A ten-minute video is about five megabytes of audio and fourteen
+  // seconds to fetch, against hundreds of megabytes and minutes for the video — and the picture is no help in
+  // deciding what was said. The video itself is fetched later, one clip's worth at a time.
+  const file = cand.local_path && existsSync(cand.local_path) ? { path: cand.local_path, duration: cand.duration_seconds }
+    : dl.audio ? await dl.audio(cand.source_url) : await dl.download(cand.source_url);
+  const audioOnly = !!dl.audio && !(cand.local_path && existsSync(cand.local_path));
+  await q(`UPDATE video_candidates SET local_path=$2, duration_seconds=COALESCE($3, duration_seconds) WHERE id=$1`,
+    [candidateId, audioOnly ? null : file.path, file.duration || null]);
   let transcript = P(cand.transcript);
   if (!transcript?.segments?.length) {
     const tr = await resolve("TRANSCRIBE", niche.transcript_adapter || "transcribe_mock");
     transcript = await tr.transcribe({ path: file.path, duration: file.duration, language: niche.language });
     await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments })]);
   }
+  // The soundtrack has done its job. What is kept is the link and what was learned from it — the transcript, and in a
+  // moment the chosen ranges — so the same video can be re-clipped later without fetching anything again.
+  if (audioOnly) await cleanup(file.path);
   let clips;
   // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
   if (niche.content_type === "MOVIE_RECAP" || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
@@ -2780,7 +2821,26 @@ async function renderClipItem(itemId, clipId) {
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   await setItem(itemId, { status: "RENDERING" });
   const transcript = P(cand.transcript) || { segments: [] }; const c = { start: Number(clip.start_seconds), end: Number(clip.end_seconds), title: clip.title, hook: clip.hook };
-  if (!cand.local_path || !existsSync(cand.local_path)) { const dl = await resolve("DOWNLOAD", niche.download_adapter || "ytdlp"); const f = await dl.download(cand.source_url); await q(`UPDATE video_candidates SET local_path=$2 WHERE id=$1`, [cand.id, f.path]); cand.local_path = f.path; }
+  // Only the part being published is fetched. A reel is forty seconds of a video that may be two hours long, and
+  // fetching the two hours to cut forty seconds of it is most of the cost of the whole pipeline. Methods that really
+  // do play across the whole video (a long reaction, a recap) have a clip spanning it, so they get what they need.
+  // The range is widened slightly and the cut re-based, because a keyframe cut can land a little inside the mark.
+  let cutOffset = 0;
+  if (!cand.local_path || !existsSync(cand.local_path)) {
+    const dl = await resolve("DOWNLOAD", niche.download_adapter || "ytdlp");
+    if (dl.section) {
+      const pad = 1.5, from = Math.max(0, c.start - pad), to = c.end + pad;
+      const f = await dl.section(cand.source_url, from, to);
+      cand.local_path = f.path; cutOffset = from;
+      log(`clip ${clipId}: fetched ${hhmmss(from)}–${hhmmss(to)} of "${cand.title}" (${Math.round(f.duration || 0)}s) instead of the whole video`);
+    } else {
+      const f = await dl.download(cand.source_url);
+      await q(`UPDATE video_candidates SET local_path=$2 WHERE id=$1`, [cand.id, f.path]);
+      cand.local_path = f.path;
+    }
+  }
+  // Everything downstream counts from the start of the file it was given, not from the start of the original video.
+  if (cutOffset) { c.start -= cutOffset; c.end -= cutOffset; transcript.segments = transcript.segments.map((s) => ({ ...s, start: s.start - cutOffset, end: s.end - cutOffset })); }
   const extras = {}; let script = clip.transcript_text || "";
   if (niche.production_method === "VOICEOVER" || niche.production_method === "MOVIE_RECAP") {
     const recap = niche.production_method === "MOVIE_RECAP";
