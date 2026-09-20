@@ -36,7 +36,7 @@ async function renderFrom(program) {
 }
 
 test("long-form reaction: source segments and commentary, 16:9, chapters in the description", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
-  const p = await eng.api("POST", "/api/programs", { ...base(), key: "react", displayName: "Reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG", methodConfig: { reactor_url: join(dir, "reactor.mp4") } });
+  const p = await eng.api("POST", "/api/programs", { ...base(), key: "react", displayName: "Reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG", methodConfig: { reactor_url: join(dir, "reactor.mp4"), min_commentary_share: 0, max_play_seconds: 600 } });
   const { item, info } = await renderFrom(p);
   const v = info.streams.find((s) => s.codec_type === "video");
   assert.deepEqual([v.width, v.height], [1920, 1080]);
@@ -69,4 +69,32 @@ test("a studio program on an instance too small for the studio still renders, th
     const done = await waitFor(async () => { const it = await small.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { timeout: 120000, interval: 500, what: "a reel rendered without the studio" });
     assert.equal(done.hero_media.kind, "VIDEO");
   } finally { await small.stop(); }
+});
+
+// A planner left to itself drifts towards long unbroken playback — duller to watch, and the shape that gets a channel
+// claimed. Whatever it returns, the plan is shaped before it renders.
+test("reaction: the plan is shaped so the host carries it, not the source", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  // A deliberately bad plan: opens on the source, one enormous clip, a token remark, way past the budget.
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_lazy_reaction", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Plan a reaction video", json: {
+    title: "Reacting to the broadcast", description: "d", hashtags: ["reaction"],
+    beats: [{ type: "play", start: 0, end: 600, chapter: "The clip" },
+            { type: "comment", text: "Wow.", chapter: "Reaction" },
+            { type: "play", start: 600, end: 1200 },
+            { type: "comment", text: "Anyway, that is the story.", chapter: "Verdict" },
+            { type: "play", start: 1200, end: 1800 }] } }] } });
+  const p = await eng.api("POST", "/api/programs", { ...base(), key: "shaped", displayName: "Shaped reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG",
+    scriptAdapter: "llm_lazy_reaction", methodConfig: { reactor_url: join(dir, "reactor.mp4"), max_play_seconds: 20, max_play_minutes: 1, min_commentary_share: 0.35 } });
+  await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: join(dir, "source.mp4"), title: "Test broadcast" });
+  const it = await waitFor(async () => { const x = (await eng.api("GET", `/api/content-items?nicheId=${p.id}`))[0]; if (x?.status === "FAILED") throw new Error(x.rejection_note); return x?.status === "PENDING_REVIEW" && x; }, { timeout: 240000, interval: 1000, what: "a shaped reaction" });
+  const full = await eng.api("GET", `/api/content-items/${it.id}`);
+  const raw = (await eng.query(`SELECT script_meta FROM content_items WHERE id = $1`, [full.id]))[0]?.script_meta;
+  const plan = typeof raw === "string" ? JSON.parse(raw) : raw;
+  const beats = plan?.beats;
+  assert.ok(beats?.length, "the shaped plan is kept with the item");
+  assert.equal(beats[0].type, "comment", "it opens on the host");
+  assert.equal(beats[beats.length - 1].type, "comment", "and closes on the host");
+  for (const b of beats.filter((x) => x.type === "play")) assert.ok(b.end - b.start <= 20.01, `no clip longer than the cap (${b.end - b.start}s)`);
+  const play = beats.filter((x) => x.type === "play").reduce((a, b) => a + (b.end - b.start), 0);
+  assert.ok(play <= 60.01, `the source stays inside its budget (${play}s)`);
+  assert.ok(plan.reaction.commentShare >= 0.34, `commentary carries the video (${Math.round(plan.reaction.commentShare * 100)}%)`);
 });
