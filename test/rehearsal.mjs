@@ -21,7 +21,7 @@ try {
     methodConfig: { ...(topic ? { topics: [topic] } : {}), desk: { settle_minutes: 0, min_sources: 1, per_sweep: 3 } },
     // The same noise the US presets filter: score tickers and betting promos are not stories.
     topicFilters: us && topic === "sports" ? { exclude: ["promo code", "betting", "odds", "parlay", "draftkings", "fanduel", "how to watch", "live stream", "gameday", "injury report", "fantasy start"] }
-      : us && topic === "entertainment" ? { exclude: ["deal of the day", "best deals", "where to buy", "shop now", "horoscope", "sponsored"] } : {} });
+      : us && topic === "entertainment" ? { exclude: ["deal of the day", "best deals", "where to buy", "shop now", "horoscope", "sponsored", "where to watch", "how to watch", "watch online", "live stream", "streaming guide", "best vpn", "promo code"] } : {} });
   await eng.api("POST", `/api/channels/${channel.id}/niches/${p.id}`);
   const sources = (await eng.api("GET", "/api/programs")).find((x) => x.id === p.id).sources;
   console.log(`catalog gave the program ${sources.length} sources`);
