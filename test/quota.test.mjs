@@ -42,9 +42,11 @@ test("a daily quota parks the job until the reset, keeps its attempts and says w
     return j?.status === "PENDING" && j.run_after && j;
   }, { what: "the job parked for the quota" });
 
-  const waitHours = (new Date(job.run_after) - Date.now()) / 3600e3;
-  assert.ok(waitHours > 1, `waits for the daily reset, not the 31 s RetryInfo (waited ${waitHours.toFixed(1)} h)`);
-  assert.ok(waitHours < 25, "and not longer than a day");
+  // The wait is until midnight in California, so how long it is depends on the hour this test runs; what must hold at
+  // every hour is that it ignored the 31-second RetryInfo that Google sends with a daily limit.
+  const waitSeconds = (new Date(job.run_after) - Date.now()) / 1000;
+  assert.ok(waitSeconds >= 300, `waits for the daily reset, not the 31 s RetryInfo (waited ${Math.round(waitSeconds)} s)`);
+  assert.ok(waitSeconds < 25 * 3600, "and not longer than a day");
   assert.equal(job.attempts, 0, "a quota is not the job's fault: it keeps its retry budget");
 
   const alert = await waitFor(async () => (await eng.api("GET", "/api/notifications")).find((n) => n.kind === "quota"), { what: "the alert that explains the quota" });
@@ -61,8 +63,12 @@ test("a news story that would be stale by the time the quota returns is dropped,
   const p = await program("stale_quota", { scriptAdapter: "llm_out_of_quota", methodConfig: { desk: { max_age_hours: 6 } } });
   // A desk story: it belongs to a cluster, so it ages out while the writer waits for tomorrow's allowance.
   const [cluster] = await eng.query(`INSERT INTO story_clusters (id, title, outlets, weight_sum, item_count, source_count) VALUES (gen_random_uuid()::text, 'Ferry delayed at Paturia', '[{"name":"Test outlet","weight":1}]'::jsonb, 1, 1, 1) RETURNING id`);
+  // The lane is held while the story is prepared: the job must not run before it belongs to a cluster, and the story
+  // is given a real age, so the test does not depend on how far away midnight in California happens to be right now.
+  await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: false } });
   const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Ferry delayed at Paturia" });
-  await eng.query(`UPDATE content_items SET cluster_id = $2 WHERE id = $1`, [id, cluster.id]);
+  await eng.query(`UPDATE content_items SET cluster_id = $2, created_at = now() - interval '10 hours' WHERE id = $1`, [id, cluster.id]);
+  await eng.api("PUT", "/api/settings/queues.enabled", { value: {} });
 
   const item = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); return it.status === "REJECTED" && it; }, { what: "the stale story set aside" });
   assert.match(item.rejection_note, /quota/i);
