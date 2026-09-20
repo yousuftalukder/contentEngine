@@ -2792,6 +2792,18 @@ async function sweepHealth() {
   if (active.n && !recent.n && hour >= 9 && hour <= 23 && (await setting("ingest.enabled", true))) await notify("stalled", "No new content in 6 hours", "Sources may be failing, the desk may be off, or every story was filtered out. Check Sources and the News desk.", { key: "stalled", cooldownHours: 12 });
   const backlog = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE status = 'PENDING_REVIEW' AND created_at < now() - interval '12 hours'`);
   if (backlog.n >= 30) await notify("review", `${backlog.n} drafts have waited over 12 hours in Review`, "Approve them, or let clean drafts publish on their own (Programs → Review: auto-approve after a window).", { key: "review", cooldownHours: 24 });
+  // A lane with claimable work that nothing has picked up for an hour has no process behind it: the video lane usually,
+  // because rendering runs on a worker service of its own, and a deployment without that worker queues video forever.
+  for (const lane of await q(`SELECT queue, COUNT(*)::int AS waiting, min(created_at) AS oldest FROM jobs
+      WHERE status = 'PENDING' AND (run_after IS NULL OR run_after <= now()) AND created_at < now() - interval '45 minutes' GROUP BY queue`)) {
+    const touched = await one(`SELECT COUNT(*)::int AS n FROM jobs WHERE queue = $1 AND (locked_at > now() - interval '1 hour' OR finished_at > now() - interval '1 hour')`, [lane.queue]);
+    if (touched.n) continue;
+    const off = (await setting("queues.enabled", {}))[lane.queue] === false;
+    await notify("lane", `The "${lane.queue}" lane has ${lane.waiting} job${lane.waiting > 1 ? "s" : ""} and nothing running it`,
+      off ? `The lane is paused on the Overview — resume it and the work goes through.`
+        : `Nothing has claimed a job in this lane for an hour. ${lane.queue === "video" ? "Video renders run on the worker service (render.yaml: content-engine-video); without it, videos queue forever." : "Check that a process is running this lane (the LANES setting on each service)."}`,
+      { key: `lane:${lane.queue}`, cooldownHours: 6 });
+  }
   // Daily digest at 21:00 Dhaka time.
   if (hour === 21) {
     const d = await one(`SELECT (SELECT COUNT(*)::int FROM content_assets WHERE status='PUBLISHED' AND published_at > now() - interval '24 hours') AS published,
@@ -3201,6 +3213,8 @@ app.get("/api/desk", async (ctx) => {
     FROM story_clusters c WHERE c.last_seen_at > now() - ($1 || ' hours')::interval ORDER BY score DESC LIMIT 150`, [hours]));
 });
 app.post("/api/desk/run", async (ctx) => { await sweepNewsDesk(); json(ctx, 200, { ok: true }); });
+// The health checks run every quarter of an hour on their own; this is for asking straight after changing something.
+app.post("/api/health/sweep", async (ctx) => { await sweepHealth(); json(ctx, 200, { ok: true, checked: nowIso() }); });
 app.get("/api/source-items", async (ctx) => { const s = ctx.query.get("sourceId"), st = ctx.query.get("status"); json(ctx, 200, await q(`SELECT si.*, s.name AS source_name FROM source_items si JOIN sources s ON s.id=si.source_id WHERE ($1::text IS NULL OR si.source_id=$1) AND ($2::text IS NULL OR si.status=$2) ORDER BY si.created_at DESC LIMIT 200`, [s, st])); });
 app.post("/api/source-items/:id/route", async (ctx) => { const it = await one(`SELECT * FROM source_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); const raw = P(it.raw) || {}; const n = await routeSourceItem({ ...it, thumbnail: it.thumbnail_url, duration: raw.duration, views: raw.views, platform: raw.platform, license: raw.license }); json(ctx, 200, { routed: n }); });
 // ---- video candidates & clips
