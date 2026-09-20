@@ -1937,12 +1937,17 @@ const DESK_NOISE = {
   entertainment: ["deal of the day", "best deals", "where to buy", "shop now", "shopping", "horoscope", "sponsored",
     "where to watch", "how to watch", "watch online", "streaming guide", "best vpn", "promo code", "gift guide",
     "everything coming to netflix", "what to watch this weekend"],
-  general: ["deal of the day", "best deals", "sponsored", "promo code", "gift guide"],
+  // Applied to every program, whatever desk it is on: a shopping post, a sponsored slot or a link to the e-paper is
+  // not a story anywhere. Deliberately short — anything arguable belongs on a desk list, not on the floor under all
+  // of them.
+  general: ["deal of the day", "best deals", "sponsored post", "promo code", "gift guide", "e-paper", "epaper",
+    "ইপেপার", "photo gallery", "video gallery", "ছবির গ্যালারি", "সাপ্তাহিক রাশিফল", "আজকের রাশিফল"],
 };
 function passesFilters(item, niche) {
   const f = P(niche.topic_filters) || {}; const hay = `${item.title} ${item.summary || ""}`.toLowerCase();
   if (f.desk_noise !== false) {
-    const noise = (methodCfg(niche).topics || []).flatMap((t) => DESK_NOISE[String(t).toLowerCase()] || []);
+    const topics = methodCfg(niche).topics || [];
+    const noise = [...DESK_NOISE.general, ...topics.flatMap((t) => (String(t).toLowerCase() === "general" ? [] : DESK_NOISE[String(t).toLowerCase()] || []))];
     if (noise.some((k) => hay.includes(k))) return false;
   }
   if (f.exclude?.length && f.exclude.some((k) => hay.includes(String(k).toLowerCase()))) return false;
