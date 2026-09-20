@@ -22,7 +22,7 @@ import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { dirname, join, extname } from "node:path";
+import { dirname, join, extname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir, totalmem } from "node:os";
 import pg from "pg";
@@ -1336,15 +1336,20 @@ impl("VOICE", "tts_command", { label: "Local speech engine (piper, espeak, any c
 // behind a hosted voice that can run out of characters or out of credit.
 const PIPER_DIR = ENV.PIPER_DIR || "/opt/piper";
 const PIPER_VOICES = { bn: "bn_BD-google-medium", en: "en_US-lessac-medium" };
-const piperInstalled = () => { try { return existsSync(join(PIPER_DIR, "voices")); } catch { return false; } };
+const piperInstalled = () => { try { return Object.values(PIPER_VOICES).some((v) => existsSync(join(PIPER_DIR, "voices", `${v}.onnx`))); } catch { return false; } };
 impl("VOICE", "tts_piper", { label: "Piper (on this machine, free, Bangla + English)",
   configSchema: { voice: { type: "string" }, dir: { type: "string", default: "/opt/piper" } },
   create: (cfg) => ({
     async synthesize({ script, voiceId, contentItemId, lang }) {
       const dir = cfg.dir || PIPER_DIR;
       const name = voiceId || cfg.voice || PIPER_VOICES[String(lang || "en").slice(0, 2)] || PIPER_VOICES.en;
-      const model = join(dir, "voices", `${name}.onnx`);
-      if (!existsSync(model)) throw new Error(`Piper voice "${name}" is not installed in ${dir}/voices — the Docker image ships ${Object.values(PIPER_VOICES).join(" and ")}`);
+      let model = join(dir, "voices", `${name}.onnx`);
+      if (!existsSync(model)) {
+        const other = Object.values(PIPER_VOICES).map((v) => join(dir, "voices", `${v}.onnx`)).find(existsSync);
+        if (!other) throw new Error(`No Piper voice is installed in ${dir}/voices — the image should ship ${Object.values(PIPER_VOICES).join(" and ")}`);
+        warn(`piper: no voice for "${name}", reading with ${basename(other, ".onnx")} instead`);
+        model = other;
+      }
       const command = await resolve("VOICE", "tts_command", { command: "piper", args: ["--model", model, "--output_file", "{out}"], format: "wav" });
       return command.synthesize({ script, contentItemId });
     } }) });

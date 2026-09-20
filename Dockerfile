@@ -18,16 +18,21 @@ RUN apt-get update \
 # on a free tier is twenty narrations a day and a hosted voice unpaid is none at all — so the last fallback is one that
 # cannot refuse. bn_BD is the reason it is worth the 150 MB: almost nothing free speaks Bangladeshi Bangla.
 ENV PIPER_DIR=/opt/piper
-RUN mkdir -p $PIPER_DIR/voices \
- && curl -fsSL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz | tar -xz -C /opt \
- && ln -sf /opt/piper/piper /usr/local/bin/piper \
- && for v in bn_BD-google-medium en_US-lessac-medium; do \
-      d=$(echo $v | cut -d- -f1); n=$(echo $v | cut -d- -f2); q=$(echo $v | cut -d- -f3); \
-      base="https://huggingface.co/rhasspy/piper-voices/resolve/main/${d%%_*}/$d/$n/$q/$v"; \
-      curl -fsSL "$base.onnx" -o $PIPER_DIR/voices/$v.onnx \
-   && curl -fsSL "$base.onnx.json" -o $PIPER_DIR/voices/$v.onnx.json; \
-    done \
- && piper --help >/dev/null 2>&1 || true
+# Written out one command at a time on purpose. A loop with shell parameter expansion in here silently produced an
+# install with the binary present and no voices, and a trailing `|| true` meant the build still passed — so the first
+# time it was needed it said "voice not installed" in production instead of during the build.
+RUN set -eux; \
+    curl -fsSL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz | tar -xz -C /opt; \
+    ln -sf /opt/piper/piper /usr/local/bin/piper; \
+    mkdir -p /opt/piper/voices; \
+    curl -fsSL -o /opt/piper/voices/bn_BD-google-medium.onnx      https://huggingface.co/rhasspy/piper-voices/resolve/main/bn/bn_BD/google/medium/bn_BD-google-medium.onnx; \
+    curl -fsSL -o /opt/piper/voices/bn_BD-google-medium.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/main/bn/bn_BD/google/medium/bn_BD-google-medium.onnx.json; \
+    curl -fsSL -o /opt/piper/voices/en_US-lessac-medium.onnx      https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx; \
+    curl -fsSL -o /opt/piper/voices/en_US-lessac-medium.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json; \
+    test -s /opt/piper/voices/bn_BD-google-medium.onnx; \
+    test -s /opt/piper/voices/en_US-lessac-medium.onnx; \
+    echo "the engine is installed" | piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/piper-check.wav; \
+    test -s /tmp/piper-check.wav; rm -f /tmp/piper-check.wav
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
