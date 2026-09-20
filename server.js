@@ -874,7 +874,11 @@ impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "st
   async audio(url) {
     await mkdir(TMP, { recursive: true });
     const base = join(TMP, randomUUID());
-    await exec("yt-dlp", [...ytdlpCommon(cfg), "-f", "ba/bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "9", "-o", `${base}.%(ext)s`, url], { timeoutMs: 25 * 60000 });
+    // Audio-only where the host offers it, and otherwise the SMALLEST thing that carries a soundtrack rather than the
+    // best. Not every host separates the audio out: archive.org offers a 101 MB mp4 and a 208 MB mkv and nothing else,
+    // and "best" dutifully fetched all 208 MB of video to listen to it — the whole point of this pass is not to. What
+    // comes back is resampled to 16 kHz mono for whisper either way, so the worst audio on the shelf is good enough.
+    await exec("yt-dlp", [...ytdlpCommon(cfg), "-f", "ba/wa/worst", "-x", "--audio-format", "mp3", "--audio-quality", "9", "-o", `${base}.%(ext)s`, url], { timeoutMs: 25 * 60000 });
     if (!existsSync(`${base}.mp3`)) throw new Error("yt-dlp produced no audio for this link");
     return { path: `${base}.mp3`, duration: await ffprobeDuration(`${base}.mp3`) };
   },
