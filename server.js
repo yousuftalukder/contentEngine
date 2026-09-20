@@ -1586,11 +1586,15 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         file = await renderReactionLong({ beats: extras.beats, sourcePath, niche, reactorUrl: c.reactor_url || extras.reactorUrl || null }); break;
       }
       case "REACTION_OVERLAY": {
-        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false, ass: caps[caps.push(await assFor(false, false)) - 1] });
+        // The captions go on after the stack, not into the clip before it. Burned in first they are sized for a
+        // 1920-wide frame and then squashed into a half-height box, which halves the type and leaves it unreadable
+        // on a phone — which is the only place a 9:16 video is watched.
+        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false });
         const ovUrl = c.overlay_video_url; if (!ovUrl) throw new Error("REACTION_OVERLAY needs method_config.overlay_video_url (your own reaction clip)");
         const ov = await toTmpFile(ovUrl, "mp4"); file = tmpPath("mp4");
+        const stackAss = caps[caps.push(await assFor(true, false)) - 1];
         const box = "scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=black";
-        const fc = `[0:v]${box}[m];[1:v]${box}[o];[m][o]vstack=inputs=2[v]`;
+        const fc = `[0:v]${box}[m];[1:v]${box}[o];[m][o]vstack=inputs=2,${assVf(stackAss)}[v]`;
         try { await exec("ffmpeg", ["-y", "-i", main, "-stream_loop", "-1", "-i", ov, "-filter_complex", `${fc};[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]`, "-map", "[v]", "-map", "[a]", "-t", String(clip.end - clip.start), ...X264, file]); }
         catch { await exec("ffmpeg", ["-y", "-i", main, "-stream_loop", "-1", "-i", ov, "-filter_complex", fc, "-map", "[v]", "-map", "0:a", "-t", String(clip.end - clip.start), ...X264, file]); }
         await cleanup(main, ov); break;
@@ -1612,7 +1616,13 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const scenes = extras.scenes?.length ? extras.scenes : [{ start: clip.start, end: clip.end }];
         const a = await toTmpFile(extras.audio.url, "mp3"); file = tmpPath("mp4");
         const trims = scenes.map((s, i) => `[0:v]trim=start=${s.start}:end=${s.end},setpts=PTS-STARTPTS[v${i}]`).join(";");
-        const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? VF_VERTICAL : VF_LANDSCAPE}[v]`;
+        // The narration, captioned. A recap is scrolled past with the sound off more often than it is listened to, and
+        // the scenes are cut from someone else's film: without the words on screen there is nothing of ours in it.
+        const nd = (await ffprobeDuration(a)) || extras.audio?.duration_seconds || scenes.reduce((n, x) => n + (x.end - x.start), 0);
+        const said = extras.audio?.spoken || extras.script || "";
+        const recapAss = c.captions === false || !said ? null
+          : caps[caps.push(await writeCaptionsAss([{ start: 0, end: nd, text: said }], 0, nd, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, accent: (await studioBrand(niche)).brand.accent })) - 1];
+        const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? VF_VERTICAL : VF_LANDSCAPE}${recapAss ? `,${assVf(recapAss)}` : ""}[v]`;
         await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
       }
       default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical)) - 1] });
