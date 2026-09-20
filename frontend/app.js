@@ -741,7 +741,9 @@ pages.sources = async (sub) => {
       h("td", { class: "mono" }, s.adapter_key), h("td", null, s.poll_interval_minutes, " min"),
       h("td", null, (s.programs || []).map((p) => p.name).join(", ") || h("span", { class: "mute" }, "nothing — link it from Programs")),
       h("td", null, h("a", { href: "#", onclick: (e) => { e.preventDefault(); inboxDialog(s); } }, s.item_count)),
-      h("td", { class: "small" }, s.last_polled_at ? ago(s.last_polled_at) : "never", s.last_error ? h("span", { class: "sub", style: "color:var(--red)" }, s.last_error.slice(0, 90)) : null),
+      h("td", { class: "small" }, s.last_polled_at ? ago(s.last_polled_at) : "never",
+        s.last_error ? h("span", { class: "sub", style: "color:var(--red)" }, s.last_error.slice(0, 90)) : null,
+        s.read_mode === "google_news" ? h("span", { class: "sub" }, h("span", { class: "tag amber" }, "headlines only"), " ", s.read_note || "") : null),
       h("td", { class: "row" },
         h("button", { class: "btn sm", onclick: () => run(() => post(`/api/sources/${s.id}/poll`), "Poll queued") }, "Poll now"),
         h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post(`/api/sources/${s.id}/preview`); previewDialog(s, r); }) }, "Preview"),
@@ -754,7 +756,7 @@ async function catalogDialog(programs) {
   const cat = await get("/api/source-catalog");
   const group = (title, rows) => rows.length ? [h("h3", { style: "margin-top:12px" }, title), h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, rows.map((e) => h("tr", null,
     h("td", null, e.name, h("span", { class: "sub mono" }, e.adapter, e.config.site ? ` · ${e.config.site}` : e.config.url ? ` · ${e.config.url.replace(/^https?:\/\//, "").slice(0, 40)}` : e.config.channel_id ? ` · ${e.config.channel_id}` : e.config.query ? ` · "${e.config.query}"` : "")),
-    h("td", { class: "small" }, e.installed ? h("span", null, h("span", { class: "tag green" }, "in use"), e.lastError ? h("span", { class: "sub", style: "color:var(--red)" }, e.lastError.slice(0, 60)) : e.lastPolledAt ? h("span", { class: "sub" }, "polled ", ago(e.lastPolledAt)) : null) : h("span", { class: "tag" }, "not added")),
+    h("td", { class: "small" }, e.installed ? h("span", null, h("span", { class: "tag green" }, "in use"), e.lastError ? h("span", { class: "sub", style: "color:var(--red)" }, e.lastError.slice(0, 60)) : e.readMode === "google_news" ? h("span", { class: "sub" }, h("span", { class: "tag amber" }, "headlines only"), " its own feed will not answer this server") : e.lastPolledAt ? h("span", { class: "sub" }, "polled ", ago(e.lastPolledAt)) : null) : h("span", { class: "tag" }, "not added")),
     h("td", { class: "small" }, (e.programs || []).join(", ")),
     h("td", null, linkPicker(programs.filter((p) => !(e.programs || []).includes(p.display_name)).map((p) => ({ id: p.id, name: p.display_name })), (id) => run(() => post("/api/source-catalog/install", { keys: [e.key], nicheIds: [id] }), "Source linked").then(() => catalogDialog(programs)), "Add to program")))))))] : [];
   modal("Bangladesh source catalog", h("div", null,

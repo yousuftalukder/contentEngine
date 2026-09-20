@@ -132,6 +132,20 @@ test("a feed the server cannot reach is read through Google News instead of goin
     assert.ok(!direct.items[0].raw?.via, "a reachable feed is read directly, not through Google News");
     assert.equal(direct.items[0].thumbnail, "https://outlet.example/photo.jpg", "which is where the photo comes from");
     assert.match(direct.items[0].summary, /Vehicles began crossing/, "and the summary");
+
+    // A source reading through Google News still polls, still returns items and still looks healthy, while losing
+    // every photograph and summary the outlet publishes. That has to be visible, and it is not an error: a successful
+    // poll clears last_error, and the health sweep would alert on it daily.
+    const src = await eng.api("POST", "/api/sources", { name: "Fallback outlet", adapterKey: "rss", config: cfg });
+    feedStatus = 403;
+    await eng.api("POST", `/api/sources/${src.id}/poll`);
+    const degraded = await waitFor(async () => { const [r] = await eng.query(`SELECT read_mode, read_note, last_error FROM sources WHERE id=$1`, [src.id]); return r?.read_mode === "google_news" && r; }, { what: "the degraded mode recorded" });
+    assert.match(degraded.read_note, /headlines only/i, "and it says what was lost");
+    assert.equal(degraded.last_error, null, "but it is not an error — the poll succeeded");
+
+    feedStatus = 200;
+    await eng.api("POST", `/api/sources/${src.id}/poll`);
+    await waitFor(async () => { const [r] = await eng.query(`SELECT read_mode, read_note FROM sources WHERE id=$1`, [src.id]); return r?.read_mode === "direct" && r.read_note === null; }, { what: "reading directly again clears the note" });
   } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/google_news.base", { value: null }); }
 });
 
@@ -185,4 +199,40 @@ test("a sports program rejects the betting and streaming noise without being tol
     assert.ok(topics.some((t) => /Vanderbilt beats Alabama/.test(t)), `the game is written — got ${JSON.stringify(topics)}`);
     for (const junk of [/prediction, odds/i, /how to watch/i, /waiver wire/i]) assert.ok(!topics.some((t) => junk.test(t)), `${junk} stays off the channel`);
   } finally { await new Promise((r) => stub.close(r)); }
+});
+
+// An outlet read through Google News gives a headline and a redirect — no summary, no article, no photograph. When it
+// is the heaviest outlet in a cluster, leading on it throws away the story another outlet actually published.
+test("a cluster leads on the outlet that has the story, not the one with the most weight", async () => {
+  const heavy = await eng.api("POST", "/api/sources", { name: "Heavy wire", adapterKey: "ingest_mock", weight: 2,
+    config: { items: [{ title: "Ferry service resumes at Paturia after three days", url: "https://news.google.com/rss/articles/CBMxyz" }] } });
+  const light = await eng.api("POST", "/api/sources", { name: "Small paper", adapterKey: "ingest_mock", weight: 1,
+    config: { items: [{ title: "Paturia ferry service resumes after three days", url: "https://small.example/ferry",
+      summary: "Vehicles began crossing at dawn on Wednesday after the channel was dredged, the authority said." }] } });
+  const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "lead_pick", displayName: "Lead pick", contentType: "NEWS_STATIC",
+    country: "Bangladesh", language: "en", useMocks: true, autoStyle: false, autoSources: false, sourceIds: [heavy.id, light.id],
+    methodConfig: { desk: { settle_minutes: 0, min_sources: 1, min_gap_minutes: 0, per_sweep: 3 } } });
+
+  await eng.api("POST", `/api/sources/${heavy.id}/poll`);
+  await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id=$1 AND cluster_id IS NOT NULL`, [heavy.id])).length, { what: "the wire clustered" });
+  await eng.api("POST", `/api/sources/${light.id}/poll`);
+  await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id=$1 AND cluster_id IS NOT NULL`, [light.id])).length, { what: "the paper clustered" });
+  await eng.api("POST", "/api/desk/run");
+
+  const clusters = await eng.api("GET", "/api/desk");
+  const ferry = clusters.find((c) => /ferry|paturia/i.test(c.title));
+  assert.equal(ferry.source_count, 2, "both outlets are on the same story");
+
+  // The desk writes a placeholder source_data_ref when it queues the story; the material is resolved when the writer
+  // runs, so the draft has to be actually written before there is anything to assert on.
+  const it = await waitFor(async () => {
+    for (const x of await eng.api("GET", `/api/content-items?nicheId=${p.id}`)) {
+      if (["QUEUED", "DRAFTING", "FETCHING_DATA"].includes(x.status)) continue;
+      const full = await eng.api("GET", `/api/content-items/${x.id}`);
+      if ((full.source_data_ref?.outlets || []).length === 2) return full;
+    }
+    return null;
+  }, { timeout: 40000, what: "the written draft for the corroborated story" });
+  assert.equal(it.source_data_ref.url, "https://small.example/ferry", "the material comes from the outlet that published something");
+  assert.deepEqual([...it.source_data_ref.outlets].sort(), ["Heavy wire", "Small paper"], "and both outlets are still credited");
 });

@@ -702,10 +702,27 @@ function tidyTitle(t) {
   return out.replace(/\s+\|\s+[^|]{1,40}$/, "").trim() || String(t || "").trim();
 }
 const FEED_UA = ENV.FEED_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36";
+// Several outlets answer a datacenter IP differently depending on what is asking. A browser user agent is refused by
+// some WAFs precisely because a browser would not be fetching XML; a declared feed reader is waved through by those and
+// refused by others. So a refusal is retried as somebody else before it counts as a refusal — three cheap requests
+// against losing an outlet's own summaries and photographs for good.
+const FEED_AGENTS = [
+  null,                                                                     // FEED_UA: a current desktop browser
+  "Feedly/1.0 (+https://feedly.com/fetcher.html; like FeedFetcher-Google)",
+  "Mozilla/5.0 (compatible; RSS reader)",
+];
 async function fetchFeed(url) {
-  const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(25000), headers: { "user-agent": FEED_UA, accept: "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8" } });
-  if (!res.ok) throw new ApiError(res.status, null, `Feed ${url.split("?")[0]} -> ${res.status}`);
-  return res.text();
+  let last = null;
+  for (const [i, ua] of FEED_AGENTS.entries()) {
+    try {
+      const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(25000),
+        headers: { "user-agent": ua || FEED_UA, accept: "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8", "accept-language": "en,bn;q=0.9" } });
+      if (res.ok) { if (i) log(`feed ${url.split("?")[0]} needed a second identity (${i}) to answer`); return res.text(); }
+      last = new ApiError(res.status, null, `Feed ${url.split("?")[0]} -> ${res.status}`);
+      if (![403, 406, 429, 503].includes(res.status)) break;               // a 404 is a 404 whoever asks
+    } catch (e) { last = e; break; }                                        // a network failure is not about identity
+  }
+  throw last || new Error(`Feed ${url.split("?")[0]} could not be read`);
 }
 // `via_site` is the outlet's domain, used only when its own feed cannot be read. An outlet's feed carries what Google
 // News strips — the summary, the article's real url, and the photo it ran — so it is always tried first; but several
@@ -715,16 +732,21 @@ impl("INGEST", "rss", { label: "RSS / Atom", configSchema: { url: { type: "strin
   async fetchItems(source) {
     const c = { ...(P(source.config) || {}), ...cfg };
     const url = c.url; if (!url) throw new Error("RSS source needs config.url");
-    const limit = c.limit || 30;
+    const limit = c.limit || 30; let why = "";
     try {
       const items = parseFeed(await fetchFeed(url));
-      if (items.length) return items.slice(0, limit);
+      // Reading directly again clears the note the fallback leaves behind, so the dashboard tracks reality.
+      if (items.length) { if (source.id) await q(`UPDATE sources SET read_mode='direct', read_note=NULL WHERE id=$1`, [source.id]).catch(() => {}); return items.slice(0, limit); }
       if (!c.via_site) return items;
       warn(`feed ${url} came back empty — reading ${c.via_site} through Google News instead`);
     } catch (e) {
       if (!c.via_site) throw e;
-      warn(`feed ${url} unreadable (${e.message.slice(0, 80)}) — reading ${c.via_site} through Google News instead`);
+      why = e.message.slice(0, 90);
+      warn(`feed ${url} unreadable (${why}) — reading ${c.via_site} through Google News instead`);
     }
+    // Recorded on the source, because a feed that quietly drops to Google News looks perfectly healthy in the
+    // dashboard while losing every photograph and every summary the outlet publishes.
+    if (source.id) await q(`UPDATE sources SET read_mode='google_news', read_note=$2 WHERE id=$1`, [source.id, `The outlet's own feed did not answer this server${why ? ` (${why})` : ""}. Reading it through Google News instead: headlines only, no summary and no photo.`]).catch(() => {});
     const gnews = await resolve("INGEST", "google_news", { site: c.via_site, language: source.language || c.language });
     return (await gnews.fetchItems(source)).slice(0, limit);
   } }) });
@@ -2034,6 +2056,7 @@ const BD_CATALOG = [
   rss("bd-bn-banglanews24", "বাংলানিউজ২৪", "bn", "https://banglanews24.com/rss.xml", 0.95, "banglanews24.com"),
   rss("bd-bn-dhakapost", "ঢাকা পোস্ট", "bn", "https://www.dhakapost.com/rss/rss.xml", 0.9, "dhakapost.com"),
   rss("bd-bn-inqilab", "দৈনিক ইনকিলাব", "bn", "https://www.dailyinqilab.com/rss/rss.xml", 0.85, "dailyinqilab.com"),
+  rss("bd-bn-ajkerpatrika", "আজকের পত্রিকা", "bn", "https://www.ajkerpatrika.com/feed", 0.85, "ajkerpatrika.com"),
   rss("bd-bn-dw", "ডয়চে ভেলে বাংলা", "bn", "https://rss.dw.com/xml/rss-ben-all", 0.9),
   rss("bd-bn-risingbd", "রাইজিংবিডি", "bn", "https://www.risingbd.com/rss/rss.xml", 0.8, "risingbd.com"),
   gn("bd-bn-bdnews24", "বিডিনিউজ টোয়েন্টিফোর", "bn", "bangla.bdnews24.com", 1.1),
@@ -2422,7 +2445,11 @@ async function clusterMaterial(item) {
     versions.push({ outlet, title: r.title, summary: r.summary || "", text, url: r.url, published_at: r.published_at, photo: leadPhoto(r) });
     if (versions.length >= 4) break;
   }
-  const lead = versions[0];
+  // The heaviest outlet is not always the one with anything to read. An outlet read through Google News gives a
+  // headline and a redirect url — no summary, no article, no photograph — so leading on it throws away the story that
+  // another outlet in the same cluster actually published. The lead for *material* is the first version that has
+  // something in it; every outlet is still credited, and the corroboration count is unchanged.
+  const lead = versions.find((v) => v.text) || versions.find((v) => v.summary) || versions[0];
   // The heaviest outlet that ran a picture: the lead's own if it has one, otherwise a corroborating outlet's, since the
   // story is the same story. Which outlet it came from is kept, because the credit on the card has to be true.
   const withPhoto = versions.find((v) => v.photo);
@@ -3366,7 +3393,7 @@ async function upgradeExistingPrograms() {
 // Catalog entries get corrected as outlets change — a feed starts refusing datacenter IPs, another is served empty. A
 // source that came from the catalog follows the correction instead of failing quietly until someone reads the logs.
 // Sources a person added themselves have no catalog_key and are never touched. Bump CATALOG_VERSION to roll out a fix.
-const CATALOG_VERSION = 4;
+const CATALOG_VERSION = 5;
 async function syncCatalogSources() {
   if (Number(await setting("upgrade.catalog_sync", 0)) >= CATALOG_VERSION) return;
   for (const e of SOURCE_CATALOG) {
@@ -3798,9 +3825,9 @@ app.post("/api/notifications/read-all", async (ctx) => { await q(`UPDATE notific
 app.post("/api/notifications/test", async (ctx) => { const tg = await telegramTarget(); await notify("test", "Test alert from Content Engine", tg ? "Alerts reach this chat." : "Telegram is not configured: this alert is only in the dashboard.", { level: "info", key: `test:${newId()}` }); json(ctx, 200, { telegram: !!tg }); });
 // ---- source catalog + news desk
 app.get("/api/source-catalog", async (ctx) => {
-  const rows = await q(`SELECT s.catalog_key, s.id, s.is_active, s.last_polled_at, s.last_error, (SELECT json_agg(n.display_name) FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id WHERE ns.source_id = s.id) AS programs FROM sources s WHERE s.catalog_key IS NOT NULL`);
+  const rows = await q(`SELECT s.catalog_key, s.id, s.is_active, s.last_polled_at, s.last_error, s.read_mode, s.read_note, (SELECT json_agg(n.display_name) FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id WHERE ns.source_id = s.id) AS programs FROM sources s WHERE s.catalog_key IS NOT NULL`);
   const by = Object.fromEntries(rows.map((r) => [r.catalog_key, r]));
-  json(ctx, 200, SOURCE_CATALOG.map((e) => ({ ...e, installed: !!by[e.key], sourceId: by[e.key]?.id || null, programs: by[e.key]?.programs || [], lastPolledAt: by[e.key]?.last_polled_at || null, lastError: by[e.key]?.last_error || null })));
+  json(ctx, 200, SOURCE_CATALOG.map((e) => ({ ...e, installed: !!by[e.key], sourceId: by[e.key]?.id || null, programs: by[e.key]?.programs || [], lastPolledAt: by[e.key]?.last_polled_at || null, lastError: by[e.key]?.last_error || null, readMode: by[e.key]?.read_mode || null, readNote: by[e.key]?.read_note || null })));
 });
 app.post("/api/source-catalog/install", async (ctx) => {
   const keys = new Set(ctx.body.keys || []); const entries = SOURCE_CATALOG.filter((e) => keys.has(e.key));
