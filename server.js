@@ -129,7 +129,9 @@ async function fetchBytes(url, opts = {}) {
 // e.transient (true/false) set by a caller overrides the guess.
 const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
 const TRANSIENT_TEXT = /UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|try again later|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|timed out/i;
-const PERMANENT_STATUS = new Set([400, 401, 404, 405, 409, 410, 413, 422]);
+// 402 is Payment Required: an account out of credit. Retrying it is pointless and it is not a quota that resets, so
+// it is permanent — and it is the one failure a person can actually fix, so it says so rather than printing a url.
+const PERMANENT_STATUS = new Set([400, 401, 402, 404, 405, 409, 410, 413, 422]);
 const PERMANENT_TEXT = /Dedup:|disabled|No API key|needs |cannot publish|credit balance|not registered|Unknown \w+ adapter/i;
 function isTransient(e) {
   if (!e) return false;
@@ -169,6 +171,7 @@ function quotaWait(e) {
     return qs.filter((x) => x?.seconds).sort((a, b) => a.seconds - b.seconds)[0] || qs.find(Boolean) || null;
   }
   const s = `${e?.message || ""} ${typeof e?.body === "string" ? e.body : JSON.stringify(e?.body || "")}`;
+  if (Number(e?.status) === 402) return { kind: "billing", seconds: null, freeTier: false, model: null };
   if (!(e?.status === 429 || /RESOURCE_EXHAUSTED|exceeded your current quota|rate limit/i.test(s))) return null;
   const freeTier = /free_tier|FreeTier/i.test(s), model = (/model: ([\w.-]+)/.exec(s) || [])[1] || null;
   if (/insufficient_quota/.test(s)) return { kind: "billing", seconds: null, freeTier, model };
@@ -1326,6 +1329,23 @@ impl("VOICE", "tts_command", { label: "Local speech engine (piper, espeak, any c
         const url = await storeLocal(mp3, `audio/${newId()}.mp3`, "audio/mpeg");
         return { ...(await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur, meta: { provider: "command", command, voice: voice || null, chars: script.length } })), units: 1, cost: 0 };
       } finally { await cleanup(raw, mp3); }
+    } }) });
+// Piper with the voices the image ships: bn_BD for Bangla, en_US for English, picked by the program's language unless
+// a voice is named. Free, unlimited, and it runs where the render runs — which is what makes it the right last resort
+// behind a hosted voice that can run out of characters or out of credit.
+const PIPER_DIR = ENV.PIPER_DIR || "/opt/piper";
+const PIPER_VOICES = { bn: "bn_BD-google-medium", en: "en_US-lessac-medium" };
+const piperInstalled = () => { try { return existsSync(join(PIPER_DIR, "voices")); } catch { return false; } };
+impl("VOICE", "tts_piper", { label: "Piper (on this machine, free, Bangla + English)",
+  configSchema: { voice: { type: "string" }, dir: { type: "string", default: "/opt/piper" } },
+  create: (cfg) => ({
+    async synthesize({ script, voiceId, contentItemId, lang }) {
+      const dir = cfg.dir || PIPER_DIR;
+      const name = voiceId || cfg.voice || PIPER_VOICES[String(lang || "en").slice(0, 2)] || PIPER_VOICES.en;
+      const model = join(dir, "voices", `${name}.onnx`);
+      if (!existsSync(model)) throw new Error(`Piper voice "${name}" is not installed in ${dir}/voices — the Docker image ships ${Object.values(PIPER_VOICES).join(" and ")}`);
+      const command = await resolve("VOICE", "tts_command", { command: "piper", args: ["--model", model, "--output_file", "{out}"], format: "wav" });
+      return command.synthesize({ script, contentItemId });
     } }) });
 impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSchema: { voice: { type: "string", default: DEFAULTS.GEMINI_TTS_VOICE }, model: { type: "string", default: DEFAULTS.GEMINI_TTS_MODELS[0] }, style: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async synthesize({ script, voiceId, contentItemId }) {
@@ -3351,7 +3371,7 @@ async function alertOnFailure(job, msg) {
   const provider = PROVIDER_HOSTS.find(([h]) => msg.includes(h))?.[1] || (msg.match(/No API key for "(\w+)"/) || [])[1] || "an API";
   const rule = [
     [/free_tier|FreeTier/i, `${provider} is on a free key and has hit its limit`, "A free key allows about 20 requests a day per model and no pictures. Enable billing on it (Google AI Studio → Billing) — the cost per post is a fraction of a cent."],
-    [/credit balance|insufficient_quota|payment/i, `${provider} account is out of credit`, "Top it up, or switch the program to another writer (Programs → Edit → Script / LLM)."],
+    [/credit balance|insufficient_quota|payment|\b402\b/i, `${provider} account is out of credit`, "Top it up, or let the program fall back: it uses the next writer or voice on its list automatically once one is set (Programs → Edit)."],
     [/limit: 0\b/i, `${provider} plan does not include this model`, "Enable billing on the key, or point the program at a model the plan includes (Programs → Edit)."],
     [/exceeded your current quota|RESOURCE_EXHAUSTED/i, `${provider} quota is exhausted`, "Raise the quota with the provider, or add a second key on the API keys page."],
     [/No API key/i, `No key for ${provider}`, "Add it on the API keys page or set the env var on Render."],
@@ -3686,7 +3706,8 @@ async function smartAdapterDefaults() {
     imageAdapterFallbacks: (await has("pexels")) ? ["pexels_stock"] : [],
     embedAdapter: gem ? "gemini_embed" : "embed_mock",
     voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
-    voiceAdapterFallbacks: [gem && "gemini_tts", el && "elevenlabs", oai && "openai_tts"].filter(Boolean).slice(1),
+    voiceAdapterFallbacks: [gem && "gemini_tts", el && "elevenlabs", oai && "openai_tts"].filter(Boolean).slice(1)
+      .concat(piperInstalled() ? ["tts_piper"] : []),                       // last, because it cannot refuse
     transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
     // "remotion" falls back to ffmpeg by itself when the rendering instance lacks the memory, so it's safe to pick here.
     renderAdapter: studioInstalled() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",

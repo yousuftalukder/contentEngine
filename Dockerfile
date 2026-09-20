@@ -14,6 +14,20 @@ RUN apt-get update \
  && chmod a+rx /usr/local/bin/yt-dlp \
  && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
+# Piper: a speech engine that runs here, costs nothing and never runs out. A hosted voice is better, but a hosted voice
+# on a free tier is twenty narrations a day and a hosted voice unpaid is none at all — so the last fallback is one that
+# cannot refuse. bn_BD is the reason it is worth the 150 MB: almost nothing free speaks Bangladeshi Bangla.
+ENV PIPER_DIR=/opt/piper
+RUN mkdir -p $PIPER_DIR/voices \
+ && curl -fsSL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz | tar -xz -C /opt \
+ && ln -sf /opt/piper/piper /usr/local/bin/piper \
+ && for v in bn_BD-google-medium en_US-lessac-medium; do \
+      d=$(echo $v | cut -d- -f1); n=$(echo $v | cut -d- -f2); q=$(echo $v | cut -d- -f3); \
+      base="https://huggingface.co/rhasspy/piper-voices/resolve/main/${d%%_*}/$d/$n/$q/$v"; \
+      curl -fsSL "$base.onnx" -o $PIPER_DIR/voices/$v.onnx \
+   && curl -fsSL "$base.onnx.json" -o $PIPER_DIR/voices/$v.onnx.json; \
+    done \
+ && piper --help >/dev/null 2>&1 || true
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev

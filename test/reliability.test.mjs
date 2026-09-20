@@ -165,3 +165,22 @@ test("a voice that refuses is replaced by the next one, and the video still gets
   assert.ok(done.voice_asset_url, "it was narrated");
   assert.equal(done.hero_media.kind, "VIDEO", "and rendered");
 });
+
+// A provider that answers 402 is out of credit. Retrying it is pointless, it is not a quota that resets, and it is the
+// one failure a person can actually fix — so it stops at once and says so instead of printing a url three times.
+test("an account out of credit fails at once with an alert that names the fix", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_unpaid", stage: "SCRIPT", impl: "llm_mock",
+    config: { fail_first: 99, fail_status: 402, fail_message: "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM -> 402" } });
+  const b = await eng.api("POST", "/api/brands", { name: "Unpaid" });
+  const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "unpaid", displayName: "Unpaid", contentType: "NEWS_STATIC",
+    useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "llm_unpaid" });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story nobody can pay for" });
+  const job = await waitFor(async () => { const [j] = await eng.query(`SELECT * FROM jobs WHERE content_item_id=$1 AND type='GENERATE_CONTENT'`, [id]); return j?.status === "FAILED" && j; },
+    { timeout: 30000, what: "the job to stop" });
+  assert.equal(job.attempts, 1, "it does not retry a bill");
+
+  const alert = await waitFor(async () => (await eng.query(`SELECT kind, title, body FROM notifications WHERE title ILIKE '%out of credit%' ORDER BY created_at DESC LIMIT 1`))[0],
+    { timeout: 20000, what: "the alert that names the fix" });
+  assert.match(alert.title, /ElevenLabs/i, "and it names the provider, not a url");
+  assert.match(alert.body, /Top it up|fall back/i);
+});
