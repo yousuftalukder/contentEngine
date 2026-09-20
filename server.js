@@ -3127,8 +3127,11 @@ async function publishAsset(assetId) {
     const publisher = await resolve("PUBLISH", pubKey);
     await q(`UPDATE content_assets SET status='PUBLISHING' WHERE id=$1`, [assetId]);
     const thumb = await one(`SELECT url FROM media_assets WHERE content_item_id=$1 AND kind='THUMBNAIL' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`, [item.id]);
-    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption: asset.caption || renderCaption(item, channel, null, niche), title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
-    await q(`UPDATE content_assets SET status='PUBLISHED', published_url=$2, external_id=$3, published_at=now(), error_message=NULL WHERE id=$1`, [assetId, res.publishedUrl, res.externalId]);
+    // The asset keeps exactly what went out. An asset made without a caption (approval renders one, other paths may
+    // not) gets the body written back here, so the record never shows a comment under a post it cannot quote.
+    const caption = asset.caption || renderCaption(item, channel, null, niche);
+    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption, title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
+    await q(`UPDATE content_assets SET status='PUBLISHED', published_url=$2, external_id=$3, caption=$4, published_at=now(), error_message=NULL WHERE id=$1`, [assetId, res.publishedUrl, res.externalId, caption]);
     await q(`UPDATE channels SET last_published_at=now() WHERE id=$1`, [channel.id]);
     // The first comment carries the source link on the platforms where the body must not. The post is out by now, so a
     // comment that fails is logged and left visible on the asset — text without an id — rather than failing the post.
