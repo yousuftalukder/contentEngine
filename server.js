@@ -3005,7 +3005,12 @@ app.get("/api/adapter-configs", async (ctx) => json(ctx, 200, (await instances(t
 app.post("/api/adapter-configs", async (ctx) => { const b = ctx.body; if (!b.key || !b.stage || !b.impl) throw new ApiError(400, null, "key, stage, impl are required"); if (!IMPLS[b.stage]?.[b.impl]) throw new ApiError(400, null, `Unknown impl ${b.impl} for stage ${b.stage}`); const id = newId(); await q(`INSERT INTO adapter_configs (id, key, stage, impl, label, config, credential_id, enabled) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`, [id, b.key, b.stage, b.impl, b.label || b.key, JSON.stringify(b.config || {}), b.credentialId || null, b.enabled === false ? 0 : 1]); instCache.at = 0; json(ctx, 201, rowJson(await one(`SELECT * FROM adapter_configs WHERE id=$1`, [id]), ["config"])); });
 app.patch("/api/adapter-configs/:id", async (ctx) => { const r = await patchRow("adapter_configs", ctx.params.id, ctx.body, { label: "label", config: "config", credentialId: "credential_id", enabled: "enabled", impl: "impl" }); instCache.at = 0; json(ctx, 200, rowJson(r, ["config"])); });
 app.delete("/api/adapter-configs/:id", async (ctx) => { await q(`DELETE FROM adapter_configs WHERE id=$1`, [ctx.params.id]); instCache.at = 0; json(ctx, 200, { ok: true }); });
-app.post("/api/adapter-configs/:key/test", async (ctx) => { const row = (await instances(true)).find((r) => r.key === ctx.params.key); if (!row) throw new ApiError(404, null, "Unknown adapter key"); const a = await resolve(row.stage, row.key); let result; if (row.stage === "SCRIPT") result = await a.complete({ prompt: "Reply with the single word OK.", mock: {} }); else if (row.stage === "INGEST") result = { items: (await a.fetchItems({ name: "test", config: ctx.body.config || row.config })).slice(0, 3) }; else if (row.stage === "EMBED") result = { dims: (await a.embed("test"))?.length ?? null }; else result = { ok: true, note: "resolved; run it through a program to test end-to-end" }; json(ctx, 200, result); });
+app.post("/api/adapter-configs/:key/test", async (ctx) => { const row = (await instances(true)).find((r) => r.key === ctx.params.key); if (!row) throw new ApiError(404, null, "Unknown adapter key"); const a = await resolve(row.stage, row.key); let result; if (row.stage === "SCRIPT") result = await a.complete({ prompt: "Reply with the single word OK.", mock: {} }); else if (row.stage === "INGEST") result = { items: (await a.fetchItems({ name: "test", config: ctx.body.config || row.config })).slice(0, 3) }; else if (row.stage === "EMBED") result = { dims: (await a.embed("test"))?.length ?? null };
+  // Voice is the one stage whose output has to be heard: it speaks a line and hands back the file, so a program is not
+  // committed to a voice nobody has listened to. Bangla by default, since that is where a voice usually disappoints.
+  else if (row.stage === "VOICE") { const m = await a.synthesize({ script: ctx.body.script || "আজকের খবর শুনুন। এটি একটি কণ্ঠস্বর পরীক্ষা।", contentItemId: null }); result = { url: m.url, seconds: m.duration_seconds, listen: "open the url to hear it" }; }
+  else if (row.stage === "IMAGE") { const m = await a.generate({ prompt: ctx.body.prompt || "a quiet street in Dhaka at dawn", headline: ctx.body.headline || "Voice and picture test", specs: { width: 1080, height: 1080, photo_query: ctx.body.prompt || "dhaka street" }, contentItemId: null }); result = { url: m.url, width: m.width, height: m.height }; }
+  else result = { ok: true, note: "resolved; run it through a program to test end-to-end" }; json(ctx, 200, result); });
 // ---- brands
 app.get("/api/brands", async (ctx) => json(ctx, 200, await q(`SELECT * FROM brands ORDER BY created_at DESC`)));
 app.post("/api/brands", async (ctx) => { if (!ctx.body.name) throw new ApiError(400, null, "name is required"); const id = newId(); await q(`INSERT INTO brands (id, name, description, brand_kit) VALUES ($1,$2,$3,$4::jsonb)`, [id, ctx.body.name, ctx.body.description ?? null, JSON.stringify(ctx.body.brandKit || {})]); json(ctx, 201, await one(`SELECT * FROM brands WHERE id=$1`, [id])); });
@@ -3227,6 +3232,19 @@ app.post("/api/generate", async (ctx) => {
   const itemId = await createQueuedItem(niche, { seriesId: seriesId || null, sourceItemId: sourceItemId || null, topic: topic || "", sourceDataRef: topic ? { provider: "manual", description: ctx.body.summary || "", url: ctx.body.url || null } : null });
   await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: 5, contentItemId: itemId });
   json(ctx, 202, await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]));
+});
+// Approving twenty drafts one at a time is the bottleneck that makes an automated newsroom manual again. This approves
+// the ones the standards check passed — the same drafts an automatic program would have published by itself — and
+// leaves anything it flagged for a person. Each one is scheduled exactly as a single approval would be.
+app.post("/api/review/approve-clean", async (ctx) => {
+  const rows = await q(`SELECT id FROM content_items WHERE status = 'PENDING_REVIEW' AND qa_status = 'PASS' AND ($1::text IS NULL OR niche_id = $1) ORDER BY created_at ASC LIMIT 100`, [ctx.body.nicheId || null]);
+  const approved = [], failed = [];
+  for (const r of rows) {
+    try { await approveItem(r.id, { auto: false }); approved.push(r.id); }
+    catch (e) { failed.push({ id: r.id, error: String(e.message).slice(0, 200) }); }
+  }
+  log(`review: approved ${approved.length} clean draft(s)${failed.length ? `, ${failed.length} could not be approved` : ""}`);
+  json(ctx, 200, { approved: approved.length, failed });
 });
 app.post("/api/content-items/:id/approve", async (ctx) => { if (rateLimited(`appr:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many approve requests"); json(ctx, 200, await itemWithMedia(await approveItem(ctx.params.id, { scheduledFor: ctx.body.scheduledFor || null }))); });
 app.post("/api/content-items/:id/reject", async (ctx) => json(ctx, 200, await rejectItem(ctx.params.id, ctx.body.note)));

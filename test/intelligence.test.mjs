@@ -93,3 +93,21 @@ test("quality gate: a score on a 0-10 scale is read as 0-10, not as passing by d
   assert.equal(held.status, "PENDING_REVIEW", "6 out of 10 is below the bar, so a person looks at it");
   assert.equal(held.qa_score, 0.6, "and the score is stored on one scale");
 });
+
+// Twenty drafts a day approved one at a time is not an automated newsroom. Bulk approval takes exactly the drafts an
+// automatic program would have published by itself, and leaves the flagged ones where they are.
+test("review: approving the clean drafts leaves the flagged ones for a person", async () => {
+  const p = await program("bulk_mixed", { approvalMode: "MANUAL", methodConfig: { qa: { auto_fix: false } } });
+  const ids = [];
+  for (const t of ["Metro fares frozen", "New ferry terminal opens"]) ids.push((await eng.api("POST", "/api/generate", { nicheId: p.id, topic: t })).id);
+  for (const id of ids) await settle(id, ["PENDING_REVIEW"]);          // written before the program's writer changes
+  // The same program, now writing with an editor that flags an unsupported number: one draft a person must look at.
+  await eng.api("PATCH", `/api/programs/${p.id}`, { scriptAdapter: "llm_flags_facts" });
+  const held = (await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Toll collection disputed" })).id;
+  await settle(held, ["PENDING_REVIEW"]);
+
+  const r = await eng.api("POST", "/api/review/approve-clean", { nicheId: p.id });
+  assert.equal(r.approved, 2, "both clean drafts go");
+  assert.equal((await item(held)).status, "PENDING_REVIEW", "the flagged one stays");
+  for (const id of ids) assert.notEqual((await item(id)).status, "PENDING_REVIEW");
+});

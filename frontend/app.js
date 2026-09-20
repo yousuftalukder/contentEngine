@@ -232,7 +232,12 @@ function step(done, content) { return h("li", { class: done ? "done" : "" }, con
 // ---------------------------------------------------------------- review
 pages.review = async (sub) => {
   const list = await get("/api/review");
-  const root = h("div", null, pageHead("Review", "Nothing publishes without your approval. Edit anything before you approve it."));
+  const clean = list.filter((it) => it.qa_status === "PASS");
+  const root = h("div", null, pageHead("Review", "Nothing publishes without your approval. Edit anything before you approve it.",
+    clean.length > 1 ? h("button", { class: "btn primary", onclick: () => confirmModal(`Approve ${clean.length} drafts?`,
+      `These are the ones the standards check passed. Each is scheduled on its channel's next free slot. ${list.length - clean.length ? `The ${list.length - clean.length} it flagged stay here for you.` : ""}`,
+      () => run(async () => { const r = await post("/api/review/approve-clean", {}); toast(`Approved ${r.approved}${r.failed.length ? ` · ${r.failed.length} could not be approved` : ""}`); }).then(route), "Approve them") },
+      `Approve ${clean.length} that passed`) : null));
   if (!list.length) {
     root.appendChild(h("div", { class: "empty" }, h("b", null, "The queue is empty"), "New drafts appear here as programs generate them. ", h("a", { href: "#/programs" }, "Generate one now"), "."));
     return root;
@@ -872,7 +877,13 @@ pages.adapters = async () => {
       h("td", { class: "small mono mute" }, Object.keys(c.config || {}).length ? JSON.stringify(c.config).slice(0, 60) : ""),
       h("td", null, yes(c.enabled) ? h("span", { class: "tag green" }, "enabled") : h("span", { class: "tag red" }, "disabled")),
       h("td", { class: "row" },
-        h("button", { class: "btn sm", onclick: () => run(async () => jsonDialog(`Test: ${c.key}`, await post(`/api/adapter-configs/${c.key}/test`))) }, "Test"),
+        h("button", { class: "btn sm", onclick: () => run(async () => {
+          const r = await post(`/api/adapter-configs/${c.key}/test`);
+          // A voice has to be heard and a picture seen; everything else reads fine as its JSON.
+          if (r.url && c.stage === "VOICE") return modal(`Test: ${c.key}`, h("div", null, h("p", { class: "muted" }, `${Math.round(r.seconds || 0)} seconds. Listen before you give a program this voice.`), h("audio", { controls: true, src: r.url, style: "width:100%" })));
+          if (r.url && c.stage === "IMAGE") return modal(`Test: ${c.key}`, h("img", { src: r.url, style: "width:100%;border-radius:6px" }));
+          jsonDialog(`Test: ${c.key}`, r);
+        }) }, "Test"),
         h("button", { class: "btn sm", onclick: () => adapterDialog(c, impls, creds) }, "Edit"),
         h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/adapter-configs/${c.id}`, { enabled: !yes(c.enabled) }), "Saved").then(route) }, yes(c.enabled) ? "Disable" : "Enable"),
         h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete instance?", `Programs referencing "${c.key}" will fail at this stage.`, () => run(() => del(`/api/adapter-configs/${c.id}`), "Deleted").then(route)) }, "Delete"))))))));
