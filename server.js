@@ -3808,7 +3808,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
@@ -4225,10 +4225,27 @@ app.post("/api/seed", async (ctx) => {
   await migrate();
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
   await recoverAbandonedWork();
+  // Render sends SIGTERM before it replaces an instance or spins one down. A job this worker was in the middle of would
+  // otherwise sit RUNNING until recovery gives up on it — LOCK_TIMEOUT_MIN later — and with several deploys a day that
+  // froze the ingest lane for most of an hour each time. Hand the work back first, then go.
+  const handBack = async (sig) => {
+    try {
+      const r = await q(`UPDATE jobs SET status='PENDING', locked_by=NULL, locked_at=NULL, attempts=GREATEST(attempts-1,0) WHERE status='RUNNING' AND locked_by=$1 RETURNING id`, [WORKER_ID]);
+      log(`${sig}: handed back ${r.length} running job(s) to the queue`);
+    } catch (e) { warn("shutdown", e.message); }
+    process.exit(0);
+  };
+  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => handBack(sig));
   if (!ENV.DASHBOARD_PASSWORD) warn("DASHBOARD_PASSWORD is not set — the dashboard and API are OPEN. Fine locally, never on Render.");
   server.listen(PORT, async () => {
     const storage = await storageBackend();
     log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, lanes: ${LANES.join(",") || "none"}, sweeps: ${RUN_SWEEPS}, storage: ${storage.name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`);
+    // Which build this is, written where it can be read without the service's address: the commit, branch and public
+    // URL Render hands the process, and what the image turned out to contain. A fix was merged at 14:31 today, redrawn
+    // from the queue at 14:36, 14:47 and 15:10, and came out byte-identical every time — and nothing in the database
+    // could say whether the new image was running at all.
+    putSetting("boot.last", { at: new Date().toISOString(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
+      url: ENV.RENDER_EXTERNAL_URL || null, lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady() }).catch((e) => warn("boot.last", e.message));
     // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
     if (storage.name === "supabase") ensureSupabaseBucket().catch((e) => warn("supabase storage:", e.message.slice(0, 200)));
     startWorkers();
