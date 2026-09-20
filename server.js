@@ -530,13 +530,20 @@ impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: 
 // Runs call(model) on the main model, then on each fallback model while the failure is an overload (503/5xx), a quota
 // (429 — Gemini's quotas are per model, so the next model often still has room), or an unknown model id (404).
 // A permanent error is thrown straight away; when every model is out of quota, withKey tries the next key.
+// A model whose daily allowance is spent, and when it comes back. The free tier grants that allowance per model
+// (the quota Google names is PerDayPerProjectPerModel), so the rest of the account's models are untouched — this keeps
+// the engine from spending a call on a model it already knows is finished for the day.
+const modelSpent = new Map();
+const spentUntil = (m) => modelSpent.get(m) || 0;
+const isSpent = (m) => spentUntil(m) > Date.now();
+function noteSpent(model, e) { const q = quotaWait(e); if (q?.kind === "day") modelSpent.set(model, Date.now() + q.seconds * 1000); }
 async function withModelFallback(models, call) {
-  const errs = [];
-  for (const model of [...new Set(models.filter(Boolean))]) {
+  const errs = [], all = [...new Set(models.filter(Boolean))], fresh = all.filter((m) => !isSpent(m));
+  for (const model of (fresh.length ? fresh : all)) {
     try { return await retryTransient(() => call(model)); }
     catch (e) {
       if (!isTransient(e) && e.status !== 404) throw e;
-      errs.push(e);
+      errs.push(e); noteSpent(model, e);
       if (isTransient(e)) warn(`model ${model} unavailable (${e.status || ""} ${(quotaWait(e)?.kind || e.message).slice(0, 60)}), trying the next one`);
     }
   }
@@ -550,21 +557,25 @@ async function withModelFallback(models, call) {
 // (cached 6 h) supplies the closest replacements of the same kind, so a retirement doesn't stop the pipeline.
 const geminiCatalog = { at: 0, list: [] };
 const GEMINI_KINDS = { text: (n) => /^gemini-.*(flash|pro)/.test(n) && !/image|tts|audio|live|embedding|vision|thinking-exp/.test(n), image: (n) => /image/.test(n) && /^gemini/.test(n), tts: (n) => /tts/.test(n) };
-async function geminiReplacements(key, kind, tried) {
+async function geminiReplacements(key, kind, tried, max = 3) {
   if (Date.now() - geminiCatalog.at > 6 * 3600e3 || !geminiCatalog.list.length) {
     const r = await fetchJson("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": key } });
     geminiCatalog.list = (r.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => m.name.replace(/^models\//, "")); geminiCatalog.at = Date.now();
   }
   // Prefer "latest" aliases, then the highest version; flash before pro for text (cost), as configured defaults do.
-  return geminiCatalog.list.filter((n) => GEMINI_KINDS[kind](n) && !tried.includes(n))
-    .sort((a, b) => Number(/latest/.test(b)) - Number(/latest/.test(a)) || Number(/lite/.test(a)) - Number(/lite/.test(b)) || Number(/flash/.test(b)) - Number(/flash/.test(a)) || b.localeCompare(a, undefined, { numeric: true })).slice(0, 3);
+  return geminiCatalog.list.filter((n) => GEMINI_KINDS[kind](n) && !tried.includes(n) && !isSpent(n))
+    .sort((a, b) => Number(/latest/.test(b)) - Number(/latest/.test(a)) || Number(/lite/.test(a)) - Number(/lite/.test(b)) || Number(/flash/.test(b)) - Number(/flash/.test(a)) || b.localeCompare(a, undefined, { numeric: true })).slice(0, max);
 }
+// Two reasons to look past the configured models: they all answered 404 (renamed or retired), or they have all spent
+// today's free allowance — which is granted per model, so the account's other models are a day's work the engine would
+// otherwise leave on the table. Only when every model of that kind is spent does the job wait for the reset.
 async function withGeminiModels(key, kind, models, call) {
   try { return await withModelFallback(models, call); }
   catch (e) {
-    if (e.status !== 404) throw e;
-    const alt = await geminiReplacements(key, kind, models).catch(() => []); if (!alt.length) throw e;
-    warn(`Gemini ${kind} model(s) ${models.join(", ")} not found; trying ${alt.join(", ")}`);
+    const spent = quotaWait(e)?.kind === "day";
+    if (e.status !== 404 && !spent) throw e;
+    const alt = await geminiReplacements(key, kind, models, spent ? 8 : 3).catch(() => []); if (!alt.length) throw e;
+    warn(`Gemini ${kind}: ${models.join(", ")} ${spent ? "have spent today's free allowance" : "not found"}; trying ${alt.join(", ")}`);
     return withModelFallback(alt, call);
   }
 }
