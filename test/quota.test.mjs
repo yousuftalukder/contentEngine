@@ -53,10 +53,14 @@ test("a daily quota parks the job until the reset, keeps its attempts and says w
   assert.match(alert.title, /free tier/i);
   assert.match(alert.body, /billing/i);
 
-  const settings = await eng.api("GET", "/api/settings");
-  assert.ok(settings[`quota.pause.${p.id}`]?.until, "the program stops taking new stories until the reset");
-  const stats = await eng.api("GET", "/api/stats");
-  assert.ok(stats.quotaPauses.some((x) => x.program === "out_of_quota"), "the dashboard can say why it is quiet");
+  // The desk is only paused when the wait is long enough to be worth pausing for: run this a minute before midnight
+  // in California and the reset is a minute away, and stopping the program for that would be pointless.
+  if (waitSeconds > 600) {
+    const settings = await eng.api("GET", "/api/settings");
+    assert.ok(settings[`quota.pause.${p.id}`]?.until, "the program stops taking new stories until the reset");
+    const stats = await eng.api("GET", "/api/stats");
+    assert.ok(stats.quotaPauses.some((x) => x.program === "out_of_quota"), "the dashboard can say why it is quiet");
+  }
 });
 
 test("a news story that would be stale by the time the quota returns is dropped, not left half-written", async () => {
@@ -196,4 +200,26 @@ test("reels: sections run on stock footage, and a section that must not use it k
     assert.ok(media.some((m) => m.meta.overlay === "textcard"), "the other keeps a picture");
     assert.equal(item.hero_media.kind, "VIDEO");
   } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
+});
+
+// A speech model reads "BNP" as a word and drifts in loudness between calls. Both are audible, and both are handled
+// before the audio is joined: the spoken text is kept on the track, so what the voice was asked to say is on record.
+test("narration: acronyms are spelled out for the voice, and a brand's own spellings win", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const b = await eng.api("POST", "/api/brands", { name: "Voice brand", brandKit: { pronounce: { WASA: "ওয়াসা" } } });
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_acronyms", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Write the video in exactly", json: {
+    title: "BNP ও WASA নিয়ে খবর", kicker: "খবর", description: "d", hashtags: ["bd"],
+    sections: [{ narration: "BNP আজ বৈঠক করেছে।", image_prompt: "x", footage_query: null }, { narration: "WASA পানি সরবরাহ বাড়িয়েছে।", image_prompt: "y", footage_query: null }] } }] } });
+  const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "voiced", displayName: "Voiced", contentType: "NEWS_REEL", language: "bn", useMocks: true,
+    autoStyle: false, autoSources: false, scriptAdapter: "llm_acronyms", voiceAdapter: "tts_mock", renderAdapter: "ffmpeg", imageAdapter: "image_no_key", methodConfig: { slides: 2 } });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "BNP ও WASA" });
+  const item = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { timeout: 120000, interval: 500, what: "a narrated reel" });
+
+  assert.match(item.script, /BNP/, "the written script keeps the acronym as written");
+  const [audio] = await eng.query(`SELECT meta, duration_seconds FROM media_assets WHERE content_item_id = $1 AND kind = 'AUDIO' ORDER BY created_at DESC LIMIT 1`, [id]);
+  const spoken = (audio.meta.spoken || []).join(" ");
+  assert.match(spoken, /বি এন পি/, "but the voice is given the acronym letter by letter, in Bangla");
+  assert.match(spoken, /ওয়াসা/, "and the brand's own spelling is used where it has one");
+  assert.ok(!/WASA/.test(spoken), "the written form does not reach the voice once a spelling exists");
+  assert.equal(audio.meta.levelled, true, "the joined narration went through the loudness pass");
+  assert.ok(audio.duration_seconds > 0);
 });
