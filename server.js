@@ -142,6 +142,15 @@ function isPermanent(e) {
   if (!e || isTransient(e)) return false;
   return PERMANENT_STATUS.has(Number(e.status)) || Number(e.status) === 403 || PERMANENT_TEXT.test(String(e.message || e));
 }
+// "The model is experiencing high demand" is not this key's quota and not a network blip: the provider is busy, and it
+// stays busy for minutes to hours. Worth waiting out rather than spending an hour of retries on.
+const OVERLOAD_TEXT = /overloaded|high demand|UNAVAILABLE|currently unavailable|server is busy/i;
+function isOverloaded(e) {
+  if (!e) return false;
+  if (e.causes?.length) return e.causes.every(isOverloaded);
+  const s = `${e.message || ""} ${typeof e.body === "string" ? e.body : JSON.stringify(e.body || "")}`;
+  return Number(e.status) === 503 || (isTransient(e) && OVERLOAD_TEXT.test(s));
+}
 // A provider's quota error, turned into how long to wait: a per-day (or free-tier) limit waits for the daily reset
 // (midnight Pacific — Google's and OpenAI's reset), a per-minute one for the delay the API names. null = not a quota error.
 function nextMidnightPacific() {
@@ -546,7 +555,13 @@ impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: 
 const modelSpent = new Map();
 const spentUntil = (m) => modelSpent.get(m) || 0;
 const isSpent = (m) => spentUntil(m) > Date.now();
-function noteSpent(model, e) { const q = quotaWait(e); if (q?.kind === "day") modelSpent.set(model, Date.now() + q.seconds * 1000); }
+// A model that is out for the day is skipped until it resets; one that is merely overloaded is skipped for a few
+// minutes, so the next job starts on a different model instead of walking into the same wall.
+function noteSpent(model, e) {
+  const q = quotaWait(e);
+  if (q?.kind === "day") modelSpent.set(model, Date.now() + q.seconds * 1000);
+  else if (isOverloaded(e)) modelSpent.set(model, Date.now() + 180e3);
+}
 async function withModelFallback(models, call) {
   const errs = [], all = [...new Set(models.filter(Boolean))], fresh = all.filter((m) => !isSpent(m));
   for (const model of (fresh.length ? fresh : all)) {
@@ -2873,7 +2888,8 @@ const QUOTA_MAX_WAIT_DAYS = Number(ENV.QUOTA_MAX_WAIT_DAYS) || 3;
 async function deferForQuota(job, payload, quota, msg) {
   // Waiting has a limit: a job that has been bouncing off a per-minute limit for hours, or off a daily one for days, is
   // not really waiting for a quota — it goes back to the ordinary backoff, and fails and alerts like anything else.
-  if (Date.now() - new Date(job.created_at).getTime() > (quota.kind === "minute" ? 2 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3)) return false;
+  const cap = quota.kind === "minute" ? 2 * 3600e3 : quota.kind === "busy" ? 8 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3;
+  if (Date.now() - new Date(job.created_at).getTime() > cap) return false;
   const itemId = job.content_item_id || payload.itemId || null;
   const item = itemId ? await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]) : null;
   const niche = item || payload.nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [item?.niche_id || payload.nicheId]) : null;
@@ -2881,7 +2897,7 @@ async function deferForQuota(job, payload, quota, msg) {
   if (niche && quota.seconds > 600) await putSetting(`quota.pause.${niche.id}`, { until: back.toISOString(), reason: msg.slice(0, 300) });
   const ageHours = item ? (Date.now() - new Date(item.created_at).getTime()) / 3600e3 + quota.seconds / 3600 : 0;
   if (item?.cluster_id && niche && ageHours > deskCfg(niche).max_age_hours) {
-    const note = `Skipped: the writer ran out of quota and this story would be about ${Math.round(ageHours)} hours old before it comes back.`;
+    const note = `Skipped: the writer ${quota.kind === "busy" ? "could not be reached" : "ran out of quota"} and this story would be about ${Math.round(ageHours)} hours old before it comes back.`;
     await q(`UPDATE jobs SET status='CANCELLED', error_message=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, note]);
     await q(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED')`, [item.id, note]);
     log(`quota: dropped stale story ${item.id} ("${(item.topic || "").slice(0, 60)}")`);
@@ -2905,8 +2921,12 @@ async function quotaPauses() {
   return out;
 }
 async function notifyQuota(quota, msg) {
-  if (quota.kind !== "day") return;
   const provider = PROVIDER_HOSTS.find(([h]) => msg.includes(h))?.[1] || "The AI provider";
+  // One alert per outage, not one per parked job, and only once it has lasted long enough to be worth knowing about.
+  if (quota.kind === "busy") return notify("outage", `${provider} is overloaded`,
+    `The model has been answering "high demand" for the past hour, so work is waiting rather than failing. It resumes on its own; stories that would be stale by then are skipped. Nothing to do unless this is still here tomorrow.`,
+    { level: "warn", key: `busy:${provider}`, cooldownHours: 6 });
+  if (quota.kind !== "day") return;
   const back = dhakaTime(new Date(Date.now() + quota.seconds * 1000));
   await notify("quota", quota.freeTier ? `${provider} free tier: today's requests are used up` : `${provider} daily quota reached`,
     (quota.freeTier
@@ -2924,7 +2944,10 @@ async function runJob(job) {
     await q(`UPDATE jobs SET status='SUCCEEDED', result=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, J(result ?? null)?.slice(0, 5000) ?? null]);
   } catch (e) {
     const msg = String(e?.message || e).slice(0, 1500);
-    const quota = quotaWait(e);
+    // A provider that has answered "overloaded" for the whole retry hour is not a job that failed, it is a provider
+    // that is down — and failing there costs a day of news. Once the ordinary backoff has given up, an outage waits
+    // the same way a quota does: no attempt spent, the program paused, stories that would go stale dropped.
+    const quota = quotaWait(e) || (isOverloaded(e) && retryDelay(job, e) == null ? { kind: "busy", seconds: 900, model: null } : null);
     if (quota?.seconds && PATIENT_JOBS.has(job.type) && (await deferForQuota(job, payload, quota, msg))) { await notifyQuota(quota, msg).catch((err) => warn("alert", err.message)); return; }
     // A limit no reset will lift (a plan without this model, an empty prepaid balance) is a person's problem, not a retry's.
     const delay = quota && !quota.seconds ? null : retryDelay(job, e);
@@ -3079,8 +3102,13 @@ async function adapterUsable(key) {
   const provider = IMPL_PROVIDER[row.impl];
   return provider ? (await credentialsFor(provider)).length > 0 : true;                    // mocks and local tools need no key
 }
+// Runs on every boot. A key added today has to reach the programs that already exist — that is the whole point of
+// noticing it, and a key is almost always added after the program it is for. Every repair here is conditional on the
+// current setting being unusable, so running it again changes nothing once there is nothing to fix. Only the one-off
+// migration onto the studio renderer is remembered, because a program deliberately moved back to ffmpeg should stay
+// on ffmpeg.
 async function upgradeAdapters() {
-  if (await setting("upgrade.adapters_v3", false)) return;
+  const migrate = !(await setting("upgrade.adapters_v3", false));
   const d = await smartAdapterDefaults(), changed = [];
   for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
     const fix = {};
@@ -3090,16 +3118,16 @@ async function upgradeAdapters() {
     if (d.imageAdapterFallbacks.includes("pexels_stock") && !imgFb.includes("pexels_stock") && n.image_adapter !== "pexels_stock" && !/_mock$/.test(n.image_adapter || "")) fix.image_adapter_fallbacks = JSON.stringify([...imgFb, "pexels_stock"]);
     for (const [col, want] of [["script_adapter", d.scriptAdapter], ["image_adapter", d.imageAdapter], ["voice_adapter", d.voiceAdapter], ["embed_adapter", d.embedAdapter], ["transcript_adapter", d.transcriptAdapter]])
       if (n[col] && n[col] !== want && !/_mock$/.test(want) && !(await adapterUsable(n[col]))) fix[col] = want;
-    if (n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
+    if (migrate && n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
     if (!Object.keys(fix).length) continue;
     await q(`UPDATE niches SET ${Object.keys(fix).map((k, i) => `${k} = $${i + 2}`).join(", ")} WHERE id = $1`, [n.id, ...Object.values(fix)]);
     changed.push(`${n.display_name}: ${Object.entries(fix).map(([k, v]) => `${k.replace("_adapter", "")} → ${v}`).join(", ")}`);
   }
   if (changed.length) {
     log(`upgrade: adapters repaired — ${changed.join(" | ")}`);
-    await notify("upgrade", "Programs moved onto the keys and tools this deployment has", `${changed.join("\n")}\n\nChange any of them on the program's Edit screen.`, { level: "info", key: "upgrade.adapters_v3", cooldownHours: 720 }).catch(() => {});
+    await notify("upgrade", "Programs moved onto the keys and tools this deployment has", `${changed.join("\n")}\n\nChange any of them on the program's Edit screen.`, { level: "info", key: `upgrade:${changed.join("|").slice(0, 80)}`, cooldownHours: 168 }).catch(() => {});
   }
-  await putSetting("upgrade.adapters_v3", true);
+  if (migrate) await putSetting("upgrade.adapters_v3", true);
 }
 
 // Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
@@ -3209,6 +3237,8 @@ app.post("/api/credentials", async (ctx) => {
   const enc = plain ? encryptSecret(plain) : null; const hint = plain ? (MULTI_FIELD_PROVIDERS[b.provider] ? "json" : secretHint(plain)) : null;
   const id = newId();
   await q(`INSERT INTO api_credentials (id, provider, label, env_var, priority, daily_quota, secret_enc, secret_hint) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [id, b.provider, b.label || envVar || `${b.provider} key`, envVar || "", b.priority ?? 0, b.dailyQuota ?? null, enc, hint]);
+  // A key is worth nothing until the programs are on it, and waiting for the next restart to find that out is a day lost.
+  await upgradeAdapters().catch((e) => warn(`adapters after new ${b.provider} key: ${e.message}`));
   json(ctx, 201, credView(await one(`SELECT * FROM api_credentials WHERE id=$1`, [id])));
 });
 app.patch("/api/credentials/:id", async (ctx) => {

@@ -19,6 +19,11 @@ const DAILY_429 = 'POST https://generativelanguage.googleapis.com/v1beta/models/
   + '"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},'
   + '{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"31s"}]}}';
 
+// Gemini's wording when the model itself is swamped: transient, not a quota, and it can last for hours.
+const BUSY_503 = 'POST https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent -> 503: '
+  + '{"error":{"code":503,"message":"This model is currently experiencing high demand. Spikes in demand may cause errors '
+  + 'that typically resolve themselves.","status":"UNAVAILABLE"}}';
+
 let eng, brand, channel;
 before(async () => {
   eng = await startEngine({ env: { PEXELS_API_KEY: "stub-key" } });   // the stock-photo test answers for Pexels itself
@@ -29,10 +34,37 @@ before(async () => {
   channel = await eng.api("POST", "/api/channels", { brandId: brand.id, key: "fb", displayName: "FB", platform: "FACEBOOK", format: "STATIC_IMAGE_CAPTION", publisherAdapter: "publish_mock" });
   await eng.api("POST", "/api/adapter-configs", { key: "llm_out_of_quota", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 99, fail_status: 429, fail_message: DAILY_429 } });
   await eng.api("POST", "/api/adapter-configs", { key: "image_no_key", stage: "IMAGE", impl: "gemini_image", config: {} });
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_overloaded", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 99, fail_status: 503, fail_message: BUSY_503 } });
 });
 after(async () => { await eng?.stop(); rmSync(dir, { recursive: true, force: true }); });
 
 const program = (key, extra) => eng.api("POST", "/api/programs", { brandId: brand.id, key, displayName: key, contentType: "NEWS_STATIC", useMocks: true, autoStyle: false, ...extra });
+
+// A busy provider is not a bad story. Gemini answering "high demand" for an hour once failed 74 drafts in a night —
+// each one burning its retries against a wall and then throwing the story away. An outage has to wait like a quota does.
+test("a provider that is overloaded past its retries parks the work instead of failing the story", async () => {
+  const p = await program("overloaded", { scriptAdapter: "llm_overloaded" });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story the model is too busy to write" });
+  // Wait for the first failure to have backed off, not merely to have started: an update landing while the job is still
+  // running is overwritten by the job's own.
+  await waitFor(async () => {
+    const [j] = await eng.query(`SELECT status, attempts, run_after FROM jobs WHERE content_item_id=$1 AND type='GENERATE_CONTENT'`, [id]);
+    return j?.status === "PENDING" && j.attempts > 0 && new Date(j.run_after) > Date.now();
+  }, { what: "the first attempt to fail and back off" });
+  // Spend the retry budget, so the next failure is the one where the engine decides between giving up on the story and
+  // deciding that the provider, not the story, is the problem.
+  await eng.query(`UPDATE jobs SET attempts = 9, run_after = now() WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [id]);
+  const job = await waitFor(async () => {
+    const [j] = await eng.query(`SELECT * FROM jobs WHERE content_item_id=$1 AND type='GENERATE_CONTENT'`, [id]);
+    return j && new Date(j.run_after) - Date.now() > 300000 && j;
+  }, { timeout: 30000, what: "the job parked for the outage" });
+  assert.equal(job.status, "PENDING", "still queued, not failed");
+  assert.ok((new Date(job.run_after) - Date.now()) / 1000 < 1800, "and comes back in minutes, not tomorrow");
+  assert.notEqual((await eng.api("GET", `/api/content-items/${id}`)).status, "FAILED", "the story is kept");
+
+  const alert = await waitFor(async () => (await eng.api("GET", "/api/notifications")).find((n) => n.kind === "outage"), { what: "one alert for the outage" });
+  assert.match(alert.body, /waiting rather than failing/i);
+});
 
 test("a daily quota parks the job until the reset, keeps its attempts and says what to do", async () => {
   const p = await program("out_of_quota", { scriptAdapter: "llm_out_of_quota" });
