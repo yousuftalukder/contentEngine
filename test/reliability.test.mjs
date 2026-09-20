@@ -90,3 +90,45 @@ test("a key added after the program exists reaches it straight away", async () =
     assert.ok((await fallbacks()).includes("pexels_stock"), "the existing program can now fall back to a library photo");
   } finally { await vault.stop(); }
 });
+
+// Nobody should have to hunt down an access token per Facebook Page. A Page token is derived from the token of a
+// person with a role on the Page, and /me/accounts returns one for every Page that person manages — so the whole job
+// is: log in once, pick pages. The tokens are stored encrypted and never sent back to the browser.
+test("connecting Facebook lists every Page the login manages and stores each token", async () => {
+  const http = await import("node:http");
+  const vault = await startEngine({ env: { SECRETS_KEY: "7".repeat(64) } });
+  let exchanged = null, asked = null;
+  const graph = http.createServer((req, res) => {
+    const u = new URL(req.url, "http://x");
+    res.writeHead(200, { "content-type": "application/json" });
+    if (u.pathname.endsWith("/oauth/access_token")) { exchanged = u.searchParams.get("fb_exchange_token"); return res.end(JSON.stringify({ access_token: "LONG-LIVED-USER", expires_in: 5184000 })); }
+    asked = u.searchParams.get("access_token");
+    return res.end(JSON.stringify({ data: [
+      { id: "1001", name: "Khobor 24", access_token: "PAGE-TOKEN-A", tasks: ["CREATE_CONTENT", "MANAGE"], instagram_business_account: { id: "9001", username: "khobor24" } },
+      { id: "1002", name: "Sideline", access_token: "PAGE-TOKEN-B", tasks: ["CREATE_CONTENT"] },
+      { id: "1003", name: "A page I only moderate", access_token: "PAGE-TOKEN-C", tasks: ["MODERATE"] }] }));
+  });
+  await new Promise((r) => graph.listen(0, "127.0.0.1", r));
+  try {
+    await vault.api("PUT", "/api/settings/meta.api_base", { value: `http://127.0.0.1:${graph.address().port}` });
+    const out = await vault.api("POST", "/api/meta/pages", { userToken: "SHORT-LIVED", appId: "app", appSecret: "secret" });
+
+    assert.equal(exchanged, "SHORT-LIVED", "the short-lived login is exchanged first");
+    assert.equal(asked, "LONG-LIVED-USER", "and the pages are read with the long-lived one");
+    assert.equal(out.longLived, true);
+    assert.deepEqual(out.pages.map((p) => p.name), ["Khobor 24", "Sideline", "A page I only moderate"]);
+    assert.deepEqual(out.pages.map((p) => p.canPost), [true, true, false], "a page you only moderate is marked unpostable");
+    assert.equal(out.pages[0].instagram.username, "khobor24");
+    assert.ok(!JSON.stringify(out).includes("PAGE-TOKEN"), "no token is ever sent back to the browser");
+
+    const stored = await vault.query(`SELECT label, secret_enc IS NOT NULL AS has FROM api_credentials WHERE provider='meta' ORDER BY label`);
+    assert.equal(stored.length, 3);
+    assert.ok(stored.every((r) => r.has), "each Page's token is stored encrypted");
+
+    const brand = await vault.api("POST", "/api/brands", { name: "Connected" });
+    const ch = await vault.api("POST", "/api/meta/channels", { brandId: brand.id, pageId: out.pages[0].pageId, credentialId: out.pages[0].credentialId, displayName: "Khobor 24" });
+    assert.equal(ch.platform_account_id, "1001");
+    assert.equal(ch.publisher_adapter, "meta_graph");
+    assert.equal(ch.credential_id, out.pages[0].credentialId, "the channel posts with that Page's own token");
+  } finally { await vault.stop(); await new Promise((r) => graph.close(r)); }
+});

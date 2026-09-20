@@ -3656,6 +3656,50 @@ app.patch("/api/programs/:id", async (ctx) => json(ctx, 200, rowJson(await patch
 app.delete("/api/niches/:id", async (ctx) => { const dep = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE niche_id=$1`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, `Program has ${dep.n} content items — deactivate it instead (PATCH isActive:false)`); await q(`DELETE FROM series WHERE niche_id=$1`, [ctx.params.id]); await q(`DELETE FROM niches WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), ctx.params.id, ctx.params.sourceId]); json(ctx, 200, { ok: true }); });
 app.delete("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`DELETE FROM niche_sources WHERE niche_id=$1 AND source_id=$2`, [ctx.params.id, ctx.params.sourceId]); json(ctx, 200, { ok: true }); });
+// ---- Meta: one login, every Page. A Page access token is derived from the token of a person who has a role on the
+// Page, and /me/accounts hands back one for every Page that person manages. So nobody needs to hunt down a token per
+// page: they grant once, the server exchanges the short-lived token for a long-lived one (Page tokens derived from a
+// long-lived user token do not expire — derived from a short-lived one they die in an hour, which is the mistake
+// everyone makes), stores each Page's token encrypted, and returns only names and ids. Tokens are never sent back.
+app.post("/api/meta/pages", async (ctx) => {
+  const b = ctx.body, ver = DEFAULTS.META_API_VERSION, graph = await setting("meta.api_base", "https://graph.facebook.com");
+  const userToken = String(b.userToken || "").trim();
+  if (!userToken) throw new ApiError(400, null, "userToken is required — log in at developers.facebook.com → Graph API Explorer, grant pages_show_list, pages_manage_posts and pages_read_engagement, and paste the token here");
+  if (!vaultReady()) throw new ApiError(400, null, "SECRETS_KEY is not set on Render — add a long random string and redeploy before storing Page tokens");
+  const appId = b.appId || ENV.META_APP_ID, appSecret = b.appSecret || ENV.META_APP_SECRET;
+  let token = userToken, longLived = false;
+  if (appId && appSecret) {
+    try {
+      const ex = await fetchJson(`${graph}/${ver}/oauth/access_token?${form({ grant_type: "fb_exchange_token", client_id: appId, client_secret: appSecret, fb_exchange_token: userToken })}`);
+      if (ex.access_token) { token = ex.access_token; longLived = true; }
+    } catch (e) { warn(`meta token exchange: ${e.message.slice(0, 160)}`); }
+  }
+  const me = await fetchJson(`${graph}/${ver}/me/accounts?${form({ access_token: token, fields: "id,name,access_token,tasks,instagram_business_account{id,username}", limit: 100 })}`);
+  const pages = [];
+  for (const pg of me.data || []) {
+    if (!pg.access_token) continue;
+    // "CREATE_CONTENT" is the task that actually allows posting; anything less is a Page you can see but not publish to.
+    const canPost = !Array.isArray(pg.tasks) || pg.tasks.includes("CREATE_CONTENT") || pg.tasks.includes("MANAGE");
+    const label = `Facebook: ${pg.name}`;
+    let cred = await one(`SELECT id FROM api_credentials WHERE provider='meta' AND label=$1`, [label]);
+    if (cred) await q(`UPDATE api_credentials SET secret_enc=$2, secret_hint=$3 WHERE id=$1`, [cred.id, encryptSecret(pg.access_token), secretHint(pg.access_token)]);
+    else { const id = newId(); await q(`INSERT INTO api_credentials (id, provider, label, env_var, priority, secret_enc, secret_hint) VALUES ($1,'meta',$2,'',0,$3,$4)`, [id, label, encryptSecret(pg.access_token), secretHint(pg.access_token)]); cred = { id }; }
+    pages.push({ pageId: pg.id, name: pg.name, canPost, credentialId: cred.id, instagram: pg.instagram_business_account ? { id: pg.instagram_business_account.id, username: pg.instagram_business_account.username } : null });
+  }
+  if (!pages.length) throw new ApiError(400, null, "That login manages no Pages the app can see. Check that pages_show_list was granted and that you have a role on the Page.");
+  json(ctx, 200, { longLived, pages,
+    note: longLived ? "Page tokens stored. Derived from a long-lived login, so they do not expire."
+      : "Page tokens stored, but this login was short-lived, so they expire in about an hour. Add META_APP_ID and META_APP_SECRET (or pass appId/appSecret here) and connect again to make them permanent." });
+});
+// Turn a connected Page into a channel, so the whole path is: log in, pick a page, done.
+app.post("/api/meta/channels", async (ctx) => {
+  const b = ctx.body; for (const r of ["brandId", "pageId", "credentialId", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
+  const id = newId(), platform = b.platform === "INSTAGRAM" ? "INSTAGRAM" : "FACEBOOK";
+  await q(`INSERT INTO channels (id, brand_id, key, display_name, platform, format, timezone, credential_id, platform_account_id, publisher_adapter) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'meta_graph')`,
+    [id, b.brandId, b.key || `fb_${String(b.pageId).slice(-6)}`, b.displayName, platform, b.format || (platform === "INSTAGRAM" ? "REEL_VIDEO" : "STATIC_IMAGE_CAPTION"), b.timezone || "Asia/Dhaka", b.credentialId, String(b.pageId)]);
+  for (const n of b.nicheIds || []) await q(`INSERT INTO channel_niches (id, channel_id, niche_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, n]);
+  json(ctx, 201, rowJson(await one(`SELECT * FROM channels WHERE id=$1`, [id]), ["platform_config", "posting_windows"]));
+});
 // ---- channels
 const CHANNEL_MAP = { credentialId: "credential_id", displayName: "display_name", platform: "platform", format: "format", credentialRef: "credential_ref", scheduleCron: "schedule_cron", timezone: "timezone", isActive: "is_active", platformAccountId: "platform_account_id", platformConfig: "platform_config", publisherAdapter: "publisher_adapter", maxPostsPerDay: "max_posts_per_day", minGapMinutes: "min_gap_minutes", postingWindows: "posting_windows", captionTemplate: "caption_template" };
 app.get("/api/channels", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM channels WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM channels ORDER BY created_at DESC`); const out = []; for (const ch of rows) out.push({ ...rowJson(ch, ["platform_config", "posting_windows"]), niches: await q(`SELECT n.* FROM niches n JOIN channel_niches cn ON cn.niche_id=n.id WHERE cn.channel_id=$1`, [ch.id]) }); json(ctx, 200, out); });
