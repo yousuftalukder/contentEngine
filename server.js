@@ -2289,6 +2289,13 @@ async function checkAndRepurpose(assetId) {
 // (defamation, communal or political incitement, graphic detail, minors), and language. The verdict is computed from the
 // findings as well as taken from the model, whichever is stricter. PASS lets automatic programs publish; a REVIEW draft
 // is revised once from the report and re-checked (auto_fix); what is still not clean waits for a person.
+// Asked for 0-1, models answer on whatever scale they please: production came back with a flat 10, which cleared a
+// threshold of 0.75 without meaning anything, so the score never gated anything. Read 8 and 85 as 0.8 and 0.85 too.
+function qaScore(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n <= 1 ? n : n <= 10 ? n / 10 : n <= 100 ? n / 100 : 1;
+}
 async function qaCfg(niche) {
   const own = (P(niche.method_config) || {}).qa || {};
   return { enabled: own.enabled ?? (await setting("qa.enabled", true)), min_score: Number(own.min_score ?? (await setting("qa.min_score", 0.75))), auto_fix: own.auto_fix ?? (await setting("qa.auto_fix", true)) };
@@ -2318,15 +2325,16 @@ async function runQa(itemId, niche) {
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500,
     system: `You are the standards editor of "${niche.display_name}"${niche.country ? ` (${niche.country})` : ""}. Before anything is published you check it against its sources and for legal and safety risks. Be specific and strict, and do not rewrite the draft. Answer in English JSON even when the draft is in another language.${style ? `\nHouse style the draft should follow:${styleBlock(style)}` : ""}`,
-    prompt: `${materialBlock(m)}\nDRAFT (language: ${lang})\n${draftText(item)}\n\nCheck:\n1. Facts: list each claim in the draft the sources do not support (numbers, names, places, dates, quotes, causes, blame). Rewording is fine; new facts are not.\n2. Headline: accurate, and not more alarming or certain than the sources?\n3. Safety: defamation (wrongdoing attributed to a named person as fact without attribution), religious, communal or political incitement, graphic detail of violence or suicide, identifying minors or victims of sexual violence, health or financial claims, rumour presented as fact.\n4. Language: natural, correct ${lang}.\nReturn JSON: {"fact_issues": ["..."], "headline_ok": true, "headline_issue": "", "safety_flags": [{"type": "...", "severity": "low|medium|high", "detail": "..."}], "language_issues": ["..."], "score": 0.0, "verdict": "PASS|REVIEW|REJECT", "summary": "one sentence"}`,
+    prompt: `${materialBlock(m)}\nDRAFT (language: ${lang})\n${draftText(item)}\n\nCheck:\n1. Facts: list each claim in the draft the sources do not support (numbers, names, places, dates, quotes, causes, blame). Rewording is fine; new facts are not.\n2. Headline: accurate, and not more alarming or certain than the sources?\n3. Safety: defamation (wrongdoing attributed to a named person as fact without attribution), religious, communal or political incitement, graphic detail of violence or suicide, identifying minors or victims of sexual violence, health or financial claims, rumour presented as fact.\n4. Language: natural, correct ${lang}.\nReturn JSON: {"fact_issues": ["..."], "headline_ok": true, "headline_issue": "", "safety_flags": [{"type": "...", "severity": "low|medium|high", "detail": "..."}], "language_issues": ["..."], "score": 0.0, "verdict": "PASS|REVIEW|REJECT", "summary": "one sentence"}\nThe score is a number between 0 and 1, where 1 means publishable exactly as written — not a mark out of 10.`,
     mock: { fact_issues: [], headline_ok: true, safety_flags: [], language_issues: [], score: 0.95, verdict: "PASS", summary: "mock review: no issues" } }));
   await addCost(itemId, r.cost);
   const d = r.data || {}, flags = (Array.isArray(d.safety_flags) ? d.safety_flags : []).filter((f) => f && f.type), facts = (Array.isArray(d.fact_issues) ? d.fact_issues : []).filter(Boolean);
+  const score = qaScore(d.score);
   let status = flags.some((f) => /high/i.test(f.severity)) ? "REJECT"
-    : facts.length || d.headline_ok === false || flags.some((f) => /medium/i.test(f.severity)) || !(Number(d.score) >= cfg.min_score) ? "REVIEW" : "PASS";
+    : facts.length || d.headline_ok === false || flags.some((f) => /medium/i.test(f.severity)) || !(score >= cfg.min_score) ? "REVIEW" : "PASS";
   const rank = { PASS: 0, REVIEW: 1, REJECT: 2 }, said = String(d.verdict || "").toUpperCase();
   if (rank[said] > rank[status]) status = said;
-  const report = { summary: d.summary || "", score: Number(d.score) || 0, fact_issues: facts, headline_ok: d.headline_ok !== false, headline_issue: d.headline_issue || "", safety_flags: flags, language_issues: (d.language_issues || []).filter(Boolean), verdict: status, model: r.model || null, checked_at: nowIso() };
+  const report = { summary: d.summary || "", score, fact_issues: facts, headline_ok: d.headline_ok !== false, headline_issue: d.headline_issue || "", safety_flags: flags, language_issues: (d.language_issues || []).filter(Boolean), verdict: status, model: r.model || null, checked_at: nowIso() };
   await q(`UPDATE content_items SET qa_status=$2, qa_score=$3, qa_report=$4::jsonb WHERE id=$1`, [itemId, status, report.score, JSON.stringify(report)]);
   return { status, report };
 }
