@@ -172,6 +172,12 @@ CREATE INDEX IF NOT EXISTS idx_source_items_status ON source_items(status, creat
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS weight      REAL NOT NULL DEFAULT 1;   -- outlet importance in news-desk ranking
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS language    TEXT;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS catalog_key TEXT;                      -- set when created from the built-in catalog
+-- How the outlet is actually being read. A feed that quietly drops to Google News still polls, still returns items and
+-- still looks healthy — while losing every summary and every photograph the outlet publishes. That is not an error, so
+-- it cannot live in last_error (a successful poll clears it, and the health sweep would alert on it daily); it is a
+-- degraded mode, and it gets its own column so the dashboard can say so.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS read_mode   TEXT;                      -- NULL/'direct' | 'google_news'
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS read_note   TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_catalog_key ON sources(catalog_key) WHERE catalog_key IS NOT NULL;
 
 -- NEWS DESK: one row per real-world story, grouping every outlet that reports it (server.js section 7c).
