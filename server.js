@@ -1744,8 +1744,14 @@ function sayable(text, { lang = "en", map = {} } = {}) {
     SAID_AS_WORD.has(acr) ? whole : `${pre}${acr.split("").map((c) => (lang === "bn" ? BN_LETTER[c] || c : c)).join(" ")}`);
 }
 // The program's voice, with everything it is asked to say run through the spellings first.
+// The voice is the one stage that had no second option. A hosted TTS runs out of characters, refuses a language, or
+// has a bad hour, and without a fallback every video the program makes stops until somebody notices. The chain is the
+// same one the writer uses; a local engine (tts_command → piper, espeak) makes a good last resort because it cannot
+// run out.
 async function voiceFor(niche) {
-  const a = await resolve("VOICE", niche.voice_adapter || "tts_mock");
+  const own = niche.voice_adapter || "tts_mock";
+  const fb = await fallbacksFor(niche.voice_adapter_fallbacks, "voice.default_fallbacks");
+  const a = fb.length ? { synthesize: (args) => withFallbacks("VOICE", own, fb, (v) => v.synthesize(args)) } : await resolve("VOICE", own);
   const brand = niche.brand_id ? await one(`SELECT brand_kit FROM brands WHERE id = $1`, [niche.brand_id]) : null;
   const opts = { lang: (niche.language || "en").slice(0, 2), map: { ...((P(brand?.brand_kit) || {}).pronounce || {}), ...((P(niche.method_config) || {}).pronounce || {}) } };
   return { ...a, synthesize: async (args) => {
@@ -3437,6 +3443,14 @@ async function upgradeAdapters() {
     // a text card once generated pictures are out of reach.
     const imgFb = P(n.image_adapter_fallbacks) || [];
     if (d.imageAdapterFallbacks.includes("pexels_stock") && !imgFb.includes("pexels_stock") && n.image_adapter !== "pexels_stock" && !/_mock$/.test(n.image_adapter || "")) fix.image_adapter_fallbacks = JSON.stringify([...imgFb, "pexels_stock"]);
+    // A second writer that the account already pays for should be behind the first one. Without this a program writes
+    // on one provider and stops for the day the moment that provider says no, while a perfectly good key sits unused.
+    for (const [col, own, want] of [["script_adapter_fallbacks", n.script_adapter, [d.scriptAdapter, ...d.scriptAdapterFallbacks]],
+                                   ["voice_adapter_fallbacks", n.voice_adapter, [d.voiceAdapter, ...(d.voiceAdapterFallbacks || [])]]]) {
+      const have = P(n[col]) || [];
+      const add = want.filter((k) => k && k !== own && !/_mock$/.test(k) && !have.includes(k));
+      if (add.length && !/_mock$/.test(own || "")) fix[col] = JSON.stringify([...have, ...add]);
+    }
     for (const [col, want] of [["script_adapter", d.scriptAdapter], ["image_adapter", d.imageAdapter], ["voice_adapter", d.voiceAdapter], ["embed_adapter", d.embedAdapter], ["transcript_adapter", d.transcriptAdapter]])
       if (n[col] && n[col] !== want && !/_mock$/.test(want) && !(await adapterUsable(n[col]))) fix[col] = want;
     if (migrate && n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
@@ -3642,10 +3656,10 @@ app.get("/api/uploads", async (ctx) => { const p = ctx.query.get("purpose"); jso
 app.delete("/api/uploads/:id", async (ctx) => { const m = await one(`SELECT * FROM media_assets WHERE id=$1 AND kind='UPLOAD'`, [ctx.params.id]); if (m) { await deleteStored(m.url).catch(() => {}); await q(`UPDATE media_assets SET deleted_at = now() WHERE id=$1`, [m.id]); } json(ctx, 200, { ok: true }); });
 app.delete("/api/brands/:id", async (ctx) => { const dep = await one(`SELECT (SELECT COUNT(*) FROM niches WHERE brand_id=$1)::int + (SELECT COUNT(*) FROM channels WHERE brand_id=$1)::int AS n`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, "Brand still has programs or channels"); await q(`DELETE FROM brands WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 // ---- niches (programs)
-const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks"];
+const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks", "voice_adapter_fallbacks"];
 const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visual_mode", topicSourceAdapter: "topic_source_adapter", scriptAdapter: "script_adapter", voiceAdapter: "voice_adapter", renderAdapter: "render_adapter", voiceId: "voice_id", factCheckStrict: "fact_check_strict", dedupThreshold: "dedup_threshold", isActive: "is_active",
   contentType: "content_type", productionMethod: "production_method", methodConfig: "method_config", language: "language", country: "country", approvalMode: "approval_mode", reviewWindowMinutes: "review_window_minutes", styleProfileId: "style_profile_id", publishToPortal: "publish_to_portal", imageAdapter: "image_adapter", imageSpecs: "image_specs", topicFilters: "topic_filters", maxItemsPerDay: "max_items_per_day", priority: "priority",
-  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", embedAdapter: "embed_adapter" };
+  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 // Adapters a new program starts with when the request doesn't name them: the live ones whose provider has a key (vault or
@@ -3662,6 +3676,7 @@ async function smartAdapterDefaults() {
     imageAdapterFallbacks: (await has("pexels")) ? ["pexels_stock"] : [],
     embedAdapter: gem ? "gemini_embed" : "embed_mock",
     voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
+    voiceAdapterFallbacks: [gem && "gemini_tts", el && "elevenlabs", oai && "openai_tts"].filter(Boolean).slice(1),
     transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
     // "remotion" falls back to ffmpeg by itself when the rendering instance lacks the memory, so it's safe to pick here.
     renderAdapter: studioInstalled() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",

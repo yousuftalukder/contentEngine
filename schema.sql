@@ -64,6 +64,9 @@ ALTER TABLE niches ADD COLUMN IF NOT EXISTS clip_adapter_fallbacks  JSONB NOT NU
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS script_adapter_fallbacks JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS image_adapter_fallbacks JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS embed_adapter           TEXT NOT NULL DEFAULT 'embed_mock';
+-- The writer and the pictures have always had somewhere to fall back to; the voice did not, so one provider saying no
+-- stopped every video the program makes for the rest of the day.
+ALTER TABLE niches ADD COLUMN IF NOT EXISTS voice_adapter_fallbacks JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE TABLE IF NOT EXISTS channels (
   id             TEXT PRIMARY KEY,

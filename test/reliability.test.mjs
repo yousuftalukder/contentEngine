@@ -132,3 +132,36 @@ test("connecting Facebook lists every Page the login manages and stores each tok
     assert.equal(ch.credential_id, out.pages[0].credentialId, "the channel posts with that Page's own token");
   } finally { await vault.stop(); await new Promise((r) => graph.close(r)); }
 });
+
+// A program writes on one provider and stops for the day the moment that provider says no. A second key the account
+// already has should be behind the first one without anybody wiring it up.
+test("a second writer the account already has is put behind the first one", async () => {
+  const vault = await startEngine({ env: { SECRETS_KEY: "5".repeat(64), GEMINI_API_KEY: "g-stub", ANTHROPIC_API_KEY: "a-stub" } });
+  try {
+    const b = await vault.api("POST", "/api/brands", { name: "Two writers" });
+    const p = await vault.api("POST", "/api/programs", { brandId: b.id, key: "two", displayName: "Two", contentType: "NEWS_STATIC",
+      country: "Bangladesh", autoStyle: false, autoSources: false, scriptAdapter: "gemini_live" });
+    await vault.query(`UPDATE niches SET script_adapter_fallbacks = '[]'::jsonb WHERE id = $1`, [p.id]);
+
+    // Adding any key re-runs the repair, which is when a program picks up what the account has gained.
+    await vault.api("POST", "/api/credentials", { provider: "pexels", secret: "stock", label: "Stock" });
+    const fb = JSON.parse((await vault.query(`SELECT script_adapter_fallbacks::text AS f FROM niches WHERE id=$1`, [p.id]))[0].f);
+    assert.ok(fb.includes("anthropic_live"), `the other writer is behind the first — got ${JSON.stringify(fb)}`);
+    assert.ok(!fb.includes("gemini_live"), "and the program's own writer is not listed as its own fallback");
+  } finally { await vault.stop(); }
+});
+
+// The voice was the one stage with no second option: a hosted TTS that runs out of characters or refuses a language
+// stopped every video the program makes. It now falls back like the writer does.
+test("a voice that refuses is replaced by the next one, and the video still gets made", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "tts_refuses", stage: "VOICE", impl: "tts_command", config: { command: "definitely-not-a-real-speech-engine", args: ["{out}"] } });
+  const b = await eng.api("POST", "/api/brands", { name: "Voice fallback" });
+  const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "vfb", displayName: "Voice fallback", contentType: "NEWS_REEL",
+    useMocks: true, autoStyle: false, autoSources: false, renderAdapter: "render_mock",
+    voiceAdapter: "tts_refuses", voiceAdapterFallbacks: ["tts_mock"], methodConfig: { slides: 2 } });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story that still gets a voice" });
+  const done = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; },
+    { timeout: 60000, what: "the reel narrated by the fallback voice" });
+  assert.ok(done.voice_asset_url, "it was narrated");
+  assert.equal(done.hero_media.kind, "VIDEO", "and rendered");
+});
