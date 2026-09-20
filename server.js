@@ -2034,6 +2034,7 @@ impl("RENDER", "remotion", { label: "Studio (Remotion) for made videos, ffmpeg f
 // ---- 6k. Publish (stage PUBLISH). publish({channel, mediaUrl, mediaKind, caption, title, hashtags}) -> {publishedUrl, externalId}
 const PLATFORM_DEFAULT_PUBLISHER = { FACEBOOK: "meta_graph", INSTAGRAM: "meta_graph", YOUTUBE: "youtube_upload" };
 impl("PUBLISH", "publish_mock", { label: "Mock", create: () => ({ async publish({ channel }) { const id = newId(); return { publishedUrl: `mock://published/${channel.platform.toLowerCase()}/${id}`, externalId: id }; },
+  async comment({ externalId }) { return { id: `mock-comment-${externalId}` }; },
   async metrics() { return { views: Math.floor(Math.random() * 2000), likes: 10, comments: 2 }; } }) });
 // Channel secrets: channels.credential_id points at an api_credentials row (provider "meta" or "youtube_oauth") whose
 // value lives in the vault or in a named env var. Legacy platform_config.*_env names still work as a fallback.
@@ -2080,6 +2081,14 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
         return { externalId: p.id, publishedUrl: info.permalink || `https://www.instagram.com/p/${p.id}` };
       }
       throw new Error(`meta_graph cannot publish to ${channel.platform}`);
+    },
+    // The first comment under what was just published: the source link lives here, not in the body. The same edge
+    // serves a Page post, a Page video, a Reel and an Instagram media id; on Instagram the token needs the
+    // instagram_manage_comments permission, and without it the post stands and the comment is logged as failed.
+    async comment({ channel, externalId, message }) {
+      const token = await metaToken(channel, cfg);
+      const r = await post(`${externalId}/comments`, { message, access_token: token });
+      return { id: r.id };
     },
     // Read-only connection check: is there a token, does it open the account the channel names, and is it the right
     // kind of token and id? Answered at setup instead of at the first post, where it would cost a real story.
@@ -2490,11 +2499,27 @@ async function rollupItemStatus(itemId) {
   const status = n("PUBLISHED") === assets.length ? "PUBLISHED" : n("FAILED") === assets.length ? "FAILED" : n("PUBLISHED") && n("FAILED") + n("PUBLISHED") === assets.length ? "PARTIALLY_PUBLISHED" : n("PUBLISHED") ? "PARTIALLY_PUBLISHED" : "READY_TO_PUBLISH";
   await q(`UPDATE content_items SET status = $2 WHERE id = $1`, [itemId, status]);
 }
-function renderCaption(item, channel, portalUrl) {
+// The source article's link. On Facebook and Instagram a link in the post body costs reach, so the body says
+// "বিস্তারিত কমেন্টে" — details in the comments — and the link goes into the first comment, the way the pages this
+// competes with do it. Where there is no comment step (YouTube's description, anything else) the link is written in.
+const COMMENT_PLATFORMS = new Set(["FACEBOOK", "INSTAGRAM"]);
+const SOURCE_WORDS = { bn: { hint: "বিস্তারিত কমেন্টে 👇", label: "সূত্র" }, en: { hint: "Details in the comments 👇", label: "Source" } };
+const sourceWords = (niche) => SOURCE_WORDS[String(niche?.language || "en").slice(0, 2)] || SOURCE_WORDS.en;
+function sourceLink(item) {
+  const sdr = P(item.source_data_ref) || {}; const url = String(sdr.url || "");
+  return /^https?:\/\//.test(url) ? { url, outlet: sdr.photo_outlet || (sdr.outlets || [])[0] || null } : null;
+}
+function sourceLine(item, niche) {
+  const link = sourceLink(item); if (!link) return null;
+  return `${sourceWords(niche).label}: ${link.outlet ? `${link.outlet}\n` : ""}${link.url}`;
+}
+function renderCaption(item, channel, portalUrl, niche = null) {
   const caps = P(item.captions) || {}; const tags = (P(item.hashtags) || []).map((h) => (h.startsWith("#") ? h : `#${h}`)).join(" ");
   const base = caps[channel.platform.toLowerCase()] || caps.default || item.summary || item.body || item.headline || item.topic || "";
-  const tpl = channel.caption_template || "{caption}\n\n{url}\n\n{hashtags}";
-  return tpl.replace("{caption}", base).replace("{headline}", item.headline || item.topic || "").replace("{url}", portalUrl || "").replace("{hashtags}", tags).replace(/\n{3,}/g, "\n\n").trim();
+  const source = !sourceLink(item) ? "" : COMMENT_PLATFORMS.has(channel.platform) ? sourceWords(niche).hint : sourceLine(item, niche);
+  let tpl = channel.caption_template || "{caption}\n\n{url}\n\n{source}\n\n{hashtags}";
+  if (source && !tpl.includes("{source}")) tpl += "\n\n{source}";   // a channel's own template still gets the line
+  return tpl.replace("{caption}", base).replace("{headline}", item.headline || item.topic || "").replace("{url}", portalUrl || "").replace("{source}", source).replace("{hashtags}", tags).replace(/\n{3,}/g, "\n\n").trim();
 }
 async function ensurePortalArticle(item, niche) {
   if (item.portal_article_id) return one(`SELECT * FROM portal_articles WHERE id = $1`, [item.portal_article_id]);
@@ -2522,7 +2547,7 @@ async function approveItem(itemId, { auto = false, scheduledFor = null } = {}) {
   for (const ch of channels) {
     const when = scheduledFor ? new Date(scheduledFor) : await nextSlot(ch);
     await q(`INSERT INTO content_assets (id, content_item_id, channel_id, status, caption, media_asset_id, scheduled_for) VALUES ($1,$2,$3,'PENDING',$4,$5,$6) ON CONFLICT (content_item_id, channel_id) DO UPDATE SET status='PENDING', scheduled_for=EXCLUDED.scheduled_for, caption=EXCLUDED.caption, error_message=NULL`,
-      [newId(), itemId, ch.id, renderCaption(item, ch, purl), item.hero_media_id, when.toISOString()]);
+      [newId(), itemId, ch.id, renderCaption(item, ch, purl, niche), item.hero_media_id, when.toISOString()]);
   }
   if (item.series_id) await q(`UPDATE series SET episode_counter = episode_counter + 1 WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM content_items WHERE id = $2 AND episode_number IS NULL)`, [item.series_id, itemId]);
   await rollupItemStatus(itemId);
@@ -3100,9 +3125,17 @@ async function publishAsset(assetId) {
     const publisher = await resolve("PUBLISH", pubKey);
     await q(`UPDATE content_assets SET status='PUBLISHING' WHERE id=$1`, [assetId]);
     const thumb = await one(`SELECT url FROM media_assets WHERE content_item_id=$1 AND kind='THUMBNAIL' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`, [item.id]);
-    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption: asset.caption || renderCaption(item, channel, null), title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
+    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption: asset.caption || renderCaption(item, channel, null, niche), title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
     await q(`UPDATE content_assets SET status='PUBLISHED', published_url=$2, external_id=$3, published_at=now(), error_message=NULL WHERE id=$1`, [assetId, res.publishedUrl, res.externalId]);
     await q(`UPDATE channels SET last_published_at=now() WHERE id=$1`, [channel.id]);
+    // The first comment carries the source link on the platforms where the body must not. The post is out by now, so a
+    // comment that fails is logged and left visible on the asset — text without an id — rather than failing the post.
+    const line = COMMENT_PLATFORMS.has(channel.platform) && publisher.comment ? sourceLine(item, niche) : null;
+    if (line) {
+      await q(`UPDATE content_assets SET comment_text=$2 WHERE id=$1`, [assetId, line]);
+      try { const c = await publisher.comment({ channel, externalId: res.externalId, message: line }); await q(`UPDATE content_assets SET comment_id=$2 WHERE id=$1`, [assetId, c?.id || null]); }
+      catch (e) { warn(`first comment on ${assetId}: ${String(e.message).slice(0, 300)}`); }
+    }
   } catch (e) {
     await q(`UPDATE content_assets SET status='FAILED', error_message=$2, retry_count=retry_count+1 WHERE id=$1`, [assetId, String(e.message).slice(0, 1500)]);
     await rollupItemStatus(item.id); throw e;

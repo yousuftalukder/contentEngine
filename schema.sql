@@ -326,6 +326,8 @@ ALTER TABLE content_assets ADD COLUMN IF NOT EXISTS media_asset_id TEXT;
 ALTER TABLE content_assets ADD COLUMN IF NOT EXISTS scheduled_for  TIMESTAMPTZ;
 ALTER TABLE content_assets ADD COLUMN IF NOT EXISTS published_at   TIMESTAMPTZ;
 ALTER TABLE content_assets ADD COLUMN IF NOT EXISTS last_metrics   JSONB;
+ALTER TABLE content_assets ADD COLUMN IF NOT EXISTS comment_text   TEXT;   -- the first comment (the source link), as sent
+ALTER TABLE content_assets ADD COLUMN IF NOT EXISTS comment_id     TEXT;   -- the platform's id for it; null = not (yet) posted
 CREATE INDEX IF NOT EXISTS idx_content_assets_sched ON content_assets(status, scheduled_for);
 
 CREATE TABLE IF NOT EXISTS media_assets (
