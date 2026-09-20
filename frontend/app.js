@@ -823,11 +823,54 @@ function clipsDialog(c) {
 }
 
 // ---------------------------------------------------------------- channels
+// One login, every Page. A Page access token comes from the token of somebody with a role on the Page, and Facebook
+// hands back one per Page — so the job is to grant once and tick the pages you want, not to find a token per page.
+async function connectFacebook(brands, programs) {
+  const tok = h("input", { class: "input mono", type: "password", placeholder: "paste the user access token", autocomplete: "off" });
+  const appId = h("input", { class: "input mono", placeholder: "App ID (optional, makes the tokens permanent)" });
+  const appSecret = h("input", { class: "input mono", type: "password", placeholder: "App Secret (optional)", autocomplete: "off" });
+  const list = h("div", { style: "margin-top:10px" });
+  const brandSel = h("select", { class: "input" }, ...brands.map((b) => h("option", { value: b.id }, b.name)));
+
+  const body = h("div", null,
+    h("p", { class: "small mute", style: "margin:0 0 8px" },
+      "At ", h("a", { href: "https://developers.facebook.com/tools/explorer/", target: "_blank", rel: "noopener" }, "Graph API Explorer"),
+      ": pick your app, press ", h("b", null, "Generate Access Token"), ", and grant ", h("span", { class: "mono" }, "pages_show_list"), ", ",
+      h("span", { class: "mono" }, "pages_manage_posts"), " and ", h("span", { class: "mono" }, "pages_read_engagement"), ". Paste it below."),
+    h("p", { class: "small mute", style: "margin:0 0 10px" },
+      "Add the App ID and Secret too and the token is exchanged for a long-lived one, which is what makes the Page tokens permanent. Without them they expire in about an hour. Tokens are stored encrypted and never shown again."),
+    field("User access token", tok), field("App ID", appId), field("App Secret", appSecret), field("Brand for new channels", brandSel), list);
+
+  const connect = async () => {
+    const r = await post("/api/meta/pages", { userToken: tok.value.trim(), appId: appId.value.trim() || undefined, appSecret: appSecret.value.trim() || undefined });
+    list.innerHTML = "";
+    list.appendChild(h("p", { class: "small" }, r.longLived ? null : h("span", { class: "tag amber", style: "margin-right:6px" }, "expires in an hour"), r.note));
+    for (const pg of r.pages) {
+      const row = h("div", { class: "panel", style: "padding:10px 12px;margin:6px 0" }, h("div", { class: "row" },
+        h("div", null, h("b", null, pg.name), h("div", { class: "small mute" }, "Page ", h("span", { class: "mono" }, pg.pageId),
+          pg.instagram ? h("span", null, " · Instagram @", pg.instagram.username) : null,
+          pg.canPost ? null : h("span", { class: "tag red", style: "margin-left:6px" }, "cannot post — you only moderate this page"))),
+        h("div", { class: "right row" },
+          h("button", { class: "btn sm", disabled: !pg.canPost, onclick: () => run(async () => {
+            await post("/api/meta/channels", { brandId: brandSel.value, pageId: pg.pageId, credentialId: pg.credentialId, displayName: pg.name, platform: "FACEBOOK" });
+          }, `Added ${pg.name}`).then(route) }, "Add as Facebook channel"),
+          pg.instagram ? h("button", { class: "btn sm", disabled: !pg.canPost, onclick: () => run(async () => {
+            await post("/api/meta/channels", { brandId: brandSel.value, pageId: pg.instagram.id, credentialId: pg.credentialId, displayName: `@${pg.instagram.username}`, platform: "INSTAGRAM" });
+          }, `Added @${pg.instagram.username}`).then(route) }, "Add Instagram") : null)));
+      list.appendChild(row);
+    }
+  };
+  const close = modal("Connect Facebook", h("div", null, body, h("div", { class: "foot" },
+    h("button", { class: "btn", onclick: () => close() }, "Close"),
+    h("button", { class: "btn primary", onclick: () => run(connect, "Pages loaded") }, "Find my pages"))), { wide: true });
+}
 pages.channels = async () => {
   const [channels, brands, programs, configs, creds] = await Promise.all([get("/api/channels"), get("/api/brands"), get("/api/programs"), get("/api/adapter-configs"), get("/api/credentials")]);
   const publishers = configs.filter((c) => c.stage === "PUBLISH" && yes(c.enabled)).map((c) => [c.key, `${c.label} (${c.key})`]);
   const root = h("div", null, pageHead("Channels", "Where approved content goes: a Facebook page, an Instagram account, a YouTube channel. Each channel subscribes to programs.",
-    h("button", { class: "btn primary", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers, creds) }, "New channel")));
+    h("div", { class: "row" },
+      h("button", { class: "btn", disabled: !brands.length, onclick: () => connectFacebook(brands, programs) }, "Connect Facebook"),
+      h("button", { class: "btn primary", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers, creds) }, "New channel"))));
   if (!channels.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No channels yet"), "Add one and subscribe it to a program."));
   for (const c of channels) root.appendChild(h("div", { class: "panel" }, h("div", { class: "row" },
     h("div", null, h("h3", { style: "margin:0" }, c.display_name, " ", yes(c.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
