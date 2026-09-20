@@ -47,7 +47,7 @@ const Heading: React.FC<{ text?: string; brand: Brand; vertical: boolean }> = ({
   );
 };
 const Body: React.FC<{ vertical: boolean; children: React.ReactNode; center?: boolean }> = ({ vertical, children, center }) => (
-  <AbsoluteFill style={{ padding: vertical ? "260px 70px 300px" : "110px 150px 150px", justifyContent: center ? "center" : "flex-start" }}>{children}</AbsoluteFill>
+  <AbsoluteFill style={{ padding: vertical ? "260px 70px 340px" : "110px 150px 196px", justifyContent: center ? "center" : "flex-start" }}>{children}</AbsoluteFill>
 );
 
 export const TitleCard: React.FC<SceneProps> = ({ data, brand, vertical }) => {
@@ -75,7 +75,11 @@ export const BulletReveal: React.FC<SceneProps> = ({ data, cues, brand, vertical
   return (
     <Body vertical={vertical}>
       <Heading text={data.heading} brand={brand} vertical={vertical} />
-      {bullets.map((t, i) => <Bullet key={i} text={t} at={cue(cues, i, 8)} brand={brand} vertical={vertical} state={i < active ? "done" : i === active ? "live" : "waiting"} />)}
+      {/* The heading stays at the top where a viewer looks first; three short bullets sit in the middle of what is
+          left, rather than clinging under it with half the frame empty below. */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+        {bullets.map((t, i) => <Bullet key={i} text={t} at={cue(cues, i, 8)} brand={brand} vertical={vertical} state={i < active ? "done" : i === active ? "live" : "waiting"} />)}
+      </div>
     </Body>
   );
 };
@@ -129,12 +133,15 @@ export const Comparison: React.FC<SceneProps> = ({ data, cues, brand, vertical }
   const l = useEnter(lAt), r = useEnter(rAt), vs = useEnter(Math.min(lAt, rAt) + 6);
   const lPop = useCue(lAt), rPop = useCue(rAt);
   const side = (d: any, e: number, pop: number, color: string, from: number, at: number) => (
-    <div style={{ flex: 1, background: `linear-gradient(160deg, ${shade(color, -0.2)}, ${shade(color, -0.55)})`, borderRadius: 28, padding: vertical ? "40px 44px" : "48px 52px",
+    // Centred, not top-aligned: the two panels are stretched to a common height for symmetry, and two short points
+    // clinging to the top of a tall box is the difference between a designed slide and a filled-in template.
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center",
+      background: `linear-gradient(160deg, ${shade(color, -0.2)}, ${shade(color, -0.55)})`, borderRadius: 28, padding: vertical ? "40px 44px" : "48px 52px",
       opacity: e, transform: `${vertical ? `translateY(${(1 - e) * from}px)` : `translateX(${(1 - e) * from}px)`} scale(${1 + pop * 0.02})`,
       boxShadow: `0 ${20 + pop * 12}px ${40 + pop * 20}px rgba(0,0,0,${0.3 + pop * 0.15})`, border: `1px solid rgba(255,255,255,${0.06 + pop * 0.2})` }}>
       <div style={{ fontSize: vertical ? 58 : 56, fontWeight: 800, color: "#fff", marginBottom: 24 }}>{d?.title}</div>
       {(d?.points || []).map((p: string, i: number) => (
-        <Reveal key={i} at={at + 6 + i * 4} frames={14} from={14} style={{ fontSize: vertical ? 42 : 40, color: "rgba(255,255,255,.9)", margin: "0 0 16px", lineHeight: 1.3 }}>• {p}</Reveal>
+        <Reveal key={i} at={at + 6 + i * 4} frames={14} from={14} style={{ fontSize: vertical ? 42 : 40, color: "rgba(255,255,255,.9)", margin: i === (d?.points || []).length - 1 ? 0 : "0 0 16px", lineHeight: 1.3 }}>• {p}</Reveal>
       ))}
     </div>
   );
