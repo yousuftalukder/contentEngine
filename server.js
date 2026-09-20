@@ -2514,8 +2514,10 @@ function sourceLine(item, niche) {
   return `${sourceWords(niche).label}: ${link.outlet ? `${link.outlet}\n` : ""}${link.url}`;
 }
 function renderCaption(item, channel, portalUrl, niche = null) {
-  const caps = P(item.captions) || {}; const tags = (P(item.hashtags) || []).map((h) => (h.startsWith("#") ? h : `#${h}`)).join(" ");
+  const caps = P(item.captions) || {};
   const base = caps[channel.platform.toLowerCase()] || caps.default || item.summary || item.body || item.headline || item.topic || "";
+  // The writer often closes the caption with a tag or two of its own; the tag line adds the rest, not the same again.
+  const tags = (P(item.hashtags) || []).map((h) => (h.startsWith("#") ? h : `#${h}`)).filter((h) => !base.toLowerCase().includes(h.toLowerCase())).join(" ");
   const source = !sourceLink(item) ? "" : COMMENT_PLATFORMS.has(channel.platform) ? sourceWords(niche).hint : sourceLine(item, niche);
   let tpl = channel.caption_template || "{caption}\n\n{url}\n\n{source}\n\n{hashtags}";
   if (source && !tpl.includes("{source}")) tpl += "\n\n{source}";   // a channel's own template still gets the line
