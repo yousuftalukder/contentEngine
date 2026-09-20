@@ -691,6 +691,16 @@ impl("INGEST", "ingest_mock", { label: "Mock feed", create: () => ({
     const fixed = P(source.config)?.items; if (Array.isArray(fixed)) return fixed.map((x) => ({ external_id: x.url, summary: "", published_at: nowIso(), kind: "ARTICLE", ...x }));
     const n = Date.now(); return [0, 1].map((i) => ({ external_id: `mock-${n}-${i}`, url: `https://example.com/story/${n}-${i}`, title: `Mock story ${n % 1000}-${i} from ${source.name}`, summary: "A deterministic mock story used to exercise the pipeline without any keys.", published_at: nowIso(), kind: "ARTICLE" })); } }) });
 // Several Bangladeshi outlets answer 403 to non-browser user agents; feeds are public, so a browser UA is used.
+// Outlets label their own headlines for their own site: "WATCH:", "LOOK:", "Report:", a section name before a pipe.
+// None of it belongs on a card or in a narration — it is the outlet talking to its readers, not part of the story.
+// "Opinion" and "Analysis" stay: they change what the piece is, and a news program presenting a column as reporting is
+// a different and worse problem than an untidy headline.
+const TITLE_LABEL = /^\s*(?:watch|look|listen|video|photos?|gallery|live|updates?|breaking|exclusive|explainer|read|must read|in pictures|in pics|just in|developing)\s*[:\-–—]\s*/i;
+function tidyTitle(t) {
+  let out = String(t || "").trim();
+  for (let i = 0; i < 3 && TITLE_LABEL.test(out); i++) out = out.replace(TITLE_LABEL, "");
+  return out.replace(/\s+\|\s+[^|]{1,40}$/, "").trim() || String(t || "").trim();
+}
 const FEED_UA = ENV.FEED_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36";
 async function fetchFeed(url) {
   const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(25000), headers: { "user-agent": FEED_UA, accept: "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8" } });
@@ -1092,7 +1102,10 @@ async function makeThumbnail(contentItemId, niche, first, headline) {
   const fit = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1";
   try {
     await exec("ffmpeg", ["-y", ...(first.kind === "VIDEO" ? ["-ss", "1"] : []), "-i", file, "-vf", fit, "-frames:v", "1", "-q:v", "2", still]);
-    const out = await composeHeadline(still, headline, { ...specs, layout: "overlay", overlay_scale: 1.15 });
+    // A cover is read at the size of a thumbnail on a phone: short text is set as large as it will go, not at the
+    // card's scale, because three big words get clicked and twelve small ones are a grey smudge.
+    const words = String(headline || "").trim().split(/\s+/).filter(Boolean).length;
+    const out = await composeHeadline(still, headline, { ...specs, layout: "overlay", overlay_scale: words <= 4 ? 1.9 : words <= 7 ? 1.55 : 1.2 });
     try {
       const url = await storeLocal(out, `images/${newId()}-thumb.jpg`, "image/jpeg");
       return await recordMedia({ contentItemId, kind: "THUMBNAIL", url, mime: "image/jpeg", width: 1280, height: 720, meta: { purpose: "youtube thumbnail", from: first.kind === "VIDEO" ? "footage frame" : "section picture" } });
@@ -1347,13 +1360,17 @@ async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1
 // these a rendered reel is a caption track over a colour field — the studio drew them, ffmpeg drew nothing, and ffmpeg
 // is what runs on an instance too small for Chromium. The headline holds for the opening seconds, where a viewer
 // decides whether to stay, and then gets out of the way of the captions.
-async function writeBrandAss({ headline, kicker, handle, credit, width, height, seconds, primary = "#b3121f", accent = "#ffc400", font = OVERLAY_FONT }) {
+async function writeBrandAss({ headline, hook, kicker, handle, credit, width, height, seconds, primary = "#b3121f", accent = "#ffc400", font = OVERLAY_FONT }) {
   const vertical = height > width, pad = Math.round(width * 0.055);
   const head = Math.round(height * (vertical ? 0.036 : 0.05)), kick = Math.round(head * 0.62), small = Math.round(head * 0.46);
   const hold = Math.max(3.5, Math.min(7.5, seconds * 0.35)), events = [];
   const top = Math.round(height * (vertical ? 0.085 : 0.07));
   if (kicker) events.push(`Dialogue: 2,${assTime(0.15)},${assTime(seconds)},Kick,,0,0,${top},,{\\fad(250,0)}${assEsc(kicker).toUpperCase().slice(0, 28)}`);
-  if (headline) events.push(`Dialogue: 2,${assTime(0.35)},${assTime(hold)},Head,,0,0,${top + Math.round(kick * 2.1)},,{\\fad(350,500)}${assEsc(headline).slice(0, 120)}`);
+  // The hook owns the first two and a half seconds, big, where the decision to keep watching is made; the headline
+  // takes over behind it and holds while the story is told.
+  const headAt = top + Math.round(kick * 2.1), hookEnd = Math.min(2.6, Math.max(1.4, seconds * 0.12));
+  if (hook) events.push(`Dialogue: 3,${assTime(0.2)},${assTime(hookEnd)},Hook,,0,0,${headAt},,{\\fad(180,260)}${assEsc(hook).slice(0, 60)}`);
+  if (headline) events.push(`Dialogue: 2,${assTime(hook ? hookEnd : 0.35)},${assTime(Math.max(hold, hookEnd + 2))},Head,,0,0,${headAt},,{\\fad(350,500)}${assEsc(headline).slice(0, 120)}`);
   const foot = [handle, credit].filter(Boolean).join("   ");
   if (foot) events.push(`Dialogue: 2,${assTime(0.5)},${assTime(seconds)},Foot,,0,0,${Math.round(height * 0.035)},,{\\fad(400,0)}${assEsc(foot).slice(0, 70)}`);
   if (!events.length) return null;
@@ -1361,6 +1378,7 @@ async function writeBrandAss({ headline, kicker, handle, credit, width, height, 
   const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n${ASS_FORMAT}\n`
     + `Style: Kick,${font},${kick},${assColor("#111111")},${assColor("#111111")},${assColor(accent)},${assColor(accent)},-1,0,0,0,100,100,${Math.round(kick * 0.1)},0,3,${Math.round(kick * 0.34)},0,7,${pad},${pad},0,1\n`
     + `Style: Head,${font},${head},${assColor("#ffffff")},${assColor("#ffffff")},${assColor(primary, "18")},${assColor(primary, "18")},-1,0,0,0,100,100,0,0,3,${Math.round(head * 0.34)},0,7,${pad},${vertical ? pad : Math.round(width * 0.34)},0,1\n`
+    + `Style: Hook,${font},${Math.round(head * 1.45)},${assColor("#111111")},${assColor("#111111")},${assColor(accent, "08")},${assColor(accent, "08")},-1,0,0,0,100,100,0,0,3,${Math.round(head * 0.38)},0,7,${pad},${vertical ? pad : Math.round(width * 0.42)},0,1\n`
     + `Style: Foot,${font},${small},${assColor("#ffffff", "50")},${assColor("#ffffff", "50")},${assColor("#000000", "60")},${assColor("#000000", "90")},0,0,0,0,100,100,${Math.round(small * 0.08)},0,1,${Math.max(1, Math.round(small * 0.08))},0,1,${pad},${pad},0,1\n`
     + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
   const f = tmpPath("ass"); await writeFile(f, ass); return f;
@@ -1544,7 +1562,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
   },
   // durations (seconds per picture) follow the narration section by section; without them the pictures share it equally.
-  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [], niche = null, headline = null, kicker = null, credit = null }) {
+  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [], niche = null, headline = null, kicker = null, credit = null, hook = null }) {
     if (!images.length) throw new Error("slideshow needs at least one image");
     const a = await toTmpFile(audio.url, "mp3"); const dur = (await ffprobeDuration(a)) || audio.duration_seconds || images.length * 4;
     const per = durations?.length === images.length ? durations.map((x) => Math.max(0.5, Number(x) || 0)) : images.map(() => dur / images.length);
@@ -1572,7 +1590,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
       // The brand's music, if it has any. A slideshow with nothing under the voice sounds like a slideshow.
       // The brand's music and the brand's own colours, if the render was told which program it is for.
       const { brand, music } = niche ? await studioBrand(niche).catch(() => ({ brand: {} })) : { brand: {} };
-      const chrome = await writeBrandAss({ headline, kicker, handle: brand.handle, credit, width: w, height: h, seconds: dur, primary: brand.primary, accent: brand.accent });
+      const chrome = await writeBrandAss({ headline, hook, kicker, handle: brand.handle, credit, width: w, height: h, seconds: dur, primary: brand.primary, accent: brand.accent });
       const out = tmpPath("mp4");
       const run = async (bed) => {
         const vf = [...(chrome ? [assVf(chrome)] : []), ...(ass ? [assVf(ass)] : [])].join(",");
@@ -2381,10 +2399,19 @@ async function generateLongPost(item, niche, style) {
 // ---- 8c. Narrated reels: NEWS_REEL (a story in 35-60 s), IMAGE_SLIDESHOW (facts video), LONG_FORM_VIDEO (researched,
 // 16:9). Script in sections → one picture per section → narration per section (measured) → the studio renders a branded
 // reel with karaoke captions; without the studio, ffmpeg renders a slideshow with the same per-section timing.
+// A newspaper lede and a short-form hook are not the same thing, and the engine was writing ledes. A reader who has
+// already opened the paper will read "Officials said on Tuesday that"; a viewer decides inside two seconds and is gone.
+// So: the most surprising concrete fact first, a question the video has to answer, and an ending that answers it.
+// None of this loosens the rule that every fact comes from the sources — an invented hook is worse than a dull one.
+const RETENTION = "Structure, in order: (1) the single most surprising concrete fact, said plainly — a number, a name, a"
+  + " thing that happened; (2) why it matters or who it hits; (3) the detail that makes it real; (4) the turn — what"
+  + " was expected instead, or what changed; (5) the answer to the question the opening raised; (6) what happens next."
+  + " Never open with the date, the outlet, 'Breaking', 'In a stunning turn' or any throat-clearing: the first words"
+  + " are the fact itself. Never tease something you do not then deliver. Short sentences, spoken not written.";
 const REEL_SPEC = {
-  NEWS_REEL: { sections: 6, words: "1-2 short spoken sentences", system: "You turn a news story into a 35-60 second vertical news reel. Open with the news in the first sentence, then the key facts, then what happens next. Facts only from the sources." },
-  IMAGE_SLIDESHOW: { sections: 8, words: "2-3 spoken sentences", system: "You write punchy 60-90 second facts videos." },
-  LONG_FORM_VIDEO: { sections: 12, words: "4-6 spoken sentences", system: "You write researched long-form YouTube video scripts." },
+  NEWS_REEL: { sections: 6, words: "1-2 short spoken sentences", system: `You turn a news story into a 35-60 second vertical news reel that people watch to the end. ${RETENTION} Facts only from the sources.` },
+  IMAGE_SLIDESHOW: { sections: 8, words: "2-3 spoken sentences", system: `You write punchy 60-90 second facts videos that people watch to the end. ${RETENTION}` },
+  LONG_FORM_VIDEO: { sections: 12, words: "4-6 spoken sentences", system: "You write researched long-form YouTube video scripts. The first 15 seconds say what the viewer will know by the end and why it is worth their time — state the payoff, do not tease it. Then earn it: each section raises the question the next one answers, and the last one closes the loop the first one opened. No filler, no recap of what was just said, no 'in this video we will'." },
 };
 async function generateReel(item, niche, style) {
   const m = await materialFor(item, niche); const type = item.content_type || niche.content_type, spec = REEL_SPEC[type] || REEL_SPEC.IMAGE_SLIDESHOW, mc = methodCfg(niche);
@@ -2394,12 +2421,13 @@ async function generateReel(item, niche, style) {
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
     system: `${spec.system} Channel: "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
-    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section (a place, an action, a scene) — or null where only a specific real event would do"}], "description": "post caption / video description", "hashtags": ["..."]}`,
-    mock: { title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
+    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"hook": "3-7 words that stop a scroll: the most surprising concrete thing in this story, stated as a claim — not a tease, not a question", "title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section (a place, an action, a scene) — or null where only a specific real event would do"}], "description": "post caption / video description", "hashtags": ["..."]}`,
+    mock: { hook: m.title.split(/\s+/).slice(0, 5).join(" "), title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
   if (!sections.length) throw new Error("The script came back without sections");
   const title = d.title || m.title, script = sections.map((s) => s.narration).join("\n\n");
-  await setItem(item.id, { headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
+  const hook = String(d.hook || "").trim().split(/\s+/).slice(0, 8).join(" ") || null;
+  await setItem(item.id, { script_meta: { ...(P(item.script_meta) || {}), ...(hook ? { hook } : {}) }, headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
   const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
   // Each section is backed by real footage where the library has some — a narrated section over moving pictures is the
   // difference between a video and a slideshow, and the clips are free. A section with no clip keeps its picture.
@@ -2438,10 +2466,12 @@ async function generateReel(item, niche, style) {
   } else {
     let t = 0; const captions = sections.map((s, i) => { const c = { start: t, end: t + narr.durations[i], text: s.narration }; t += narr.durations[i]; return c; });
     video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation,
-      captions: mc.captions === false ? [] : captions, niche, headline: title, kicker: d.kicker, credit });
+      captions: mc.captions === false ? [] : captions, niche, headline: title, kicker: d.kicker, credit, hook });
   }
   // A landscape video is a YouTube video, and a YouTube video without a thumbnail is a grey frame in a list of covers.
-  if (!vertical) await makeThumbnail(item.id, niche, images[0], title).catch((e) => warn(`thumbnail: ${e.message.slice(0, 140)}`));
+  // A cover is read at the size of a thumbnail on a phone, where a twelve-word headline is a grey smudge. The hook is
+  // three to seven words, which is what fits and what gets clicked.
+  if (!vertical) await makeThumbnail(item.id, niche, images[0], hook || title).catch((e) => warn(`thumbnail: ${e.message.slice(0, 140)}`));
   await setItem(item.id, { hero_media_id: video.id });
 }
 
@@ -2973,7 +3003,7 @@ const HANDLERS = {
         if ((it.kind || "ARTICLE") === "ARTICLE" && it.published_at && Date.now() - Date.parse(it.published_at) > maxAgeMs) continue;
         const hash = sha(it.url); const id = newId();
         const ins = await q(`INSERT INTO source_items (id, source_id, external_id, url, url_hash, title, summary, published_at, thumbnail_url, kind, raw) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT (url_hash) DO NOTHING RETURNING id`,
-          [id, sourceId, it.external_id || null, it.url, hash, it.title.slice(0, 500), it.summary || null, it.published_at || null, it.thumbnail || null, it.kind || "ARTICLE", JSON.stringify({ ...(it.raw || {}), duration: it.duration, views: it.views, platform: it.platform, license: it.license })]);
+          [id, sourceId, it.external_id || null, it.url, hash, tidyTitle(it.title).slice(0, 500), it.summary || null, it.published_at || null, it.thumbnail || null, it.kind || "ARTICLE", JSON.stringify({ ...(it.raw || {}), duration: it.duration, views: it.views, platform: it.platform, license: it.license })]);
         if (!ins.length) continue; added++;
         // Articles go to the news desk (clustered, then picked per program); videos are routed to video programs directly.
         if (desk && (it.kind || "ARTICLE") === "ARTICLE") toCluster.push({ ...it, id, source_id: sourceId });
