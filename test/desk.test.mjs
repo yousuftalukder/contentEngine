@@ -60,3 +60,17 @@ test("a Bangladesh program starts with the catalog sources for its language", as
   const programs = await eng.api("GET", "/api/programs");
   assert.equal(programs.find((x) => x.id === p.id).sources.length, bn.length);
 });
+
+// A US program takes the US desk, and only the part of it that its program is about.
+test("a US sports program starts with the US sports sources, not the rest of the catalog", async () => {
+  const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "us_sport", displayName: "US Sports", contentType: "NEWS_REEL",
+    country: "United States", language: "en", useMocks: true, autoStyle: false, methodConfig: { topics: ["sports"] } });
+  const linked = (await eng.api("GET", "/api/programs")).find((x) => x.id === p.id).sources;
+  const catalog = await eng.api("GET", "/api/source-catalog");
+  const names = new Set(linked.map((s) => s.name || s.display_name));
+  const sport = catalog.filter((e) => e.country === "United States" && e.topic === "sports");
+  assert.ok(sport.length >= 5, "the catalog carries a US sports desk");
+  for (const e of sport) assert.ok(names.has(e.name), `${e.key} linked`);
+  assert.ok(!catalog.filter((e) => e.topic === "entertainment").some((e) => names.has(e.name)), "and nothing from another desk");
+  assert.ok(!catalog.filter((e) => e.country === "Bangladesh").some((e) => names.has(e.name)), "or another country");
+});

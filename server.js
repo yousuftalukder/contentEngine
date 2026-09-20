@@ -1685,7 +1685,7 @@ async function routeSourceItem(item) {
 const gn = (key, name, language, site, weight = 1) => ({ key, name, language, adapter: "google_news", config: { site, language }, weight, poll: 20 });
 const rss = (key, name, language, url, weight = 1) => ({ key, name, language, adapter: "rss", config: { url }, weight, poll: 10 });
 const ytc = (key, name, channel_id, weight = 1) => ({ key, name, language: "bn", adapter: "youtube_rss", config: { channel_id }, weight, poll: 15, kind: "VIDEO" });
-const SOURCE_CATALOG = [
+const BD_CATALOG = [
   rss("bd-en-dailystar", "The Daily Star", "en", "https://www.thedailystar.net/news/bangladesh/rss.xml", 1.2),
   // Prothom Alo's English feed is served empty, and Dhaka Tribune's answers 403 to datacenter IPs (it opens fine from a
   // home connection, which is why it looked healthy when the catalog was built). Both are read through Google News.
@@ -1724,11 +1724,46 @@ const SOURCE_CATALOG = [
   ytc("bd-tv-dbc", "DBC NEWS", "UCUvXoiDEKI8VZJrr58g4VAw", 0.8),
   ytc("bd-tv-rtv", "Rtv News", "UC2P5Fd5g41Gtdqf0Uzh8Qaw", 0.8),
 ].map((e) => ({ country: "Bangladesh", kind: "ARTICLE", ...e }));
+
+// United States, for programs aimed at that audience: sports, entertainment, technology and general news. Feeds that
+// answer datacenter IPs are read directly; ESPN returns an empty body and Bleacher Report a 403, so those come through
+// Google News like the blocked Bangladeshi outlets do. `topic` lets a program take only the desk it is about.
+const rssUs = (key, name, url, topic, weight = 1) => ({ key, name, adapter: "rss", config: { url }, weight, poll: 10, topic });
+const gnUs = (key, name, site, topic, weight = 1) => ({ key, name, adapter: "google_news", config: { site, language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight, poll: 20, topic });
+const US_CATALOG = [
+  rssUs("us-sport-cbs", "CBS Sports", "https://www.cbssports.com/rss/headlines/", "sports", 1.1),
+  rssUs("us-sport-yahoo", "Yahoo Sports", "https://sports.yahoo.com/rss/", "sports", 1),
+  gnUs("us-sport-espn", "ESPN", "espn.com", "sports", 1.2),
+  gnUs("us-sport-br", "Bleacher Report", "bleacherreport.com", "sports", 0.9),
+  gnUs("us-sport-si", "Sports Illustrated", "si.com", "sports", 0.9),
+  { key: "us-sport-gnews", name: "Google News: US sport", adapter: "google_news", config: { query: "NFL OR NBA OR MLB", language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight: 0.7, poll: 20, topic: "sports" },
+  rssUs("us-ent-variety", "Variety", "https://variety.com/feed/", "entertainment", 1.2),
+  rssUs("us-ent-deadline", "Deadline", "https://deadline.com/feed/", "entertainment", 1.1),
+  rssUs("us-ent-thr", "The Hollywood Reporter", "https://www.hollywoodreporter.com/feed/", "entertainment", 1.1),
+  rssUs("us-ent-billboard", "Billboard", "https://www.billboard.com/feed/", "entertainment", 1),
+  rssUs("us-ent-rollingstone", "Rolling Stone", "https://www.rollingstone.com/feed/", "entertainment", 0.9),
+  gnUs("us-ent-ew", "Entertainment Weekly", "ew.com", "entertainment", 0.8),
+  { key: "us-ent-gnews", name: "Google News: US entertainment", adapter: "google_news", config: { query: "box office OR streaming series OR celebrity", language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight: 0.7, poll: 20, topic: "entertainment" },
+  rssUs("us-tech-verge", "The Verge", "https://www.theverge.com/rss/index.xml", "tech", 1.1),
+  rssUs("us-tech-techcrunch", "TechCrunch", "https://techcrunch.com/feed/", "tech", 1),
+  rssUs("us-news-npr", "NPR", "https://feeds.npr.org/1001/rss.xml", "general", 1.2),
+  rssUs("us-news-abc", "ABC News", "https://abcnews.go.com/abcnews/topstories", "general", 1.1),
+  { key: "us-news-gnews", name: "Google News: United States", adapter: "google_news", config: { query: "United States", language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight: 0.7, poll: 20, topic: "general" },
+].map((e) => ({ country: "United States", language: "en", kind: "ARTICLE", ...e }));
+
+const SOURCE_CATALOG = [...BD_CATALOG, ...US_CATALOG];
 // Catalog entries a program should start with: same country, its language, articles or TV depending on the program type.
 function catalogFor(niche) {
-  if (!/bangladesh|^bd$/i.test(niche.country || "")) return [];
+  const c = String(niche.country || "").trim().toLowerCase();
+  const country = /^(bangladesh|bd)$/.test(c) ? "Bangladesh" : /^(united states|usa|us|america)$/.test(c) ? "United States" : null;
+  if (!country) return [];
   const video = VIDEO_TYPES.has(niche.content_type);
-  return SOURCE_CATALOG.filter((e) => (video ? e.kind === "VIDEO" : e.kind === "ARTICLE" && e.language === (niche.language || "en").slice(0, 2)));
+  // A program says what it is about in method_config.topics (["sports"], ["entertainment"] …); without that it takes
+  // every desk for its country, which is what a general news program wants.
+  const topics = ((P(niche.method_config) || {}).topics || []).map((t) => String(t).toLowerCase());
+  return SOURCE_CATALOG.filter((e) => e.country === country)
+    .filter((e) => (video ? e.kind === "VIDEO" : e.kind === "ARTICLE" && e.language === (niche.language || "en").slice(0, 2)))
+    .filter((e) => !topics.length || !e.topic || topics.includes(e.topic));
 }
 // Creates catalog sources that don't exist yet (one shared row per catalog key) and links them to the given programs.
 async function installCatalogSources(entries, nicheIds = []) {

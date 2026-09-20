@@ -16,7 +16,7 @@ performed. You create brands and programs; the engine does the rest and alerts y
 
 ## What it does
 
-**Sources, no keys needed.** A built-in catalog of Bangladeshi sources verified live: outlet RSS feeds (Prothom Alo, The
+**Sources, no keys needed.** A built-in catalog verified live, for two audiences. **United States**: CBS Sports and Yahoo Sports direct, ESPN, Bleacher Report and Sports Illustrated through Google News (their feeds refuse datacenter IPs), Variety, Deadline, The Hollywood Reporter, Billboard and Rolling Stone for entertainment, The Verge and TechCrunch for technology, NPR and ABC News for general. A program says which desk it is about (`method_config.topics`) and takes only that one. **Bangladesh**: outlet RSS feeds (Prothom Alo, The
 Daily Star, Dhaka Tribune, TBS, BBC Bangla, Bangla Tribune, Dhaka Post, DW Bangla, Risingbd), outlets reached through Google
 News where their own feeds are blocked (bdnews24, Kaler Kantho, Samakal, Jugantor, Ittefaq, Jagonews24, Kalbela, Bangladesh
 Pratidin, Financial Express, New Age, UNB, BSS), and the YouTube feeds of ten TV news channels (Somoy, Jamuna, Channel 24,
