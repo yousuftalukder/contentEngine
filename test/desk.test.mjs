@@ -74,3 +74,23 @@ test("a US sports program starts with the US sports sources, not the rest of the
   assert.ok(!catalog.filter((e) => e.topic === "entertainment").some((e) => names.has(e.name)), "and nothing from another desk");
   assert.ok(!catalog.filter((e) => e.country === "Bangladesh").some((e) => names.has(e.name)), "or another country");
 });
+
+// US feeds escape their punctuation every way there is, and a headline reading "Vanderbilt&#039;s win" goes onto the
+// card and into the narration exactly as written. The parser is what has to undo it.
+test("feeds: escaped punctuation is decoded before it reaches a headline", async () => {
+  const http = await import("node:http");
+  const rss = `<?xml version="1.0"?><rss version="2.0"><channel>
+    <item><title>Vanderbilt&#039;s stunning win over NC State</title><link>https://x.example/1</link><description>It&#8217;s the upset of the week&hellip;</description><pubDate>${new Date().toUTCString()}</pubDate></item>
+    <item><title>Ole Miss &amp;amp; Texas A&amp;M rise</title><link>https://x.example/2</link><description>Both climb</description><pubDate>${new Date().toUTCString()}</pubDate></item>
+  </channel></rss>`;
+  const stub = http.createServer((_, res) => { res.writeHead(200, { "content-type": "application/rss+xml" }); res.end(rss); });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  try {
+    await eng.api("POST", "/api/adapter-configs", { key: "rss_entities", stage: "INGEST", impl: "rss", config: {} });
+    const out = await eng.api("POST", "/api/adapter-configs/rss_entities/test", { config: { url: `http://127.0.0.1:${stub.address().port}/feed.xml` } });
+    const titles = out.items.map((i) => i.title);
+    assert.ok(titles.includes("Vanderbilt's stunning win over NC State"), `apostrophe decoded — got ${JSON.stringify(titles)}`);
+    assert.ok(titles.includes("Ole Miss & Texas A&M rise"), "double-escaped ampersand decoded");
+    assert.match(out.items[0].summary, /It’s the upset of the week…/, "and the summary too");
+  } finally { await new Promise((r) => stub.close(r)); }
+});
