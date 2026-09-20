@@ -605,6 +605,7 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'openai_tts',       'VOICE',      'openai_tts',       'OpenAI TTS',                     '{}'),
   (gen_random_uuid()::text, 'image_mock',       'IMAGE',      'image_mock',       'Mock image (SVG card)',          '{}'),
   (gen_random_uuid()::text, 'gemini_image',     'IMAGE',      'gemini_image',     'Gemini image generation',        '{}'),
+  (gen_random_uuid()::text, 'pexels_stock',     'IMAGE',      'pexels_stock',     'Stock photo (Pexels)',           '{}'),
   (gen_random_uuid()::text, 'tts_mock',         'VOICE',      'tts_mock',         'Mock TTS (silent audio)',        '{}'),
   (gen_random_uuid()::text, 'elevenlabs',       'VOICE',      'elevenlabs',       'ElevenLabs TTS',                 '{}'),
   (gen_random_uuid()::text, 'gemini_tts',       'VOICE',      'gemini_tts',       'Gemini TTS (Bangla + English)',  '{}'),

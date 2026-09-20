@@ -21,7 +21,7 @@ const DAILY_429 = 'POST https://generativelanguage.googleapis.com/v1beta/models/
 
 let eng, brand, channel;
 before(async () => {
-  eng = await startEngine();
+  eng = await startEngine({ env: { PEXELS_API_KEY: "stub-key" } });   // the stock-photo test answers for Pexels itself
   await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
   await eng.api("PUT", "/api/settings/planner.enabled", { value: false });
   if (ffmpeg) spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0xffc400:s=320x120", "-frames:v", "1", join(dir, "logo.png")]);
@@ -105,4 +105,58 @@ test("no picture, still a post: the hero is a branded text card, and a headline 
   const edited = await eng.api("PATCH", `/api/content-items/${id}`, { headline: "সিলেটে বন্যার পানি নামছে ধীরে" });
   assert.notEqual(edited.hero_media_id, item.hero_media_id, "the card is redrawn with the new headline");
   assert.equal(edited.hero_media.meta.overlay, "textcard");
+});
+
+// A library photo is fine for "monsoon rain in Dhaka" and dishonest for a named person's arrest. The writer makes that
+// call by giving a search phrase or withholding one, and a withheld phrase must not be worked around.
+test("stock photos: a story the writer won't illustrate gets a card, not a stand-in photo", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_no_photo", stage: "SCRIPT", impl: "llm_mock",
+    config: { respond: [{ match: "Produce JSON", json: { headline: "Businessman arrested over a land dispute", summary: "Police detained a named businessman.", photo_query: null, image_prompt: "courtroom", captions: { facebook: "x" }, hashtags: ["bd"] } }] } });
+  const p = await program("no_photo", { scriptAdapter: "llm_no_photo", imageAdapter: "pexels_stock" });
+  await eng.query(`DELETE FROM notifications`);                      // earlier tests here already raised the no-pictures alert
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Businessman arrested over a land dispute" });
+  const item = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { what: "a draft with no photo" });
+  assert.equal(item.hero_media.meta.overlay, "textcard");
+  assert.match(item.hero_media.meta.fallback, /mislead/i, "and it records why there is no photo");
+  const alerts = await eng.api("GET", "/api/notifications");
+  assert.ok(!alerts.some((n) => /text cards|pictures/i.test(n.title)), "an editorial choice is not something for a person to fix, so it raises no alert");
+});
+
+// The whole stock-photo path against a local stand-in for Pexels: the phrase the writer chose becomes a search, the
+// photo is fetched and composed into the brand's card, and the card carries the illustrative note and the credit.
+test("stock photos: the photo is fetched, composed into the card, and credited", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const photo = join(dir, "stock.jpg");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1600x1000", "-frames:v", "1", photo]);
+  const { readFileSync } = await import("node:fs");
+  const bytes = readFileSync(photo);
+  let asked = null;
+  const http = await import("node:http");
+  const stub = http.createServer((req, res) => {
+    if (req.url.startsWith("/search")) {
+      asked = { query: new URL(req.url, "http://x").searchParams.get("query"), auth: req.headers.authorization };
+      const src = `http://127.0.0.1:${stub.address().port}/photo.jpg`;
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ photos: [{ id: 42, width: 1600, height: 1000, url: "https://pexels.com/p/42", photographer: "A Photographer", alt: "rain over a city", src: { large2x: src, original: src } }] }));
+    }
+    res.writeHead(200, { "content-type": "image/jpeg" }); res.end(bytes);
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  try {
+    await eng.api("POST", "/api/credentials", { provider: "pexels", label: "stub", envVar: "PEXELS_API_KEY" });
+    await eng.api("POST", "/api/adapter-configs", { key: "stock_stub", stage: "IMAGE", impl: "pexels_stock", config: { api_base: `http://127.0.0.1:${stub.address().port}` } });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_wants_photo", stage: "SCRIPT", impl: "llm_mock",
+      config: { respond: [{ match: "Produce JSON", json: { headline: "Monsoon rain floods Dhaka streets", summary: "Heavy rain left roads under water.", photo_query: "monsoon rain dhaka street", image_prompt: "rain", captions: { facebook: "x" }, hashtags: ["bd"] } }] } });
+    const p = await program("with_photo", { scriptAdapter: "llm_wants_photo", imageAdapter: "stock_stub" });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Monsoon rain floods Dhaka streets" });
+    const item = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { what: "a draft with a stock photo" });
+
+    assert.equal(asked?.query, "monsoon rain dhaka street", "the writer's phrase is what gets searched");
+    assert.ok(asked.auth, "the key goes in the Authorization header");
+    assert.equal(item.hero_media.meta.overlay, "photocard", "a real picture means a normal photocard, not a text card");
+    assert.equal(item.hero_media.meta.photographer, "A Photographer");
+    assert.match(item.hero_media.meta.compose_specs.photo_credit, /Illustrative photo · Pexels\/A Photographer/);
+    const out = join(dir, "stockcard.jpg");
+    writeFileSync(out, Buffer.from(await (await fetch(item.hero_media.url.replace(/^https?:\/\/[^/]+/, eng.base))).arrayBuffer()));
+    assert.deepEqual([probe(out).streams[0].width, probe(out).streams[0].height], [1080, 1080]);
+  } finally { await new Promise((r) => stub.close(r)); }
 });
