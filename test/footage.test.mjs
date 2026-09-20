@@ -53,3 +53,20 @@ test("voice-over reel: vertical blur-pad layout covering the whole narration", {
   assert.ok(Number(info.format.duration) >= Number(item.hero_media.duration_seconds) - 0.5);
   assert.ok(item.script?.length > 0, "the narration is stored as the script");
 });
+
+// The studio renderer is picked for any program that makes its own videos, on whatever machine the video lane runs on.
+// An instance too small for Chromium must still produce the reel through ffmpeg rather than fail the item.
+test("a studio program on an instance too small for the studio still renders, through ffmpeg", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const small = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999" } });
+  try {
+    await small.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const b = await small.api("POST", "/api/brands", { name: "Small instance", brandKit: { primary_color: "#0b3d91" } });
+    // Pictures come from the text-card fallback, so the sections are real JPEGs: the mock adapter's SVG needs an
+    // ffmpeg built with librsvg, which this test should not depend on.
+    await small.api("POST", "/api/adapter-configs", { key: "image_no_key", stage: "IMAGE", impl: "gemini_image", config: {} });
+    const p = await small.api("POST", "/api/programs", { brandId: b.id, key: "reels", displayName: "Reels", contentType: "NEWS_REEL", useMocks: true, autoStyle: false, autoSources: false, renderAdapter: "remotion", voiceAdapter: "tts_mock", imageAdapter: "image_no_key", methodConfig: { slides: 2 } });
+    const { id } = await small.api("POST", "/api/generate", { nicheId: p.id, topic: "Metro rail extends its hours" });
+    const done = await waitFor(async () => { const it = await small.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { timeout: 120000, interval: 500, what: "a reel rendered without the studio" });
+    assert.equal(done.hero_media.kind, "VIDEO");
+  } finally { await small.stop(); }
+});

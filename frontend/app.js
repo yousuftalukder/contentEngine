@@ -188,9 +188,14 @@ pages.overview = async () => {
         stat((it.FAILED || 0) + (as.FAILED || 0), "Failed", (it.FAILED || as.FAILED) ? "red" : ""),
         stat(stats?.activeSources ?? 0, "Active sources"))),
 
+    (stats?.quotaPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber)" },
+      h("b", { style: "font-weight:500" }, "Waiting for the AI quota to reset"),
+      stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free key allows about 20 requests a day per model — enable billing on it to lift the cap.")) : null,
+
     h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
     h("div", { class: "panel" }, alerts.length ? [
-      alerts.map((a) => h("div", { class: "row", style: `padding:6px 0;border-bottom:1px solid var(--ink-3);opacity:${a.read_at ? 0.6 : 1}` },
+      alerts.map((a) => h("div", { class: "row", style: `padding:8px 0;border-bottom:1px solid var(--ink-3);align-items:flex-start;opacity:${a.read_at ? 0.6 : 1}` },
         h("span", { class: `tag ${{ error: "red", warn: "amber", info: "green" }[a.level] || ""}` }, a.level), h("div", { class: "grow" }, h("b", { style: "font-weight:500" }, a.title), a.body ? h("span", { class: "sub", style: "white-space:pre-wrap" }, a.body.slice(0, 400)) : null), h("span", { class: "small mute" }, ago(a.created_at)))),
       h("div", { class: "row", style: "margin-top:10px" }, h("button", { class: "btn sm", onclick: () => run(() => post("/api/notifications/read-all"), "Marked as read").then(route) }, "Mark all read"), h("a", { class: "small", href: "#/settings" }, "Send alerts to Telegram"))]
       : h("p", { class: "muted", style: "margin:0" }, "No alerts. Problems you need to act on — a rejected or unpaid AI key, a failing feed, an expired publishing token, the budget cap — show up here and, if you connect Telegram, on your phone.")),
@@ -287,6 +292,7 @@ function proofView(it, onDone) {
     field("Headline", headline),
     heroEl,
     hero ? h("div", { class: "row small mute", style: "margin:-6px 0 10px" }, h("span", null, hero.kind, hero.width ? ` ${hero.width}×${hero.height}` : "", hero.duration_seconds ? ` ${Math.round(hero.duration_seconds)}s` : ""), h("a", { href: hero.url, target: "_blank" }, "Open"), !isVideo ? h("button", { class: "btn link sm", onclick: () => regen("image") }, "Regenerate image") : null) : null,
+    hero?.meta?.fallback ? h("p", { class: "small", style: "margin:-6px 0 10px;color:var(--amber)" }, "Text card — no picture could be made: ", hero.meta.fallback.slice(0, 160)) : null,
     field("Summary", summary),
     body ? field(it.body != null ? "Article / post body" : "Script", body) : null,
     imgPrompt ? field("Image prompt", imgPrompt, "Edit and regenerate the image to get a different visual.") : null,
@@ -814,7 +820,12 @@ pages.channels = async () => {
       h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · token ", c.credential_id ? h("span", { class: "tag green" }, creds.find((k) => k.id === c.credential_id)?.label || "linked") : h("span", { class: "tag" }, "env default"), " · up to ", c.max_posts_per_day ?? "∞", "/day, ", c.min_gap_minutes ?? 0, " min apart · ", c.timezone),
       h("div", { class: "small", style: "margin-top:4px" }, "Programs: ", (c.niches || []).length ? c.niches.map((n) => n.display_name).join(", ") : h("span", { class: "mute" }, "none — subscribe from Programs"))),
     h("div", { class: "right row" },
-      h("button", { class: "btn sm", onclick: () => run(async () => jsonDialog("Test publish result", await post(`/api/channels/${c.id}/test-publish`, { message: "Content Engine connection test" }))) }, "Test"),
+      h("button", { class: "btn sm", onclick: () => run(async () => {
+        const r = await post(`/api/channels/${c.id}/check`, {});
+        jsonDialog(r.ok ? `Connected${r.account ? ` to ${r.account.name}` : ""}` : "Cannot connect", r);
+      }) }, "Check"),
+      h("button", { class: "btn sm", onclick: () => confirmModal("Publish a test post?", `This puts a real post on ${c.display_name}. Delete it on the platform afterwards.`,
+        () => run(async () => jsonDialog("Test publish result", await post(`/api/channels/${c.id}/test-publish`, { message: "Content Engine connection test" })))) }, "Test post"),
       h("button", { class: "btn sm", onclick: () => channelDialog(c, brands, programs, publishers, creds) }, "Edit"),
       h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/channels/${c.id}`, { isActive: !yes(c.is_active) }), "Saved").then(route) }, yes(c.is_active) ? "Pause" : "Activate"),
       h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete channel?", "Only works if nothing was ever published to it.", () => run(() => del(`/api/channels/${c.id}`), "Deleted").then(route)) }, "Delete")))));

@@ -38,6 +38,18 @@ test("the same story from two outlets becomes one draft that credits both; a dif
   assert.equal((await eng.api("GET", `/api/content-items?nicheId=${p.id}`)).length, 2, "a covered story is not written twice");
 });
 
+test("the source catalog is well formed: unique keys, an adapter and config for each", async () => {
+  const catalog = await eng.api("GET", "/api/source-catalog");
+  assert.ok(catalog.length >= 30, "a real catalog, not a stub");
+  assert.equal(new Set(catalog.map((e) => e.key)).size, catalog.length, "catalog keys are unique");
+  for (const e of catalog) {
+    assert.ok(e.name && e.adapter && e.config, `${e.key} is complete`);
+    if (e.adapter === "rss") assert.match(e.config.url, /^https:\/\//, `${e.key} has a feed url`);
+    if (e.adapter === "google_news") assert.ok(e.config.site || e.config.query, `${e.key} has a site or query`);
+    if (e.adapter === "youtube_rss") assert.match(e.config.channel_id, /^UC[\w-]{20,}$/, `${e.key} has a channel id`);
+  }
+});
+
 test("a Bangladesh program starts with the catalog sources for its language", async () => {
   const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "bn_news", displayName: "বাংলা খবর", contentType: "NEWS_STATIC", country: "Bangladesh", language: "bn", useMocks: true });
   const catalog = await eng.api("GET", "/api/source-catalog");

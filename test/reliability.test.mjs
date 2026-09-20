@@ -48,3 +48,16 @@ test("a permanent failure fails the job at once", async () => {
   assert.equal(job.attempts, 1);
   assert.equal((await eng.api("GET", `/api/content-items/${item.id}`)).status, "FAILED");
 });
+
+// A channel that cannot reach its platform should say so while someone is setting it up, not at the first real post.
+test("a channel reports whether it can reach its platform, without publishing anything", async () => {
+  const mock = await eng.api("POST", "/api/channels", { brandId: brand.id, key: "mock_fb", displayName: "Mock FB", platform: "FACEBOOK", format: "STATIC_IMAGE_CAPTION", publisherAdapter: "publish_mock" });
+  const mockCheck = await eng.api("POST", `/api/channels/${mock.id}/check`, {});
+  assert.equal(mockCheck.ok, true);
+  assert.match(mockCheck.notes[0], /nowhere real/);
+
+  const live = await eng.api("POST", "/api/channels", { brandId: brand.id, key: "live_fb", displayName: "Live FB", platform: "FACEBOOK", format: "STATIC_IMAGE_CAPTION", publisherAdapter: "meta_graph", platformAccountId: "123456" });
+  const liveCheck = await eng.api("POST", `/api/channels/${live.id}/check`, {});
+  assert.equal(liveCheck.ok, false, "no token, so it cannot connect");
+  assert.match(liveCheck.error, /Meta access token/i);
+});

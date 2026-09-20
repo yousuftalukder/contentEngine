@@ -41,8 +41,9 @@ const LOCK_TIMEOUT_MIN = Number(ENV.JOB_LOCK_TIMEOUT_MINUTES) || 45;
 const DEFAULTS = {
   ANTHROPIC_MODEL: ENV.ANTHROPIC_MODEL || "claude-sonnet-5",
   GEMINI_MODEL: ENV.GEMINI_MODEL || "gemini-flash-latest",
-  // Tried in order when the main model is overloaded (503) or unknown (404). Comma-separated; "" disables.
-  GEMINI_FALLBACK_MODELS: (ENV.GEMINI_FALLBACK_MODELS ?? "gemini-flash-lite-latest").split(",").map((s) => s.trim()).filter(Boolean),
+  // Tried in order when the main model is overloaded (503), unknown (404) or out of quota (429). Comma-separated; ""
+  // disables. Quotas are counted per model, so a free key's small daily allowance is multiplied by this list.
+  GEMINI_FALLBACK_MODELS: (ENV.GEMINI_FALLBACK_MODELS ?? "gemini-flash-lite-latest,gemini-2.5-flash,gemini-2.5-flash-lite").split(",").map((s) => s.trim()).filter(Boolean),
   GEMINI_IMAGE_MODEL: ENV.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image",
   GEMINI_TTS_MODELS: (ENV.GEMINI_TTS_MODELS ?? "gemini-2.5-flash-preview-tts,gemini-2.5-flash-tts,gemini-2.5-pro-preview-tts").split(",").map((s) => s.trim()).filter(Boolean),
   GEMINI_TTS_VOICE: ENV.GEMINI_TTS_VOICE || "Kore",
@@ -132,6 +133,32 @@ function isTransient(e) {
 function isPermanent(e) {
   if (!e || isTransient(e)) return false;
   return PERMANENT_STATUS.has(Number(e.status)) || Number(e.status) === 403 || PERMANENT_TEXT.test(String(e.message || e));
+}
+// A provider's quota error, turned into how long to wait: a per-day (or free-tier) limit waits for the daily reset
+// (midnight Pacific — Google's and OpenAI's reset), a per-minute one for the delay the API names. null = not a quota error.
+function nextMidnightPacific() {
+  const hour = (t) => Number(new Intl.DateTimeFormat("en-US", { hour: "numeric", hourCycle: "h23", timeZone: "America/Los_Angeles" }).format(t));
+  let t = new Date(Date.now() + 3600e3); t.setUTCMinutes(5, 0, 0);
+  for (let i = 0; i < 26 && hour(t) !== 0; i++) t = new Date(t.getTime() + 3600e3);
+  return t;
+}
+// kind: "minute" (wait `seconds`), "day" (wait for the reset), "plan" (limit 0 — the plan doesn't include this model; no
+// reset will help) or "billing" (out of prepaid credit). An error aggregated over fallbacks (e.causes) waits for the
+// soonest reset among its quota causes, or backs off normally if one of them is an ordinary outage.
+function quotaWait(e) {
+  if (e?.causes?.length) {
+    const qs = e.causes.map(quotaWait);
+    if (e.causes.some((c, i) => !qs[i] && isTransient(c))) return null;
+    return qs.filter((x) => x?.seconds).sort((a, b) => a.seconds - b.seconds)[0] || qs.find(Boolean) || null;
+  }
+  const s = `${e?.message || ""} ${typeof e?.body === "string" ? e.body : JSON.stringify(e?.body || "")}`;
+  if (!(e?.status === 429 || /RESOURCE_EXHAUSTED|exceeded your current quota|rate limit/i.test(s))) return null;
+  const freeTier = /free_tier|FreeTier/i.test(s), model = (/model: ([\w.-]+)/.exec(s) || [])[1] || null;
+  if (/insufficient_quota/.test(s)) return { kind: "billing", seconds: null, freeTier, model };
+  if (/limit: 0\b/.test(s)) return { kind: "plan", seconds: null, freeTier, model };
+  if (/PerDay|per day|\bRPD\b/i.test(s)) return { kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)), freeTier, model };
+  const d = Number((/retry(?:Delay"?:\s*"| in )(\d+(?:\.\d+)?)s/i.exec(s) || [])[1]);
+  return { kind: "minute", seconds: Math.max(30, Math.round(d || 60) + 5), freeTier, model };
 }
 // Short in-call retry for transient failures. 429 is left to withKey, which rotates to the next key instead.
 async function retryTransient(fn, { tries = 3, baseMs = 1500 } = {}) {
@@ -258,7 +285,10 @@ async function withKey(provider, fn, pin = null) {
       const quota = e.status === 429 || (e.status === 403 && /quota|limit/i.test(JSON.stringify(e.body || "")));
       if (!quota) throw e;
       warn(`key ${c.label} for ${provider} hit quota; rotating`);
-      if (!c.id.startsWith("env:")) await q(`UPDATE api_credentials SET cooldown_until = now() + interval '30 minutes', last_error = $2 WHERE id = $1`, [c.id, String(e.message).slice(0, 500)]);
+      // A per-minute limit rests the key for as long as the API asks; a daily one for 30 min (other models on the key
+      // may still have room); a plan limit (limit 0 on one model) says nothing about the key's other models.
+      const qw = quotaWait(e), rest = qw?.kind === "minute" ? qw.seconds : qw?.kind === "plan" ? 0 : 1800;
+      if (rest && !c.id.startsWith("env:")) await q(`UPDATE api_credentials SET cooldown_until = now() + ($3 || ' seconds')::interval, last_error = $2 WHERE id = $1`, [c.id, String(e.message).slice(0, 500), String(rest)]);
     }
   }
   throw last;
@@ -298,6 +328,29 @@ async function r2Request(method, path, body = null, contentType = null) {
   if (!res.ok && !(method === "DELETE" && res.status === 404)) throw new ApiError(res.status, await res.text().catch(() => ""), `R2 ${method} ${path} -> ${res.status}`);
   return res;
 }
+// Supabase Storage. The bucket is made on the first upload so setting the two env vars is all it takes; a bucket that
+// already exists is used as it is, and a private one is reported rather than quietly opened — platforms fetch media by
+// URL, so a private bucket means every post is published without its picture.
+const supaUrl = () => String(ENV.SUPABASE_URL || "").replace(/\/+$/, "");
+const supaBucket = () => ENV.SUPABASE_BUCKET || "media";
+const supaAuth = () => ({ Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, apikey: ENV.SUPABASE_SERVICE_ROLE_KEY });
+let supabaseBucketChecked = false;
+async function ensureSupabaseBucket() {
+  if (supabaseBucketChecked) return;
+  const bucket = supaBucket(), headers = { ...supaAuth(), "Content-Type": "application/json" };
+  let existing = null;
+  try { existing = await fetchJson(`${supaUrl()}/storage/v1/bucket/${bucket}`, { headers }); }
+  catch (e) { if (e.status !== 404) throw e; }
+  if (!existing) {
+    await fetchJson(`${supaUrl()}/storage/v1/bucket`, { method: "POST", headers, body: JSON.stringify({ id: bucket, name: bucket, public: true }) })
+      .catch((e) => { if (!/already exists|Duplicate/i.test(typeof e.body === "string" ? e.body : JSON.stringify(e.body || e.message))) throw e; });
+    log(`supabase storage: created public bucket "${bucket}"`);
+  } else if (existing.public === false) {
+    warn(`supabase bucket "${bucket}" is private — media URLs will not open`);
+    await notify("storage", `The Supabase bucket "${bucket}" is private`, "Facebook, Instagram and YouTube fetch media by URL, so posts will go out without their picture or video. Make the bucket public: Supabase → Storage → the bucket → Settings → Public.", { level: "error", key: "storage:private-bucket", cooldownHours: 24 }).catch(() => {});
+  }
+  supabaseBucketChecked = true;
+}
 const STORAGE = {
   r2: {
     // Not "available" without public_url: platforms fetch files by URL, so a bucket with no public address is useless
@@ -309,9 +362,9 @@ const STORAGE = {
   },
   supabase: {
     name: "supabase", available: async () => !!(ENV.SUPABASE_URL && ENV.SUPABASE_SERVICE_ROLE_KEY),
-    publicBase: async () => `${ENV.SUPABASE_URL}/storage/v1/object/public/${ENV.SUPABASE_BUCKET || "media"}`,
-    put: async (path, bytes, ct) => { const bucket = ENV.SUPABASE_BUCKET || "media"; await fetchJson(`${ENV.SUPABASE_URL}/storage/v1/object/${bucket}/${path}`, { method: "POST", body: bytes, headers: { Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, "Content-Type": ct, "x-upsert": "true" } }); return `${await STORAGE.supabase.publicBase()}/${path}`; },
-    del: async (path) => { await fetchJson(`${ENV.SUPABASE_URL}/storage/v1/object/${ENV.SUPABASE_BUCKET || "media"}`, { method: "DELETE", headers: { Authorization: `Bearer ${ENV.SUPABASE_SERVICE_ROLE_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: [path] }) }).catch((e) => { if (e.status !== 404) throw e; }); },
+    publicBase: async () => `${supaUrl()}/storage/v1/object/public/${supaBucket()}`,
+    put: async (path, bytes, ct) => { await ensureSupabaseBucket(); await fetchJson(`${supaUrl()}/storage/v1/object/${supaBucket()}/${path}`, { method: "POST", body: bytes, headers: { ...supaAuth(), "Content-Type": ct, "x-upsert": "true" } }); return `${await STORAGE.supabase.publicBase()}/${path}`; },
+    del: async (path) => { await fetchJson(`${supaUrl()}/storage/v1/object/${supaBucket()}`, { method: "DELETE", headers: { ...supaAuth(), "Content-Type": "application/json" }, body: JSON.stringify({ prefixes: [path] }) }).catch((e) => { if (e.status !== 404) throw e; }); },
   },
   local: {
     name: "local", available: async () => true,
@@ -433,7 +486,7 @@ async function withFallbacks(stage, primary, fallbacks, fn) {
   if (!errors.length) throw new Error(`No ${stage} adapter available`);
   if (errors.length === 1) throw errors[0][1];
   const e = new Error(errors.map(([k, x]) => `${k}: ${x.message}`).join(" | "));
-  e.status = errors[0][1].status; e.transient = errors.some(([, x]) => isTransient(x));
+  e.status = errors[0][1].status; e.transient = errors.some(([, x]) => isTransient(x)); e.causes = errors.map(([, x]) => x);
   throw e;
 }
 // A program without its own fallback list uses the global one (Settings → llm.default_fallbacks / image.default_fallbacks).
@@ -474,21 +527,24 @@ impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: 
       return { text, data: json ? extractJson(text) : null, cost: tokenCost(model, u.input_tokens, u.output_tokens), model, units: 1 };
     }, ctx.pin);
   } }) });
-// Runs call(model) on the main model, then on each fallback model while the failure is an overload (503/5xx) or an
-// unknown model id (404). A 429 or a permanent error is thrown straight away (withKey rotates keys on 429).
+// Runs call(model) on the main model, then on each fallback model while the failure is an overload (503/5xx), a quota
+// (429 — Gemini's quotas are per model, so the next model often still has room), or an unknown model id (404).
+// A permanent error is thrown straight away; when every model is out of quota, withKey tries the next key.
 async function withModelFallback(models, call) {
-  let last, lastTransient;
+  const errs = [];
   for (const model of [...new Set(models.filter(Boolean))]) {
     try { return await retryTransient(() => call(model)); }
     catch (e) {
-      last = e;
-      if (e.status === 429) throw e;
-      if (isTransient(e)) { lastTransient = e; warn(`model ${model} unavailable (${e.status || e.message.slice(0, 60)}), trying the next one`); continue; }
-      if (e.status === 404) continue;
-      throw e;
+      if (!isTransient(e) && e.status !== 404) throw e;
+      errs.push(e);
+      if (isTransient(e)) warn(`model ${model} unavailable (${e.status || ""} ${(quotaWait(e)?.kind || e.message).slice(0, 60)}), trying the next one`);
     }
   }
-  throw lastTransient || last;
+  // The error the caller should act on: an ordinary outage (retry soon) before a quota that resets soonest, before a
+  // limit no reset will lift; all 404s → the last 404, so the caller can look for renamed models.
+  const wait = (x) => quotaWait(x)?.seconds;
+  if (!errs.length) throw new Error("No model is configured for this adapter");
+  throw errs.find((x) => isTransient(x) && !quotaWait(x)) || errs.filter(wait).sort((a, b) => wait(a) - wait(b))[0] || errs.find(isTransient) || errs[errs.length - 1];
 }
 // Gemini model ids get renamed and retired. When every configured id of a kind answers 404, the account's live model list
 // (cached 6 h) supplies the closest replacements of the same kind, so a retirement doesn't stop the pipeline.
@@ -624,7 +680,11 @@ impl("INGEST", "google_news", { label: "Google News (search / edition, no key)",
       const title = outlet && it.title.endsWith(` - ${outlet}`) ? it.title.slice(0, -(outlet.length + 3)).trim() : it.title;
       // Google also indexes outlets' tag and section pages ("tech companies", "Tokyo Olympics"): real headlines are longer.
       if (!title || GN_NOISE.test(title) || title.split(/\s+/).filter(Boolean).length < 4) continue;
-      out.push({ ...it, title, summary: "", raw: { outlet, via: "google_news" } });
+      // Google names the outlet, but sometimes only as a hostname ("today.thefinancialexpress.com.bd"), which would end
+      // up in a photocard's source credit. For a single-outlet source the name on the source is the one a reader knows;
+      // a mixed query feed keeps whatever Google said, since every item is a different outlet.
+      const named = outlet && !/^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(outlet) ? outlet : c.site ? source.name : outlet;
+      out.push({ ...it, title, summary: "", raw: { outlet: named, via: "google_news" } });
     }
     return out.slice(0, c.limit || 40);
   } }) });
@@ -873,6 +933,55 @@ async function composePhotocard(inPath, headline, specs = {}) {
   try { await exec("ffmpeg", ["-y", "-i", inPath, ...(logo ? ["-i", logo] : []), "-filter_complex", fc, "-map", "[out]", "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
   finally { await cleanup(assPath, logo); }
 }
+// ---- Text card: the photocard without a picture, for when no picture can be made (no image key, a plan with no image
+// quota, an outage) — the post still goes out, in the brand's colours: a gradient in the brand colour, the logo (and a
+// faint oversized copy as texture), a small label, the headline set large above the same rule, date, credit and handle
+// as the photocard. With an empty headline it is just the branded backdrop, which reel sections use as their picture.
+const rgb255 = (c, dflt) => { const h = (/^#?[0-9a-f]{6}$/i.test(c || "") ? c : dflt).replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
+async function composeTextCard(headline, specs = {}) {
+  const kit = specs.kit || {}, meta = specs.card_meta || {};
+  const W = specs.width || 1080, H = specs.height || 1080, m = Math.round(W * 0.062);
+  const text = String(headline || "").trim(), bn = /[ঀ-৿]/.test(text + (specs.brand || "")), font = kit.font || OVERLAY_FONT;
+  const [R, G, B] = rgb255(kit.primary_color, "#b3121f");
+  const fg = assColor(kit.text_color || "#ffffff"), dim = assColor(kit.text_color || "#ffffff", "55"), acc = assColor(kit.accent_color || "#ffc400");
+  const hexc = (c, d) => (/^#?[0-9a-f]{6}$/i.test(c || "") ? c : d).replace("#", "0x");
+  const metaSize = Math.round(H * 0.024), metaBand = Math.round(metaSize * 2.6);
+  const labelSize = Math.round(H * 0.028), labelPad = Math.round(labelSize * 0.45);
+  const label = text ? String(specs.label ?? (bn ? "সর্বশেষ" : "LATEST")).trim().slice(0, 28) : "";
+  const logoBox = Math.round(W * (kit.logo_scale || 0.17));
+  let logo = null; if (kit.logo_url) { try { logo = await toTmpFile(kit.logo_url, "png"); } catch (e) { warn(`brand logo: ${e.message}`); } }
+  const alpha = logo ? await exec("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", logo]).then(({ out }) => /^(rgba|bgra|argb|abgr|ya\d|yuva|gbrap)/.test(out.trim())).catch(() => false) : false;
+  // The headline sits on the bottom margin and grows upward; the label rides just above it, so a short headline reads as
+  // one block instead of floating. Both stay clear of the logo.
+  const headBottom = metaBand + Math.round(m * 0.6), logoBottom = logo ? m + logoBox + Math.round(m * 0.55) : m;
+  const labelH = label ? Math.round(labelSize * 2.6) : 0, glyph = bn ? 0.54 : 0.5;
+  const size = fitFontSize(text, W - 2 * m, H - headBottom - logoBottom - labelH, Math.round(H * 0.105), glyph);
+  const lines = Math.max(1, Math.ceil(text.length / Math.max(6, Math.floor((W - 2 * m) / (size * glyph)))));
+  const labelTop = Math.max(logoBottom, H - headBottom - Math.round(lines * size * 1.34) - labelH - Math.round(m * 0.3));
+  const st = (name, sz, col, bold, align, mv, box = null) => `Style: ${name},${font},${sz},${col},${col},${box || "&H00000000"},&H00000000,${bold ? -1 : 0},0,0,0,100,100,0,0,${box ? 3 : 1},${box ? labelPad : 0},0,${align},${m},${m},${mv},1`;
+  const metaLine = [meta.date, meta.credit].filter(Boolean).join("   •   ");
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${W}\nPlayResY: ${H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n${ASS_FORMAT}\n`
+    + [st("Head", size, fg, true, 1, headBottom), st("Label", labelSize, assColor(kit.label_color || "#141414"), true, 7, 0, acc), st("Meta", metaSize, dim, false, 1, Math.round(metaSize * 0.9)), st("Handle", metaSize, acc, true, 3, Math.round(metaSize * 0.9))].join("\n")
+    + `\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`
+    + (label ? `Dialogue: 0,0:00:00.00,0:00:10.00,Label,,0,0,0,,{\\an7\\pos(${m + labelPad},${labelTop + labelPad})}${assEsc(label)}\n` : "")
+    + (text ? `Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(text)}\n` : "")
+    + (text && metaLine ? `Dialogue: 0,0:00:00.00,0:00:10.00,Meta,,0,0,0,,${assEsc(metaLine)}\n` : "")
+    + (text && kit.handle ? `Dialogue: 0,0:00:00.00,0:00:10.00,Handle,,0,0,0,,${assEsc(kit.handle)}\n` : "");
+  const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
+  const fontsDir = await brandFontsDir(kit);
+  const fade = (c) => `'${c}*(1-0.40*(X/W+Y/H)/2)'`;
+  let fc = `color=c=black:s=${W}x${H}:d=1,format=gbrp,geq=r=${fade(R)}:g=${fade(G)}:b=${fade(B)}[bg]`;
+  let last = "bg";
+  if (text) { fc += `;[bg]drawbox=x=${m}:y=${H - metaBand - Math.max(3, Math.round(H * 0.004))}:w=${W - 2 * m}:h=${Math.max(3, Math.round(H * 0.004))}:color=${hexc(kit.accent_color, "#ffc400")}@0.85:t=fill[b1]`; last = "b1"; }
+  if (logo) {
+    fc += `;[0:v]${alpha ? "split[l0][l1]" : "null[l0]"};[l0]scale=${logoBox}:${logoBox}:force_original_aspect_ratio=decrease[lg]`;
+    if (alpha) { fc += `;[l1]scale=${Math.round(W * 0.66)}:-1,format=rgba,colorchannelmixer=aa=0.07[wm];[${last}][wm]overlay=${Math.round(W * 0.46)}:${-Math.round(H * 0.05)}[bw]`; last = "bw"; }
+    fc += `;[${last}][lg]overlay=${m}:${m}[bl]`; last = "bl";
+  }
+  fc += `;[${last}]${assVf(assPath, fontsDir)}[out]`;
+  try { await exec("ffmpeg", ["-y", ...(logo ? ["-i", logo] : []), "-filter_complex", fc, "-map", "[out]", "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
+  finally { await cleanup(assPath, logo); }
+}
 // Gemini's supported aspect ratio closest to w:h — the picture area of a photocard is wider than the card.
 const IMAGE_RATIOS = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
 const nearestRatio = (w, h) => IMAGE_RATIOS.map((r) => [r, Math.abs(Math.log((Number(r.split(":")[0]) / Number(r.split(":")[1])) / (w / h)))]).sort((a, b) => a[1] - b[1])[0][0];
@@ -904,6 +1013,17 @@ async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}, comp
   }
   const url = await storeFile(`images/${newId()}.${j.ext}`, j.bytes, j.mime);
   return recordMedia({ contentItemId, kind: "IMAGE", url, mime: j.mime, width: dims.width || null, height: dims.height || null, meta: { ...meta, source_mime: mime } });
+}
+// A text card as an item's hero image. It carries no IMAGE_BASE row: the card is drawn from scratch, so a later headline
+// edit redraws it from compose_specs alone.
+async function storeTextCard(contentItemId, headline, specs = {}, reason = null) {
+  const out = await composeTextCard(headline, specs);
+  try {
+    const url = await storeLocal(out, `images/${newId()}.jpg`, "image/jpeg");
+    const { kit, card_meta, width, height, brand, label } = specs;
+    return await recordMedia({ contentItemId, kind: "IMAGE", url, mime: "image/jpeg", width: width || 1080, height: height || 1080,
+      meta: { overlay: "textcard", ...(reason ? { fallback: String(reason).slice(0, 300) } : {}), compose_specs: { kit, card_meta, width, height, brand, label, layout: "textcard" } } });
+  } finally { await cleanup(out); }
 }
 impl("IMAGE", "image_mock", { label: "Mock image (SVG card)", create: () => ({
   async generate({ headline, specs = {}, contentItemId }) {
@@ -1273,7 +1393,9 @@ async function narrateParts(niche, parts, contentItemId) {
 impl("RENDER", "remotion", { label: "Studio (Remotion) for made videos, ffmpeg for footage", create: (cfg, ctx) => {
   const ff = IMPLS.RENDER.ffmpeg.create(cfg, ctx);
   return {
-    renderForChannel: (a) => ff.renderForChannel(a), renderClip: (a) => ff.renderClip(a),
+    // Everything the studio does not draw itself stays with ffmpeg — including the slideshow this falls back to when
+    // the instance is too small for Chromium, which is what makes picking "remotion" safe on any size of machine.
+    renderForChannel: (a) => ff.renderForChannel(a), renderClip: (a) => ff.renderClip(a), renderSlideshow: (a) => ff.renderSlideshow(a),
     // sections: [{image: url, narration, seconds}], audio: media row; returns a VIDEO media row.
     async renderReel({ sections, audio, niche, headline, kicker, credit, orientation = "9:16", contentItemId }) {
       const vertical = orientation !== "16:9", { brand, music } = await studioBrand(niche), locals = [];
@@ -1341,6 +1463,27 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
       }
       throw new Error(`meta_graph cannot publish to ${channel.platform}`);
     },
+    // Read-only connection check: is there a token, does it open the account the channel names, and is it the right
+    // kind of token and id? Answered at setup instead of at the first post, where it would cost a real story.
+    async check({ channel }) {
+      const token = await metaToken(channel, cfg), acct = channel.platform_account_id, notes = [];
+      if (!acct) return { ok: false, error: `This channel has no ${channel.platform === "INSTAGRAM" ? "Instagram user ID" : "Facebook Page ID"} — add it on the channel (Edit → account id).` };
+      if (channel.platform === "INSTAGRAM") {
+        // A Page has a "username" too, so that field cannot tell the two apart. media_count exists only on an
+        // Instagram account; when the id is really a Page, the Page names the Instagram account linked to it.
+        const ig = await fetchJson(`${base}/${acct}?${form({ fields: "id,username,media_count", access_token: token })}`).catch(() => null);
+        if (ig?.username && ig.media_count !== undefined) return { ok: true, account: { id: ig.id, name: `@${ig.username}` }, notes };
+        const page = await fetchJson(`${base}/${acct}?${form({ fields: "id,name,instagram_business_account{id,username}", access_token: token })}`).catch(() => null);
+        const linked = page?.instagram_business_account;
+        return { ok: false, error: linked
+          ? `That is the Facebook Page "${page.name}", not an Instagram account. Its Instagram id is ${linked.id} (@${linked.username}) — put that on the channel.`
+          : `${acct} does not open an Instagram account with this token. Instagram publishing needs the IG user id of a professional account linked to the Page.` };
+      }
+      const account = await fetchJson(`${base}/${acct}?${form({ fields: "id,name", access_token: token })}`);
+      const me = await fetchJson(`${base}/me?${form({ fields: "id,name", access_token: token })}`).catch(() => null);
+      if (me && me.id !== String(acct)) notes.push(`This is a token for "${me.name}", not for the Page itself. Posting is more reliable with a Page access token.`);
+      return { ok: true, account: { id: account.id, name: account.name }, notes };
+    },
     async metrics({ channel, asset }) {
       const token = await metaToken(channel, cfg);
       if (channel.platform === "INSTAGRAM") { const r = await fetchJson(`${base}/${asset.external_id}?${form({ fields: "like_count,comments_count", access_token: token })}`); return { views: 0, likes: r.like_count, comments: r.comments_count }; }
@@ -1368,10 +1511,26 @@ impl("PUBLISH", "youtube_upload", { label: "YouTube upload", configSchema: { pri
     const r = await fetchJson(loc, { method: "PUT", headers: { "Content-Type": "video/mp4", "Content-Length": String(bytes.length) }, body: bytes });
     // Custom thumbnails need a verified channel; a refusal is logged, never fatal to the upload.
     if (thumbnailUrl && !isShort) { try { const t = await toTmpFile(thumbnailUrl, "jpg"); const tb = await readFile(t); await cleanup(t); await fetchJson(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${r.id}&uploadType=media`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "image/jpeg", "Content-Length": String(tb.length) }, body: tb }); } catch (e) { warn(`YouTube thumbnail for ${r.id}: ${e.message.slice(0, 200)}`); } }
-    return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts" : "watch?v="}${r.id}` };
+    return { externalId: r.id, publishedUrl: `https://www.youtube.com/${isShort ? "shorts/" : "watch?v="}${r.id}` };
   },
-  async metrics({ asset }) {
-    return withKey("youtube", async (key) => { const r = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?${form({ part: "statistics", id: asset.external_id, key })}`); const s = r.items?.[0]?.statistics || {}; return { views: Number(s.viewCount || 0), likes: Number(s.likeCount || 0), comments: Number(s.commentCount || 0), units: 1 }; }, ctx.pin);
+  // Read-only: the refresh token still works and names the channel it will upload to.
+  async check({ channel }) {
+    const token = await youtubeAccessToken(channel, cfg);
+    const r = await fetchJson("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", { headers: { Authorization: `Bearer ${token}` } });
+    const ch = r.items?.[0];
+    if (!ch) return { ok: false, error: "The OAuth token works but owns no YouTube channel — authorise with the Google account that owns the channel." };
+    return { ok: true, account: { id: ch.id, name: ch.snippet?.title }, notes: [] };
+  },
+  async metrics({ channel, asset }) {
+    const read = async (params, opts = {}) => {
+      const r = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?${form({ part: "statistics", id: asset.external_id, ...params })}`, opts);
+      const s = r.items?.[0]?.statistics || {};
+      return { views: Number(s.viewCount || 0), likes: Number(s.likeCount || 0), comments: Number(s.commentCount || 0), units: 1 };
+    };
+    // A data-API key if there is one; otherwise the channel's own OAuth token, which reads its videos' statistics too —
+    // uploading should not also require a second key just to count views.
+    if ((await credentialsFor("youtube", ctx.pin)).length) return withKey("youtube", (key) => read({ key }), ctx.pin);
+    return read({}, { headers: { Authorization: `Bearer ${await youtubeAccessToken(channel, cfg)}` } });
   } }) });
 
 // === 7. dedup / router / scheduler / review helpers ===================
@@ -1456,8 +1615,10 @@ const rss = (key, name, language, url, weight = 1) => ({ key, name, language, ad
 const ytc = (key, name, channel_id, weight = 1) => ({ key, name, language: "bn", adapter: "youtube_rss", config: { channel_id }, weight, poll: 15, kind: "VIDEO" });
 const SOURCE_CATALOG = [
   rss("bd-en-dailystar", "The Daily Star", "en", "https://www.thedailystar.net/news/bangladesh/rss.xml", 1.2),
-  rss("bd-en-prothomalo", "Prothom Alo English", "en", "https://en.prothomalo.com/feed/", 1.1),
-  rss("bd-en-dhakatribune", "Dhaka Tribune", "en", "https://www.dhakatribune.com/feed/", 1),
+  // Prothom Alo's English feed is served empty, and Dhaka Tribune's answers 403 to datacenter IPs (it opens fine from a
+  // home connection, which is why it looked healthy when the catalog was built). Both are read through Google News.
+  gn("bd-en-prothomalo", "Prothom Alo English", "en", "en.prothomalo.com", 1.1),
+  gn("bd-en-dhakatribune", "Dhaka Tribune", "en", "dhakatribune.com", 1),
   rss("bd-en-tbs", "The Business Standard", "en", "https://www.tbsnews.net/top-news/rss.xml", 1),
   gn("bd-en-bdnews24", "bdnews24.com", "en", "bdnews24.com", 1.1),
   gn("bd-en-fe", "The Financial Express", "en", "thefinancialexpress.com.bd", 0.9),
@@ -1520,7 +1681,7 @@ async function installCatalogSources(entries, nicheIds = []) {
 const DESK_TYPES = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", ...MADE_VIDEO_TYPES]);
 // Per program (method_config.desk): min_sources = outlets required; settle_minutes = wait for more outlets unless already
 // corroborated; max_age_hours = oldest publication date taken; per_sweep / min_gap_minutes = pacing.
-const deskCfg = (niche) => ({ min_sources: 1, settle_minutes: 5, max_age_hours: 12, per_sweep: 2, min_gap_minutes: 10, ...((P(niche.method_config) || {}).desk || {}) });
+const deskCfg = (niche) => ({ min_sources: 1, settle_minutes: 5, max_age_hours: 12, per_sweep: 2, min_gap_minutes: 10, max_pending: 3, ...((P(niche.method_config) || {}).desk || {}) });
 const trimVec = (v, n = 256) => (Array.isArray(v) ? v.slice(0, n).map((x) => Math.round(x * 1e4) / 1e4) : null);
 async function deskEmbedder() {
   const key = await setting("desk.embed_adapter", null) || (await one(`SELECT embed_adapter AS k, COUNT(*) AS n FROM niches WHERE is_active::int = 1 AND embed_adapter <> 'embed_mock' GROUP BY embed_adapter ORDER BY n DESC LIMIT 1`))?.k;
@@ -1569,6 +1730,12 @@ async function sweepNewsDesk() {
   for (const niche of programs) {
     const cfg = deskCfg(niche);
     if (!(await underDailyCap(niche))) continue;
+    // Don't take stories the writer cannot get to: while its quota is used up, and whenever work is already piling up.
+    const pause = await setting(`quota.pause.${niche.id}`, null);
+    if (pause?.until && new Date(pause.until) > new Date()) continue;
+    const pending = await one(`SELECT COUNT(*)::int AS n FROM jobs j JOIN content_items ci ON ci.id = j.content_item_id
+      WHERE ci.niche_id = $1 AND j.status IN ('PENDING','RUNNING') AND j.type IN ('GENERATE_CONTENT','RENDER_CLIP','PROCESS_CANDIDATE')`, [niche.id]);
+    if (pending.n >= cfg.max_pending) continue;
     const last = await one(`SELECT max(created_at) AS t FROM content_items WHERE niche_id = $1 AND cluster_id IS NOT NULL`, [niche.id]);
     if (last?.t && Date.now() - new Date(last.t).getTime() < cfg.min_gap_minutes * 60000) continue;
     const rows = await q(`SELECT c.*, LEAST(c.weight_sum, 6) * exp(-extract(epoch FROM now() - c.first_seen_at) / 64800.0) AS score FROM story_clusters c
@@ -1579,7 +1746,7 @@ async function sweepNewsDesk() {
       ORDER BY score DESC LIMIT 40`, [niche.id, String(cfg.max_age_hours), cfg.min_sources, String(cfg.settle_minutes)]);
     let taken = 0;
     for (const c of rows) {
-      if (taken >= cfg.per_sweep || !(await underDailyCap(niche))) break;
+      if (taken >= cfg.per_sweep || taken + pending.n >= cfg.max_pending || !(await underDailyCap(niche))) break;
       // The lead version comes from the program's own sources, preferring its language and the heaviest outlet.
       const rep = await one(`SELECT si.* FROM source_items si JOIN sources s ON s.id = si.source_id JOIN niche_sources ns ON ns.source_id = si.source_id AND ns.niche_id = $2
         WHERE si.cluster_id = $1 ORDER BY COALESCE(s.language = $3, false) DESC, s.weight DESC, si.created_at ASC LIMIT 1`, [c.id, niche.id, (niche.language || "en").slice(0, 2)]);
@@ -1669,6 +1836,7 @@ async function rejectItem(itemId, note) {
 // draft publishes, a flagged one waits, a REJECT is set aside. AUTO_AFTER_WINDOW: only a clean draft gets the countdown.
 async function finishGeneration(itemId, niche) {
   const mode = niche.approval_mode || "MANUAL";
+  if (await setting(`quota.pause.${niche.id}`, null)) await putSetting(`quota.pause.${niche.id}`, null);   // the writer answered: take stories again
   const qa = await qualityGate(itemId, niche), clean = qa.status === "PASS" || qa.status === "SKIPPED";
   if (mode === "AUTO" && qa.status === "REJECT") return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, `Quality gate: ${qa.report?.summary || "flagged as unsafe to publish"}`]);
   if (mode === "AUTO" && clean) { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
@@ -1706,8 +1874,38 @@ async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
   if (!own.style && niche.content_type === "NEWS_STATIC") specs.style = "Editorial illustration in a modern digital-painting style: rich colour, dramatic light, clearly an illustration rather than a photograph, no identifiable real people, no text.";
   return specs;
 }
+// The little label on a text card: news says "latest" in the program's language, anything else says which program it is.
+const cardLabel = (niche) => (/^NEWS/.test(niche.content_type || "") ? undefined : niche.display_name);
 const llmFor = async (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks"), fn);
 const imageFor = async (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks"), fn);
+// The hero picture — or, when every image adapter fails (no key, a plan without image generation, an outage), a text
+// card in the brand's colours so the post still goes out. The reason is kept on the media row and raised once as an
+// alert rather than per item. `backdrop` asks for the card without text (a reel section's background), `skipApi` says
+// an earlier picture in the same item already failed, so don't call the API again.
+async function imageOrCard(niche, itemId, { prompt, headline, specs, label = undefined, backdrop = false, skipApi = null }) {
+  let err = skipApi;
+  if (!err) {
+    try { return await imageFor(niche, (ia) => ia.generate({ prompt, headline, specs, contentItemId: itemId })); }
+    catch (e) { if (!(await setting("image.text_card_fallback", true))) throw e; err = e; }
+  }
+  const kit = specs.kit || P((await one(`SELECT brand_kit FROM brands WHERE id=$1`, [niche.brand_id]))?.brand_kit) || {};
+  let card;
+  try { card = await storeTextCard(itemId, backdrop ? "" : headline, { ...specs, kit, label }, err.message); }
+  catch (e2) { warn(`text card failed: ${e2.message.slice(0, 160)}`); throw err; }
+  if (!skipApi) {
+    warn(`no picture (${err.message.slice(0, 140)}) — used a ${backdrop ? "brand backdrop" : "text card"}`);
+    await notifyNoPictures(err).catch((e) => warn("alert", e.message));
+  }
+  return { ...card, cost: 0, fallbackError: err };
+}
+async function notifyNoPictures(e) {
+  const qw = quotaWait(e), provider = PROVIDER_HOSTS.find(([h]) => e.message.includes(h))?.[1] || "The image model";
+  const hint = qw && qw.kind !== "minute" && qw.freeTier ? `${provider}'s free tier does not generate pictures. Enable billing on the key (Google AI Studio → Billing — about $0.04 a picture) and pictures come back on their own.`
+    : qw ? `${provider} is over its image quota. It resumes when the quota resets; enabling billing or adding a second key lifts it.`
+    : /No API key/i.test(e.message) ? `Add an image key on the API keys page (or set it on Render) to get pictures back.`
+    : `${provider} could not make a picture.`;
+  await notify("provider", "Posts are going out as text cards (no pictures)", `${hint}\n\nLast error: ${String(e.message).slice(0, 400)}`, { key: "image-fallback", cooldownHours: 12 });
+}
 
 // Fetch the source page of an article and keep its main text, so the writer works from the real story instead of
 // the one-line RSS summary. Readability-lite: drop scripts/nav/etc, prefer <article>, keep substantial <p> blocks.
@@ -1784,7 +1982,7 @@ async function generateStatic(item, niche, style) {
   const d = r.data || {}; await addCost(item.id, r.cost);
   await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: d.captions || {}, hashtags: Array.isArray(d.hashtags) ? d.hashtags : [], image_prompt: d.image_prompt || null });
   const specs = await cardSpecs(niche, m);
-  const img = await imageFor(niche, (ia) => ia.generate({ prompt: d.image_prompt, headline: d.headline || m.title, specs, contentItemId: item.id }));
+  const img = await imageOrCard(niche, item.id, { prompt: d.image_prompt, headline: d.headline || m.title, specs, label: cardLabel(niche) });
   await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id });
 }
 // ---- 8b. LONG_POST: research first (notes with citations), then write in the style profile
@@ -1805,7 +2003,7 @@ async function generateLongPost(item, niche, style) {
     mock: { headline: m.title, post: `${m.title}\n\n${notes.map((n) => n.fact).join("\n\n")}`, hashtags: ["longpost"], image_prompt: `Cover for ${m.title}` } }));
   await addCost(item.id, post.cost); const d = post.data || {};
   await setItem(item.id, { headline: d.headline || m.title, body: d.post || "", summary: (d.post || "").slice(0, 280), captions: { facebook: d.post || "", default: d.post || "" }, hashtags: d.hashtags || [], image_prompt: d.image_prompt || null });
-  if ((P(niche.method_config) || {}).cover_image !== false) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: d.image_prompt, headline: d.headline || m.title, specs: { width: 1200, height: 630, brand: niche.display_name, ...(P(niche.image_specs) || {}) }, contentItemId: item.id })); await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id }); }
+  if ((P(niche.method_config) || {}).cover_image !== false) { const img = await imageOrCard(niche, item.id, { prompt: d.image_prompt, headline: d.headline || m.title, label: cardLabel(niche), specs: { width: 1200, height: 630, brand: niche.display_name, ...(P(niche.image_specs) || {}) } }); await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id }); }
 }
 // ---- 8c. Narrated reels: NEWS_REEL (a story in 35-60 s), IMAGE_SLIDESHOW (facts video), LONG_FORM_VIDEO (researched,
 // 16:9). Script in sections → one picture per section → narration per section (measured) → the studio renders a branded
@@ -1830,8 +2028,12 @@ async function generateReel(item, niche, style) {
   const title = d.title || m.title, script = sections.map((s) => s.narration).join("\n\n");
   await setItem(item.id, { headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
   const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
-  const images = [];
-  for (const s of sections) { const img = await imageFor(niche, (ia) => ia.generate({ prompt: s.image_prompt, headline: title, specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}), style: style2 }, contentItemId: item.id })); await addCost(item.id, img.cost); images.push(img); }
+  const images = []; let noPics = null;
+  for (const s of sections) {
+    const img = await imageOrCard(niche, item.id, { prompt: s.image_prompt, headline: title, backdrop: true, skipApi: noPics,
+      specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}), style: style2 } });
+    noPics = noPics || img.fallbackError; await addCost(item.id, img.cost); images.push(img);
+  }
   const narr = await narrateParts(niche, sections.map((s) => s.narration), item.id); await addCost(item.id, narr.cost);
   await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
@@ -2017,7 +2219,7 @@ async function runGeneration(itemId) {
 async function regenerate(itemId, part) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
-  if (part === "image") { const specs = await cardSpecs(niche, { versions: (P(item.source_data_ref)?.outlets || []).map((outlet) => ({ outlet })) }); const img = await imageFor(niche, (ia) => ia.generate({ prompt: item.image_prompt, headline: item.headline || item.topic, specs, contentItemId: itemId })); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
+  if (part === "image") { const specs = await cardSpecs(niche, { versions: (P(item.source_data_ref)?.outlets || []).map((outlet) => ({ outlet })) }); const img = await imageOrCard(niche, itemId, { prompt: item.image_prompt, headline: item.headline || item.topic, specs, label: cardLabel(niche) }); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
   if (part === "all") { await setItem(itemId, { headline: null, summary: null, body: null, hero_media_id: null }); return runGeneration(itemId); }
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500, system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style)}`,
     prompt: `Current headline: ${item.headline}\nSummary: ${item.summary}\nBody: ${(item.body || "").slice(0, 3000)}\n\nRewrite ONLY the ${part} to be stronger, keeping the facts identical. Return JSON: ${part === "headline" ? '{"headline": "..."}' : part === "captions" ? '{"captions": {"facebook": "...", "instagram": "...", "x": "...", "linkedin": "..."}, "hashtags": ["..."]}' : '{"body": "..."}'}`,
@@ -2058,7 +2260,7 @@ async function pollMetrics(assetId) {
   const publisher = await resolve("PUBLISH", channel.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[channel.platform] || "publish_mock");
   if (!publisher.metrics) return;
   const m = await publisher.metrics({ channel, asset });
-  await q(`INSERT INTO performance_metrics (id, asset_id, views, likes, comments) VALUES ($1,$2,$3,$4,$5)`, [newId(), assetId, m.views || 0, m.likes || 0, m.comments || 0]);
+  await q(`INSERT INTO performance_metrics (id, asset_id, views, likes, comments, shares) VALUES ($1,$2,$3,$4,$5,$6)`, [newId(), assetId, m.views || 0, m.likes || 0, m.comments || 0, m.shares || 0]);
   await q(`UPDATE content_assets SET last_metrics=$2::jsonb WHERE id=$1`, [assetId, JSON.stringify({ ...m, at: nowIso() })]);
   await checkAndRepurpose(assetId);
 }
@@ -2164,11 +2366,15 @@ async function qualityGate(itemId, niche) {
 async function recomposeCard(itemId) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); if (!item?.hero_media_id) return null;
   const hero = await one(`SELECT * FROM media_assets WHERE id=$1`, [item.hero_media_id]); const meta = P(hero?.meta) || {};
-  if (!meta.base_media_id || !meta.overlay || !meta.compose_specs) return null;
-  const base = await one(`SELECT * FROM media_assets WHERE id=$1 AND deleted_at IS NULL`, [meta.base_media_id]); if (!base) return null;
-  const file = await toTmpFile(base.url, "jpg");
+  if (!meta.overlay || !meta.compose_specs) return null;
+  const card = meta.overlay === "textcard";                                        // drawn from scratch: no stored picture
+  if (!card && !meta.base_media_id) return null;
+  const base = card ? null : await one(`SELECT * FROM media_assets WHERE id=$1 AND deleted_at IS NULL`, [meta.base_media_id]);
+  if (!card && !base) return null;
+  const file = card ? null : await toTmpFile(base.url, "jpg");
   try {
-    const out = meta.overlay === "photocard" ? await composePhotocard(file, item.headline || item.topic, meta.compose_specs) : await composeHeadline(file, item.headline || item.topic, meta.compose_specs);
+    const out = card ? await composeTextCard(item.headline || item.topic, meta.compose_specs)
+      : meta.overlay === "photocard" ? await composePhotocard(file, item.headline || item.topic, meta.compose_specs) : await composeHeadline(file, item.headline || item.topic, meta.compose_specs);
     const url = await storeLocal(out, `images/${newId()}.jpg`, "image/jpeg"); await cleanup(out);
     const media = await recordMedia({ contentItemId: itemId, kind: "IMAGE", url, mime: "image/jpeg", width: hero.width, height: hero.height, meta: { ...meta, recomposed_at: nowIso() } });
     await setItem(itemId, { hero_media_id: media.id }); return media;
@@ -2377,6 +2583,55 @@ function retryDelay(job, e) {
   return transient ? Math.min(60 * 2 ** Math.max(0, job.attempts - 1), 3600) : 30 * job.attempts;
 }
 async function deferJob(job, minutes) { await q(`UPDATE jobs SET status='PENDING', run_after=now() + ($2 || ' minutes')::interval, attempts=attempts-1, locked_by=NULL WHERE id=$1`, [job.id, String(minutes)]); job._deferred = true; }
+// A provider's quota is not this job's fault, so it waits for the reset — the delay the API names, or midnight Pacific
+// for a daily limit — without spending an attempt, and the program stops taking new stories until then so the queue
+// does not fill with work that cannot run. A news story that would be stale by the time the quota returns is dropped.
+const QUOTA_MAX_WAIT_DAYS = Number(ENV.QUOTA_MAX_WAIT_DAYS) || 3;
+async function deferForQuota(job, payload, quota, msg) {
+  // Waiting has a limit: a job that has been bouncing off a per-minute limit for hours, or off a daily one for days, is
+  // not really waiting for a quota — it goes back to the ordinary backoff, and fails and alerts like anything else.
+  if (Date.now() - new Date(job.created_at).getTime() > (quota.kind === "minute" ? 2 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3)) return false;
+  const itemId = job.content_item_id || payload.itemId || null;
+  const item = itemId ? await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]) : null;
+  const niche = item || payload.nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [item?.niche_id || payload.nicheId]) : null;
+  const back = new Date(Date.now() + quota.seconds * 1000);
+  if (niche && quota.seconds > 600) await putSetting(`quota.pause.${niche.id}`, { until: back.toISOString(), reason: msg.slice(0, 300) });
+  const ageHours = item ? (Date.now() - new Date(item.created_at).getTime()) / 3600e3 + quota.seconds / 3600 : 0;
+  if (item?.cluster_id && niche && ageHours > deskCfg(niche).max_age_hours) {
+    const note = `Skipped: the writer ran out of quota and this story would be about ${Math.round(ageHours)} hours old before it comes back.`;
+    await q(`UPDATE jobs SET status='CANCELLED', error_message=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, note]);
+    await q(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED')`, [item.id, note]);
+    log(`quota: dropped stale story ${item.id} ("${(item.topic || "").slice(0, 60)}")`);
+    return true;
+  }
+  await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=$3, attempts=GREATEST(attempts-1,0), locked_by=NULL WHERE id=$1`, [job.id, msg, back.toISOString()]);
+  // The item is not being written after all: say it is queued again, so the dashboard doesn't count it as in progress.
+  if (item && ["DRAFTING", "FETCHING_DATA", "RENDERING"].includes(item.status)) await q(`UPDATE content_items SET status='QUEUED' WHERE id=$1`, [item.id]);
+  log(`quota: ${job.type} ${job.id} waits until ${back.toISOString()} (${quota.kind})`);
+  return true;
+}
+const dhakaTime = (d) => { try { return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" }).format(d); } catch { return d.toISOString().slice(0, 16).replace("T", " ") + " UTC"; } };
+// Programs whose writer is waiting for a quota to reset, for the dashboard: [{program, until}].
+async function quotaPauses() {
+  const m = await settings(); const now = Date.now(), out = [];
+  for (const [k, v] of Object.entries(m)) {
+    if (!k.startsWith("quota.pause.") || !v?.until || new Date(v.until).getTime() <= now) continue;
+    const n = await one(`SELECT display_name FROM niches WHERE id=$1`, [k.slice("quota.pause.".length)]);
+    if (n) out.push({ program: n.display_name, until: v.until });
+  }
+  return out;
+}
+async function notifyQuota(quota, msg) {
+  if (quota.kind !== "day") return;
+  const provider = PROVIDER_HOSTS.find(([h]) => msg.includes(h))?.[1] || "The AI provider";
+  const back = dhakaTime(new Date(Date.now() + quota.seconds * 1000));
+  await notify("quota", quota.freeTier ? `${provider} free tier: today's requests are used up` : `${provider} daily quota reached`,
+    (quota.freeTier
+      ? `A free key allows only about 20 requests a day per model${quota.model ? ` — this one ran out on ${quota.model}` : ""}, which is a handful of posts. Enable billing on the key (Google AI Studio → Billing) and the cap goes away; Flash costs a fraction of a cent per post.`
+      : `Raise the project's quota with the provider, or add a second key on the API keys page.`)
+    + `\n\nWork resumes on its own around ${back} (Dhaka). Until then new stories are not started, and ones that would be stale by then are skipped.`,
+    { level: "error", key: `quota:${provider}:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 20 });
+}
 async function runJob(job) {
   const h = HANDLERS[job.type]; const payload = P(job.payload) || {};
   try {
@@ -2385,7 +2640,11 @@ async function runJob(job) {
     if (job._deferred) return;
     await q(`UPDATE jobs SET status='SUCCEEDED', result=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, J(result ?? null)?.slice(0, 5000) ?? null]);
   } catch (e) {
-    const msg = String(e?.message || e).slice(0, 1500); const delay = retryDelay(job, e);
+    const msg = String(e?.message || e).slice(0, 1500);
+    const quota = quotaWait(e);
+    if (quota?.seconds && PATIENT_JOBS.has(job.type) && (await deferForQuota(job, payload, quota, msg))) { await notifyQuota(quota, msg).catch((err) => warn("alert", err.message)); return; }
+    // A limit no reset will lift (a plan without this model, an empty prepaid balance) is a person's problem, not a retry's.
+    const delay = quota && !quota.seconds ? null : retryDelay(job, e);
     warn(`job ${job.type} ${job.id} failed (attempt ${job.attempts}${delay != null ? `, retrying in ${delay}s` : ", giving up"}): ${msg}`);
     if (delay != null) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE id=$1`, [job.id, msg, String(delay)]);
     else {
@@ -2457,7 +2716,10 @@ const PROVIDER_HOSTS = [["api.anthropic.com", "Anthropic"], ["generativelanguage
 async function alertOnFailure(job, msg) {
   const provider = PROVIDER_HOSTS.find(([h]) => msg.includes(h))?.[1] || (msg.match(/No API key for "(\w+)"/) || [])[1] || "an API";
   const rule = [
-    [/credit balance|billing|insufficient_quota|exceeded your current quota|payment/i, `${provider} account is out of credit`, "Top it up, or switch the program to another writer (Programs → Edit → Script / LLM)."],
+    [/free_tier|FreeTier/i, `${provider} is on a free key and has hit its limit`, "A free key allows about 20 requests a day per model and no pictures. Enable billing on it (Google AI Studio → Billing) — the cost per post is a fraction of a cent."],
+    [/credit balance|insufficient_quota|payment/i, `${provider} account is out of credit`, "Top it up, or switch the program to another writer (Programs → Edit → Script / LLM)."],
+    [/limit: 0\b/i, `${provider} plan does not include this model`, "Enable billing on the key, or point the program at a model the plan includes (Programs → Edit)."],
+    [/exceeded your current quota|RESOURCE_EXHAUSTED/i, `${provider} quota is exhausted`, "Raise the quota with the provider, or add a second key on the API keys page."],
     [/No API key/i, `No key for ${provider}`, "Add it on the API keys page or set the env var on Render."],
     [/API key not valid|invalid[_ ]api[_ ]key|Incorrect API key|\b401\b|PERMISSION_DENIED|Unauthorized/i, `${provider} rejected the key`, "Check the key on the API keys page (Test button)."],
     [/access token|OAuthException|Session has expired|\(#190\)|invalid_grant/i, `${provider} publishing token expired or was revoked`, "Create a new token and update the channel's key."],
@@ -2498,6 +2760,48 @@ async function upgradeExistingPrograms() {
   }
   await putSetting("upgrade.catalog_v1", true);
 }
+// Catalog entries get corrected as outlets change — a feed starts refusing datacenter IPs, another is served empty. A
+// source that came from the catalog follows the correction instead of failing quietly until someone reads the logs.
+// Sources a person added themselves have no catalog_key and are never touched. Bump CATALOG_VERSION to roll out a fix.
+const CATALOG_VERSION = 2;
+async function syncCatalogSources() {
+  if (Number(await setting("upgrade.catalog_sync", 0)) >= CATALOG_VERSION) return;
+  for (const e of SOURCE_CATALOG) {
+    const row = await one(`SELECT * FROM sources WHERE catalog_key = $1`, [e.key]);
+    if (!row || (row.adapter_key === e.adapter && JSON.stringify(P(row.config) || {}) === JSON.stringify(e.config))) continue;
+    await q(`UPDATE sources SET adapter_key = $2, config = $3::jsonb, poll_interval_minutes = $4, last_error = NULL WHERE id = $1`, [row.id, e.adapter, JSON.stringify(e.config), e.poll || row.poll_interval_minutes]);
+    log(`catalog: "${row.name}" now reads through ${e.adapter}`);
+  }
+  await putSetting("upgrade.catalog_sync", CATALOG_VERSION);
+}
+// A program keeps the adapters it was created with, which go stale: a voice whose provider never got a key would fail the
+// first reel the program is asked for, and rendering stays on ffmpeg after the studio arrives. This repairs what cannot
+// work on this deployment and takes the studio when it is there. Deliberate choices that do work — including mocks — stay.
+const IMPL_PROVIDER = { anthropic: "anthropic", gemini: "gemini", openai: "openai", gemini_image: "gemini", openai_image: "openai", elevenlabs: "elevenlabs", openai_tts: "openai", gemini_tts: "gemini", gemini_embed: "gemini", gemini_transcribe: "gemini", whisper_api: "openai" };
+async function adapterUsable(key) {
+  const row = await one(`SELECT impl FROM adapter_configs WHERE key=$1 AND enabled::int=1`, [key]);
+  if (!row) return false;
+  const provider = IMPL_PROVIDER[row.impl];
+  return provider ? (await credentialsFor(provider)).length > 0 : true;                    // mocks and local tools need no key
+}
+async function upgradeAdapters() {
+  if (await setting("upgrade.adapters_v2", false)) return;
+  const d = await smartAdapterDefaults(), changed = [];
+  for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
+    const fix = {};
+    for (const [col, want] of [["script_adapter", d.scriptAdapter], ["image_adapter", d.imageAdapter], ["voice_adapter", d.voiceAdapter], ["embed_adapter", d.embedAdapter], ["transcript_adapter", d.transcriptAdapter]])
+      if (n[col] && n[col] !== want && !/_mock$/.test(want) && !(await adapterUsable(n[col]))) fix[col] = want;
+    if (n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
+    if (!Object.keys(fix).length) continue;
+    await q(`UPDATE niches SET ${Object.keys(fix).map((k, i) => `${k} = $${i + 2}`).join(", ")} WHERE id = $1`, [n.id, ...Object.values(fix)]);
+    changed.push(`${n.display_name}: ${Object.entries(fix).map(([k, v]) => `${k.replace("_adapter", "")} → ${v}`).join(", ")}`);
+  }
+  if (changed.length) {
+    log(`upgrade: adapters repaired — ${changed.join(" | ")}`);
+    await notify("upgrade", "Programs moved onto the keys and tools this deployment has", `${changed.join("\n")}\n\nChange any of them on the program's Edit screen.`, { level: "info", key: "upgrade:adapters_v2", cooldownHours: 720 }).catch(() => {});
+  }
+  await putSetting("upgrade.adapters_v2", true);
+}
 
 // Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
 // ledger and story clusters are pruned once nothing refers to them, bulky fields (article text, embeddings) are dropped
@@ -2509,7 +2813,7 @@ async function sweepRetention() {
   await q(`UPDATE source_items SET raw = raw - 'article_text', embedding = NULL WHERE created_at < now() - interval '3 days' AND (embedding IS NOT NULL OR raw ? 'article_text')`);
   const b = await q(`DELETE FROM story_clusters c WHERE c.last_seen_at < now() - interval '7 days' AND NOT EXISTS (SELECT 1 FROM content_items ci WHERE ci.cluster_id = c.id) RETURNING id`);
   await q(`UPDATE story_clusters SET embedding = NULL WHERE last_seen_at < now() - interval '3 days' AND embedding IS NOT NULL`);
-  const c = await q(`DELETE FROM jobs WHERE (status = 'SUCCEEDED' AND finished_at < now() - interval '7 days') OR (status = 'FAILED' AND finished_at < now() - interval '30 days') RETURNING id`);
+  const c = await q(`DELETE FROM jobs WHERE (status IN ('SUCCEEDED','CANCELLED') AND finished_at < now() - interval '7 days') OR (status = 'FAILED' AND finished_at < now() - interval '30 days') RETURNING id`);
   await q(`UPDATE content_items SET topic_embedding = NULL WHERE created_at < now() - interval '60 days' AND topic_embedding IS NOT NULL`);
   if (a.length || b.length || c.length) log(`retention: removed ${a.length} old source items, ${b.length} story clusters, ${c.length} finished jobs`);
 }
@@ -2521,7 +2825,7 @@ function startWorkers() {
   every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
   every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
   every(15 * 60000, sweepHealth);
-  upgradeExistingPrograms().catch((e) => warn("upgrade", e.message));
+  upgradeExistingPrograms().then(upgradeAdapters).then(syncCatalogSources).catch((e) => warn("upgrade", e.message));
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
@@ -2573,7 +2877,7 @@ app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await ins
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}) });
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), quotaPauses: await quotaPauses() });
 });
 // ---- storage
 app.get("/api/storage", async (ctx) => {
@@ -2731,6 +3035,15 @@ app.patch("/api/channels/:id", async (ctx) => json(ctx, 200, rowJson(await patch
 app.delete("/api/channels/:id", async (ctx) => { const dep = await one(`SELECT COUNT(*)::int AS n FROM content_assets WHERE channel_id=$1`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, "Channel has publish history — deactivate instead"); await q(`DELETE FROM channels WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/channels/:id/niches/:nicheId", async (ctx) => { await q(`INSERT INTO channel_niches (id, channel_id, niche_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), ctx.params.id, ctx.params.nicheId]); json(ctx, 200, { ok: true }); });
 app.delete("/api/channels/:id/niches/:nicheId", async (ctx) => { await q(`DELETE FROM channel_niches WHERE channel_id=$1 AND niche_id=$2`, [ctx.params.id, ctx.params.nicheId]); json(ctx, 200, { ok: true }); });
+// Read-only connection check. Publishing to a real account fails for dull reasons — a token for the wrong thing, an id
+// from the wrong place — and this says which, before a story is spent finding out.
+app.post("/api/channels/:id/check", async (ctx) => {
+  const ch = await one(`SELECT * FROM channels WHERE id=$1`, [ctx.params.id]); if (!ch) throw new ApiError(404, null, "Channel not found");
+  const pub = await resolve("PUBLISH", ch.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[ch.platform] || "publish_mock");
+  if (!pub.check) return json(ctx, 200, { ok: true, notes: [`${pub.key} publishes nowhere real, so there is nothing to check.`] });
+  try { json(ctx, 200, await pub.check({ channel: ch })); }
+  catch (e) { json(ctx, 200, { ok: false, error: String(e.message).slice(0, 500) }); }
+});
 app.post("/api/channels/:id/test-publish", async (ctx) => { const ch = await one(`SELECT * FROM channels WHERE id=$1`, [ctx.params.id]); if (!ch) throw new ApiError(404, null, "Channel not found"); const pub = await resolve("PUBLISH", ch.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[ch.platform] || "publish_mock"); if (ch.platform !== "FACEBOOK" || pub.impl !== "meta_graph") return json(ctx, 200, { ok: true, note: `resolved publisher ${pub.key}; only Facebook text test-posts are supported here` }); json(ctx, 200, await pub.publish({ channel: ch, mediaKind: "TEXT", caption: ctx.body.message || "Content Engine connection test", title: "test" })); });
 // ---- series
 app.get("/api/series", async (ctx) => { const n = ctx.query.get("nicheId"); json(ctx, 200, n ? await q(`SELECT * FROM series WHERE niche_id=$1 ORDER BY created_at DESC`, [n]) : await q(`SELECT * FROM series ORDER BY created_at DESC`)); });
@@ -2783,6 +3096,7 @@ app.get("/api/setup-status", async (ctx) => {
   const programs = await one(`SELECT COUNT(*)::int AS n FROM niches WHERE is_active::int = 1`);
   const live = await q(`SELECT c.* FROM channels c WHERE c.is_active::int = 1 AND COALESCE(c.publisher_adapter, '') <> 'publish_mock' AND c.platform <> 'PORTAL'`);
   let liveReady = 0; for (const c of live) { const needs = c.platform === "YOUTUBE" ? "youtube_oauth" : "meta"; if (c.credential_id || (needs === "meta" ? ENV.META_ACCESS_TOKEN : ENV.YOUTUBE_REFRESH_TOKEN)) liveReady++; }
+  const freeTier = await one(`SELECT 1 AS x FROM notifications WHERE kind = 'quota' AND title ILIKE '%free tier%' AND created_at > now() - interval '48 hours' LIMIT 1`);
   const items = [
     { key: "ai", ok: gem || oai || ant, title: "An AI key", detail: gem ? "Gemini is set" : oai ? "OpenAI is set" : ant ? "Anthropic is set" : "Add a Gemini key (API keys page, or GEMINI_API_KEY on Render)", link: "#/keys" },
     { key: "password", ok: !!ENV.DASHBOARD_PASSWORD, title: "Dashboard password", detail: ENV.DASHBOARD_PASSWORD ? "Set" : "Set DASHBOARD_PASSWORD on Render — the dashboard is open to anyone", link: null },
@@ -2792,6 +3106,8 @@ app.get("/api/setup-status", async (ctx) => {
     { key: "brand", ok: kit.n > 0, title: "A brand kit", detail: kit.n ? "Set" : "Give a brand its logo and colours — every photocard and video uses them", link: "#/brands" },
     { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
     { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
+    { key: "billing", ok: !freeTier, title: "An AI key with billing", detail: freeTier ? "This key ran out of free-tier requests in the last two days — a free key allows about 20 a day per model and no pictures. Enable billing on it (Google AI Studio → Billing)" : "No free-tier limit hit recently", link: "#/keys" },
+    { key: "budget", ok: Number(await setting("budget.daily_cap_usd", 0)) > 0, title: "A daily spend cap", detail: Number(await setting("budget.daily_cap_usd", 0)) > 0 ? `$${await setting("budget.daily_cap_usd", 0)} a day` : "Set one in Settings so a busy news day cannot run up a bill", link: "#/settings" },
     { key: "alerts", ok: !!(await telegramTarget().catch(() => null)), title: "Alerts on your phone", detail: "Telegram bot token + chat id (Settings → Alerts)", link: "#/settings" },
     { key: "studio", ok: studioInstalled(), title: "Video studio", detail: studioInstalled() ? `Installed. Renders run where the video lane runs and need ${STUDIO_MIN_MEMORY_MB} MB (this instance: ${memoryLimitMb()} MB)` : "Installed by the Docker image (reels and explainers)", link: null },
   ];
@@ -2896,5 +3212,11 @@ app.post("/api/seed", async (ctx) => {
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
   await recoverAbandonedWork();
   if (!ENV.DASHBOARD_PASSWORD) warn("DASHBOARD_PASSWORD is not set — the dashboard and API are OPEN. Fine locally, never on Render.");
-  server.listen(PORT, async () => { log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, lanes: ${LANES.join(",") || "none"}, sweeps: ${RUN_SWEEPS}, storage: ${(await storageBackend()).name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`); startWorkers(); });
+  server.listen(PORT, async () => {
+    const storage = await storageBackend();
+    log(`Content Engine listening on http://localhost:${PORT}  (worker ${WORKER_ID}, lanes: ${LANES.join(",") || "none"}, sweeps: ${RUN_SWEEPS}, storage: ${storage.name}, vault: ${vaultReady() ? "on" : "off — set SECRETS_KEY to store secrets from the dashboard"})`);
+    // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
+    if (storage.name === "supabase") ensureSupabaseBucket().catch((e) => warn("supabase storage:", e.message.slice(0, 200)));
+    startWorkers();
+  });
 })().catch((e) => { console.error("boot failed:", e); process.exit(1); });

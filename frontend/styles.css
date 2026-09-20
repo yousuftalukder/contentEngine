@@ -100,7 +100,8 @@ table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-weight: 500; color: var(--paper-dim); font-size: 12px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
 td { padding: 9px 10px; border-bottom: 1px solid var(--ink-3); vertical-align: top; }
 tr:hover td { background: rgba(255,255,255,.02); }
-td .sub { display: block; color: var(--paper-mute); font-size: 12px; }
+/* Subtext under a line: a block, so a title and its detail never run together (alerts, tables, lists). */
+.sub { display: block; color: var(--paper-mute); font-size: 12px; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r); background: var(--ink-2); }
 
 /* ---- cards / panels ---- */
