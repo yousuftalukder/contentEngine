@@ -454,6 +454,11 @@ const PRESETS = {
   tv_voiceover: { label: "TV news — voice-over reels", key: "tv_voiceover", displayName: "News in 60 seconds", contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 8, _orientation: "9:16", _verticalLayout: "blurpad" },
   reaction_long: { label: "Reaction videos — long-form", key: "reactions", displayName: "Reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 2, _orientation: "16:9" },
   explainers: { label: "Animated explainers of big stories", key: "explainers", displayName: "Explained", contentType: "ANIMATED_EXPLAINER", language: "bn", country: "Bangladesh", approvalMode: "MANUAL", maxItemsPerDay: 2, _orientation: "16:9", _explainerMinutes: 4, _deskMinSources: 3, _deskGap: 240 },
+  // United States audience. Short form renders in the studio, where quality matters most and a minute of video is a
+  // couple of minutes of rendering; semi-long uses ffmpeg, because ten minutes through the studio is hours of CPU.
+  us_sports_reels: { label: "US sport — YouTube Shorts", key: "us_sport", displayName: "US Sport", contentType: "NEWS_REEL", language: "en", country: "United States", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 30, maxItemsPerDay: 8, tone: "fast, confident, for fans", _orientation: "9:16", _deskMinSources: 2, _deskGap: 45, _topics: ["sports"] },
+  us_ent_reels: { label: "US entertainment — YouTube Shorts", key: "us_ent", displayName: "US Entertainment", contentType: "NEWS_REEL", language: "en", country: "United States", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 30, maxItemsPerDay: 8, tone: "lively, in the know", _orientation: "9:16", _deskMinSources: 2, _deskGap: 45, _topics: ["entertainment"] },
+  us_semi_long: { label: "US semi-long video (16:9, ffmpeg)", key: "us_long", displayName: "US Explained", contentType: "LONG_FORM_VIDEO", language: "en", country: "United States", approvalMode: "MANUAL", maxItemsPerDay: 2, renderAdapter: "ffmpeg", tone: "considered, plain-spoken", _orientation: "16:9", _deskMinSources: 2, _deskGap: 240, _topics: ["general", "tech"] },
   facts_series: { label: "Facts videos — daily, planner-driven", key: "facts", displayName: "Facts", contentType: "IMAGE_SLIDESHOW", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 60, maxItemsPerDay: 3, _orientation: "9:16", _apTopics: 1, autoSources: false },
 };
 async function programDialog(p, brands, sources, adapters, styles, done) {
@@ -498,6 +503,7 @@ async function programDialog(p, brands, sources, adapters, styles, done) {
   formDialog(p ? "Edit program" : "New program", f, async (v) => {
     if (preset?.autoSources === false) v.autoSources = false;
     v.methodConfig = readAutomation(v, readVideo(v, p?.method_config || {}));
+    if (preset?._topics) v.methodConfig.topics = preset._topics;          // which desk of its country the program takes
     for (const k of Object.keys(v)) if (v[k] === "" && k !== "tone") delete v[k];
     if (v.sourceIds) v.sourceIds = Array.from(f.querySelector("[name=sourceIds]").selectedOptions).map((o) => o.value);
     if (p) { delete v.brandId; delete v.key; await patch(`/api/programs/${p.id}`, v); } else await post("/api/programs", v);
