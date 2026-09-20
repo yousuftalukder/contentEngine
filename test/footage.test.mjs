@@ -150,3 +150,55 @@ test("the clipper finds the loud moment and cuts it at the pauses", { skip: !ffm
   assert.ok(end > start + 15, `and it is long enough to be a clip (${(end - start).toFixed(0)}s)`);
   assert.match(clip.reason, /loudest stretch/, "and says why it chose there");
 });
+
+// "The loudest part" and "the part that means something" are not the same answer, and the second one is the product.
+// Here they are deliberately in different places: the loud stretch is a man saying nothing at all, and a quieter one
+// later is a whole thought with something in it. Same video, same soundtrack, two pickers — the one that only hears
+// takes the noise, the one that reads takes the point. The words arrive through a configured instance of the mock
+// transcriber, so what is under test is the choosing and nothing else.
+test("the meaning clipper takes the quiet thought over the loud filler", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const src = join(dir, "loudfiller.mp4");
+  ff("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15:duration=215",
+     "-f", "lavfi", "-i", "sine=frequency=200:duration=215",
+     "-filter_complex", "[1:a]volume='if(between(t,100,135),1.0,if(between(t,97,100)+between(t,135,140)+between(t,175,178),0.0,0.06))':eval=frame[a]",
+     "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", src);
+
+  const seg = (start, text) => ({ start, end: start + 7, text });
+  const segments = [
+    ...Array.from({ length: 14 }, (_, i) => seg(i * 7, "This is the bit before anything has happened yet.")),
+    // 100-135: loud, and empty. Every one of these is filler by the word.
+    ...[100, 107, 114, 121, 128].map((t) => seg(t, "Um, you know, it is sort of, I mean, kind of like that.")),
+    // 140-175: quiet, and the whole point of the video — opens on its own feet, closes, and says things.
+    seg(140, "We spent 3 years building the wrong product."),
+    seg(147, "I think the mistake was never asking who it was for."),
+    seg(154, "Nobody on the team wanted to say it out loud."),
+    seg(161, "The truth is we shipped 40 features and only 2 mattered."),
+    seg(168, "That was the most expensive lesson we ever learned."),
+    // Far enough after it that no window can swallow both the thought and the sign-off.
+    seg(190, "Anyway, thanks for listening to all of that."),
+    seg(197, "See you again next week on the programme."),
+    seg(204, "That is all from us today."),
+  ];
+  await eng.api("POST", "/api/adapter-configs", { key: "transcribe_fixture", stage: "TRANSCRIBE", impl: "transcribe_mock", label: "Fixture transcript", config: { segments } });
+
+  const method = { clips_per_video: 1, clip_min_seconds: 25, clip_max_seconds: 45, orientation: "9:16", min_score: 0, captions: false };
+  const clipBy = async (key, clipAdapter) => {
+    const p = await eng.api("POST", "/api/programs", { ...base(), key, displayName: key, contentType: "PODCAST_CLIP",
+      productionMethod: "PODCAST_HIGHLIGHT", transcriptAdapter: "transcribe_fixture", clipAdapter, methodConfig: method });
+    await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "Loud nothing, quiet something" });
+    const it = await waitFor(async () => { const x = (await eng.api("GET", `/api/content-items?nicheId=${p.id}`))[0]; if (x?.status === "FAILED") throw new Error(String(x.rejection_note).slice(-300)); return x?.status === "PENDING_REVIEW" && x; },
+      { timeout: 300000, interval: 1000, what: `a clip chosen by ${clipAdapter}` });
+    return (await eng.query(`SELECT start_seconds, end_seconds, title, reason FROM clips WHERE content_item_id=$1`, [it.id]))[0];
+  };
+
+  const heard = await clipBy("byloudness", "clip_signal");
+  assert.ok(Number(heard.start_seconds) >= 90 && Number(heard.start_seconds) <= 115,
+    `the picker that only hears takes the loud filler (took ${heard.start_seconds}s)`);
+
+  const read = await clipBy("bymeaning", "clip_meaning");
+  const start = Number(read.start_seconds), end = Number(read.end_seconds);
+  assert.ok(start >= 137 && start <= 143, `it starts where the thought starts, not where the noise is (started ${start}s)`);
+  assert.ok(end >= 172 && end <= 178, `and ends where the thought ends (ended ${end}s)`);
+  assert.match(read.title, /We spent 3 years/, `the clip is titled with the sentence it opens on (got "${read.title}")`);
+  assert.match(read.reason, /whole thought/, `and says why it chose there (got "${read.reason}")`);
+});
