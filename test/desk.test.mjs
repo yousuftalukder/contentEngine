@@ -236,3 +236,28 @@ test("a cluster leads on the outlet that has the story, not the one with the mos
   assert.equal(it.source_data_ref.url, "https://small.example/ferry", "the material comes from the outlet that published something");
   assert.deepEqual([...it.source_data_ref.outlets].sort(), ["Heavy wire", "Small paper"], "and both outlets are still credited");
 });
+
+// The desk sees far more stories than it will ever write — hundreds a day against a couple of posts. Given the choice
+// it should take the one that arrived with a photograph and a summary, rather than discovering at render time that the
+// story it picked is a bare headline and the post has to go out as a text card.
+test("the desk prefers a story that came with a photo and a summary", async () => {
+  const bare = await eng.api("POST", "/api/sources", { name: "Headline wire", adapterKey: "ingest_mock",
+    config: { items: [{ title: "Parliament debates the new transport bill at length" }].map((x, i) => ({ ...x, url: `https://bare.example/${Date.now()}-${i}` })) } });
+  const rich = await eng.api("POST", "/api/sources", { name: "Full wire", adapterKey: "ingest_mock",
+    config: { items: [{ title: "Ferry capsizes on the Padma with sixty aboard",
+      summary: "Rescuers pulled forty people from the water on Wednesday morning, and the search for the rest continued after dark.",
+      thumbnail: "https://full.example/photo.jpg", url: `https://full.example/${Date.now()}` }] } });
+  const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "pick_rich", displayName: "Pick rich", contentType: "NEWS_STATIC",
+    country: "Bangladesh", language: "en", useMocks: true, autoStyle: false, autoSources: false, sourceIds: [bare.id, rich.id],
+    methodConfig: { desk: { settle_minutes: 0, min_sources: 1, min_gap_minutes: 0, per_sweep: 1 } } });
+
+  // The bare headline is ingested first, so recency alone would favour it.
+  await eng.api("POST", `/api/sources/${rich.id}/poll`);
+  await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id=$1 AND cluster_id IS NOT NULL`, [rich.id])).length, { what: "the full story clustered" });
+  await eng.api("POST", `/api/sources/${bare.id}/poll`);
+  await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id=$1 AND cluster_id IS NOT NULL`, [bare.id])).length, { what: "the bare headline clustered" });
+
+  await eng.api("POST", "/api/desk/run");
+  const picked = await waitFor(async () => { const [x] = await eng.api("GET", `/api/content-items?nicheId=${p.id}`); return x?.topic; }, { timeout: 40000, what: "the desk to pick one" });
+  assert.match(picked, /Ferry capsizes/, `it took the story it can actually make something of — picked "${picked}"`);
+});

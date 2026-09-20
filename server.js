@@ -2429,7 +2429,14 @@ async function sweepNewsDesk() {
     if (pending.n >= cfg.max_pending) continue;
     const last = await one(`SELECT max(created_at) AS t FROM content_items WHERE niche_id = $1 AND cluster_id IS NOT NULL`, [niche.id]);
     if (last?.t && Date.now() - new Date(last.t).getTime() < cfg.min_gap_minutes * 60000) continue;
-    const rows = await q(`SELECT c.*, LEAST(c.weight_sum, 6) * exp(-extract(epoch FROM now() - c.first_seen_at) / 64800.0) AS score FROM story_clusters c
+    // A story that came with a photograph and a summary makes a better post than one that is a bare headline, and the
+    // desk has far more clusters than it will ever write: 264 in six hours against a couple of posts a day. So having
+    // something to work with is part of the score, not a detail discovered later when the card turns out to be text.
+    // It is a nudge, not a gate — a big corroborated story with no picture still beats a quiet one that has one.
+    const rows = await q(`SELECT c.*, LEAST(c.weight_sum, 6) * exp(-extract(epoch FROM now() - c.first_seen_at) / 64800.0)
+        * (1 + 0.45 * (EXISTS (SELECT 1 FROM source_items si WHERE si.cluster_id = c.id AND si.thumbnail_url IS NOT NULL))::int
+             + 0.20 * (EXISTS (SELECT 1 FROM source_items si WHERE si.cluster_id = c.id AND length(COALESCE(si.summary,'')) > 80))::int) AS score
+      FROM story_clusters c
       WHERE COALESCE(c.published_at, c.first_seen_at) > now() - ($2 || ' hours')::interval AND c.source_count >= $3
         AND (c.source_count >= 2 OR c.first_seen_at < now() - ($4 || ' minutes')::interval)
         AND EXISTS (SELECT 1 FROM source_items si JOIN niche_sources ns ON ns.source_id = si.source_id WHERE si.cluster_id = c.id AND ns.niche_id = $1)
