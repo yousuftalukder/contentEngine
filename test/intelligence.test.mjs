@@ -81,3 +81,15 @@ test("series: the next episode is planned from the earlier ones and numbered", a
   assert.equal(ep.episode_number, 1);
   assert.equal(ep.series_id, s.id);
 });
+
+// Models answer the quality score on whatever scale they like. Production returned a flat 10 against a 0.75 threshold,
+// so the score cleared it without meaning anything: it has to be read on the scale it was written on.
+test("quality gate: a score on a 0-10 scale is read as 0-10, not as passing by default", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_scores_out_of_ten", stage: "SCRIPT", impl: "llm_mock",
+    config: { respond: [{ match: "standards editor", json: { fact_issues: [], headline_ok: true, safety_flags: [], language_issues: [], score: 6, verdict: "PASS", summary: "readable but thin" } }] } });
+  const p = await program("scale_ten", { approvalMode: "AUTO", scriptAdapter: "llm_scores_out_of_ten" });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A thin story" });
+  const held = await settle(id, ["PENDING_REVIEW", "PUBLISHED"]);
+  assert.equal(held.status, "PENDING_REVIEW", "6 out of 10 is below the bar, so a person looks at it");
+  assert.equal(held.qa_score, 0.6, "and the score is stored on one scale");
+});
