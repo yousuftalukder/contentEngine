@@ -1038,6 +1038,24 @@ async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}, comp
   const url = await storeFile(`images/${newId()}.${j.ext}`, j.bytes, j.mime);
   return recordMedia({ contentItemId, kind: "IMAGE", url, mime: j.mime, width: dims.width || null, height: dims.height || null, meta: { ...meta, source_mime: mime } });
 }
+// A 1280x720 cover for the video: the section picture the story opens on, with the headline burned over it the way a
+// person would set it. A frame is pulled out of stock footage where that is what the section holds.
+async function makeThumbnail(contentItemId, niche, first, headline) {
+  if (!first?.url) return null;
+  const specs = await cardSpecs(niche, {}, { width: 1280, height: 720 });
+  // YouTube wants 1280x720 whatever shape the section picture is, so the base is cropped to it before the headline
+  // goes on: composeHeadline sizes its type from the image it is given.
+  const file = await toTmpFile(first.url, first.kind === "VIDEO" ? "mp4" : undefined), still = tmpPath("jpg");
+  const fit = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1";
+  try {
+    await exec("ffmpeg", ["-y", ...(first.kind === "VIDEO" ? ["-ss", "1"] : []), "-i", file, "-vf", fit, "-frames:v", "1", "-q:v", "2", still]);
+    const out = await composeHeadline(still, headline, { ...specs, layout: "overlay", overlay_scale: 1.15 });
+    try {
+      const url = await storeLocal(out, `images/${newId()}-thumb.jpg`, "image/jpeg");
+      return await recordMedia({ contentItemId, kind: "THUMBNAIL", url, mime: "image/jpeg", width: 1280, height: 720, meta: { purpose: "youtube thumbnail", from: first.kind === "VIDEO" ? "footage frame" : "section picture" } });
+    } finally { await cleanup(out); }
+  } finally { await cleanup(file, still); }
+}
 // A text card as an item's hero image. It carries no IMAGE_BASE row: the card is drawn from scratch, so a later headline
 // edit redraws it from compose_specs alone.
 async function storeTextCard(contentItemId, headline, specs = {}, reason = null) {
@@ -1255,6 +1273,17 @@ const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
 const VF_VERTICAL_BLURPAD = "split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:4,eq=brightness=-0.18[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=0:(H-h)/2,setsar=1";
 const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black";
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"];
+// A music bed under narration. Not a flat quiet layer fighting the words: the bed is faded in and out, and a sidechain
+// compressor keyed on the narration itself pulls it down under every phrase and lets it back up in the gaps — the duck
+// an editor rides by hand. `mi` and `vi` are the ffmpeg input indexes of the music and of the voice.
+// Both chains are forced to one format first: sidechaincompress and amix want their inputs to agree, and the music and
+// the narration arrive as whatever their encoders felt like.
+const AFMT = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo";
+const duckUnder = (mi, vi, dur) =>
+  `[${mi}:a]${AFMT},volume=0.22,afade=t=in:st=0:d=1.5,afade=t=out:st=${Math.max(0, dur - 2.5).toFixed(2)}:d=2.5[bed];` +
+  `[${vi}:a]${AFMT},asplit=2[voice][key];` +
+  `[bed][key]sidechaincompress=threshold=0.03:ratio=12:attack=15:release=350[duck];` +
+  `[voice][duck]amix=inputs=2:duration=first:dropout_transition=0,alimiter=limit=0.95[mix]`;
 async function cutClip(input, start, end, { vertical = true, ass = null, layout = "crop" } = {}) {
   const vf = [vertical ? (layout === "blurpad" ? VF_VERTICAL_BLURPAD : VF_VERTICAL) : VF_LANDSCAPE];
   if (ass) vf.push(assVf(ass));
@@ -1416,7 +1445,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
   },
   // durations (seconds per picture) follow the narration section by section; without them the pictures share it equally.
-  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [] }) {
+  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [], niche = null }) {
     if (!images.length) throw new Error("slideshow needs at least one image");
     const a = await toTmpFile(audio.url, "mp3"); const dur = (await ffprobeDuration(a)) || audio.duration_seconds || images.length * 4;
     const per = durations?.length === images.length ? durations.map((x) => Math.max(0.5, Number(x) || 0)) : images.map(() => dur / images.length);
@@ -1441,9 +1470,17 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
       }
       const list = tmpPath("txt"); await writeFile(list, segs.map((s) => `file '${s.replace(/\\/g, "/")}'`).join("\n"));
       let ass = null; if (captions.length) ass = await writeCaptionsAss(captions, 0, dur, { width: w, height: h });
+      // The brand's music, if it has any. A slideshow with nothing under the voice sounds like a slideshow.
+      const music = niche ? await studioBrand(niche).then((s) => s.music, () => undefined) : undefined;
       const out = tmpPath("mp4");
-      try { await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, ...(ass ? ["-vf", assVf(ass)] : []), "-map", "0:v", "-map", "1:a", "-shortest", ...X264, out]); }
-      finally { await cleanup(list, ass); }
+      const run = async (bed) => {
+        const fc = [...(ass ? [`[0:v]${assVf(ass)}[v]`] : []), ...(bed ? [duckUnder(2, 1, dur)] : [])];
+        await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, ...(bed ? ["-stream_loop", "-1", "-i", bed] : []),
+          ...(fc.length ? ["-filter_complex", fc.join(";")] : []), "-map", ass ? "[v]" : "0:v", "-map", bed ? "[mix]" : "1:a", "-shortest", ...X264, out]);
+      };
+      // An ffmpeg without sidechaincompress or alimiter must still produce the video, just without the bed.
+      try { await run(music).catch((e) => { if (!music) throw e; warn(`music bed: ${e.message.slice(0, 140)}`); return run(null); }); }
+      finally { await cleanup(list, ass, music); }
       return publishRender(out, contentItemId, { method: "SLIDESHOW", orientation, slides: images.length });
     } finally { await cleanup(a, ...files, ...segs); }
   },
@@ -2259,8 +2296,10 @@ async function generateReel(item, niche, style) {
       sections: sections.map((s, i) => ({ image: images[i].url, video: images[i].kind === "VIDEO", narration: s.narration, seconds: narr.durations[i] + 0.15 })) });
   } else {
     let t = 0; const captions = sections.map((s, i) => { const c = { start: t, end: t + narr.durations[i], text: s.narration }; t += narr.durations[i]; return c; });
-    video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation, captions: mc.captions === false ? [] : captions });
+    video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation, captions: mc.captions === false ? [] : captions, niche });
   }
+  // A landscape video is a YouTube video, and a YouTube video without a thumbnail is a grey frame in a list of covers.
+  if (!vertical) await makeThumbnail(item.id, niche, images[0], title).catch((e) => warn(`thumbnail: ${e.message.slice(0, 140)}`));
   await setItem(item.id, { hero_media_id: video.id });
 }
 
