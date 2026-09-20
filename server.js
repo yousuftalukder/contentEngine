@@ -452,7 +452,11 @@ async function toTmpFile(url, ext) {
   await writeFile(out, await fetchBytes(url));
   return out;
 }
+// ffmpeg writes two kilobytes of build flags before anything else, so a failure that is kept as an error message ends
+// up being mostly "--enable-libvorbis". Every call gets -hide_banner unless it asked for something else, which leaves
+// the tail of stderr as what actually went wrong.
 function exec(cmd, args, { timeoutMs = 45 * 60000, input = null } = {}) {
+  if (/^(ffmpeg|ffprobe)/.test(cmd) && !args.includes("-hide_banner") && !args.includes("-version")) args = ["-hide_banner", ...args];
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
     let out = "", err = "";
@@ -1106,9 +1110,23 @@ async function storeTextCard(contentItemId, headline, specs = {}, reason = null)
       meta: { overlay: "textcard", ...(reason ? { fallback: String(reason).slice(0, 300) } : {}), compose_specs: { kit, card_meta, width, height, brand, label, layout: "textcard" } } });
   } finally { await cleanup(out); }
 }
-impl("IMAGE", "image_mock", { label: "Mock image (SVG card)", create: () => ({
+// A raster, not the SVG this used to return. An SVG needs an ffmpeg built with librsvg to decode, which most are not,
+// so a program on mocks produced pictures that every video render then refused — a failure that looks like a bug in
+// the renderer and is really the stand-in picture. A mock should be able to stand in.
+impl("IMAGE", "image_mock", { label: "Mock image (flat card)", create: () => ({
   async generate({ headline, specs = {}, contentItemId }) {
-    return storeImage(Buffer.from(svgCard(headline, specs)), "image/svg+xml", contentItemId, { mock: true }, { width: specs.width || 1080, height: specs.height || 1080 });
+    const w = specs.width || 1080, h = specs.height || 1080;
+    const hue = (sha(String(headline || "mock")).charCodeAt(0) * 7) % 360;
+    const out = tmpPath("jpg");
+    try {
+      await exec("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=0x202838:s=${w}x${h}`,
+        "-vf", `format=gbrp,geq=r='128+80*sin(${hue}+X/${w}*3)':g='120+70*sin(1+Y/${h}*3)':b='150+70*sin(2+(X+Y)/${w}*3)'`,
+        "-frames:v", "1", "-q:v", "3", out], { timeoutMs: 60000 });
+      return await storeImage(await readFile(out), "image/jpeg", contentItemId, { mock: true }, { width: w, height: h });
+    } catch {
+      // No ffmpeg at all: the SVG is still better than failing, and whatever consumes it can say so itself.
+      return storeImage(Buffer.from(svgCard(headline, specs)), "image/svg+xml", contentItemId, { mock: true }, { width: w, height: h });
+    } finally { await cleanup(out); }
   } }) });
 impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_IMAGE_MODEL } }, create: (cfg, ctx = {}) => ({
   async generate({ prompt, headline, specs = {}, contentItemId }) {
