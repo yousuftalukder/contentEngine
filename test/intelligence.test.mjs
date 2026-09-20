@@ -111,3 +111,29 @@ test("review: approving the clean drafts leaves the flagged ones for a person", 
   assert.equal((await item(held)).status, "PENDING_REVIEW", "the flagged one stays");
   for (const id of ids) assert.notEqual((await item(id)).status, "PENDING_REVIEW");
 });
+
+// A generated style once invented "Tap the link in our bio for the full story" for a program that publishes no link,
+// and every caption on every platform ended with that promise. A CTA may only point where something exists.
+// The mock writer answers to what it is told, so these assert on the instruction the writer actually received.
+const LINKY = "Tap the link in our bio for the full story.";
+async function styledProgram(key, portal) {
+  const p = await program(key, { publishToPortal: portal, scriptAdapter: "llm_sees_instruction" });
+  const [prof] = await eng.query(`INSERT INTO style_profiles (id, brand_id, niche_id, name, language, tone, rules, cta, generated)
+    VALUES (gen_random_uuid()::text, $1, $2, 'Linky', 'en', 'clear', 'Lead with the news.', $3, 1) RETURNING id`, [brand.id, p.id, LINKY]);
+  await eng.api("PATCH", `/api/programs/${p.id}`, { styleProfileId: prof.id });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: `Ferry service resumes ${key}` });
+  return settle(id, ["PENDING_REVIEW"]);
+}
+
+test("style: a generated call to action that promises a link is dropped when posts carry none", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_sees_instruction", stage: "SCRIPT", impl: "llm_mock", config: { respond: [
+    { match: "never tell readers to tap a link", json: { headline: "TOLD: no link", summary: "s", captions: { facebook: "c" }, hashtags: [] } },
+    { match: `End with this call to action: ${LINKY}`, json: { headline: "TOLD: use the CTA", summary: "s", captions: { facebook: "c" }, hashtags: [] } },
+  ] } });
+
+  const withoutPortal = await styledProgram("cta_no_portal", false);
+  assert.equal(withoutPortal.headline, "TOLD: no link", "with no link to give, the writer is told not to promise one");
+
+  const withPortal = await styledProgram("cta_portal", true);
+  assert.equal(withPortal.headline, "TOLD: use the CTA", "with an article page behind every post, the call to action stands");
+});
