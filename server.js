@@ -77,7 +77,15 @@ const J = (v) => (v === undefined || v === null ? null : JSON.stringify(v));
 const P = (v) => { if (v == null) return null; if (typeof v === "object") return v; try { return JSON.parse(v); } catch { return null; } };
 const slugify = (s) => String(s).toLowerCase().normalize("NFKD").replace(/[^\w\s-]/g, "").trim().replace(/[\s_-]+/g, "-").slice(0, 80) || "post";
 const stripHtml = (s) => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-const decodeXml = (s) => String(s || "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, "&");
+// Feeds escape their punctuation in every style there is: &#039; and &#8217; for apostrophes, &hellip; for an ellipsis,
+// and plenty are double-escaped (&amp;#039;). Numeric entities are decoded generically, named ones from the short list
+// that actually appears in news, and the whole thing runs twice to undo one level of double-escaping.
+const XML_NAMED = { lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…", mdash: "—", ndash: "–", rsquo: "’", lsquo: "‘", ldquo: "“", rdquo: "”", amp: "&" };
+const decodeOnce = (s) => s
+  .replace(/&#x([0-9a-f]{1,6});/gi, (m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return m; } })
+  .replace(/&#(\d{1,7});/g, (m, d) => { try { return String.fromCodePoint(Number(d)); } catch { return m; } })
+  .replace(/&(lt|gt|quot|apos|nbsp|hellip|mdash|ndash|rsquo|lsquo|ldquo|rdquo|amp);/gi, (m, n) => XML_NAMED[n.toLowerCase()] ?? m);
+const decodeXml = (s) => decodeOnce(decodeOnce(String(s || "")));
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const nice = (s) => String(s || "").replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
 const tmpPath = (ext) => join(TMP, `${randomUUID()}.${ext}`);

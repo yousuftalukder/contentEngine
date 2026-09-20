@@ -12,7 +12,16 @@ try {
   await eng.api("PUT", "/api/settings/planner.enabled", { value: false });
   const brand = await eng.api("POST", "/api/brands", { name: "Rehearsal" });
   const channel = await eng.api("POST", "/api/channels", { brandId: brand.id, key: "fb", displayName: "FB", platform: "FACEBOOK", format: "STATIC_IMAGE_CAPTION", publisherAdapter: "publish_mock" });
-  const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "bd_en", displayName: "Bangladesh News", contentType: "NEWS_STATIC", country: "Bangladesh", language: "en", useMocks: true, autoStyle: false, approvalMode: "AUTO" });
+  // `npm run rehearse` takes the country and, for the United States, which desk: `npm run rehearse -- us sports`.
+  const [where = "bd", topic] = process.argv.slice(2).map((a) => String(a).toLowerCase());
+  const us = /^(us|usa|united states)$/.test(where);
+  const p = await eng.api("POST", "/api/programs", {
+    brandId: brand.id, key: us ? `us_${topic || "all"}` : "bd_en", displayName: us ? `US ${topic || "news"}` : "Bangladesh News",
+    contentType: "NEWS_STATIC", country: us ? "United States" : "Bangladesh", language: "en", useMocks: true, autoStyle: false, approvalMode: "AUTO",
+    methodConfig: { ...(topic ? { topics: [topic] } : {}), desk: { settle_minutes: 0, min_sources: 1, per_sweep: 3 } },
+    // The same noise the US presets filter: score tickers and betting promos are not stories.
+    topicFilters: us && topic === "sports" ? { exclude: ["promo code", "betting", "odds", "parlay", "draftkings", "fanduel", "how to watch", "live stream", "gameday", "injury report", "fantasy start"] }
+      : us && topic === "entertainment" ? { exclude: ["deal of the day", "best deals", "where to buy", "shop now", "horoscope", "sponsored"] } : {} });
   await eng.api("POST", `/api/channels/${channel.id}/niches/${p.id}`);
   const sources = (await eng.api("GET", "/api/programs")).find((x) => x.id === p.id).sources;
   console.log(`catalog gave the program ${sources.length} sources`);
