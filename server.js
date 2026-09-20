@@ -2613,7 +2613,11 @@ async function generateReel(item, niche, style) {
   for (const [i, s] of sections.entries()) {
     // An explicit null is the writer saying only the real event would do here; that section keeps a picture.
     const query = s.footage_query === null ? null : s.footage_query || s.image_prompt;
-    if (broll && query) {
+    // The opening section belongs to the story's own photograph, not to stock footage. A clip of a generic bank is
+    // worth less than the photograph of the bank this story is about, and the first second is where a viewer decides.
+    // Every later section takes footage, so the video still moves and is not one picture held for forty seconds.
+    const ownPhoto = i === 0 && m.photo && methodCfg(niche).source_photos !== false;
+    if (broll && query && !ownPhoto) {
       // Narration length is only measured later, so the clip is chosen against a reading-speed estimate of this section.
       const spoken = Math.max(4, Math.round(String(s.narration).split(/\s+/).filter(Boolean).length / 2.2));
       const clip = await pexelsFootage(query, { vertical, seconds: spoken + 1 });
