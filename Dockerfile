@@ -33,6 +33,10 @@ RUN set -eux; \
     test -s /opt/piper/voices/en_US-lessac-medium.onnx; \
     echo "the engine is installed" | piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/piper-check.wav; \
     test -s /tmp/piper-check.wav; rm -f /tmp/piper-check.wav
+# The Bangla voice is downloaded but silent with this piper build: its phoneme map contains a two-codepoint symbol and
+# piper 2023.11.14 rejects anything that is not one ("aɪ" is not a single codepoint). The file is correct and a newer
+# piper will read it, so it stays; the engine falls back to another installed voice rather than failing a video over
+# it. Bangla narration is not on the critical path — a clip cut from a long video keeps the source's own audio.
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
