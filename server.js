@@ -1114,6 +1114,17 @@ function svgCard(headline, specs) {
 // headline. Set image_specs.render_text=true on a program to let the model draw the text instead (overlay is then skipped),
 // or image_specs.overlay=false for no text at all.
 const OVERLAY_FONT = ENV.OVERLAY_FONT || "Noto Sans Bengali";
+// Every Bangla headline on a live card came out as boxes: the glyphs were missing, not the text. Naming a font in an
+// ASS style asks fontconfig to find it, and fontconfig always answers — with a substitute when it cannot, and the
+// substitute has no Bengali in it. So the directory the fonts actually live in is handed to libass directly, which
+// makes the lookup a file lookup instead of a negotiation. Checked once, at boot, and reported.
+const SYSTEM_FONT_DIRS = ["/usr/share/fonts/truetype/noto", "/usr/share/fonts/truetype", "/usr/share/fonts"];
+let systemFontsDir;
+function fontsDirFor(kitDir) {
+  if (kitDir) return kitDir;
+  if (systemFontsDir === undefined) systemFontsDir = SYSTEM_FONT_DIRS.find((d) => { try { return existsSync(d); } catch { return false; } }) || null;
+  return systemFontsDir;
+}
 const assEsc = (t) => String(t || "").replace(/[\r\n]+/g, " ").replace(/[{}\\]/g, "").trim();
 // A file path as a filtergraph option value: quoted so the graph parser passes it through, colon escaped for the option
 // parser (Windows drive letters), forward slashes throughout.
@@ -1178,7 +1189,7 @@ async function composePhotocard(inPath, headline, specs = {}) {
     + (specs.photo_credit ? `Dialogue: 1,0:00:00.00,0:00:10.00,Photo,,0,0,0,,${assEsc(specs.photo_credit)}\n` : "");
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
   let logo = null; if (kit.logo_url) { try { logo = await toTmpFile(kit.logo_url, "png"); } catch (e) { warn(`brand logo: ${e.message}`); } }
-  const fontsDir = await brandFontsDir(kit);
+  const fontsDir = await brandFontsDir(kit);   // null for a brand with no font of its own
   let fc = `color=c=${hex(kit.primary_color, "#b3121f")}:s=${W}x${H}:d=1[bg];[0:v]scale=${W}:${split}:force_original_aspect_ratio=increase,crop=${W}:${split},setsar=1[img];[bg][img]overlay=0:0[b0];`
     + `[b0]drawbox=x=0:y=${split}:w=${W}:h=${Math.max(4, Math.round(H * 0.008))}:color=${hex(kit.accent_color, "#ffc400")}@1:t=fill[b1]`;
   let last = "b1";
@@ -1222,7 +1233,7 @@ async function composeTextCard(headline, specs = {}) {
     + (text && metaLine ? `Dialogue: 0,0:00:00.00,0:00:10.00,Meta,,0,0,0,,${assEsc(metaLine)}\n` : "")
     + (text && kit.handle ? `Dialogue: 0,0:00:00.00,0:00:10.00,Handle,,0,0,0,,${assEsc(kit.handle)}\n` : "");
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
-  const fontsDir = await brandFontsDir(kit);
+  const fontsDir = await brandFontsDir(kit);   // null for a brand with no font of its own
   // A card is mostly covered by its headline, so a plain diagonal fade is enough. A backdrop is the whole frame of a
   // reel section, and a flat field there reads as a missing picture: a broad diagonal sheen and a soft vignette give it
   // somewhere to look. Written without commas, which a geq expression inside a filtergraph cannot carry.
@@ -1557,7 +1568,9 @@ impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { mode
 // Burned-in text is always an ASS file drawn by the `ass` filter with complex shaping: ffmpeg's `subtitles` filter and
 // drawtext use simple shaping, which scrambles Bangla (vowel signs and conjuncts render in the wrong place).
 const assTime = (s) => { const cs = Math.max(0, Math.round(s * 100)); return `${Math.floor(cs / 360000)}:${String(Math.floor(cs / 6000) % 60).padStart(2, "0")}:${String(Math.floor(cs / 100) % 60).padStart(2, "0")}.${String(cs % 100).padStart(2, "0")}`; };
-const assVf = (file, fontsDir = null) => `ass=filename=${ffPath(file)}:shaping=complex${fontsDir ? `:fontsdir=${ffPath(fontsDir)}` : ""}`;
+// Every burned caption and overlay goes through here, so the font directory is settled here too rather than at each
+// of a dozen call sites — a Bangla caption on a reel fails exactly the way a Bangla headline on a card does.
+const assVf = (file, fontsDir = null) => { const d = fontsDirFor(fontsDir); return `ass=filename=${ffPath(file)}:shaping=complex${d ? `:fontsdir=${ffPath(d)}` : ""}`; };
 const ASS_FORMAT = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding";
 // Captions for [start, end] of a timed transcript, shifted to 0 and cut into short phrases (a few words, timed by character
 // count). Karaoke colours each word as it is spoken. An optional hook sits in a box at the top for the first four seconds.
@@ -3627,6 +3640,18 @@ async function sweepHealth() {
   }
 }
 // Programs created before the source catalog existed get its sources (and a house style) once.
+// Said out loud at boot, because a font that is missing shows up as a page of boxes on a finished card — after the
+// story is written, the picture fetched and the post rendered — and nothing before that point complains.
+async function reportFonts() {
+  const dir = fontsDirFor(null);
+  const want = OVERLAY_FONT;
+  let match = null;
+  try { const { out } = await exec("fc-match", ["-f", "%{family}|%{file}", want], { timeoutMs: 20000 }); match = String(out).trim(); } catch {}
+  const bengali = await exec("sh", ["-c", `fc-list :lang=bn family 2>/dev/null | head -3`], { timeoutMs: 20000 }).then(({ out }) => String(out).trim()).catch(() => "");
+  log(`fonts: overlay "${want}"${match ? ` resolves to ${match}` : " (fc-match unavailable)"}; libass reads ${dir || "system defaults"}`);
+  if (!bengali) warn(`fonts: nothing installed here can draw Bengali — every Bangla headline will render as boxes. The image installs fonts-noto-core for this.`);
+  else log(`fonts: Bengali available from ${bengali.split(/\r?\n/).join(", ")}`);
+}
 async function upgradeExistingPrograms() {
   if (await setting("upgrade.catalog_v1", false)) return;
   for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
@@ -3729,6 +3754,7 @@ function startWorkers() {
   every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
   every(15 * 60000, sweepHealth);
   upgradeExistingPrograms().then(upgradeAdapters).then(syncCatalogSources).catch((e) => warn("upgrade", e.message));
+  reportFonts().catch(() => {});
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
