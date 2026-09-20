@@ -75,3 +75,18 @@ test("a lane with work and nothing running it raises an alert naming the lane", 
     assert.match(alert.body, /worker service/i, "and it says where video rendering is supposed to run");
   } finally { await web.stop(); }
 });
+
+// Keys almost always arrive after the programs that need them: someone signs up for a stock-photo account on the day
+// the pictures stop appearing. A key that only reaches programs created after it is a key that does nothing.
+test("a key added after the program exists reaches it straight away", async () => {
+  const vault = await startEngine({ env: { SECRETS_KEY: "0".repeat(64) } });
+  try {
+    const b = await vault.api("POST", "/api/brands", { name: "Late key" });
+    const p = await vault.api("POST", "/api/programs", { brandId: b.id, key: "latekey", displayName: "Late key news", contentType: "NEWS_STATIC", country: "Bangladesh", autoStyle: false, autoSources: false, imageAdapter: "gemini_image" });
+    const fallbacks = async () => JSON.parse((await vault.query(`SELECT image_adapter_fallbacks::text AS f FROM niches WHERE id=$1`, [p.id]))[0].f || "[]");
+    assert.ok(!(await fallbacks()).includes("pexels_stock"), "nothing to fall back to yet");
+
+    await vault.api("POST", "/api/credentials", { provider: "pexels", secret: "test-stock-key", label: "Stock photos" });
+    assert.ok((await fallbacks()).includes("pexels_stock"), "the existing program can now fall back to a library photo");
+  } finally { await vault.stop(); }
+});
