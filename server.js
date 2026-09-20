@@ -915,8 +915,11 @@ impl("DOWNLOAD", "direct", { label: "Direct link / uploaded file", create: () =>
 
 // ---- 6e. Transcribe (stage TRANSCRIBE). transcribe({path, language}) -> {segments:[{start,end,text}], text}
 const joinSegments = (segs) => segs.map((s) => s.text).join(" ");
-impl("TRANSCRIBE", "transcribe_mock", { label: "Mock", create: () => ({
-  async transcribe({ duration = 600 }) { const segs = []; for (let t = 0; t < Math.min(duration, 1800); t += 8) segs.push({ start: t, end: t + 8, text: `Mock transcript sentence covering seconds ${t} to ${t + 8}; the speaker makes a surprising point here.` }); return { segments: segs, text: joinSegments(segs) }; } }) });
+impl("TRANSCRIBE", "transcribe_mock", { label: "Mock", configSchema: { segments: { type: "array" } }, create: (cfg = {}) => ({
+  // An instance of this impl can carry the words themselves (Adapters → new instance → config.segments), which is how
+  // a test about *what was said* supplies a transcript. Without them, filler on an eight-second grid as before.
+  async transcribe({ duration = 600 }) { const given = P(cfg.segments) || []; if (given.length) return { segments: given, text: joinSegments(given) };
+    const segs = []; for (let t = 0; t < Math.min(duration, 1800); t += 8) segs.push({ start: t, end: t + 8, text: `Mock transcript sentence covering seconds ${t} to ${t + 8}; the speaker makes a surprising point here.` }); return { segments: segs, text: joinSegments(segs) }; } }) });
 async function extractAudio(videoPath) { const out = tmpPath("mp3"); await exec("ffmpeg", ["-y", "-i", videoPath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", out]); return out; }
 impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped transcript)", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL } }, create: (cfg, ctx = {}) => ({
   async transcribe({ path, language }) {
@@ -1077,6 +1080,103 @@ impl("CLIP", "clip_signal", { label: "Loudest moment (free, no key)", create: ()
       const text = segs.filter((x) => x.end > start && x.start < end).map((x) => x.text).join(" ").trim();
       picked.push({ start, end, title: text.split(/(?<=[.!?])\s/)[0]?.slice(0, 70) || "Clip", hook: "",
         score: Number(w.score.toFixed(3)), reason: `loudest stretch with speech in it (${Math.round(w.score * 100)}%)` });
+    }
+    return picked;
+  } }) });
+// Sentences, each with a time. whisper hands back segments of a sentence or two, and a clip that begins halfway
+// through a sentence reads as an accident however good the moment inside it is — so the unit a clip is built from
+// here is the sentence, not a five-second grid. Time within a segment is shared out by character count: close
+// enough at this scale, and free. The danda (।) ends a Bangla sentence the way a full stop ends an English one.
+function sentencesOf(segments) {
+  const out = [];
+  for (const seg of segments || []) {
+    const text = String(seg.text || "").trim(); if (!text) continue;
+    const start = Number(seg.start) || 0, span = Math.max(0.1, (Number(seg.end) || 0) - start);
+    const parts = text.split(/(?<=[.!?।])\s+/).map((p) => p.trim()).filter(Boolean);
+    let at = start;
+    for (const p of (parts.length ? parts : [text])) {
+      const d = span * (p.length / text.length);
+      out.push({ start: Number(at.toFixed(2)), end: Number(Math.min(start + span, at + d).toFixed(2)), text: p });
+      at += d;
+    }
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+// What makes a stretch of talk worth watching on its own, read off the words themselves. None of it needs a model,
+// which is the point: it has to run on every video, every day, on a free tier. The structural tests — does it begin
+// where a thought begins, does it end where one ends, is anyone actually saying anything — hold in any language; the
+// lexical lists are strongest in English and carry the Bangla markers I am confident of.
+// `\b` is defined over [A-Za-z0-9_] only, so it does nothing at the edge of a Bangla word: "কিন্তু\b" matches nothing,
+// and "কি" matches as a prefix of "কিন্তু" — which read "but…" as a strong opening. Bangla words end where the
+// Bengali block ends, so that is the boundary they get.
+const BN_END = "(?![\\u0980-\\u09FF])";
+const OPENS_MID_THOUGHT = new RegExp(`^(?:(?:and|so|but|then|because|which|who|that|it|he|she|they|this|these|those|also|anyway|plus|or|however|therefore|thus)\\b|(?:আর|তাই|কিন্তু|তারপর|সেটা|এটা|এবং)${BN_END})`, "i");
+const STRONG_OPENER = new RegExp(`^(?:(?:what|why|how|when|who|where|if|imagine|look|listen|here'?s|there (?:is|are|was|were)|the (?:truth|point|problem|question|reason|thing)|i|we|you|let me)\\b|(?:কি|কেন|কীভাবে|কখন|কোথায়|যদি|দেখুন|শুনুন|আমি|আমরা|আপনি)${BN_END})`, "i");
+const SUBSTANCE = [
+  /\b\d+(?:[.,]\d+)?\s*(?:%|percent|million|billion|thousand|years?|months?|days?|hours?|minutes?|dollars?|times)\b/i,
+  /\b(?:never|always|first|last|best|worst|most|least|only|every|nobody|everyone|everything|nothing|impossible)\b/i,
+  /\b(?:i (?:think|believe|realised|realized|learned|learnt|found|know|remember)|the (?:truth|reason|problem|point) is|turns out|actually|in fact)\b/i,
+  /\?\s*$/,
+  /[০-৯]/,
+  /(?:সবচেয়ে|প্রথম|কখনো|আসলে|সত্যি|কেবল)/,
+];
+const FILLER = /\b(?:u[mh]+|er+|you know|i mean|sort of|kind of|basically|literally)\b/gi;
+// Everything a window can earn: the neutral half, a clean opening, a clean finish, and a full house of substance.
+const MEANING_MAX = 0.5 + 0.2 + 0.1 + 0.35;
+impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no key)", create: () => ({
+  async selectClips({ transcript, niche, signals }) {
+    const c = methodCfg(niche);
+    const sentences = sentencesOf(transcript?.segments);
+    const said = sentences.reduce((n, s) => n + (s.end - s.start), 0);
+    // Nothing to read means nothing to judge. Throwing rather than answering "no moments here" is what hands the
+    // video on to the next adapter in the chain — clip_signal, which needs no words at all.
+    if (sentences.length < 2 || said < 10) throw new Error("no usable transcript to pick a moment from");
+    const { loud = [], silences = [] } = signals || {};
+    const min = Math.max(5, c.clip_min_seconds || 25), max = Math.max(min + 5, c.clip_max_seconds || 45);
+    const duration = sentences.at(-1).end, scored = [];
+    // Every run of whole sentences that lasts about as long as a clip should. Starting and ending on a sentence is
+    // not a refinement on top of the choice — it is most of what makes a clip feel deliberate rather than snipped.
+    for (let i = 0; i < sentences.length; i++) {
+      for (let j = i; j < sentences.length; j++) {
+        const start = sentences[i].start, end = sentences[j].end, span = end - start;
+        if (span > max) break;
+        if (span < min) continue;
+        const run = sentences.slice(i, j + 1), text = run.map((s) => s.text).join(" ");
+        const words = text.split(/\s+/).filter(Boolean).length;
+        const density = clamp(run.reduce((n, s) => n + (s.end - s.start), 0) / span, 0, 1);
+        const why = []; let meaning = 0.5;
+        if (OPENS_MID_THOUGHT.test(run[0].text)) { meaning -= 0.35; why.push("starts mid-thought"); }
+        else if (STRONG_OPENER.test(run[0].text)) { meaning += 0.2; why.push("opens on its own feet"); }
+        if (/[.!?।]$/.test(text)) meaning += 0.1; else { meaning -= 0.15; why.push("trails off"); }
+        const hits = SUBSTANCE.filter((re) => re.test(text)).length;
+        if (hits) { meaning += Math.min(0.35, hits * 0.12); why.push(`${hits} thing${hits > 1 ? "s" : ""} actually said`); }
+        const filler = (text.match(FILLER) || []).length;
+        if (filler) { meaning -= Math.min(0.25, (filler / Math.max(words, 1)) * 2); why.push(`${filler} filler`); }
+        if (words / span < 1.2) { meaning -= 0.2; why.push("barely a word in it"); }
+        if (start < 30) meaning -= 0.15;                              // hello-and-welcome
+        if (duration > 180 && end > duration - 20) meaning -= 0.15;   // thanks-for-watching
+        // As a fraction of the best a window could possibly do, rather than capped at one. Capping made two windows
+        // that both scored "full marks" indistinguishable — the five-sentence thought and the four-sentence tail of
+        // the same thought tied, and a hair of loudness picked the worse one, which dropped the sentence that set it
+        // up. Two windows that differ in what they contain should differ in what they score.
+        meaning = clamp(meaning, 0, MEANING_MAX) / MEANING_MAX;
+        const energy = energyOf(loud, start, end);
+        // Loudness stays in the score because emphasis is real, but it decides nothing on its own: a shouted stretch
+        // of filler loses to a quiet sentence that says something, which is the whole difference from clip_signal.
+        scored.push({ start, end, first: run[0], meaning, energy, why, score: clamp(0.62 * meaning + 0.23 * energy + 0.15 * density, 0, 1) });
+      }
+    }
+    if (!scored.length) throw new Error(`nothing in this transcript is a whole ${min}-${max}s of sentences`);
+    scored.sort((a, b) => b.score - a.score);
+    const picked = [];
+    for (const w of scored) {
+      if (picked.length >= (c.clips_per_video || 1)) break;
+      if (picked.some((p) => w.start < p.end && w.end > p.start)) continue;
+      // The sentence boundary is the right place to cut; the pause beside it is the exact frame.
+      const start = snapToSilence(w.start, silences, { edge: "start" }), end = snapToSilence(w.end, silences, { edge: "end" });
+      if (end - start < Math.min(10, min * 0.5)) continue;
+      picked.push({ start, end, hook: "", score: Number(w.score.toFixed(3)), title: w.first.text.replace(/[.!?।]+$/, "").slice(0, 70),
+        reason: `a whole thought in ${Math.round(end - start)}s — ${w.why.join(", ") || "clean start and finish"} (meaning ${Math.round(w.meaning * 100)}%, loudness ${Math.round(w.energy * 100)}%)` });
     }
     return picked;
   } }) });
