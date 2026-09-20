@@ -37,3 +37,13 @@ test("news pipeline: poll source -> draft lands in review -> approve -> publishe
   const res = await fetch(done.portal_url.replace(/^https?:\/\/[^/]+/, eng.base));
   assert.equal(res.status, 200);
 });
+
+// settings.value is JSONB: the driver parses it for us. Parsing it a second time turned every string setting into null,
+// which silently disabled anything configured as text — the Telegram chat id most of all.
+test("settings: values survive a round trip whatever their type", async () => {
+  const cases = { "t.text": "123456789", "t.flag": false, "t.num": 42, "t.obj": { a: 1 }, "t.list": ["x"] };
+  for (const [k, v] of Object.entries(cases)) await eng.api("PUT", `/api/settings/${k}`, { value: v });
+  const back = await eng.api("GET", "/api/settings");
+  for (const [k, v] of Object.entries(cases)) assert.deepEqual(back[k], v, `${k} reads back as it was written`);
+  assert.equal(typeof back["t.text"], "string", "a chat id stays a string, not null");
+});
