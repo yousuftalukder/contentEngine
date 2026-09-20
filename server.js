@@ -238,7 +238,7 @@ const secretHint = (s) => { const t = String(s || "").trim(); return t.length > 
 const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
 const parseSecret = (provider, raw) => (MULTI_FIELD_PROVIDERS[provider] && raw ? (P(raw) || {}) : raw);
 
-const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN" };
+const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", pexels: "PEXELS_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN" };
 const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2"];
 // Resolve the usable secret of one credential row: vault first, then the named env var.
 function credSecret(r) {
@@ -930,9 +930,12 @@ async function composePhotocard(inPath, headline, specs = {}) {
   const metaLine = [meta.date, meta.credit].filter(Boolean).join("   •   ");
   const style = (name, sz, col, bold, align, mv) => `Style: ${name},${font},${sz},${col},${col},&H00000000,&H00000000,${bold ? -1 : 0},0,0,0,100,100,0,0,1,0,0,${align},${m},${m},${mv},1`;
   const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${W}\nPlayResY: ${H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n`
-    + [style("Head", size, fg, true, 7, split + Math.round(m * 0.8)), style("Meta", metaSize, dim, false, 1, Math.round(metaSize * 0.9)), style("Handle", metaSize, acc, true, 3, Math.round(metaSize * 0.9))].join("\n")
+    + [style("Head", size, fg, true, 7, split + Math.round(m * 0.8)), style("Meta", metaSize, dim, false, 1, Math.round(metaSize * 0.9)), style("Handle", metaSize, acc, true, 3, Math.round(metaSize * 0.9)),
+      // A photo that only illustrates the story says so, in the corner of the picture, outlined so it reads on anything.
+      `Style: Photo,${font},${Math.round(metaSize * 0.8)},${assColor("#ffffff")},${assColor("#ffffff")},&H96000000,&H00000000,0,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(metaSize * 0.09))},0,3,${Math.round(m * 0.6)},${Math.round(m * 0.6)},${H - split + Math.round(metaSize * 0.5)},1`].join("\n")
     + `\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`
-    + (metaLine ? `Dialogue: 0,0:00:00.00,0:00:10.00,Meta,,0,0,0,,${assEsc(metaLine)}\n` : "") + (kit.handle ? `Dialogue: 0,0:00:00.00,0:00:10.00,Handle,,0,0,0,,${assEsc(kit.handle)}\n` : "");
+    + (metaLine ? `Dialogue: 0,0:00:00.00,0:00:10.00,Meta,,0,0,0,,${assEsc(metaLine)}\n` : "") + (kit.handle ? `Dialogue: 0,0:00:00.00,0:00:10.00,Handle,,0,0,0,,${assEsc(kit.handle)}\n` : "")
+    + (specs.photo_credit ? `Dialogue: 1,0:00:00.00,0:00:10.00,Photo,,0,0,0,,${assEsc(specs.photo_credit)}\n` : "");
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
   let logo = null; if (kit.logo_url) { try { logo = await toTmpFile(kit.logo_url, "png"); } catch (e) { warn(`brand logo: ${e.message}`); } }
   const fontsDir = await brandFontsDir(kit);
@@ -1015,8 +1018,8 @@ async function storeImage(bytes, mime, contentItemId, meta = {}, dims = {}, comp
       // The clean picture is kept (IMAGE_BASE) so the card can be redrawn when the headline is edited.
       const base = await recordMedia({ contentItemId, kind: "IMAGE_BASE", url: await storeFile(`images/${newId()}-base.jpg`, j.bytes, "image/jpeg"), mime: "image/jpeg", meta: { purpose: "card background" } });
       j = { bytes: await readFile(out), mime: "image/jpeg", ext: "jpg" }; await cleanup(out);
-      const { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale } = compose.specs;
-      meta = { ...meta, overlay: card ? "photocard" : true, base_media_id: base.id, compose_specs: { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale } };
+      const { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale, photo_credit } = compose.specs;
+      meta = { ...meta, overlay: card ? "photocard" : true, base_media_id: base.id, compose_specs: { kit, card_meta, width, height, layout, brand, accent_color, text_color, overlay_scale, photo_credit } };
       if (card) dims = { width: compose.specs.width || 1080, height: compose.specs.height || 1080 };
     }
     catch (e) { warn(`headline overlay skipped: ${e.message.slice(0, 160)}`); }
@@ -1056,6 +1059,33 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
     }, ctx.pin);
   } }) });
 
+// ---- Stock photography (Pexels, free key, commercial use). A real photo behind the headline where a generated
+// picture is not available or not worth paying for. Two rules keep it honest: the writer decides whether a generic
+// photo could mislead for this story and gives no search phrase when it could (the post then falls back to a text
+// card), and every photo is marked as illustrative on the card, with the photographer credited.
+const pexelsUsed = new Map();                                                    // photo id -> when it was last used
+impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { orientation: { type: "string", default: "landscape" }, per_page: { type: "number", default: 15 }, api_base: { type: "string", default: "https://api.pexels.com/v1" } }, create: (cfg, ctx = {}) => ({
+  async generate({ prompt, headline, specs = {}, contentItemId }) {
+    // An explicit null is the writer's judgement that a library photo would mislead here: the post takes a text card
+    // instead. An absent phrase (a program that doesn't produce one) falls back to what it was going to draw.
+    if (specs.photo_query === null) { const e = new Error("A library photo could mislead for this story, so it has none"); e.editorial = true; throw e; }
+    const query = String(specs.photo_query || prompt || headline || "").trim().split(/\s+/).filter((w) => w.length > 2).slice(0, 6).join(" ");
+    if (!query) throw new Error("No stock photo search phrase for this story");
+    return withKey("pexels", async (key) => {
+      const r = await fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" })}`, { headers: { Authorization: key } });
+      const wide = specs.width && specs.height ? specs.width / specs.height : 1;
+      const fresh = (r.photos || []).filter((p) => p?.src && Date.now() - (pexelsUsed.get(p.id) || 0) > 14 * 86400e3);
+      const pool = (fresh.length ? fresh : r.photos || []).filter((p) => p.width >= 1000 && (wide < 1 || p.width >= p.height));
+      if (!pool.length) throw new Error(`No usable stock photo for "${query}"`);
+      const photo = pool[Math.floor(Math.random() * Math.min(5, pool.length))];   // vary the pick so a topic isn't always the same picture
+      pexelsUsed.set(photo.id, Date.now());
+      const bytes = await fetchBytes(photo.src.large2x || photo.src.large || photo.src.original);
+      const credit = `${specs.lang === "bn" ? "প্রতীকী ছবি" : "Illustrative photo"} · Pexels/${photo.photographer}`;
+      const media = await storeImage(bytes, "image/jpeg", contentItemId, { provider: "pexels", photo_id: photo.id, photographer: photo.photographer, photo_url: photo.url, query, alt: photo.alt || null },
+        {}, { headline, specs: { ...specs, photo_credit: credit } });
+      return { ...media, cost: 0, units: 1 };
+    }, ctx.pin);
+  } }) });
 impl("IMAGE", "openai_image", { label: "OpenAI image generation", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_IMAGE_MODEL }, quality: { type: "string", default: "medium" } }, create: (cfg, ctx = {}) => ({
   async generate({ prompt, headline, specs = {}, contentItemId }) {
     const model = cfg.model || DEFAULTS.OPENAI_IMAGE_MODEL;
@@ -1876,7 +1906,7 @@ function styleBlock(style) {
 async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
   const brand = await one(`SELECT name, brand_kit FROM brands WHERE id = $1`, [niche.brand_id]);
   const kit = P(brand?.brand_kit) || {}, own = P(niche.image_specs) || {}, lang = (niche.language || "en").slice(0, 2);
-  const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", kit, ...own };
+  const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", lang, kit, ...own };
   if (specs.layout === "photocard") {
     const outlets = [...new Set((m.versions?.length ? m.versions.map((v) => v.outlet) : [m.raw?.outlet]).filter(Boolean))].slice(0, 2);
     specs.card_meta = { date: cardDate(lang, /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC"), credit: kit.credit_sources === false || !outlets.length ? null : `${lang === "bn" ? "সূত্র" : "Source"}: ${outlets.join(", ")}` };
@@ -1905,7 +1935,9 @@ async function imageOrCard(niche, itemId, { prompt, headline, specs, label = und
   catch (e2) { warn(`text card failed: ${e2.message.slice(0, 160)}`); throw err; }
   if (!skipApi) {
     warn(`no picture (${err.message.slice(0, 140)}) — used a ${backdrop ? "brand backdrop" : "text card"}`);
-    await notifyNoPictures(err).catch((e) => warn("alert", e.message));
+    // An editorial decision not to illustrate a story is a normal outcome, not something for a person to fix.
+    const editorial = err.editorial || (err.causes?.length > 0 && err.causes.every((c) => c.editorial));
+    if (!editorial) await notifyNoPictures(err).catch((e) => warn("alert", e.message));
   }
   return { ...card, cost: 0, fallbackError: err };
 }
@@ -1988,11 +2020,12 @@ async function generateStatic(item, niche, style) {
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
     system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style)}${item._series || ""}`,
-    prompt: `${materialBlock(m)}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${richMaterial(m) ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line credit naming the source outlet(s)\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
-    mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
+    prompt: `${materialBlock(m)}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${richMaterial(m) ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line credit naming the source outlet(s)\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "photo_query": 2-5 words to find a library photo that honestly illustrates this story (a place, an activity, an object) — or null when a generic photo could mislead a reader: a specific incident, crime, accident or death, a named person, or a claim a reader would take the photo as evidence for\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
+    mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, photo_query: "dhaka city", captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
   await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: d.captions || {}, hashtags: Array.isArray(d.hashtags) ? d.hashtags : [], image_prompt: d.image_prompt || null });
-  const specs = await cardSpecs(niche, m);
+  // photo_query is the writer's judgement that a library photo can illustrate this story honestly; no phrase, no photo.
+  const specs = { ...(await cardSpecs(niche, m)), photo_query: typeof d.photo_query === "string" ? d.photo_query : null };
   const img = await imageOrCard(niche, item.id, { prompt: d.image_prompt, headline: d.headline || m.title, specs, label: cardLabel(niche) });
   await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id });
 }
@@ -2804,10 +2837,14 @@ async function adapterUsable(key) {
   return provider ? (await credentialsFor(provider)).length > 0 : true;                    // mocks and local tools need no key
 }
 async function upgradeAdapters() {
-  if (await setting("upgrade.adapters_v2", false)) return;
+  if (await setting("upgrade.adapters_v3", false)) return;
   const d = await smartAdapterDefaults(), changed = [];
   for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
     const fix = {};
+    // A stock-photo key added later should reach programs that already exist: it is what stands between a story and
+    // a text card once generated pictures are out of reach.
+    const imgFb = P(n.image_adapter_fallbacks) || [];
+    if (d.imageAdapterFallbacks.includes("pexels_stock") && !imgFb.includes("pexels_stock") && n.image_adapter !== "pexels_stock" && !/_mock$/.test(n.image_adapter || "")) fix.image_adapter_fallbacks = JSON.stringify([...imgFb, "pexels_stock"]);
     for (const [col, want] of [["script_adapter", d.scriptAdapter], ["image_adapter", d.imageAdapter], ["voice_adapter", d.voiceAdapter], ["embed_adapter", d.embedAdapter], ["transcript_adapter", d.transcriptAdapter]])
       if (n[col] && n[col] !== want && !/_mock$/.test(want) && !(await adapterUsable(n[col]))) fix[col] = want;
     if (n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
@@ -2817,9 +2854,9 @@ async function upgradeAdapters() {
   }
   if (changed.length) {
     log(`upgrade: adapters repaired — ${changed.join(" | ")}`);
-    await notify("upgrade", "Programs moved onto the keys and tools this deployment has", `${changed.join("\n")}\n\nChange any of them on the program's Edit screen.`, { level: "info", key: "upgrade:adapters_v2", cooldownHours: 720 }).catch(() => {});
+    await notify("upgrade", "Programs moved onto the keys and tools this deployment has", `${changed.join("\n")}\n\nChange any of them on the program's Edit screen.`, { level: "info", key: "upgrade.adapters_v3", cooldownHours: 720 }).catch(() => {});
   }
-  await putSetting("upgrade.adapters_v2", true);
+  await putSetting("upgrade.adapters_v3", true);
 }
 
 // Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
@@ -2952,6 +2989,7 @@ app.post("/api/credentials/:id/test", async (ctx) => {
     openai: () => fetchJson("https://api.openai.com/v1/models?limit=1", { headers: auth(c.secret) }),
     elevenlabs: () => fetchJson("https://api.elevenlabs.io/v1/user", { headers: { "xi-api-key": c.secret } }),
     newsapi: () => fetchJson(`https://newsapi.org/v2/top-headlines?country=us&pageSize=1&apiKey=${encodeURIComponent(c.secret)}`),
+    pexels: () => fetchJson("https://api.pexels.com/v1/search?query=dhaka&per_page=1", { headers: { Authorization: c.secret } }).then((r) => ({ photos: r.total_results })),
     youtube: () => fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=id&chart=mostPopular&maxResults=1&key=${encodeURIComponent(c.secret)}`),
     meta: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/me?${form({ fields: "id,name", access_token: c.secret })}`),
     youtube_oauth: () => fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: c.secret.client_id, client_secret: c.secret.client_secret, refresh_token: c.secret.refresh_token, grant_type: "refresh_token" }) }).then((t) => ({ token_type: t.token_type, expires_in: t.expires_in })),
@@ -3021,6 +3059,8 @@ async function smartAdapterDefaults() {
     scriptAdapter: gem ? "gemini_live" : oai ? "openai_live" : ant ? "anthropic_live" : "llm_mock",
     scriptAdapterFallbacks: [gem && "gemini_live", oai && "openai_live", ant && "anthropic_live"].filter(Boolean).slice(1),
     imageAdapter: gem ? "gemini_image" : oai ? "openai_image" : "image_mock",
+    // A library photo is the step between a generated picture and a text card: free, and better than no picture at all.
+    imageAdapterFallbacks: (await has("pexels")) ? ["pexels_stock"] : [],
     embedAdapter: gem ? "gemini_embed" : "embed_mock",
     voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
     transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
@@ -3109,7 +3149,7 @@ app.get("/api/schedule", async (ctx) => json(ctx, 200, {
 // ---- setup checklist: what still stands between this install and running on its own
 app.get("/api/setup-status", async (ctx) => {
   const has = async (p) => (await credentialsFor(p)).length > 0;
-  const [gem, oai, ant] = await Promise.all([has("gemini"), has("openai"), has("anthropic")]);
+  const [gem, oai, ant, pex] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("pexels")]);
   const storage = (await storageBackend()).name;
   const kit = await one(`SELECT COUNT(*)::int AS n FROM brands WHERE brand_kit ? 'logo_url' OR brand_kit ? 'primary_color'`);
   const programs = await one(`SELECT COUNT(*)::int AS n FROM niches WHERE is_active::int = 1`);
@@ -3126,6 +3166,7 @@ app.get("/api/setup-status", async (ctx) => {
     { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
     { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
     { key: "billing", ok: !freeTier, title: "An AI key with billing", detail: freeTier ? "This key ran out of free-tier requests in the last two days — a free key allows about 20 a day per model and no pictures. Enable billing on it (Google AI Studio → Billing)" : "No free-tier limit hit recently", link: "#/keys" },
+    { key: "photos", ok: pex, title: "Photos for posts", detail: pex ? "Stock photos are available when a picture cannot be generated" : "Without generated pictures, posts go out as text cards. A free Pexels key (pexels.com/api) gives them real photos — the writer skips one when it could mislead", link: "#/keys" },
     { key: "budget", ok: Number(await setting("budget.daily_cap_usd", 0)) > 0, title: "A daily spend cap", detail: Number(await setting("budget.daily_cap_usd", 0)) > 0 ? `$${await setting("budget.daily_cap_usd", 0)} a day` : "Set one in Settings so a busy news day cannot run up a bill", link: "#/settings" },
     { key: "alerts", ok: !!(await telegramTarget().catch(() => null)), title: "Alerts on your phone", detail: "Telegram bot token + chat id (Settings → Alerts)", link: "#/settings" },
     { key: "studio", ok: studioInstalled(), title: "Video studio", detail: studioInstalled() ? `Installed. Renders run where the video lane runs and need ${STUDIO_MIN_MEMORY_MB} MB (this instance: ${memoryLimitMb()} MB)` : "Installed by the Docker image (reels and explainers)", link: null },

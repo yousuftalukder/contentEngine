@@ -66,7 +66,10 @@ stalled pipeline, a growing review queue — on the dashboard and on Telegram, p
 (quotas count per model, so the fallback list multiplies what a free key can do); a per-minute limit waits the delay the API
 names; a daily one parks the job until the reset — without spending a retry — and the program stops taking new stories until
 then, so the queue can't fill with work that cannot run. News that would be stale by the reset is dropped rather than posted
-late, and one alert says what to do. If no picture can be made at all (no image key, a plan with no image quota), the post
+late, and one alert says what to do. If no picture can be generated (no image key, a plan with no image quota), the engine falls back to a **stock photo**
+(Pexels, free key) — and the writer withholds the search phrase when a generic photo could mislead, for a specific
+incident, a named person, or a claim a reader would take the photo as evidence for. Every stock photo is marked
+illustrative and credits the photographer. With no photo either, the post
 still goes out as a **text card**: the brand's colours, logo, label, headline, date and source credit, redrawn if the
 headline is edited. A free Gemini key allows roughly 20 requests a day per model and no pictures — enable billing on it for
 the engine to run at full speed.
@@ -115,6 +118,7 @@ yt-dlp, Bangla fonts, the studio and headless Chrome, and pre-builds the studio 
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | yes (split deploy) | media storage in the `media` bucket |
 | `GEMINI_API_KEY` | yes | writing, images, embeddings, Bangla TTS, transcription (or add it on the API keys page) |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | recommended | alerts and the daily digest |
+| `PEXELS_API_KEY` | recommended | free stock photos when a picture cannot be generated (otherwise posts are text cards) |
 | `META_ACCESS_TOKEN` | to publish | Facebook Page / Instagram (or per-channel keys in the dashboard) |
 | `YOUTUBE_CLIENT_ID`, `_SECRET`, `_REFRESH_TOKEN` | to publish | YouTube uploads (or per-channel keys) |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY` | optional | alternative or backup writers and voices |
