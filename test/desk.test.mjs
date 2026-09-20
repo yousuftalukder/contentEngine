@@ -258,6 +258,12 @@ test("the desk prefers a story that came with a photo and a summary", async () =
   await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id=$1 AND cluster_id IS NOT NULL`, [bare.id])).length, { what: "the bare headline clustered" });
 
   await eng.api("POST", "/api/desk/run");
-  const picked = await waitFor(async () => { const [x] = await eng.api("GET", `/api/content-items?nicheId=${p.id}`); return x?.topic; }, { timeout: 40000, what: "the desk to pick one" });
-  assert.match(picked, /Ferry capsizes/, `it took the story it can actually make something of — picked "${picked}"`);
+  // Which one it reached for first is the whole claim. A later sweep will quite rightly come back for the leftover
+  // headline — per_sweep caps a sweep, not a day — so asking the API for "the first item" is asking the wrong
+  // question: it answers newest-first, and the answer changes as soon as the desk runs again.
+  const order = await waitFor(async () => {
+    const rows = await eng.query(`SELECT topic FROM content_items WHERE niche_id=$1 ORDER BY created_at ASC`, [p.id]);
+    return rows.length ? rows : null;
+  }, { timeout: 40000, what: "the desk to pick one" });
+  assert.match(order[0].topic, /Ferry capsizes/, `it reached first for the story it can actually make something of — took "${order[0].topic}"`);
 });
