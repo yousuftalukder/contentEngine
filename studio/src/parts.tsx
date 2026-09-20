@@ -1,7 +1,7 @@
 // Building blocks shared by the compositions: karaoke captions, Ken Burns stills, brand bar, headline strip, outro card.
 import React from "react";
 import { AbsoluteFill, Img, OffthreadVideo, interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
-import { Brand, Word, src, MOTION, shade, isBangla } from "./theme";
+import { Brand, Word, src, MOTION, EASE, shade, drift, isBangla } from "./theme";
 
 // A few words at a time, the spoken word in the accent colour — the karaoke style short-form viewers expect.
 export const Captions: React.FC<{ words: Word[]; brand: Brand; perChunk: number; fontSize: number; bottom: number }> = ({ words, brand, perChunk, fontSize, bottom }) => {
@@ -83,6 +83,27 @@ export const Outro: React.FC<{ brand: Brand; lang: string; credit?: string; vert
       <div style={{ fontSize: vertical ? 50 : 42, fontWeight: 700, opacity: pop }}>{cta}</div>
       {brand.handle ? <div style={{ fontSize: vertical ? 40 : 34, color: brand.accent, fontWeight: 700, opacity: pop }}>{brand.handle}</div> : null}
       {credit ? <div style={{ position: "absolute", bottom: 60, fontSize: 26, opacity: 0.7 }}>{credit}</div> : null}
+    </AbsoluteFill>
+  );
+};
+
+// The ground every scene stands on. A flat colour reads as a slide; two slow, out-of-phase colour fields, a fine grid
+// that drifts, and a vignette give depth and keep the frame alive even where nothing is animating.
+export const Backdrop: React.FC<{ brand: Brand; vertical: boolean }> = ({ brand, vertical }) => {
+  const frame = useCurrentFrame();
+  const base = shade(brand.primary, -0.72);
+  const blob = (x: number, y: number, size: number, color: string, opacity: number) => ({
+    position: "absolute" as const, width: size, height: size, left: `${x}%`, top: `${y}%`,
+    marginLeft: -size / 2, marginTop: -size / 2, borderRadius: "50%", background: color, opacity,
+    filter: `blur(${size / 3}px)`,
+  });
+  const s = vertical ? 1100 : 1400;
+  return (
+    <AbsoluteFill style={{ background: base, overflow: "hidden" }}>
+      <div style={{ ...blob(22 + drift(frame, 4, 900), 18 + drift(frame, 3, 700, 0.2), s, shade(brand.primary, -0.25), 0.55) }} />
+      <div style={{ ...blob(84 + drift(frame, 5, 780, 0.5), 78 + drift(frame, 4, 640, 0.7), s * 0.85, shade(brand.accent, -0.55), 0.28) }} />
+      <AbsoluteFill style={{ backgroundImage: "radial-gradient(rgba(255,255,255,.06) 2px, transparent 2px)", backgroundSize: "46px 46px", transform: `translateY(${-(frame % 46) * 0.35}px)` }} />
+      <AbsoluteFill style={{ background: "radial-gradient(ellipse at center, transparent 45%, rgba(0,0,0,.55) 100%)" }} />
     </AbsoluteFill>
   );
 };

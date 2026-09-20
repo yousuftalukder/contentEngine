@@ -1,6 +1,6 @@
 // Shared design system for every composition (blueprint §4: one palette, one display + one body face, fixed motion
 // constants, safe margins, two transitions). Brand kits from the engine map onto these tokens.
-import { staticFile, delayRender, continueRender } from "remotion";
+import { staticFile, delayRender, continueRender, Easing } from "remotion";
 import { loadFont as loadBengali } from "@remotion/google-fonts/NotoSansBengali";
 import { loadFont as loadInter } from "@remotion/google-fonts/Inter";
 
@@ -25,8 +25,18 @@ export function useBrandFont(b: Brand) {
   new FontFace(b.font, `url(${src(b.fontUrl)})`).load().then((f) => { (document.fonts as any).add(f); continueRender(handle); }).catch(() => continueRender(handle));
 }
 
-// Motion constants: entrances spring with a little overshoot, exits ease out quickly, lists stagger.
-export const MOTION = { enter: { damping: 13, stiffness: 170, mass: 0.7 }, enterFrames: 9, exitFrames: 6, stagger: 3 };
+// Motion constants. Entrances spring with a little overshoot, exits ease out quickly, lists stagger. `pop` is for the
+// small emphasis a thing gets on the word that names it; `soft` is for anything large, which should never snap.
+export const MOTION = {
+  enter: { damping: 13, stiffness: 170, mass: 0.7 },
+  soft: { damping: 22, stiffness: 110, mass: 1 },
+  pop: { damping: 9, stiffness: 260, mass: 0.6 },
+  enterFrames: 9, exitFrames: 8, stagger: 3,
+};
+// Easing that looks designed rather than computed: everything decelerates hard into place, nothing arrives linearly.
+export const EASE = { out: Easing.bezier(0.16, 1, 0.3, 1), inOut: Easing.bezier(0.65, 0, 0.35, 1) };
+// Nothing on screen is ever perfectly still: a slow, unrepeating drift, in pixels, for whatever it is applied to.
+export const drift = (frame: number, amp = 6, period = 240, phase = 0) => Math.sin((frame / period + phase) * Math.PI * 2) * amp;
 
 export const shade = (hex: string, amt: number) => {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex || ""); if (!m) return hex;
