@@ -137,3 +137,30 @@ test("style: a generated call to action that promises a link is dropped when pos
   const withPortal = await styledProgram("cta_portal", true);
   assert.equal(withPortal.headline, "TOLD: use the CTA", "with an article page behind every post, the call to action stands");
 });
+
+// A Bangladeshi news page writing in English is writing for the wrong people. The country implies the language, and
+// the check that the draft came back in it is a script test rather than a question put to the same model that wrote it.
+test("a Bangladesh program writes in Bangla, and an English draft is held for review", async () => {
+  const bn = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "bd_lang", displayName: "বাংলাদেশ সংবাদ",
+    contentType: "NEWS_STATIC", country: "Bangladesh", useMocks: true, autoStyle: false, autoSources: false });
+  assert.equal(bn.language, "bn", "the country says which language its readers read");
+  const us = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "us_lang", displayName: "US desk",
+    contentType: "NEWS_STATIC", country: "United States", useMocks: true, autoStyle: false, autoSources: false });
+  assert.equal(us.language, "en");
+  const forced = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "bd_en", displayName: "BD in English",
+    contentType: "NEWS_STATIC", country: "Bangladesh", language: "en", useMocks: true, autoStyle: false, autoSources: false });
+  assert.equal(forced.language, "en", "and an explicit language still wins");
+
+  // A writer that answers in the language of its sources instead of the channel's.
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_answers_english", stage: "SCRIPT", impl: "llm_mock", config: { respond: [
+    { match: "Produce JSON", json: { headline: "Metro rail extends its operating hours from Sunday",
+      summary: "The authority said trains will run two hours later every day from this Sunday onwards.",
+      image_prompt: "metro", photo_query: null, captions: { facebook: "Metro rail runs later from Sunday" }, hashtags: ["dhaka"] } }] } });
+  const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "bd_slip", displayName: "বাংলা ডেস্ক",
+    contentType: "NEWS_STATIC", country: "Bangladesh", useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "llm_answers_english" });
+  await eng.api("POST", `/api/channels/${channel.id}/niches/${p.id}`);
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "মেট্রোরেলের সময়সূচি" });
+  const drafted = await waitFor(async () => { const x = await item(id); return x.qa_report && x; }, { what: "the draft checked" });
+  assert.ok(drafted.qa_report.language_issues.some((x) => /Bangla/i.test(x)), `the wrong language is caught — got ${JSON.stringify(drafted.qa_report.language_issues)}`);
+  assert.notEqual(drafted.qa_status, "PASS", "and it does not pass on the mock reviewer's word");
+});

@@ -2374,6 +2374,17 @@ function materialBlock(m) {
     + (vs.length > 1 ? "Use only facts the sources state. Prefer facts several sources agree on; where they differ (numbers, names, times) use the most careful wording or say that reports differ. Never merge details from different incidents.\n" : "")
     + (vs.some((v) => v.text) ? "" : "Only headlines/summaries are available — write ONLY what they support and keep it short rather than padding it.\n");
 }
+// A bare language code in front of English source material is not an instruction a model reliably follows: it reads
+// the sources, and it answers in their language. Naming the language and saying explicitly that the sources are not
+// the language to write in is the difference between a Bangladeshi channel posting in Bangla and posting in English.
+// The language a country's audience actually reads, used only when a program does not say.
+const COUNTRY_LANGUAGE = { bangladesh: "bn", "united states": "en", "united kingdom": "en", india: "en", pakistan: "ur", indonesia: "id", "saudi arabia": "ar", nepal: "ne" };
+const LANG_NAMES = { bn: "Bangla (Bengali)", en: "English", hi: "Hindi", ur: "Urdu", ar: "Arabic", es: "Spanish", fr: "French", pt: "Portuguese", id: "Indonesian", ta: "Tamil", ne: "Nepali" };
+const langLine = (code) => {
+  const c = String(code || "en").slice(0, 2).toLowerCase(), name = LANG_NAMES[c] || c;
+  return c === "en" ? `Language: ${name}.`
+    : `Language: ${name} — write EVERY word you produce in ${name}: headline, summary, narration, captions and hashtags. The source material is often in English; translate its facts into ${name} rather than copying its wording, and never answer in the language of the sources. Proper nouns keep their usual local spelling.`;
+};
 const richMaterial = (m) => (m.versions?.length ? m.versions.some((v) => v.text) : !!m.text);
 // Resolve the raw material for a text item: a news-desk story cluster, a routed source_item, or a legacy TOPIC adapter pull.
 async function materialFor(item, niche) {
@@ -2395,7 +2406,7 @@ async function generateStatic(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
-    system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style, niche)}${item._series || ""}`,
+    system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. ${langLine(lang)} Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style, niche)}${item._series || ""}`,
     prompt: `${materialBlock(m)}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${richMaterial(m) ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line credit naming the source outlet(s)\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "photo_query": 2-5 words to find a library photo that honestly illustrates this story (a place, an activity, an object) — or null when a generic photo could mislead a reader: a specific incident, crime, accident or death, a named person, or a claim a reader would take the photo as evidence for\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
     mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, photo_query: "dhaka city", captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
@@ -2418,7 +2429,7 @@ async function generateLongPost(item, niche, style) {
   const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
   await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify(cites), research.model || "mock"]);
   const post = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
-    system: `You write long-form Facebook posts for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style, niche)} Use ONLY the research notes as facts.${item._series || ""}`,
+    system: `You write long-form Facebook posts for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)} Use ONLY the research notes as facts.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nReturn JSON: {"headline": "first line hook", "post": "the full 250-600 word post with paragraph breaks", "hashtags": ["..."], "image_prompt": "visual for a cover image"}`,
     mock: { headline: m.title, post: `${m.title}\n\n${notes.map((n) => n.fact).join("\n\n")}`, hashtags: ["longpost"], image_prompt: `Cover for ${m.title}` } }));
   await addCost(item.id, post.cost); const d = post.data || {};
@@ -2458,7 +2469,7 @@ async function generateReel(item, niche, style) {
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
-    system: `${spec.system} Channel: "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
+    system: `${spec.system} Channel: "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
     prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"hook": "3-7 words that stop a scroll: the most surprising concrete thing in this story, stated as a claim — not a tease, not a question", "title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section (a place, an action, a scene) — or null where only a specific real event would do"}], "description": "post caption / video description", "hashtags": ["..."]}`,
     mock: { hook: m.title.split(/\s+/).slice(0, 5).join(" "), title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
@@ -2539,7 +2550,7 @@ async function generateExplainer(item, niche, style) {
   await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), research.model || "mock"]);
   const sceneCount = Math.max(4, Math.round(minutes * 3.5));
   const plan = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
-    system: `You script animated explainer videos for "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
+    system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(EXPLAINER_LAYOUTS).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\nStart with a TitleCard; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
     mock: { title: m.title, description: `About ${m.title}`, hashtags: ["explained"], scenes: [
       { layout: "TitleCard", chapter: "Intro", data: { title: m.title, subtitle: "Explained" }, parts: [`Here is ${m.title}, explained.`] },
@@ -2617,7 +2628,7 @@ async function renderClipItem(itemId, clipId) {
   if (niche.production_method === "VOICEOVER" || niche.production_method === "MOVIE_RECAP") {
     const recap = niche.production_method === "MOVIE_RECAP";
     const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: recap ? 4000 : 1200,
-      system: `You write ${recap ? "gripping ~60 second movie recaps that preserve suspense and never spoil the ending" : "short punchy voice-over narration re-telling a clip in our own words"} for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style, niche)}`,
+      system: `You write ${recap ? "gripping ~60 second movie recaps that preserve suspense and never spoil the ending" : "short punchy voice-over narration re-telling a clip in our own words"} for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
       prompt: recap ? `Film: ${cand.title}\nTimestamped transcript:\n${transcript.segments.map((s) => `[${s.start}-${s.end}] ${s.text}`).join("\n").slice(0, 100000)}\n\nWrite a ${methodCfg(niche).recap_seconds || 60}-second narrated recap in ${Math.max(6, Math.round((methodCfg(niche).recap_seconds || 60) / 6))} beats. For each beat pick the source timestamps that visually match. Return JSON: {"title": "...", "beats": [{"narration": "...", "start": seconds, "end": seconds}], "hashtags": ["..."]}`
         : `Clip transcript (${(c.end - c.start).toFixed(0)}s): ${script}\n\nWrite narration of the same length that re-tells this in our voice. Return JSON: {"title": "...", "narration": "...", "hashtags": ["..."]}`,
       mock: recap ? { title: cand.title, beats: [{ narration: `Mock recap of ${cand.title}.`, start: 0, end: 10 }, { narration: "And then everything changes.", start: 30, end: 40 }], hashtags: ["recap"] } : { title: clip.title, narration: `Mock narration: ${script.slice(0, 200)}`, hashtags: ["clip"] } }));
@@ -2673,7 +2684,7 @@ JSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "cha
   const video = await renderer.renderClip({ clip: c, sourcePath: cand.local_path, transcript, niche, contentItemId: itemId, extras });
   await q(`UPDATE clips SET render_url=$2, status='RENDERED' WHERE id=$1`, [clipId, video.url]);
   const cap = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 600,
-    system: `You write social captions for "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style, niche)}`,
+    system: `You write social captions for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
     prompt: `Clip title: ${c.title}\nHook: ${c.hook}\nWhat is said: ${script.slice(0, 1500)}\nSource: ${cand.title}\nReturn JSON: {"headline": "video title max 90 chars", "captions": {"facebook": "...", "instagram": "...", "youtube": "description with credit to the source"}, "hashtags": ["..."]}`,
     mock: { headline: c.title, captions: { facebook: c.hook || c.title, instagram: c.hook || c.title, youtube: `Clip from ${cand.title}` }, hashtags: ["shorts"] } }));
   await addCost(itemId, cap.cost); const cd = cap.data || {};
@@ -2703,7 +2714,7 @@ async function regenerate(itemId, part) {
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   if (part === "image") { const sdr = P(item.source_data_ref) || {}; const specs = await cardSpecs(niche, { versions: (sdr.outlets || []).map((outlet) => ({ outlet })), photo: sdr.photo, photo_outlet: sdr.photo_outlet }); const img = await imageOrCard(niche, itemId, { prompt: item.image_prompt, headline: item.headline || item.topic, specs, label: cardLabel(niche) }); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
   if (part === "all") { await setItem(itemId, { headline: null, summary: null, body: null, hero_media_id: null }); return runGeneration(itemId); }
-  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500, system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style, niche)}`,
+  const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500, system: `You are the editor of "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
     prompt: `Current headline: ${item.headline}\nSummary: ${item.summary}\nBody: ${(item.body || "").slice(0, 3000)}\n\nRewrite ONLY the ${part} to be stronger, keeping the facts identical. Return JSON: ${part === "headline" ? '{"headline": "..."}' : part === "captions" ? '{"captions": {"facebook": "...", "instagram": "...", "x": "...", "linkedin": "..."}, "hashtags": ["..."]}' : '{"body": "..."}'}`,
     mock: part === "headline" ? { headline: `${item.headline} (v2)` } : part === "captions" ? { captions: P(item.captions), hashtags: P(item.hashtags) } : { body: item.body } }));
   await addCost(itemId, r.cost); const d = r.data || {};
@@ -2801,6 +2812,17 @@ async function qaMaterial(item, niche) {
   }
   return m;
 }
+// A model asked to write Bangla will sometimes answer in the language of the sources instead, and a standards editor
+// made of the same model is not the thing to catch it. The script is: a Bangla headline containing no Bangla letters
+// is not a Bangla headline, whatever anyone says about it.
+const LANG_SCRIPT = { bn: /[ঀ-৿]/gu, hi: /[ऀ-ॿ]/gu, ne: /[ऀ-ॿ]/gu, ur: /[؀-ۿ]/gu, ar: /[؀-ۿ]/gu, ta: /[஀-௿]/gu, si: /[඀-෿]/gu };
+function wrongScript(text, lang) {
+  const re = LANG_SCRIPT[String(lang || "").slice(0, 2).toLowerCase()];
+  if (!re) return false;                                                   // nothing to check for a Latin-script language
+  const t = String(text || ""), letters = (t.match(/\p{L}/gu) || []).length;
+  if (letters < 12) return false;                                          // too short to judge
+  return (t.match(re) || []).length / letters < 0.3;
+}
 async function runQa(itemId, niche) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]);
   const m = await qaMaterial(item, niche), lang = niche.language || "en", cfg = await qaCfg(niche);
@@ -2816,6 +2838,9 @@ async function runQa(itemId, niche) {
     : facts.length || d.headline_ok === false || flags.some((f) => /medium/i.test(f.severity)) || !(score >= cfg.min_score) ? "REVIEW" : "PASS";
   const rank = { PASS: 0, REVIEW: 1, REJECT: 2 }, said = String(d.verdict || "").toUpperCase();
   if (rank[said] > rank[status]) status = said;
+  // Checked here rather than believed from the model: publishing a Bangladeshi story in English is not a small slip.
+  const offLanguage = wrongScript(`${item.headline || ""} ${item.summary || item.script || ""}`, lang);
+  if (offLanguage) { (d.language_issues || (d.language_issues = [])).unshift(`The draft is not written in ${LANG_NAMES[lang] || lang}. This channel publishes in ${LANG_NAMES[lang] || lang}: rewrite every field in it, translating the sources rather than copying them.`); if (rank[status] < 1) status = "REVIEW"; }
   const report = { summary: d.summary || "", score, fact_issues: facts, headline_ok: d.headline_ok !== false, headline_issue: d.headline_issue || "", safety_flags: flags, language_issues: (d.language_issues || []).filter(Boolean), verdict: status, model: r.model || null, checked_at: nowIso() };
   await q(`UPDATE content_items SET qa_status=$2, qa_score=$3, qa_report=$4::jsonb WHERE id=$1`, [itemId, status, report.score, JSON.stringify(report)]);
   return { status, report };
@@ -2827,7 +2852,7 @@ async function reviseFromQa(itemId, niche, report) {
   if (!notes.length) return false;
   const caps = P(item.captions) || {};
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 4000,
-    system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Fix exactly what the standards editor flagged, keep everything else, and never add a fact the sources do not state.`,
+    system: `You are the editor of "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Fix exactly what the standards editor flagged, keep everything else, and never add a fact the sources do not state.`,
     prompt: `${materialBlock(m)}\nCURRENT DRAFT\n${draftText(item)}\n\nSTANDARDS EDITOR'S NOTES\n${notes.join("\n")}\n\nReturn JSON with the corrected fields: {"headline": "...", "summary": "..."${item.body ? ', "body": "... (same HTML format)"' : ""}${Object.keys(caps).length ? `, "captions": {${Object.keys(caps).map((k) => `"${k}": "..."`).join(", ")}}` : ""}}`,
     mock: {} }));
   await addCost(itemId, r.cost); const d = r.data || {}, upd = {};
@@ -3012,7 +3037,7 @@ async function nextEpisode(seriesId) {
   const niche = await one(`SELECT * FROM niches WHERE id=$1`, [s.niche_id]);
   const eps = await q(`SELECT episode_number, headline, left(summary, 240) AS summary FROM content_items WHERE series_id=$1 AND status NOT IN ('FAILED','REJECTED') ORDER BY created_at DESC LIMIT 8`, [s.id]);
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 800,
-    system: `You plan the episodes of the series "${s.display_name}" for "${niche.display_name}". Language: ${niche.language || "en"}.`,
+    system: `You plan the episodes of the series "${s.display_name}" for "${niche.display_name}". ${langLine(niche.language)}`,
     prompt: `Premise: ${s.premise || "(none)"}\nEpisodes so far (newest first):\n${eps.map((e) => `- Ep ${e.episode_number ?? "?"}: ${e.headline} — ${e.summary || ""}`).join("\n") || "(none yet: plan the first episode)"}\n\nPropose the next episode. It continues naturally and repeats none of the above. JSON: {"topic": "...", "summary": "what it covers"}`,
     mock: { topic: `${s.display_name}: episode ${s.episode_counter + 1}`, summary: "" } }));
   const d = r.data || {};
@@ -3552,6 +3577,9 @@ async function smartAdapterDefaults() {
 }
 app.post("/api/niches", async (ctx) => {
   const b = { ...(ctx.body.useMocks ? {} : await smartAdapterDefaults()), ...ctx.body }; for (const r of ["brandId", "key", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
+  // A country implies the language its audience reads, and getting that wrong is not a small default: a Bangladeshi
+  // news page writing in English is writing for the wrong people. Say `language` explicitly to override it.
+  if (!b.language && b.country) b.language = COUNTRY_LANGUAGE[String(b.country).trim().toLowerCase()] || undefined;
   const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter) VALUES ($1,$2,$3,$4,$5,$6)`, [id, b.brandId, b.key, b.displayName, b.tone || "", b.topicSourceAdapter || "newsapi_mock"]);
   const rest = { ...b }; delete rest.brandId; delete rest.key; delete rest.displayName; delete rest.tone; delete rest.topicSourceAdapter;
   const row = Object.keys(rest).some((k) => k in NICHE_MAP) ? await patchRow("niches", id, rest, NICHE_MAP) : await one(`SELECT * FROM niches WHERE id=$1`, [id]);
