@@ -471,6 +471,7 @@ function exec(cmd, args, { timeoutMs = 45 * 60000, input = null } = {}) {
   });
 }
 async function ffprobeDuration(file) { try { const { out } = await exec("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file]); return Number(out.trim()) || 0; } catch { return 0; } }
+async function hasVideoStream(file) { try { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file]); return /video/.test(out); } catch { return false; } }
 const cleanup = (...files) => Promise.all(files.filter(Boolean).map((f) => unlink(f).catch(() => {})));
 
 // === 5. adapter registry ==============================================
@@ -848,6 +849,10 @@ impl("INGEST", "ytdlp_list", { label: "yt-dlp listing (any site)", configSchema:
 // ---- 6d. Download (stage DOWNLOAD). download(url) -> {path, duration}
 const hhmmss = (s) => { const n = Math.max(0, Math.floor(Number(s) || 0)); return `${String(Math.floor(n / 3600)).padStart(2, "0")}:${String(Math.floor(n / 60) % 60).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}`; };
 const ytdlpCommon = (cfg) => ["--no-playlist", "--no-warnings", ...(ENV.YTDLP_COOKIES_FILE ? ["--cookies", ENV.YTDLP_COOKIES_FILE] : []), ...(cfg?.max_minutes ? ["--match-filter", `duration<=${cfg.max_minutes * 60}`] : [])];
+// Plain HTTPS (DASH) formats first, HLS only when nothing else is offered. YouTube's best 1080p is often an HLS
+// "Premium" stream, and a --download-sections fetch of an HLS video silently yields the audio and no picture — a
+// 21-minute speech came back as a 35-second clip with sound and a black frame. A DASH format cuts exactly.
+const VIDEO_FORMAT = "bv*[protocol^=http][height<=1080]+ba[protocol^=http]/b[protocol^=http][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]/b";
 impl("DOWNLOAD", "download_mock", { label: "Mock", create: () => ({ async download() { return { path: null, duration: 600, mock: true }; } }) });
 // Four ways to take a video, in increasing cost, because the expensive one is almost never the one needed:
 //   probe(url)               — title, duration, thumbnail. Downloads nothing, takes about three seconds.
@@ -874,16 +879,19 @@ impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "st
     const base = join(TMP, randomUUID());
     // --force-keyframes-at-cuts re-encodes the edges so the range is exactly the range; without it a cut lands on
     // whatever keyframe happens to be nearby, which on a long video can be seconds out.
-    await exec("yt-dlp", [...ytdlpCommon(cfg), "-f", cfg.format || "bv*[height<=1080]+ba/b[height<=1080]/b", "--merge-output-format", "mp4",
+    await exec("yt-dlp", [...ytdlpCommon(cfg), "-f", cfg.format || VIDEO_FORMAT, "--merge-output-format", "mp4",
       "--download-sections", `*${hhmmss(start)}-${hhmmss(end)}`, "--force-keyframes-at-cuts", "-o", `${base}.%(ext)s`, url], { timeoutMs: 30 * 60000 });
     const path = ["mp4", "mkv", "webm"].map((e) => `${base}.${e}`).find((p) => existsSync(p));
     if (!path) throw new Error(`yt-dlp produced no file for ${hhmmss(start)}–${hhmmss(end)} of this link`);
+    // A section that came back as sound alone (a video format the site would not serve) went on to be rendered and
+    // reviewed as a clip with no picture. Refuse it here, with the reason, rather than let it through.
+    if (!(await hasVideoStream(path))) throw new Error(`the ${hhmmss(start)}–${hhmmss(end)} section of this link arrived without a video stream — the site did not serve a video format (yt-dlp may need its JavaScript runtime, or cookies)`);
     return { path, duration: await ffprobeDuration(path) };
   },
   async download(url) {
     await mkdir(TMP, { recursive: true });
     const base = join(TMP, randomUUID());
-    const args = ["-f", cfg.format || "bv*[height<=1080]+ba/b[height<=1080]/b", "--merge-output-format", "mp4", "--no-playlist", "--no-warnings", "-o", `${base}.%(ext)s`, url];
+    const args = ["-f", cfg.format || VIDEO_FORMAT, "--merge-output-format", "mp4", "--no-playlist", "--no-warnings", "-o", `${base}.%(ext)s`, url];
     if (cfg.max_minutes) args.unshift("--match-filter", `duration<=${cfg.max_minutes * 60}`);
     if (ENV.YTDLP_COOKIES_FILE) args.unshift("--cookies", ENV.YTDLP_COOKIES_FILE);
     await exec("yt-dlp", args, { timeoutMs: 40 * 60000 });
