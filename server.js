@@ -1880,9 +1880,13 @@ async function checkDuplicate(text, niche, seriesId = null, excludeId = null) {
 // blocklist — so the desk it is on supplies the floor, and topic_filters.exclude adds to it rather than replacing it.
 // A program that genuinely wants this sets topic_filters.desk_noise = false.
 const DESK_NOISE = {
+  // The betting-preview family is endless and all of it is the same article: who to bet on. Matching the whole family
+  // rather than one phrasing of it, because "prediction, odds" and "prediction, picks" are the same piece twice.
   sports: ["promo code", "betting", "odds", "parlay", "draftkings", "fanduel", "bet365", "sportsbook", "how to watch",
     "live stream", "livestream", "where to watch", "start 'em", "sit 'em", "fantasy start", "waiver wire", "dfs picks",
-    "best bets", "prediction, odds", "spread pick", "gameday", "injury report", "final score:", "recap and highlights"],
+    "best bets", "prediction", "predictions", "preview:", "over/under", "player props", "how to bet", "against the spread",
+    "picks and prediction", "prediction, picks", "picks, preview", "expert picks", "top picks", "picks against",
+    "gameday", "injury report", "final score:", "recap and highlights", "fight card:", "what channel"],
   entertainment: ["deal of the day", "best deals", "where to buy", "shop now", "shopping", "horoscope", "sponsored",
     "where to watch", "how to watch", "watch online", "streaming guide", "best vpn", "promo code", "gift guide",
     "everything coming to netflix", "what to watch this weekend"],
@@ -2002,26 +2006,31 @@ const BD_CATALOG = [
 // United States, for programs aimed at that audience: sports, entertainment, technology and general news. Feeds that
 // answer datacenter IPs are read directly; ESPN returns an empty body and Bleacher Report a 403, so those come through
 // Google News like the blocked Bangladeshi outlets do. `topic` lets a program take only the desk it is about.
-const rssUs = (key, name, url, topic, weight = 1) => ({ key, name, adapter: "rss", config: { url }, weight, poll: 10, topic });
+// Same as the Bangladesh catalog: the domain is the fallback route, used only when the server cannot read the feed.
+const rssUs = (key, name, url, topic, weight = 1, site = null) => ({ key, name, adapter: "rss", config: { url, ...(site ? { via_site: site } : {}) }, weight, poll: 10, topic });
 const gnUs = (key, name, site, topic, weight = 1) => ({ key, name, adapter: "google_news", config: { site, language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight, poll: 20, topic });
 const US_CATALOG = [
-  rssUs("us-sport-cbs", "CBS Sports", "https://www.cbssports.com/rss/headlines/", "sports", 1.1),
-  rssUs("us-sport-yahoo", "Yahoo Sports", "https://sports.yahoo.com/rss/", "sports", 1),
+  rssUs("us-sport-cbs", "CBS Sports", "https://www.cbssports.com/rss/headlines/", "sports", 1.1, "cbssports.com"),
+  rssUs("us-sport-yahoo", "Yahoo Sports", "https://sports.yahoo.com/rss/", "sports", 1, "sports.yahoo.com"),
   gnUs("us-sport-espn", "ESPN", "espn.com", "sports", 1.2),
   gnUs("us-sport-br", "Bleacher Report", "bleacherreport.com", "sports", 0.9),
-  gnUs("us-sport-si", "Sports Illustrated", "si.com", "sports", 0.9),
+  rssUs("us-sport-si", "Sports Illustrated", "https://www.si.com/feed", "sports", 0.9, "si.com"),
+  rssUs("us-sport-aa", "Awful Announcing", "https://awfulannouncing.com/feed", "sports", 0.7, "awfulannouncing.com"),
   { key: "us-sport-gnews", name: "Google News: US sport", adapter: "google_news", config: { query: "NFL OR NBA OR MLB", language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight: 0.7, poll: 20, topic: "sports" },
-  rssUs("us-ent-variety", "Variety", "https://variety.com/feed/", "entertainment", 1.2),
-  rssUs("us-ent-deadline", "Deadline", "https://deadline.com/feed/", "entertainment", 1.1),
-  rssUs("us-ent-thr", "The Hollywood Reporter", "https://www.hollywoodreporter.com/feed/", "entertainment", 1.1),
-  rssUs("us-ent-billboard", "Billboard", "https://www.billboard.com/feed/", "entertainment", 1),
-  rssUs("us-ent-rollingstone", "Rolling Stone", "https://www.rollingstone.com/feed/", "entertainment", 0.9),
+  rssUs("us-ent-variety", "Variety", "https://variety.com/feed/", "entertainment", 1.2, "variety.com"),
+  rssUs("us-ent-deadline", "Deadline", "https://deadline.com/feed/", "entertainment", 1.1, "deadline.com"),
+  rssUs("us-ent-thr", "The Hollywood Reporter", "https://www.hollywoodreporter.com/feed/", "entertainment", 1.1, "hollywoodreporter.com"),
+  rssUs("us-ent-billboard", "Billboard", "https://www.billboard.com/feed/", "entertainment", 1, "billboard.com"),
+  rssUs("us-ent-rollingstone", "Rolling Stone", "https://www.rollingstone.com/feed/", "entertainment", 0.9, "rollingstone.com"),
+  rssUs("us-ent-screenrant", "Screen Rant", "https://screenrant.com/feed/", "entertainment", 0.8, "screenrant.com"),
+  rssUs("us-ent-collider", "Collider", "https://collider.com/feed/", "entertainment", 0.8, "collider.com"),
+  rssUs("us-ent-pitchfork", "Pitchfork", "https://pitchfork.com/feed/feed-news/rss", "entertainment", 0.8, "pitchfork.com"),
   gnUs("us-ent-ew", "Entertainment Weekly", "ew.com", "entertainment", 0.8),
   { key: "us-ent-gnews", name: "Google News: US entertainment", adapter: "google_news", config: { query: "box office OR streaming series OR celebrity", language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight: 0.7, poll: 20, topic: "entertainment" },
-  rssUs("us-tech-verge", "The Verge", "https://www.theverge.com/rss/index.xml", "tech", 1.1),
-  rssUs("us-tech-techcrunch", "TechCrunch", "https://techcrunch.com/feed/", "tech", 1),
-  rssUs("us-news-npr", "NPR", "https://feeds.npr.org/1001/rss.xml", "general", 1.2),
-  rssUs("us-news-abc", "ABC News", "https://abcnews.go.com/abcnews/topstories", "general", 1.1),
+  rssUs("us-tech-verge", "The Verge", "https://www.theverge.com/rss/index.xml", "tech", 1.1, "theverge.com"),
+  rssUs("us-tech-techcrunch", "TechCrunch", "https://techcrunch.com/feed/", "tech", 1, "techcrunch.com"),
+  rssUs("us-news-npr", "NPR", "https://feeds.npr.org/1001/rss.xml", "general", 1.2, "npr.org"),
+  rssUs("us-news-abc", "ABC News", "https://abcnews.go.com/abcnews/topstories", "general", 1.1, "abcnews.go.com"),
   { key: "us-news-gnews", name: "Google News: United States", adapter: "google_news", config: { query: "United States", language: "en", gl: "US", hl: "en-US", ceid: "US:en" }, weight: 0.7, poll: 20, topic: "general" },
 ].map((e) => ({ country: "United States", language: "en", kind: "ARTICLE", ...e }));
 
@@ -3301,7 +3310,7 @@ async function upgradeExistingPrograms() {
 // Catalog entries get corrected as outlets change — a feed starts refusing datacenter IPs, another is served empty. A
 // source that came from the catalog follows the correction instead of failing quietly until someone reads the logs.
 // Sources a person added themselves have no catalog_key and are never touched. Bump CATALOG_VERSION to roll out a fix.
-const CATALOG_VERSION = 3;
+const CATALOG_VERSION = 4;
 async function syncCatalogSources() {
   if (Number(await setting("upgrade.catalog_sync", 0)) >= CATALOG_VERSION) return;
   for (const e of SOURCE_CATALOG) {
