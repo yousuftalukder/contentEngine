@@ -964,10 +964,88 @@ impl("TRANSCRIBE", "whisper_local", { label: "Whisper CLI (local)", configSchema
 
 // ---- 6f. Clip selection (stage CLIP). selectClips({transcript, niche, candidate}) -> [{start,end,title,hook,score,reason}]
 const methodCfg = (niche) => ({ clip_min_seconds: 25, clip_max_seconds: 75, clips_per_video: 3, min_score: 0.5, orientation: "9:16", ...(P(niche.method_config) || {}) });
+
+// What the soundtrack knows that the transcript does not: where the room got loud, and where nobody was speaking.
+// Both come free out of ffmpeg in one pass over audio we have already fetched, and together they answer the two
+// questions a transcript cannot — which moment had energy in it, and where a cut will not land mid-word.
+async function audioSignals(path) {
+  const loud = [], silences = [];
+  try {
+    const { err } = await exec("ffmpeg", ["-nostats", "-i", path,
+      "-af", "aresample=8000,asetnsamples=8000,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level,silencedetect=noise=-34dB:d=0.30",
+      "-f", "null", "-"], { timeoutMs: 15 * 60000 });
+    let at = 0, open = null;
+    for (const line of String(err).split(/\r?\n/)) {
+      const t = /pts_time:([\d.]+)/.exec(line); if (t) { at = Number(t[1]); continue; }
+      const rms = /RMS_level=(-?[\d.]+|-?inf)/.exec(line);
+      if (rms) { loud.push({ at, db: rms[1] === "-inf" ? -90 : Number(rms[1]) }); continue; }
+      const ss = /silence_start:\s*([\d.]+)/.exec(line); if (ss) { open = Number(ss[1]); continue; }
+      const se = /silence_end:\s*([\d.]+)/.exec(line); if (se && open !== null) { silences.push({ start: open, end: Number(se[1]) }); open = null; }
+    }
+  } catch (e) { warn(`audio signals: ${e.message.slice(0, 120)}`); }
+  return { loud, silences };
+}
+// How loud a stretch is against the rest of the video, 0..1. Relative, because one recording's shout is another's
+// speaking voice, and an absolute threshold would call a quiet podcast silent from end to end.
+function energyOf(loud, start, end) {
+  if (!loud.length) return 0.5;
+  const inside = loud.filter((x) => x.at >= start && x.at < end).map((x) => x.db);
+  if (!inside.length) return 0.5;
+  const all = loud.map((x) => x.db).sort((a, b) => a - b);
+  const lo = all[Math.floor(all.length * 0.1)], hi = all[Math.floor(all.length * 0.9)];
+  const mean = inside.reduce((a, b) => a + b, 0) / inside.length;
+  return hi === lo ? 0.5 : clamp((mean - lo) / (hi - lo), 0, 1);
+}
+// Move a cut to the nearest moment nobody was speaking, inside a small window. A clip that starts mid-word reads as
+// an accident however good the moment is; one that starts in the breath before it reads as a decision.
+function snapToSilence(t, silences, { window = 2.5, edge = "start" } = {}) {
+  let best = t, bestGap = Infinity;
+  for (const s of silences) {
+    // Starting: come in at the end of the pause. Ending: go out at the start of the next one.
+    const point = edge === "start" ? s.end : s.start;
+    const gap = Math.abs(point - t);
+    if (gap < bestGap && gap <= window) { best = point; bestGap = gap; }
+  }
+  return Number(best.toFixed(2));
+}
 impl("CLIP", "clip_mock", { label: "Mock clipper", create: () => ({
   async selectClips({ transcript, niche }) { const c = methodCfg(niche); const dur = transcript.segments.at(-1)?.end || 300; const out = []; for (let i = 0; i < c.clips_per_video; i++) { const s = Math.min(i * 90, Math.max(0, dur - c.clip_max_seconds)); out.push({ start: s, end: Math.min(dur, s + c.clip_min_seconds + 20), title: `Mock clip ${i + 1}`, hook: "You won't believe this part", score: 0.8 - i * 0.1, reason: "mock" }); } return out; } }) });
+// A clipper that costs nothing and needs no key: the moment with the most energy and the most speech in it, cut at
+// the pauses either side. It will not find the moment that is *interesting* — only a reader of the words can do that
+// — but it reliably finds the moment where something was happening, and it works on a day when every quota is spent.
+impl("CLIP", "clip_signal", { label: "Loudest moment (free, no key)", create: () => ({
+  async selectClips({ transcript, niche, signals }) {
+    const c = methodCfg(niche);
+    const segs = transcript.segments || [];
+    const duration = segs.at(-1)?.end || 0; if (!duration) return [];
+    const { loud = [], silences = [] } = signals || {};
+    const want = clamp((c.clip_min_seconds + c.clip_max_seconds) / 2, 15, 90);
+    const out = [];
+    // Slide a window of the target length and score it by loudness and by how much of it is speech.
+    for (let start = 0; start + want <= duration; start += 5) {
+      const end = start + want;
+      const spoken = segs.filter((x) => x.end > start && x.start < end)
+        .reduce((n, x) => n + (Math.min(x.end, end) - Math.max(x.start, start)), 0);
+      const density = clamp(spoken / want, 0, 1);
+      if (density < 0.35) continue;                                        // mostly silence: nothing to clip
+      out.push({ start, end, score: 0.6 * energyOf(loud, start, end) + 0.4 * density });
+    }
+    out.sort((a, b) => b.score - a.score);
+    const picked = [];
+    for (const w of out) {
+      if (picked.length >= c.clips_per_video) break;
+      if (picked.some((p) => w.start < p.end && w.end > p.start)) continue;  // no overlapping clips
+      const start = snapToSilence(w.start, silences, { edge: "start" });
+      const end = snapToSilence(w.end, silences, { edge: "end" });
+      if (end - start < Math.min(10, c.clip_min_seconds * 0.5)) continue;
+      const text = segs.filter((x) => x.end > start && x.start < end).map((x) => x.text).join(" ").trim();
+      picked.push({ start, end, title: text.split(/(?<=[.!?])\s/)[0]?.slice(0, 70) || "Clip", hook: "",
+        score: Number(w.score.toFixed(3)), reason: `loudest stretch with speech in it (${Math.round(w.score * 100)}%)` });
+    }
+    return picked;
+  } }) });
 impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSchema: { llm: { type: "string", default: "(program's script adapter)" }, llm_fallbacks: { type: "array" } }, create: (cfg) => ({
-  async selectClips({ transcript, niche, candidate }) {
+  async selectClips({ transcript, niche, candidate, signals }) {
     const c = methodCfg(niche);
     const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 120000);
     // config.llm lets clipping run on a different SCRIPT instance (e.g. "openai_live") than the program's writer.
@@ -976,7 +1054,21 @@ impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSch
       system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}. Tone: ${niche.tone || "engaging"}.`,
       prompt: `Video: "${candidate.title}"\nTimestamped transcript:\n${lines}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why"}]`,
       mock: [{ start: 0, end: c.clip_min_seconds + 10, title: "Mock clip", hook: "Mock hook", score: 0.7, reason: "mock" }] }));
-    const clips = (Array.isArray(r.data) ? r.data : r.data?.clips || []).map((x) => ({ start: Number(x.start) || 0, end: Number(x.end) || 0, title: x.title || candidate.title, hook: x.hook || "", score: Number(x.score) || 0, reason: x.reason || "" }))
+    // The model reads the words and says which moment means something. Where the cut lands is not its decision: it
+    // proposes a time, the pauses either side of that time decide the frame it actually starts and ends on, and the
+    // soundtrack's energy breaks ties between moments the model liked equally.
+    const { loud = [], silences = [] } = signals || {};
+    const clips = (Array.isArray(r.data) ? r.data : r.data?.clips || []).map((x) => {
+      const rawStart = Number(x.start) || 0, rawEnd = Number(x.end) || 0;
+      const start = snapToSilence(rawStart, silences, { edge: "start" });
+      const end = snapToSilence(rawEnd, silences, { edge: "end" });
+      const said = Number(x.score);
+      const energy = energyOf(loud, start, end);
+      const score = Number(((Number.isFinite(said) ? clamp(said, 0, 1) : 0.6) * 0.75 + energy * 0.25).toFixed(3));
+      const moved = Math.abs(start - rawStart) + Math.abs(end - rawEnd);
+      return { start, end, title: x.title || candidate.title, hook: x.hook || "", score,
+        reason: [x.reason, moved > 0.05 ? `cut moved ${moved.toFixed(1)}s to the nearest pause` : null].filter(Boolean).join("; ") };
+    })
       .filter((x) => x.end - x.start >= Math.min(10, c.clip_min_seconds * 0.5)).sort((a, b) => b.score - a.score);
     clips.cost = r.cost || 0; return clips;
   } }) });
@@ -2798,13 +2890,15 @@ async function processCandidate(candidateId) {
     transcript = await tr.transcribe({ path: file.path, duration: file.duration, language: niche.language });
     await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments })]);
   }
+  // One pass over the soundtrack for what the words do not say: where it got loud, and where nobody was speaking.
+  const signals = existsSync(file.path) ? await audioSignals(file.path) : { loud: [], silences: [] };
   // The soundtrack has done its job. What is kept is the link and what was learned from it — the transcript, and in a
   // moment the chosen ranges — so the same video can be re-clipped later without fetching anything again.
   if (audioOnly) await cleanup(file.path);
   let clips;
   // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
   if (niche.content_type === "MOVIE_RECAP" || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
-  else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand })); clips = clips.slice(0, methodCfg(niche).clips_per_video); }
+  else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand, signals })); clips = clips.slice(0, methodCfg(niche).clips_per_video); }
   if (!clips.length) throw new Error("no clip-worthy moments found");
   for (const cl of clips) {
     const clipId = newId(); const text = transcript.segments.filter((s) => s.end > cl.start && s.start < cl.end).map((s) => s.text).join(" ");

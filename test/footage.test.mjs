@@ -125,3 +125,28 @@ test("reaction: the plan is shaped so the host carries it, not the source", { sk
   assert.ok(play <= 60.01, `the source stays inside its budget (${play}s)`);
   assert.ok(plan.reaction.commentShare >= 0.34, `commentary carries the video (${Math.round(plan.reaction.commentShare * 100)}%)`);
 });
+
+// Picking the moment is the product. The transcript says what was said; the soundtrack says where something was
+// happening and where nobody was speaking — and a cut that lands mid-word reads as an accident however good the
+// moment is. This runs with no LLM and no key at all, which is also the day every quota is spent.
+test("the clipper finds the loud moment and cuts it at the pauses", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  // Three minutes of quiet with one loud stretch at 100-135s, and a clear pause either side of it.
+  const src = join(dir, "loudspot.mp4");
+  ff("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15:duration=180",
+     "-f", "lavfi", "-i", "sine=frequency=200:duration=180",
+     "-filter_complex", "[1:a]volume='if(between(t,100,135),1.0,if(between(t,97,100)+between(t,135,138),0.0,0.06))':eval=frame[a]",
+     "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", src);
+
+  const p = await eng.api("POST", "/api/programs", { ...base(), key: "signalclip", displayName: "Signal clip",
+    contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "clip_signal",
+    methodConfig: { clips_per_video: 1, clip_min_seconds: 25, clip_max_seconds: 45, orientation: "9:16", min_score: 0 } });
+  await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "Quiet with one loud stretch" });
+  const it = await waitFor(async () => { const x = (await eng.api("GET", `/api/content-items?nicheId=${p.id}`))[0]; if (x?.status === "FAILED") throw new Error(String(x.rejection_note).slice(-300)); return x?.status === "PENDING_REVIEW" && x; },
+    { timeout: 300000, interval: 1000, what: "a clip chosen by sound" });
+
+  const clip = (await eng.query(`SELECT start_seconds, end_seconds, reason FROM clips WHERE content_item_id=$1`, [it.id]))[0];
+  const start = Number(clip.start_seconds), end = Number(clip.end_seconds);
+  assert.ok(start >= 90 && start <= 115, `it starts on the loud stretch, not at the top of the video (started ${start}s)`);
+  assert.ok(end > start + 15, `and it is long enough to be a clip (${(end - start).toFixed(0)}s)`);
+  assert.match(clip.reason, /loudest stretch/, "and says why it chose there");
+});
