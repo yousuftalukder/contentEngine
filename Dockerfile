@@ -49,15 +49,20 @@ RUN set -eux; \
     test -s /tmp/piper-check.wav; rm -f /tmp/piper-check.wav
 ENV WHISPER_DIR=/opt/whisper
 COPY --from=whisper /out/whisper-cli /usr/local/bin/whisper-cli
-# The multilingual base model rather than base.en: the clips come from English video, but a Bangladeshi programme has
-# Bangla sources too, and one model that handles both beats a better English one that handles nothing else.
+# The multilingual models rather than the .en ones: the clips come from English video, but a Bangladeshi programme has
+# Bangla sources too, and one model that handles both beats a better English one that handles nothing else. Both sizes
+# ship because the machine decides: base is 141 MB and needs a few hundred more to run in, which a 512 MB instance
+# does not have — it was killed part-way through loading the first time production tried. tiny is 74 MB, hears less
+# well, and runs. server.js picks by the memory it finds; a bigger worker gets base without being told.
 RUN set -eux; \
     mkdir -p $WHISPER_DIR; \
     curl -fsSL -o $WHISPER_DIR/ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin; \
+    curl -fsSL -o $WHISPER_DIR/ggml-tiny.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin; \
     test -s $WHISPER_DIR/ggml-base.bin; \
+    test -s $WHISPER_DIR/ggml-tiny.bin; \
     ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=400:duration=2" -ar 16000 -ac 1 /tmp/w.wav; \
-    whisper-cli -m $WHISPER_DIR/ggml-base.bin -f /tmp/w.wav -oj -of /tmp/w >/dev/null; \
-    test -s /tmp/w.json; rm -f /tmp/w.wav /tmp/w.json
+    for m in tiny base; do whisper-cli -m $WHISPER_DIR/ggml-$m.bin -f /tmp/w.wav -oj -of /tmp/w >/dev/null; test -s /tmp/w.json; rm -f /tmp/w.json; done; \
+    rm -f /tmp/w.wav
 # The Bangla voice is downloaded but silent with this piper build: its phoneme map contains a two-codepoint symbol and
 # piper 2023.11.14 rejects anything that is not one ("aɪ" is not a single codepoint). The file is correct and a newer
 # piper will read it, so it stays; the engine falls back to another installed voice rather than failing a video over

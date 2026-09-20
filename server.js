@@ -466,7 +466,11 @@ function exec(cmd, args, { timeoutMs = 45 * 60000, input = null } = {}) {
     p.stdout.on("data", (d) => (out += d)); p.stderr.on("data", (d) => (err += d));
     const t = setTimeout(() => { p.kill("SIGKILL"); reject(new Error(`${cmd} timed out`)); }, timeoutMs);
     p.on("error", (e) => { clearTimeout(t); reject(new Error(`${cmd} is not available on this machine (${e.message}). On Render use the Dockerfile.`)); });
-    p.on("close", (c) => { clearTimeout(t); c === 0 ? resolve({ out, err }) : reject(new Error(`${cmd} exited ${c}: ${err.slice(-1200)}`)); });
+    // A process killed by a signal has no exit code, and reporting "exited null" hides the one thing worth knowing:
+    // SIGKILL on a small instance is almost always the out-of-memory killer, not a fault in the command.
+    p.on("close", (c, sig) => { clearTimeout(t); if (c === 0) return resolve({ out, err });
+      const how = c === null ? `was killed (${sig || "signal"})${sig === "SIGKILL" ? ` — on a ${memoryLimitMb()} MB instance that is normally the out-of-memory killer` : ""}` : `exited ${c}`;
+      reject(new Error(`${cmd} ${how}: ${err.slice(-1200)}`)); });
     if (input) p.stdin.write(input); p.stdin.end();
   });
 }
@@ -966,20 +970,30 @@ impl("TRANSCRIBE", "whisper_api", { label: "OpenAI Whisper API", configSchema: {
 // quota goes the way its TTS quota does, and Whisper's API is about a cent a minute. This runs on the worker, takes
 // as long as it takes, and costs nothing — which is what makes clipping something that can run every day.
 const WHISPER_DIR = ENV.WHISPER_DIR || "/opt/whisper";
-const whisperInstalled = () => { try { return existsSync(join(WHISPER_DIR, "ggml-base.bin")); } catch { return false; } };
+// Which model this machine can actually hold. base is 141 MB on disk and wants a few hundred more to run in; on a
+// 512 MB instance, alongside node and ffmpeg, it is killed part-way through loading — which is what happened the
+// first time production was asked to transcribe anything. tiny is 74 MB and hears less well, and hearing less well
+// beats not hearing at all. A bigger worker gets base without being told, the way the studio and the render size
+// already work; an adapter instance that names a model gets the one it names.
+const WHISPER_BIG_MEMORY_MB = Number(ENV.WHISPER_BIG_MEMORY_MB) || 1024;
+const whisperModelFor = (cfg) => cfg?.model || (memoryLimitMb() >= WHISPER_BIG_MEMORY_MB ? "ggml-base.bin" : "ggml-tiny.bin");
+const whisperInstalled = () => { try { return existsSync(join(WHISPER_DIR, whisperModelFor())); } catch { return false; } };
 impl("TRANSCRIBE", "whisper_cpp", { label: "whisper.cpp (on this machine, free)",
   configSchema: { model: { type: "string", default: "ggml-base.bin" }, threads: { type: "number" }, dir: { type: "string", default: "/opt/whisper" } },
   create: (cfg) => ({
     async transcribe({ path, language }) {
-      const dir = cfg.dir || WHISPER_DIR, model = join(dir, cfg.model || "ggml-base.bin");
-      if (!existsSync(model)) throw new Error(`whisper.cpp model ${model} is not installed — the Docker image ships ggml-base.bin`);
+      const dir = cfg.dir || WHISPER_DIR, model = join(dir, whisperModelFor(cfg));
+      if (!existsSync(model)) throw new Error(`whisper.cpp model ${model} is not installed — the Docker image ships ggml-tiny.bin and ggml-base.bin`);
       // 16 kHz mono is what the model wants; anything else it resamples badly or refuses.
       const wav = tmpPath("wav"), base = wav.replace(/\.wav$/, "");
       try {
         await exec("ffmpeg", ["-y", "-i", path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav], { timeoutMs: 20 * 60000 });
         const lang = String(language || "").slice(0, 2).toLowerCase();
+        // Fewer threads on a small box: each one carries its own scratch, and a fraction of a CPU does not go faster
+        // for being divided into four.
+        const threads = cfg.threads || (memoryLimitMb() < WHISPER_BIG_MEMORY_MB ? 2 : null);
         await exec("whisper-cli", ["-m", model, "-f", wav, "-oj", "-of", base, "-nt",
-          ...(cfg.threads ? ["-t", String(cfg.threads)] : []),
+          ...(threads ? ["-t", String(threads)] : []),
           ...(lang && lang !== "auto" ? ["-l", lang] : ["-l", "auto"])], { timeoutMs: 90 * 60000 });
         const data = JSON.parse(await readFile(`${base}.json`, "utf8"));
         const segs = (data.transcription || []).map((x) => ({
