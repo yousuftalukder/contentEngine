@@ -5,6 +5,20 @@
 #   fontconfig       → lets libass find fonts by name ("Noto Sans Bengali"); OVERLAY_FONT env var overrides the name
 # The video studio (studio/, Remotion) renders news reels and animated explainers in headless Chrome; the libraries
 # below are what Chrome Headless Shell needs on Debian. Its bundle is built here so the first render starts at once.
+
+# whisper.cpp, compiled in a stage of its own so the compiler and its headers do not ship. Transcription is what turns
+# a long video into a list of moments worth clipping, and it is the one step with no free hosted option that survives
+# a day's use — so it runs here, on the worker, unlimited and costing nothing. Built static: one binary to copy out.
+FROM debian:bookworm-slim AS whisper
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates; \
+    curl -fsSL https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.4.tar.gz | tar -xz -C /tmp; \
+    cmake -S /tmp/whisper.cpp-1.9.4 -B /tmp/b -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF; \
+    cmake --build /tmp/b --config Release -j "$(nproc)" --target whisper-cli; \
+    install -Dm755 "$(find /tmp/b -name whisper-cli -type f | head -1)" /out/whisper-cli; \
+    /out/whisper-cli --help >/dev/null 2>&1 || true
+
 FROM node:22-bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg python3 curl ca-certificates fontconfig fonts-dejavu-core fonts-noto-core \
@@ -33,6 +47,17 @@ RUN set -eux; \
     test -s /opt/piper/voices/en_US-lessac-medium.onnx; \
     echo "the engine is installed" | piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/piper-check.wav; \
     test -s /tmp/piper-check.wav; rm -f /tmp/piper-check.wav
+ENV WHISPER_DIR=/opt/whisper
+COPY --from=whisper /out/whisper-cli /usr/local/bin/whisper-cli
+# The multilingual base model rather than base.en: the clips come from English video, but a Bangladeshi programme has
+# Bangla sources too, and one model that handles both beats a better English one that handles nothing else.
+RUN set -eux; \
+    mkdir -p $WHISPER_DIR; \
+    curl -fsSL -o $WHISPER_DIR/ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin; \
+    test -s $WHISPER_DIR/ggml-base.bin; \
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=400:duration=2" -ar 16000 -ac 1 /tmp/w.wav; \
+    whisper-cli -m $WHISPER_DIR/ggml-base.bin -f /tmp/w.wav -oj -of /tmp/w >/dev/null; \
+    test -s /tmp/w.json; rm -f /tmp/w.wav /tmp/w.json
 # The Bangla voice is downloaded but silent with this piper build: its phoneme map contains a two-codepoint symbol and
 # piper 2023.11.14 rejects anything that is not one ("aɪ" is not a single codepoint). The file is correct and a newer
 # piper will read it, so it stays; the engine falls back to another installed voice rather than failing a video over

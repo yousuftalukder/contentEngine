@@ -31,3 +31,11 @@ jobs:
       - name: Piper speaks, inside the image
         run: |
           docker run --rm content-engine:ci sh -c 'set -eux;             printf "%s" "The engine speaks for itself, which is the only claim worth testing here."               | piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/en.wav;             dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/en.wav);             echo "narration: ${dur}s";             awk -v d="$dur" "BEGIN { exit (d > 1.5 ? 0 : 1) }"'
+      - name: whisper.cpp transcribes speech inside the image
+        run: |
+          docker run --rm content-engine:ci sh -c 'set -eux; \
+            piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/say.wav <<< "The quick brown fox jumps over the lazy dog near the river bank."; \
+            ffmpeg -hide_banner -loglevel error -y -i /tmp/say.wav -ar 16000 -ac 1 -c:a pcm_s16le /tmp/in.wav; \
+            whisper-cli -m /opt/whisper/ggml-base.bin -f /tmp/in.wav -oj -of /tmp/out -nt -l en; \
+            cat /tmp/out.json; \
+            grep -qi "fox" /tmp/out.json'
