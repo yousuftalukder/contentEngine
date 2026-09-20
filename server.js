@@ -950,6 +950,34 @@ impl("TRANSCRIBE", "whisper_api", { label: "OpenAI Whisper API", configSchema: {
       }, ctx.pin);
     } finally { await cleanup(audio); }
   } }) });
+// whisper.cpp, compiled into the image. Transcription is what turns a long video into a list of moments worth
+// clipping, and it is the one step of that with no free hosted option that survives a day's use: Gemini's transcribe
+// quota goes the way its TTS quota does, and Whisper's API is about a cent a minute. This runs on the worker, takes
+// as long as it takes, and costs nothing — which is what makes clipping something that can run every day.
+const WHISPER_DIR = ENV.WHISPER_DIR || "/opt/whisper";
+const whisperInstalled = () => { try { return existsSync(join(WHISPER_DIR, "ggml-base.bin")); } catch { return false; } };
+impl("TRANSCRIBE", "whisper_cpp", { label: "whisper.cpp (on this machine, free)",
+  configSchema: { model: { type: "string", default: "ggml-base.bin" }, threads: { type: "number" }, dir: { type: "string", default: "/opt/whisper" } },
+  create: (cfg) => ({
+    async transcribe({ path, language }) {
+      const dir = cfg.dir || WHISPER_DIR, model = join(dir, cfg.model || "ggml-base.bin");
+      if (!existsSync(model)) throw new Error(`whisper.cpp model ${model} is not installed — the Docker image ships ggml-base.bin`);
+      // 16 kHz mono is what the model wants; anything else it resamples badly or refuses.
+      const wav = tmpPath("wav"), base = wav.replace(/\.wav$/, "");
+      try {
+        await exec("ffmpeg", ["-y", "-i", path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav], { timeoutMs: 20 * 60000 });
+        const lang = String(language || "").slice(0, 2).toLowerCase();
+        await exec("whisper-cli", ["-m", model, "-f", wav, "-oj", "-of", base, "-nt",
+          ...(cfg.threads ? ["-t", String(cfg.threads)] : []),
+          ...(lang && lang !== "auto" ? ["-l", lang] : ["-l", "auto"])], { timeoutMs: 90 * 60000 });
+        const data = JSON.parse(await readFile(`${base}.json`, "utf8"));
+        const segs = (data.transcription || []).map((x) => ({
+          start: Number(x.offsets?.from ?? 0) / 1000, end: Number(x.offsets?.to ?? 0) / 1000, text: String(x.text || "").trim(),
+        })).filter((x) => x.text && x.end > x.start);
+        if (!segs.length) throw new Error("whisper.cpp returned no speech — is there any in this audio?");
+        return { segments: segs, text: joinSegments(segs), cost: 0 };
+      } finally { await cleanup(wav, `${base}.json`); }
+    } }) });
 impl("TRANSCRIBE", "whisper_local", { label: "Whisper CLI (local)", configSchema: { model: { type: "string", default: "base" } }, create: (cfg, ctx = {}) => ({
   async transcribe({ path, language }) {
     const audio = await extractAudio(path); const outDir = join(TMP, randomUUID()); await mkdir(outDir, { recursive: true });
@@ -3891,7 +3919,10 @@ async function smartAdapterDefaults() {
     voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
     voiceAdapterFallbacks: [gem && "gemini_tts", el && "elevenlabs", oai && "openai_tts"].filter(Boolean).slice(1)
       .concat(piperInstalled() ? ["tts_piper"] : []),                       // last, because it cannot refuse
-    transcriptAdapter: gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
+    // The local one first when it is there. A hosted transcriber is faster, but transcription is per-minute-of-video
+    // rather than per-post, so it is the step most likely to exhaust a free tier or run up a bill — and the one whose
+    // slowness nobody sees, because it happens before anything is published.
+    transcriptAdapter: whisperInstalled() ? "whisper_cpp" : gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
     // "remotion" falls back to ffmpeg by itself when the rendering instance lacks the memory, so it's safe to pick here.
     renderAdapter: studioInstalled() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",
   };
