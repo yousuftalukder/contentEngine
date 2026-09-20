@@ -309,3 +309,44 @@ test("narration: acronyms are spelled out for the voice, and a brand's own spell
   assert.equal(audio.meta.levelled, true, "the joined narration went through the loudness pass");
   assert.ok(audio.duration_seconds > 0);
 });
+
+// Stock footage is what keeps a reel moving, but it is generic by definition. The opening second is where a viewer
+// decides, and the photograph the outlet ran of this story beats a library clip of something like it.
+test("the opening section is the story's own photo; the rest take footage", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const photo = join(dir, "own.jpg"), clipFile = join(dir, "broll2.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1600x900", "-frames:v", "1", photo]);
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "mandelbrot=size=720x1280:rate=30", "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p", clipFile]);
+  const { readFileSync } = await import("node:fs");
+  const http = await import("node:http");
+  const stub = http.createServer((req, res) => {
+    if (req.url.startsWith("/videos/search")) {
+      const src = `http://127.0.0.1:${stub.address().port}/clip.mp4`;
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ videos: [{ id: 4242, duration: 12, user: { name: "A Filmer" }, url: "https://pexels.com/v/4242",
+        video_files: [{ link: src, width: 720, height: 1280, quality: "hd", file_type: "video/mp4" }] }] }));
+    }
+    if (req.url === "/own.jpg") { res.writeHead(200, { "content-type": "image/jpeg" }); return res.end(readFileSync(photo)); }
+    res.writeHead(200, { "content-type": "video/mp4" }); res.end(readFileSync(clipFile));
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  const port = stub.address().port;
+  try {
+    await eng.api("PUT", "/api/settings/footage.api_base", { value: `http://127.0.0.1:${port}/videos` });
+    const src = await eng.api("POST", "/api/sources", { name: "Photo wire", adapterKey: "ingest_mock",
+      config: { items: [{ title: "Rickshaw drivers block the Mirpur road over fare rules", url: `http://127.0.0.1:${port}/story`, summary: "Traffic stopped for three hours on Wednesday morning." }] } });
+    await eng.query(`UPDATE sources SET language='en' WHERE id=$1`, [src.id]);
+    const p = await program("open_on_photo", { contentType: "NEWS_REEL", sourceIds: [src.id], renderAdapter: "ffmpeg", voiceAdapter: "tts_mock",
+      methodConfig: { slides: 3, orientation: "9:16", desk: { settle_minutes: 0, min_sources: 1, min_gap_minutes: 0, per_sweep: 2 } } });
+    await eng.query(`UPDATE source_items SET thumbnail_url=$2 WHERE source_id=$1`, [src.id, `http://127.0.0.1:${port}/own.jpg`]).catch(() => {});
+    await eng.api("POST", `/api/sources/${src.id}/poll`);
+    await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id=$1`, [src.id])).length, { what: "ingested" });
+    await eng.query(`UPDATE source_items SET thumbnail_url=$2 WHERE source_id=$1`, [src.id, `http://127.0.0.1:${port}/own.jpg`]);
+    await eng.api("POST", "/api/desk/run");
+
+    const id = await waitFor(async () => { const [x] = await eng.api("GET", `/api/content-items?nicheId=${p.id}`); return x && !["QUEUED", "DRAFTING", "FETCHING_DATA"].includes(x.status) && x.id; }, { timeout: 180000, interval: 1500, what: "the reel written" });
+    const used = await eng.query(`SELECT kind, meta->>'provider' AS provider, meta->>'section' AS section FROM media_assets
+      WHERE content_item_id=$1 AND kind IN ('IMAGE','VIDEO') AND meta->>'purpose' IS DISTINCT FROM 'youtube thumbnail' ORDER BY created_at`, [id]);
+    assert.equal(used[0]?.provider, "source", `the reel opens on the outlet's own photo — got ${JSON.stringify(used)}`);
+    assert.ok(used.slice(1).some((r) => r.provider === "pexels"), "and the later sections take footage");
+  } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: "https://api.pexels.com/videos" }); }
+});
