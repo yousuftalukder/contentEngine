@@ -71,7 +71,7 @@ export async function startEngine({ env = {} } = {}) {
   const query = async (text, params) => (await sql.query(text, params)).rows;
 
   return {
-    base, api, query, logs: () => logs,
+    base, api, query, logs: () => logs, pid: child.pid,
     // The in-process database is left open on purpose: closing PGlite while the socket server is still draining a query
     // from the killed server crashes it asynchronously. The test process exits right after, which releases it.
     async stop() {

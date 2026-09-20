@@ -4225,6 +4225,17 @@ app.post("/api/seed", async (ctx) => {
   await migrate();
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
   await recoverAbandonedWork();
+  // Render sends SIGTERM before it replaces an instance or spins one down. A job this worker was in the middle of would
+  // otherwise sit RUNNING until recovery gives up on it — LOCK_TIMEOUT_MIN later — and with several deploys a day that
+  // froze the ingest lane for most of an hour each time. Hand the work back first, then go.
+  const handBack = async (sig) => {
+    try {
+      const r = await q(`UPDATE jobs SET status='PENDING', locked_by=NULL, locked_at=NULL, attempts=GREATEST(attempts-1,0) WHERE status='RUNNING' AND locked_by=$1 RETURNING id`, [WORKER_ID]);
+      log(`${sig}: handed back ${r.length} running job(s) to the queue`);
+    } catch (e) { warn("shutdown", e.message); }
+    process.exit(0);
+  };
+  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => handBack(sig));
   if (!ENV.DASHBOARD_PASSWORD) warn("DASHBOARD_PASSWORD is not set — the dashboard and API are OPEN. Fine locally, never on Render.");
   server.listen(PORT, async () => {
     const storage = await storageBackend();
