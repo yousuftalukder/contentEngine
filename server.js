@@ -1468,12 +1468,21 @@ impl("PUBLISH", "meta_graph", { label: "Facebook Page / Instagram", configSchema
     async check({ channel }) {
       const token = await metaToken(channel, cfg), acct = channel.platform_account_id, notes = [];
       if (!acct) return { ok: false, error: `This channel has no ${channel.platform === "INSTAGRAM" ? "Instagram user ID" : "Facebook Page ID"} — add it on the channel (Edit → account id).` };
-      const ig = channel.platform === "INSTAGRAM";
-      const account = await fetchJson(`${base}/${acct}?${form({ fields: ig ? "id,username,name" : "id,name", access_token: token })}`);
-      if (ig && !account.username) notes.push("That id opens a Facebook Page, not an Instagram account — Instagram needs the IG user id from the Page's linked account.");
+      if (channel.platform === "INSTAGRAM") {
+        // A Page has a "username" too, so that field cannot tell the two apart. media_count exists only on an
+        // Instagram account; when the id is really a Page, the Page names the Instagram account linked to it.
+        const ig = await fetchJson(`${base}/${acct}?${form({ fields: "id,username,media_count", access_token: token })}`).catch(() => null);
+        if (ig?.username && ig.media_count !== undefined) return { ok: true, account: { id: ig.id, name: `@${ig.username}` }, notes };
+        const page = await fetchJson(`${base}/${acct}?${form({ fields: "id,name,instagram_business_account{id,username}", access_token: token })}`).catch(() => null);
+        const linked = page?.instagram_business_account;
+        return { ok: false, error: linked
+          ? `That is the Facebook Page "${page.name}", not an Instagram account. Its Instagram id is ${linked.id} (@${linked.username}) — put that on the channel.`
+          : `${acct} does not open an Instagram account with this token. Instagram publishing needs the IG user id of a professional account linked to the Page.` };
+      }
+      const account = await fetchJson(`${base}/${acct}?${form({ fields: "id,name", access_token: token })}`);
       const me = await fetchJson(`${base}/me?${form({ fields: "id,name", access_token: token })}`).catch(() => null);
-      if (!ig && me && me.id !== String(acct)) notes.push(`This is a token for "${me.name}", not for the Page itself. Posting is more reliable with a Page access token.`);
-      return { ok: true, account: { id: account.id, name: account.username || account.name }, notes };
+      if (me && me.id !== String(acct)) notes.push(`This is a token for "${me.name}", not for the Page itself. Posting is more reliable with a Page access token.`);
+      return { ok: true, account: { id: account.id, name: account.name }, notes };
     },
     async metrics({ channel, asset }) {
       const token = await metaToken(channel, cfg);
