@@ -1,6 +1,6 @@
 // Building blocks shared by the compositions: karaoke captions, Ken Burns stills, brand bar, headline strip, outro card.
 import React from "react";
-import { AbsoluteFill, Img, interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
+import { AbsoluteFill, Img, OffthreadVideo, interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
 import { Brand, Word, src, MOTION, shade, isBangla } from "./theme";
 
 // A few words at a time, the spoken word in the accent colour — the karaoke style short-form viewers expect.
@@ -24,7 +24,9 @@ export const Captions: React.FC<{ words: Word[]; brand: Brand; perChunk: number;
 };
 
 // Slow zoom / pan on a still, a different direction per index, fading in over the previous one.
-export const KenBurns: React.FC<{ image: string; duration: number; index: number }> = ({ image, duration, index }) => {
+// A section's backdrop: stock footage where there is some, otherwise the picture with a slow push. Footage is muted and
+// loops, because it only has to cover the narration — the voice is the engine's, not the clip's.
+export const KenBurns: React.FC<{ image: string; duration: number; index: number; video?: boolean }> = ({ image, duration, index, video }) => {
   const frame = useCurrentFrame();
   const t = Math.min(1, frame / Math.max(1, duration));
   const d = index % 4, scale = d % 2 ? interpolate(t, [0, 1], [1.16, 1.04]) : interpolate(t, [0, 1], [1.04, 1.16]);
@@ -32,7 +34,9 @@ export const KenBurns: React.FC<{ image: string; duration: number; index: number
   const fade = interpolate(frame, [0, 10], [0, 1], { extrapolateRight: "clamp" });
   return (
     <AbsoluteFill style={{ opacity: fade, overflow: "hidden" }}>
-      <Img src={src(image)!} style={{ width: "100%", height: "100%", objectFit: "cover", transform: `scale(${scale}) translateX(${x}%)` }} />
+      {video
+        ? <OffthreadVideo src={src(image)!} muted loop style={{ width: "100%", height: "100%", objectFit: "cover", transform: `scale(${1.02})` }} />
+        : <Img src={src(image)!} style={{ width: "100%", height: "100%", objectFit: "cover", transform: `scale(${scale}) translateX(${x}%)` }} />}
     </AbsoluteFill>
   );
 };

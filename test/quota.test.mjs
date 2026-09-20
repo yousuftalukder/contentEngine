@@ -158,5 +158,42 @@ test("stock photos: the photo is fetched, composed into the card, and credited",
     const out = join(dir, "stockcard.jpg");
     writeFileSync(out, Buffer.from(await (await fetch(item.hero_media.url.replace(/^https?:\/\/[^/]+/, eng.base))).arrayBuffer()));
     assert.deepEqual([probe(out).streams[0].width, probe(out).streams[0].height], [1080, 1080]);
-  } finally { await new Promise((r) => stub.close(r)); }
+  } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
+});
+
+// Stock footage is the difference between a video and a slideshow, and it is free. Sections take a clip where the
+// library has one; a section the writer marks as needing the real event keeps a picture, and the reel still renders.
+test("reels: sections run on stock footage, and a section that must not use it keeps a picture", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const clipFile = join(dir, "broll.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30", "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p", clipFile]);
+  const { readFileSync } = await import("node:fs");
+  const bytes = readFileSync(clipFile);
+  const asked = [];
+  const http = await import("node:http");
+  const stub = http.createServer((req, res) => {
+    if (req.url.startsWith("/videos/search")) {
+      asked.push(new URL(req.url, "http://x").searchParams.get("query"));
+      const link = `http://127.0.0.1:${stub.address().port}/clip.mp4`;
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ videos: [{ id: 7, duration: 6, url: "https://pexels.com/v/7", user: { name: "A Filmmaker" }, video_files: [{ file_type: "video/mp4", width: 720, height: 1280, link }] }] }));
+    }
+    res.writeHead(200, { "content-type": "video/mp4" }); res.end(bytes);
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  try {
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_reel_footage", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Write the video in exactly", json: {
+      title: "Rain floods the capital", kicker: "Weather", description: "d", hashtags: ["bd"],
+      sections: [{ narration: "Heavy rain has flooded several roads in the capital.", image_prompt: "rain", footage_query: "monsoon rain city" },
+                 { narration: "The mayor visited the worst affected area this morning.", image_prompt: "mayor", footage_query: null }] } }] } });
+    await eng.api("PUT", "/api/settings/footage.api_base", { value: `http://127.0.0.1:${stub.address().port}/videos` });
+    const p = await program("reel_broll", { contentType: "NEWS_REEL", scriptAdapter: "llm_reel_footage", imageAdapter: "image_no_key", voiceAdapter: "tts_mock", renderAdapter: "ffmpeg", methodConfig: { slides: 2 } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Rain floods the capital" });
+    const item = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { timeout: 120000, interval: 500, what: "a reel built on footage" });
+
+    assert.deepEqual(asked, ["monsoon rain city"], "only the section that may use footage asks for a clip");
+    const media = await eng.query(`SELECT kind, meta FROM media_assets WHERE content_item_id = $1 AND kind IN ('VIDEO','IMAGE') ORDER BY created_at`, [id]);
+    assert.equal(media.filter((m) => m.meta.provider === "pexels").length, 1, "one section on footage");
+    assert.ok(media.some((m) => m.meta.overlay === "textcard"), "the other keeps a picture");
+    assert.equal(item.hero_media.kind, "VIDEO");
+  } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
 });

@@ -5,7 +5,8 @@ import { AbsoluteFill, Audio, Sequence, useVideoConfig } from "remotion";
 import { Brand, Word, fontStack, src, useBrandFont } from "./theme";
 import { BrandBar, Captions, HeadlineStrip, KenBurns, Outro, ProgressBar } from "./parts";
 
-export type ReelSection = { image: string; durationInFrames: number; narration: string; words: Word[] };
+export type ReelSection = {
+  video?: boolean; image: string; durationInFrames: number; narration: string; words: Word[] };
 export type ReelProps = {
   width?: number; height?: number; fps?: number; lang: string; brand: Brand; headline: string; kicker?: string; credit?: string;
   audio?: string; music?: string; musicVolume?: number; sections: ReelSection[]; outroFrames: number;
@@ -23,7 +24,7 @@ export const NewsReel: React.FC<ReelProps> = (p) => {
     <AbsoluteFill style={{ backgroundColor: "#000", fontFamily: fontStack(p.brand) }}>
       {seqs.map((s) => (
         <Sequence key={`img${s.i}`} from={s.from} durationInFrames={s.durationInFrames + (s.i < seqs.length - 1 ? 10 : 0)}>
-          <KenBurns image={s.image} duration={s.durationInFrames + 10} index={s.i} />
+          <KenBurns image={s.image} video={s.video} duration={s.durationInFrames + 10} index={s.i} />
         </Sequence>
       ))}
       <AbsoluteFill style={{ background: "linear-gradient(180deg, rgba(0,0,0,.6) 0%, rgba(0,0,0,0) 30%, rgba(0,0,0,0) 52%, rgba(0,0,0,.78) 100%)" }} />

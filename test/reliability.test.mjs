@@ -62,14 +62,16 @@ test("a channel reports whether it can reach its platform, without publishing an
   assert.match(liveCheck.error, /Meta access token/i);
 });
 
-// A deployment without the worker service queues every video job forever, in silence. A lane holding claimable work
-// that nothing has touched for an hour is a configuration problem, and it should say so.
+// A deployment without the worker service queues every video job forever, in silence. The engine under test runs only
+// the text lane, exactly as a web service without its video worker does, so nothing ever claims the render.
 test("a lane with work and nothing running it raises an alert naming the lane", async () => {
-  const [{ id }] = await eng.query(`INSERT INTO jobs (id, type, status, payload, queue, created_at) VALUES (gen_random_uuid()::text, 'RENDER_CLIP', 'PENDING', '{}', 'video', now() - interval '3 hours') RETURNING id`);
+  const web = await startEngine({ env: { LANES: "text" } });
   try {
-    await eng.api("POST", "/api/health/sweep", {});
-    const alert = await waitFor(async () => (await eng.api("GET", "/api/notifications")).find((n) => n.kind === "lane"), { what: "the stuck-lane alert" });
+    await web.query(`INSERT INTO jobs (id, type, status, payload, queue, created_at) VALUES (gen_random_uuid()::text, 'RENDER_CLIP', 'PENDING', '{}', 'video', now() - interval '3 hours')`);
+    await web.api("POST", "/api/health/sweep", {});
+    const alert = (await web.api("GET", "/api/notifications")).find((n) => n.kind === "lane");
+    assert.ok(alert, "the silence is reported");
     assert.match(alert.title, /"video" lane/);
     assert.match(alert.body, /worker service/i, "and it says where video rendering is supposed to run");
-  } finally { await eng.query(`DELETE FROM jobs WHERE id = $1`, [id]); }
+  } finally { await web.stop(); }
 });

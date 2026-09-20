@@ -202,7 +202,9 @@ const rowJson = (row, fields) => { if (!row) return row; const c = { ...row }; f
 const settingsCache = { at: 0, map: {} };
 async function settings() {
   if (Date.now() - settingsCache.at < 10000) return settingsCache.map;
-  settingsCache.map = Object.fromEntries((await q(`SELECT key, value FROM settings`)).map((r) => [r.key, P(r.value)]));
+  // settings.value is JSONB, so the driver hands back the value already parsed. Parsing it again turned every string
+  // setting into null — a Telegram chat id set here was read as "not configured", and alerts went nowhere.
+  settingsCache.map = Object.fromEntries((await q(`SELECT key, value FROM settings`)).map((r) => [r.key, typeof r.value === "string" ? r.value : P(r.value)]));
   settingsCache.at = Date.now();
   return settingsCache.map;
 }
@@ -1059,6 +1061,27 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
     }, ctx.pin);
   } }) });
 
+// ---- Stock footage (Pexels, the same free key). A narrated section over real moving footage is the difference between
+// a slideshow and a video, and it costs nothing. Returns a clip long enough for the section, in the right shape, or
+// null — a section with no footage falls back to its picture, so a reel is never held up by a missing clip.
+const pexelsClipUsed = new Map();
+async function pexelsFootage(query, { vertical = true, seconds = 6, ctx = {} } = {}) {
+  const q = String(query || "").trim().split(/\s+/).filter((w) => w.length > 2).slice(0, 5).join(" ");
+  if (!q) return null;
+  const base = await setting("footage.api_base", "https://api.pexels.com/videos");
+  return withKey("pexels", async (key) => {
+    const r = await fetchJson(`${base}/search?${form({ query: q, per_page: 12, orientation: vertical ? "portrait" : "landscape", size: "medium" })}`, { headers: { Authorization: key } });
+    const want = vertical ? { w: 720, h: 1080 } : { w: 1280, h: 720 };
+    const pool = (r.videos || []).filter((v) => v.duration >= Math.min(seconds, 4) && Date.now() - (pexelsClipUsed.get(v.id) || 0) > 14 * 86400e3);
+    for (const v of pool.slice(0, 6)) {
+      const file = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.width >= want.w && f.height >= want.h).sort((a, b) => a.width * a.height - b.width * b.height)[0];
+      if (!file) continue;
+      pexelsClipUsed.set(v.id, Date.now());
+      return { url: file.link, seconds: v.duration, photographer: v.user?.name || "Pexels", id: v.id, page: v.url };
+    }
+    return null;
+  }, ctx.pin).catch((e) => { warn(`stock footage "${q}": ${e.message.slice(0, 120)}`); return null; });
+}
 // ---- Stock photography (Pexels, free key, commercial use). A real photo behind the headline where a generated
 // picture is not available or not worth paying for. Two rules keep it honest: the writer decides whether a generic
 // photo could mislead for this story and gives no search phrase when it could (the post then falls back to a text
@@ -1358,9 +1381,17 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     try {
       for (const [i, im] of images.entries()) {
         const f = await toTmpFile(im.url); files.push(f); const frames = Math.max(15, Math.round(per[i] * 30)), seg = tmpPath("mp4");
-        const z = i % 2 ? `if(eq(on,0),1.12,max(zoom-0.0008,1.0))` : `min(zoom+0.0008,1.12)`;
-        await exec("ffmpeg", ["-y", "-i", f, "-vf", `scale=${Math.round(w * 1.25)}:${Math.round(h * 1.25)}:force_original_aspect_ratio=increase,crop=${Math.round(w * 1.25)}:${Math.round(h * 1.25)},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,format=yuv420p`,
-          "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+        if (im.kind === "VIDEO" || /^video\//.test(im.mime || "")) {
+          // Footage: cover the section's narration, looping a short clip rather than freezing on its last frame, filled
+          // to the frame and silent — the narration is the only voice.
+          await exec("ffmpeg", ["-y", "-stream_loop", "-1", "-i", f, "-t", per[i].toFixed(2), "-an",
+            "-vf", `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1,fps=30,format=yuv420p`,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+        } else {
+          const z = i % 2 ? `if(eq(on,0),1.12,max(zoom-0.0008,1.0))` : `min(zoom+0.0008,1.12)`;
+          await exec("ffmpeg", ["-y", "-i", f, "-vf", `scale=${Math.round(w * 1.25)}:${Math.round(h * 1.25)}:force_original_aspect_ratio=increase,crop=${Math.round(w * 1.25)}:${Math.round(h * 1.25)},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,format=yuv420p`,
+            "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+        }
         segs.push(seg);
       }
       const list = tmpPath("txt"); await writeFile(list, segs.map((s) => `file '${s.replace(/\\/g, "/")}'`).join("\n"));
@@ -1445,7 +1476,7 @@ impl("RENDER", "remotion", { label: "Studio (Remotion) for made videos, ffmpeg f
         props.audio = audio?.url && !audio.mock ? locals[locals.push(await toTmpFile(audio.url, "mp3")) - 1] : undefined;
         for (const s of sections) {
           const frames = Math.max(STUDIO_FPS, Math.round(s.seconds * STUDIO_FPS));
-          props.sections.push({ image: locals[locals.push(await toTmpFile(s.image)) - 1], durationInFrames: frames, narration: s.narration, words: wordTimings(s.narration, frames) });
+          props.sections.push({ image: locals[locals.push(await toTmpFile(s.image, s.video ? "mp4" : undefined)) - 1], video: !!s.video, durationInFrames: frames, narration: s.narration, words: wordTimings(s.narration, frames) });
         }
         const out = await studioRender("NewsReel", props);
         return publishRender(out, contentItemId, { method: "STUDIO_REEL", orientation, sections: sections.length });
@@ -2065,19 +2096,35 @@ async function generateReel(item, niche, style) {
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
     system: `${spec.system} Channel: "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear"}.${styleBlock(style)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
-    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces"}], "description": "post caption / video description", "hashtags": ["..."]}`,
+    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section (a place, an action, a scene) — or null where only a specific real event would do"}], "description": "post caption / video description", "hashtags": ["..."]}`,
     mock: { title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
   if (!sections.length) throw new Error("The script came back without sections");
   const title = d.title || m.title, script = sections.map((s) => s.narration).join("\n\n");
   await setItem(item.id, { headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
   const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
-  const images = []; let noPics = null;
-  for (const s of sections) {
+  // Each section is backed by real footage where the library has some — a narrated section over moving pictures is the
+  // difference between a video and a slideshow, and the clips are free. A section with no clip keeps its picture.
+  const broll = mc.broll !== false && (await credentialsFor("pexels")).length > 0;
+  const images = []; let noPics = null, footage = 0;
+  for (const [i, s] of sections.entries()) {
+    // An explicit null is the writer saying only the real event would do here; that section keeps a picture.
+    const query = s.footage_query === null ? null : s.footage_query || s.image_prompt;
+    if (broll && query) {
+      // Narration length is only measured later, so the clip is chosen against a reading-speed estimate of this section.
+      const spoken = Math.max(4, Math.round(String(s.narration).split(/\s+/).filter(Boolean).length / 2.2));
+      const clip = await pexelsFootage(query, { vertical, seconds: spoken + 1 });
+      if (clip) {
+        const media = await recordMedia({ contentItemId: item.id, kind: "VIDEO", url: clip.url, mime: "video/mp4",
+          meta: { provider: "pexels", clip_id: clip.id, photographer: clip.photographer, page: clip.page, section: i, purpose: "b-roll" } });
+        images.push({ ...media, kind: "VIDEO", cost: 0 }); footage++; continue;
+      }
+    }
     const img = await imageOrCard(niche, item.id, { prompt: s.image_prompt, headline: title, backdrop: true, skipApi: noPics,
       specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}), style: style2 } });
     noPics = noPics || img.fallbackError; await addCost(item.id, img.cost); images.push(img);
   }
+  if (footage) log(`reel ${item.id}: ${footage} of ${sections.length} sections on stock footage`);
   const narr = await narrateParts(niche, sections.map((s) => s.narration), item.id); await addCost(item.id, narr.cost);
   await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
@@ -2086,7 +2133,7 @@ async function generateReel(item, niche, style) {
   let video;
   if (renderer.renderReel && studioReady() && !narr.audio.mock) {
     video = await renderer.renderReel({ niche, headline: title, kicker: d.kicker, credit, orientation, contentItemId: item.id, audio: narr.audio,
-      sections: sections.map((s, i) => ({ image: images[i].url, narration: s.narration, seconds: narr.durations[i] + 0.15 })) });
+      sections: sections.map((s, i) => ({ image: images[i].url, video: images[i].kind === "VIDEO", narration: s.narration, seconds: narr.durations[i] + 0.15 })) });
   } else {
     let t = 0; const captions = sections.map((s, i) => { const c = { start: t, end: t + narr.durations[i], text: s.narration }; t += narr.durations[i]; return c; });
     video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation, captions: mc.captions === false ? [] : captions });
