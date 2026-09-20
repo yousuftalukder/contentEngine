@@ -1462,6 +1462,16 @@ const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1
 // A slideshow's segments are concatenated and then re-encoded with the captions and the brand on top, so whatever
 // quality they are written at is thrown away. Encoding them at ultrafast and a loose CRF costs nothing in the finished
 // video and is most of the render time on a small instance.
+// The frame size a render should use here. Not a quality setting so much as an honesty one: a box that cannot encode
+// 1080p in reasonable time should not pretend to, because the job then runs for half an hour and starves everything
+// else on the instance.
+function renderSize(orientation) {
+  const forced = Number(ENV.RENDER_HEIGHT) || 0;
+  const tall = orientation !== "16:9";
+  const long = forced || (memoryLimitMb() >= STUDIO_MIN_MEMORY_MB ? 1920 : 1280);
+  const short = Math.round((long * 9) / 16 / 2) * 2;
+  return tall ? [short, long] : [long, short];
+}
 const SEG_ENCODE = ["-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p"];
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"];
 // A music bed under narration. Not a flat quiet layer fighting the words: the bed is faded in and out, and a sidechain
@@ -1660,7 +1670,10 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     if (!images.length) throw new Error("slideshow needs at least one image");
     const a = await toTmpFile(audio.url, "mp3"); const dur = (await ffprobeDuration(a)) || audio.duration_seconds || images.length * 4;
     const per = durations?.length === images.length ? durations.map((x) => Math.max(0.5, Number(x) || 0)) : images.map(() => dur / images.length);
-    const [w, h] = orientation === "16:9" ? [1920, 1080] : [1080, 1920];
+    // 1080p on half a CPU is twenty minutes a reel, and the same box is also serving the dashboard and the news desk.
+    // A small instance renders at 720p — which every platform accepts for short-form — and a real worker renders at
+    // 1080p. RENDER_HEIGHT forces either.
+    const [w, h] = renderSize(orientation);
     // One Ken Burns segment per picture, exactly as long as its narration, zooming in and out alternately; then joined.
     const segs = [], files = [];
     try {

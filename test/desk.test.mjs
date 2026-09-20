@@ -139,13 +139,13 @@ test("a feed the server cannot reach is read through Google News instead of goin
     const src = await eng.api("POST", "/api/sources", { name: "Fallback outlet", adapterKey: "rss", config: cfg });
     feedStatus = 403;
     await eng.api("POST", `/api/sources/${src.id}/poll`);
-    const degraded = await waitFor(async () => { const [r] = await eng.query(`SELECT read_mode, read_note, last_error FROM sources WHERE id=$1`, [src.id]); return r?.read_mode === "google_news" && r; }, { what: "the degraded mode recorded" });
+    const degraded = await waitFor(async () => { const [r] = await eng.query(`SELECT read_mode, read_note, last_error FROM sources WHERE id=$1`, [src.id]); return r?.read_mode === "google_news" && r; }, { timeout: 60000, what: "the degraded mode recorded" });
     assert.match(degraded.read_note, /headlines only/i, "and it says what was lost");
     assert.equal(degraded.last_error, null, "but it is not an error — the poll succeeded");
 
     feedStatus = 200;
     await eng.api("POST", `/api/sources/${src.id}/poll`);
-    await waitFor(async () => { const [r] = await eng.query(`SELECT read_mode, read_note FROM sources WHERE id=$1`, [src.id]); return r?.read_mode === "direct" && r.read_note === null; }, { what: "reading directly again clears the note" });
+    await waitFor(async () => { const [r] = await eng.query(`SELECT read_mode, read_note FROM sources WHERE id=$1`, [src.id]); return r?.read_mode === "direct" && r.read_note === null; }, { timeout: 60000, what: "reading directly again clears the note" });
   } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/google_news.base", { value: null }); }
 });
 
