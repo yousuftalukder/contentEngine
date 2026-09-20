@@ -946,12 +946,16 @@ async function imageDims(file) { const { out } = await exec("ffprobe", ["-v", "e
 async function composeHeadline(inPath, headline, specs = {}) {
   const { width: w, height: h } = await imageDims(inPath);
   const short = w > h, size = Math.round(h * (short ? 0.062 : 0.05) * (specs.overlay_scale || 1)), small = Math.round(size * 0.48);
+  // The brand tag sits at the top. It used to be pinned just above the middle of the frame, where a headline set large
+  // enough to be read at thumbnail size grows straight through it.
   const mL = Math.round(w * 0.06), mV = Math.round(h * 0.075), accent = assColor(specs.accent_color || "#6c8cff"), fg = assColor(specs.text_color || "#ffffff");
-  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${Math.round(h * 0.7)})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${mV})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
   // A gradient, not three steps: at three the seams are visible straight lines across the picture. Twelve overlapping
   // boxes of low alpha compound into a smooth ramp from the middle of the frame to the bottom.
-  const band = Array.from({ length: 12 }, (_, i) => `drawbox=x=0:y=ih*${(0.52 + i * 0.038).toFixed(3)}:w=iw:h=ih:color=black@0.11:t=fill`).join(",");
+  // Big cover type sits over whatever the photo happens to be doing; the ramp deepens to carry it.
+  const step = (specs.overlay_scale || 1) > 1.3 ? 0.135 : 0.11;
+  const band = Array.from({ length: 12 }, (_, i) => `drawbox=x=0:y=ih*${(0.52 + i * 0.038).toFixed(3)}:w=iw:h=ih:color=black@${step}:t=fill`).join(",");
   try { await exec("ffmpeg", ["-y", "-i", inPath, "-vf", `${band},${assVf(assPath)}`, "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
   finally { await cleanup(assPath); }
 }
@@ -2425,6 +2429,15 @@ const RETENTION = "Structure, in order: (1) the single most surprising concrete 
   + " was expected instead, or what changed; (5) the answer to the question the opening raised; (6) what happens next."
   + " Never open with the date, the outlet, 'Breaking', 'In a stunning turn' or any throat-clearing: the first words"
   + " are the fact itself. Never tease something you do not then deliver. Short sentences, spoken not written.";
+// A hook that ends on "over", "of" or "the" reads as a sentence someone cut in half — which is exactly what it looks
+// like on a cover, where it is the only text. Trailing joining words come off; if that leaves nothing, there is no hook
+// and the headline is used instead.
+const HOOK_TAIL = /^(?:a|an|the|of|for|over|under|in|on|to|and|or|with|as|at|by|from|that|than|after|before|into|about|is|was|are|were|has|have|had|but|its|his|her|their)$/i;
+function tidyHook(raw) {
+  const w = String(raw || "").trim().replace(/[\s–—-]+$/, "").split(/\s+/).filter(Boolean).slice(0, 8);
+  while (w.length && HOOK_TAIL.test(w[w.length - 1].replace(/[^\p{L}\p{N}']/gu, ""))) w.pop();
+  return w.length >= 2 ? w.join(" ") : null;
+}
 const REEL_SPEC = {
   NEWS_REEL: { sections: 6, words: "1-2 short spoken sentences", system: `You turn a news story into a 35-60 second vertical news reel that people watch to the end. ${RETENTION} Facts only from the sources.` },
   IMAGE_SLIDESHOW: { sections: 8, words: "2-3 spoken sentences", system: `You write punchy 60-90 second facts videos that people watch to the end. ${RETENTION}` },
@@ -2443,7 +2456,7 @@ async function generateReel(item, niche, style) {
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
   if (!sections.length) throw new Error("The script came back without sections");
   const title = d.title || m.title, script = sections.map((s) => s.narration).join("\n\n");
-  const hook = String(d.hook || "").trim().split(/\s+/).slice(0, 8).join(" ") || null;
+  const hook = tidyHook(d.hook);
   await setItem(item.id, { script_meta: { ...(P(item.script_meta) || {}), ...(hook ? { hook } : {}) }, headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
   const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
   // Each section is backed by real footage where the library has some — a narrated section over moving pictures is the
