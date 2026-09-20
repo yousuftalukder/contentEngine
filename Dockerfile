@@ -71,6 +71,7 @@ COPY studio ./studio
 RUN cd studio && node render.mjs --bundle-only
 COPY server.js schema.sql ./
 COPY frontend ./frontend
+COPY fonts ./fonts
 ENV NODE_ENV=production PORT=4000 WORK_DIR=/tmp
 EXPOSE 4000
 HEALTHCHECK --interval=60s --timeout=10s CMD curl -fsS http://localhost:4000/health || exit 1

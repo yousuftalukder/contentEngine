@@ -1118,7 +1118,11 @@ const OVERLAY_FONT = ENV.OVERLAY_FONT || "Noto Sans Bengali";
 // ASS style asks fontconfig to find it, and fontconfig always answers — with a substitute when it cannot, and the
 // substitute has no Bengali in it. So the directory the fonts actually live in is handed to libass directly, which
 // makes the lookup a file lookup instead of a negotiation. Checked once, at boot, and reported.
-const SYSTEM_FONT_DIRS = ["/usr/share/fonts/truetype/noto", "/usr/share/fonts/truetype", "/usr/share/fonts"];
+// The fonts ship with the code. Production turned out to be running as a plain Node app on a runtime with no Bengali
+// font at all — every Bangla card drew boxes — and the image that installs Noto had never been what was running. A
+// directory in the repo is the one place a font can be counted on wherever this file runs; the system directories are
+// only for a kit that names something else.
+const SYSTEM_FONT_DIRS = [join(__dirname, "fonts"), "/usr/share/fonts/truetype/noto", "/usr/share/fonts/truetype", "/usr/share/fonts"];
 let systemFontsDir;
 function fontsDirFor(kitDir) {
   if (kitDir) return kitDir;
@@ -3808,7 +3812,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, fonts: fontsDirFor(null), lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
