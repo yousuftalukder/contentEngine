@@ -1459,6 +1459,10 @@ const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
 // Landscape footage in a vertical frame without cropping: the whole picture (TV chyrons included) over a blurred fill.
 const VF_VERTICAL_BLURPAD = "split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:4,eq=brightness=-0.18[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=0:(H-h)/2,setsar=1";
 const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black";
+// A slideshow's segments are concatenated and then re-encoded with the captions and the brand on top, so whatever
+// quality they are written at is thrown away. Encoding them at ultrafast and a loose CRF costs nothing in the finished
+// video and is most of the render time on a small instance.
+const SEG_ENCODE = ["-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p"];
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"];
 // A music bed under narration. Not a flat quiet layer fighting the words: the bed is faded in and out, and a sidechain
 // compressor keyed on the narration itself pulls it down under every phrase and lets it back up in the gaps — the duck
@@ -1667,7 +1671,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
           // to the frame and silent — the narration is the only voice.
           await exec("ffmpeg", ["-y", "-stream_loop", "-1", "-i", f, "-t", per[i].toFixed(2), "-an",
             "-vf", `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1,fps=30,format=yuv420p`,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+            "-c:v", "libx264", ...SEG_ENCODE, seg]);
         } else {
           // A press photo is landscape and a reel is not. Cropping a 16:9 photograph to 9:16 throws away two thirds of
           // it — usually including whoever the story is about — and an infographic cropped that way is unreadable.
@@ -1684,11 +1688,11 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
               + `[0:v]scale=${Math.round(w * 0.95)}:${Math.round(h * 0.95)}:force_original_aspect_ratio=decrease,fps=30,`
               + `scale=w='iw*(1${i % 2 ? "+0.035" : ""}${grow >= 0 ? "+" : ""}${grow}*n)':h=-2:eval=frame[fg];`
               + `[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,setsar=1,format=yuv420p[v]`,
-              "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+              "-map", "[v]", "-an", "-c:v", "libx264", ...SEG_ENCODE, seg]);
           } else {
             const z = i % 2 ? `if(eq(on,0),1.12,max(zoom-0.0008,1.0))` : `min(zoom+0.0008,1.12)`;
             await exec("ffmpeg", ["-y", "-i", f, "-vf", `scale=${Math.round(w * 1.25)}:${Math.round(h * 1.25)}:force_original_aspect_ratio=increase,crop=${Math.round(w * 1.25)}:${Math.round(h * 1.25)},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,format=yuv420p`,
-              "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+              "-frames:v", String(frames), "-an", "-c:v", "libx264", ...SEG_ENCODE, seg]);
           }
         }
         segs.push(seg);
