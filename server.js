@@ -2041,6 +2041,16 @@ function memoryLimitMb() {
   }
   return Math.round(totalmem() / 2 ** 20);
 }
+// What this host's processor can actually do. Recorded at boot because a binary compiled for the machine that built
+// the image died here with SIGILL, and whoever next considers turning the instruction-set extensions back on should
+// be able to read what is supported rather than assume it.
+function cpuFeatures() {
+  try {
+    const line = readFileSync("/proc/cpuinfo", "utf8").split(/\r?\n/).find((l) => l.startsWith("flags"));
+    const have = new Set((line || "").split(":")[1]?.trim().split(/\s+/) || []);
+    return ["sse4_2", "avx", "avx2", "f16c", "fma", "avx512f"].filter((f) => have.has(f));
+  } catch { return []; }
+}
 const STUDIO_MIN_MEMORY_MB = Number(ENV.STUDIO_MIN_MEMORY_MB) || 1400;
 const studioInstalled = () => existsSync(join(STUDIO_DIR, "render.mjs")) && existsSync(join(STUDIO_DIR, "node_modules", "@remotion", "renderer"));
 const studioReady = () => studioInstalled() && memoryLimitMb() >= STUDIO_MIN_MEMORY_MB;
@@ -4409,7 +4419,8 @@ app.post("/api/seed", async (ctx) => {
     // from the queue at 14:36, 14:47 and 15:10, and came out byte-identical every time — and nothing in the database
     // could say whether the new image was running at all.
     putSetting("boot.last", { at: new Date().toISOString(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
-      url: ENV.RENDER_EXTERNAL_URL || null, lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady() }).catch((e) => warn("boot.last", e.message));
+      url: ENV.RENDER_EXTERNAL_URL || null, lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
+      memory_mb: memoryLimitMb(), cpu: cpuFeatures() }).catch((e) => warn("boot.last", e.message));
     // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
     if (storage.name === "supabase") ensureSupabaseBucket().catch((e) => warn("supabase storage:", e.message.slice(0, 200)));
     startWorkers();

@@ -9,12 +9,19 @@
 # whisper.cpp, compiled in a stage of its own so the compiler and its headers do not ship. Transcription is what turns
 # a long video into a list of moments worth clipping, and it is the one step with no free hosted option that survives
 # a day's use — so it runs here, on the worker, unlimited and costing nothing. Built static: one binary to copy out.
+#
+# GGML_NATIVE=OFF, and every instruction-set extension off with it, is not a detail. ggml defaults to -march=native,
+# which compiles for whatever machine built the image; the machine that runs it is a different one, and production
+# died with SIGILL on its first real transcription — an instruction the host does not have. Nothing catches this in
+# a build: the smoke test below runs on the builder's own CPU, and so does CI's, so both pass and production still
+# falls over. A baseline binary is slower and it runs everywhere, which is the trade worth making on a shared vCPU.
 FROM debian:bookworm-slim AS whisper
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates; \
     curl -fsSL https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.4.tar.gz | tar -xz -C /tmp; \
-    cmake -S /tmp/whisper.cpp-1.9.4 -B /tmp/b -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF; \
+    cmake -S /tmp/whisper.cpp-1.9.4 -B /tmp/b -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF \
+      -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF; \
     cmake --build /tmp/b --config Release -j "$(nproc)" --target whisper-cli; \
     install -Dm755 "$(find /tmp/b -name whisper-cli -type f | head -1)" /out/whisper-cli; \
     /out/whisper-cli --help >/dev/null 2>&1 || true
