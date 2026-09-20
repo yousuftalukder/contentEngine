@@ -94,3 +94,43 @@ test("feeds: escaped punctuation is decoded before it reaches a headline", async
     assert.match(out.items[0].summary, /It’s the upset of the week…/, "and the summary too");
   } finally { await new Promise((r) => stub.close(r)); }
 });
+
+// Several Bangladeshi outlets serve their feed to a laptop and 403 to a datacenter, so a catalog checked from a desk
+// can be half-dead on the server. The outlet's own feed is always tried first — it carries the summary, the real
+// article url and the photo the outlet ran, none of which survive Google News — and only a feed the server cannot
+// read falls back to reading that outlet through Google News.
+test("a feed the server cannot reach is read through Google News instead of going quiet", async () => {
+  const http = await import("node:http");
+  let feedStatus = 403;
+  const stub = http.createServer((req, res) => {
+    if (req.url.startsWith("/rss/search")) {
+      const site = /site:([^+&%\s]+)/.exec(decodeURIComponent(req.url))?.[1];
+      res.writeHead(200, { "content-type": "application/rss+xml" });
+      return res.end(`<?xml version="1.0"?><rss version="2.0"><channel><item><title>Ferry service resumes at Paturia - ${site}</title>
+        <link>https://news.google.com/rss/articles/abc</link><pubDate>${new Date().toUTCString()}</pubDate></item></channel></rss>`);
+    }
+    if (feedStatus !== 200) { res.writeHead(feedStatus); return res.end("blocked"); }
+    res.writeHead(200, { "content-type": "application/rss+xml" });
+    res.end(`<?xml version="1.0"?><rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel><item>
+      <title>Ferry service resumes at Paturia</title><link>https://outlet.example/1</link>
+      <media:content url="https://outlet.example/photo.jpg" /><description>Vehicles began crossing at dawn.</description>
+      <pubDate>${new Date().toUTCString()}</pubDate></item></channel></rss>`);
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  const port = stub.address().port;
+  try {
+    await eng.api("PUT", "/api/settings/google_news.base", { value: `http://127.0.0.1:${port}` });
+    await eng.api("POST", "/api/adapter-configs", { key: "rss_blocked", stage: "INGEST", impl: "rss", config: {} });
+    const cfg = { url: `http://127.0.0.1:${port}/feed`, via_site: "outlet.example" };
+
+    const viaGoogle = await eng.api("POST", "/api/adapter-configs/rss_blocked/test", { config: cfg });
+    assert.equal(viaGoogle.items.length, 1, "the outlet is still read when its own feed refuses the server");
+    assert.equal(viaGoogle.items[0].raw?.via, "google_news", "and it says so, because the story arrives thinner");
+
+    feedStatus = 200;
+    const direct = await eng.api("POST", "/api/adapter-configs/rss_blocked/test", { config: cfg });
+    assert.ok(!direct.items[0].raw?.via, "a reachable feed is read directly, not through Google News");
+    assert.equal(direct.items[0].thumbnail, "https://outlet.example/photo.jpg", "which is where the photo comes from");
+    assert.match(direct.items[0].summary, /Vehicles began crossing/, "and the summary");
+  } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/google_news.base", { value: null }); }
+});

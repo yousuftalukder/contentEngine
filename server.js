@@ -478,14 +478,16 @@ async function instances(force = false) {
   instCache.rows = await q(`SELECT * FROM adapter_configs`); instCache.at = Date.now();
   return instCache.rows;
 }
-async function resolve(stage, key) {
+// `extra` lets a caller build an adapter with config it works out at runtime — one adapter standing in for another,
+// without a configured instance for every combination.
+async function resolve(stage, key, extra = null) {
   if (!key) throw new Error(`No ${stage} adapter configured`);
   const row = (await instances()).find((r) => r.key === key && r.stage === stage);
   const implId = row ? row.impl : (IMPLS[stage]?.[key] ? key : null);
   const def = implId && IMPLS[stage]?.[implId];
   if (!def) throw new Error(`Unknown ${stage} adapter "${key}" (impl "${implId || key}" is not registered)`);
   if (row && !flag(row.enabled)) throw new Error(`${stage} adapter instance "${key}" is disabled`);
-  const cfg = P(row?.config) || {};
+  const cfg = { ...(P(row?.config) || {}), ...(extra || {}) };
   // Key pinning: adapter instance may name a specific credential (Adapters page → Credential), so e.g. a "gemini_writing"
   // instance uses one Gemini key and "gemini_image" another. Falls back to the provider pool if that key is unavailable.
   const a = def.create(cfg, { key, row, pin: row?.credential_id || cfg.credential_id || null });
@@ -691,26 +693,42 @@ async function fetchFeed(url) {
   if (!res.ok) throw new ApiError(res.status, null, `Feed ${url.split("?")[0]} -> ${res.status}`);
   return res.text();
 }
-impl("INGEST", "rss", { label: "RSS / Atom", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 30 } }, create: (cfg, ctx = {}) => ({
+// `via_site` is the outlet's domain, used only when its own feed cannot be read. An outlet's feed carries what Google
+// News strips — the summary, the article's real url, and the photo it ran — so it is always tried first; but several
+// Bangladeshi outlets answer 403 to datacenter IPs while opening fine from a home connection, and a source that works
+// on a laptop and not on the server is worse than one that quietly falls back.
+impl("INGEST", "rss", { label: "RSS / Atom", configSchema: { url: { type: "string", required: true }, limit: { type: "number", default: 30 }, via_site: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
-    const url = cfg.url || P(source.config)?.url; if (!url) throw new Error("RSS source needs config.url");
-    return parseFeed(await fetchFeed(url)).slice(0, cfg.limit || P(source.config)?.limit || 30);
+    const c = { ...(P(source.config) || {}), ...cfg };
+    const url = c.url; if (!url) throw new Error("RSS source needs config.url");
+    const limit = c.limit || 30;
+    try {
+      const items = parseFeed(await fetchFeed(url));
+      if (items.length) return items.slice(0, limit);
+      if (!c.via_site) return items;
+      warn(`feed ${url} came back empty — reading ${c.via_site} through Google News instead`);
+    } catch (e) {
+      if (!c.via_site) throw e;
+      warn(`feed ${url} unreadable (${e.message.slice(0, 80)}) — reading ${c.via_site} through Google News instead`);
+    }
+    const gnews = await resolve("INGEST", "google_news", { site: c.via_site, language: source.language || c.language });
+    return (await gnews.fetchItems(source)).slice(0, limit);
   } }) });
 // Google News needs no key and reaches outlets whose own feeds are blocked (Cloudflare) or missing: a search ("query"
 // and/or "site") or an edition's top stories. Titles arrive as "Headline - Outlet"; the outlet is split off. Links are
 // Google redirect URLs, so the article text usually comes from other outlets in the same story cluster (news desk).
 const GN_NOISE = /e-?paper|ইপেপার|আর্কাইভ|\barchive\b|video gallery|photo gallery|today'?s'? paper|todays'? paper|^[\s\-–|]*$/i;
-function googleNewsUrl(c) {
+function googleNewsUrl(c, base = "https://news.google.com") {
   const bn = /^bn/i.test(c.language || c.hl || ""); const gl = c.gl || "BD";
   const hl = c.hl || (bn ? "bn" : "en-BD"), ceid = c.ceid || `${gl}:${bn ? "bn" : "en"}`;
-  if (!c.query && !c.site) return `https://news.google.com/rss?${form({ hl, gl, ceid })}`;
+  if (!c.query && !c.site) return `${base}/rss?${form({ hl, gl, ceid })}`;
   const q = [c.query, c.site ? `site:${c.site}` : null, c.when === "" ? null : `when:${c.when || "1d"}`].filter(Boolean).join(" ");
-  return `https://news.google.com/rss/search?${form({ q, hl, gl, ceid })}`;
+  return `${base}/rss/search?${form({ q, hl, gl, ceid })}`;
 }
 impl("INGEST", "google_news", { label: "Google News (search / edition, no key)", configSchema: { query: { type: "string" }, site: { type: "string" }, language: { type: "string", default: "en" }, when: { type: "string", default: "1d" }, limit: { type: "number", default: 40 } }, create: (cfg) => ({
   async fetchItems(source) {
     const c = { ...cfg, ...(P(source.config) || {}) }; const out = [];
-    for (const m of (await fetchFeed(googleNewsUrl(c))).matchAll(/<item\b[\s\S]*?<\/item>/gi)) {
+    for (const m of (await fetchFeed(googleNewsUrl(c, await setting("google_news.base", "https://news.google.com")))).matchAll(/<item\b[\s\S]*?<\/item>/gi)) {
       const [it] = parseFeed(m[0]); if (!it) continue;
       const outlet = decodeXml((m[0].match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [])[1] || "").trim();
       const title = outlet && it.title.endsWith(` - ${outlet}`) ? it.title.slice(0, -(outlet.length + 3)).trim() : it.title;
@@ -917,7 +935,9 @@ async function composeHeadline(inPath, headline, specs = {}) {
   const mL = Math.round(w * 0.06), mV = Math.round(h * 0.075), accent = assColor(specs.accent_color || "#6c8cff"), fg = assColor(specs.text_color || "#ffffff");
   const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${Math.round(h * 0.7)})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
-  const band = [0.58, 0.68, 0.78].map((y, i) => `drawbox=x=0:y=ih*${y}:w=iw:h=ih:color=black@${0.18 + i * 0.16}:t=fill`).join(",");
+  // A gradient, not three steps: at three the seams are visible straight lines across the picture. Twelve overlapping
+  // boxes of low alpha compound into a smooth ramp from the middle of the frame to the bottom.
+  const band = Array.from({ length: 12 }, (_, i) => `drawbox=x=0:y=ih*${(0.52 + i * 0.038).toFixed(3)}:w=iw:h=ih:color=black@0.11:t=fill`).join(",");
   try { await exec("ffmpeg", ["-y", "-i", inPath, "-vf", `${band},${assVf(assPath)}`, "-frames:v", "1", "-q:v", "2", out], { timeoutMs: 90000 }); return out; }
   finally { await cleanup(assPath); }
 }
@@ -1008,7 +1028,11 @@ async function composeTextCard(headline, specs = {}) {
     + (text && kit.handle ? `Dialogue: 0,0:00:00.00,0:00:10.00,Handle,,0,0,0,,${assEsc(kit.handle)}\n` : "");
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
   const fontsDir = await brandFontsDir(kit);
-  const fade = (c) => `'${c}*(1-0.40*(X/W+Y/H)/2)'`;
+  // A card is mostly covered by its headline, so a plain diagonal fade is enough. A backdrop is the whole frame of a
+  // reel section, and a flat field there reads as a missing picture: a broad diagonal sheen and a soft vignette give it
+  // somewhere to look. Written without commas, which a geq expression inside a filtergraph cannot carry.
+  const depth = text ? "" : "*(1+0.10*sin((X+Y)/220))*(1-0.55*((X/W-0.5)*(X/W-0.5)+(Y/H-0.5)*(Y/H-0.5)))";
+  const fade = (c) => `'${c}*(1-0.40*(X/W+Y/H)/2)${depth}'`;
   let fc = `color=c=black:s=${W}x${H}:d=1,format=gbrp,geq=r=${fade(R)}:g=${fade(G)}:b=${fade(B)}[bg]`;
   let last = "bg";
   if (text) { fc += `;[bg]drawbox=x=${m}:y=${H - metaBand - Math.max(3, Math.round(H * 0.004))}:w=${W - 2 * m}:h=${Math.max(3, Math.round(H * 0.004))}:color=${hexc(kit.accent_color, "#ffc400")}@0.85:t=fill[b1]`; last = "b1"; }
@@ -1150,6 +1174,24 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
       return { ...media, cost: 0, units: 1 };
     }, ctx.pin);
   } }) });
+// The photo the outlet ran with the story — the actual people, the actual place. It is what every Bangladeshi news page
+// on Facebook is built from, it is free, and no generated illustration competes with it for a story about real people.
+// Small images are refused: a byline portrait, a section badge or a tracking pixel is worse than no picture at all.
+impl("IMAGE", "source_photo", { label: "The story's own photo", configSchema: { min_width: { type: "number", default: 600 }, min_height: { type: "number", default: 340 } }, create: (cfg) => ({
+  async generate({ headline, specs = {}, contentItemId }) {
+    const url = specs.photo;
+    if (!url) { const e = new Error("The story came without a photo of its own"); e.editorial = true; throw e; }
+    const file = await toTmpFile(url);
+    try {
+      const { width, height } = await imageDims(file);
+      if (width < (cfg.min_width || 600) || height < (cfg.min_height || 340)) throw new Error(`The story's photo is only ${width}×${height} — a badge or a byline portrait, not a news picture`);
+      const outlet = specs.photo_outlet || null;
+      const credit = outlet ? `${specs.lang === "bn" ? "ছবি" : "Photo"}: ${outlet}` : undefined;
+      const media = await storeImage(await readFile(file), "image/jpeg", contentItemId, { provider: "source", photo_url: url, outlet, width, height },
+        {}, { headline, specs: { ...specs, ...(credit ? { photo_credit: credit } : {}) } });
+      return { ...media, cost: 0, units: 1 };
+    } finally { await cleanup(file); }
+  } }) });
 impl("IMAGE", "openai_image", { label: "OpenAI image generation", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_IMAGE_MODEL }, quality: { type: "string", default: "medium" } }, create: (cfg, ctx = {}) => ({
   async generate({ prompt, headline, specs = {}, contentItemId }) {
     const model = cfg.model || DEFAULTS.OPENAI_IMAGE_MODEL;
@@ -1283,6 +1325,28 @@ async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1
     + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
   const f = tmpPath("ass"); await writeFile(f, ass); return f;
 }
+// What a news editor burns into a video and the ffmpeg path never did: the label, the headline, the handle. Without
+// these a rendered reel is a caption track over a colour field — the studio drew them, ffmpeg drew nothing, and ffmpeg
+// is what runs on an instance too small for Chromium. The headline holds for the opening seconds, where a viewer
+// decides whether to stay, and then gets out of the way of the captions.
+async function writeBrandAss({ headline, kicker, handle, credit, width, height, seconds, primary = "#b3121f", accent = "#ffc400", font = OVERLAY_FONT }) {
+  const vertical = height > width, pad = Math.round(width * 0.055);
+  const head = Math.round(height * (vertical ? 0.036 : 0.05)), kick = Math.round(head * 0.62), small = Math.round(head * 0.46);
+  const hold = Math.max(3.5, Math.min(7.5, seconds * 0.35)), events = [];
+  const top = Math.round(height * (vertical ? 0.085 : 0.07));
+  if (kicker) events.push(`Dialogue: 2,${assTime(0.15)},${assTime(seconds)},Kick,,0,0,${top},,{\\fad(250,0)}${assEsc(kicker).toUpperCase().slice(0, 28)}`);
+  if (headline) events.push(`Dialogue: 2,${assTime(0.35)},${assTime(hold)},Head,,0,0,${top + Math.round(kick * 2.1)},,{\\fad(350,500)}${assEsc(headline).slice(0, 120)}`);
+  const foot = [handle, credit].filter(Boolean).join("   ");
+  if (foot) events.push(`Dialogue: 2,${assTime(0.5)},${assTime(seconds)},Foot,,0,0,${Math.round(height * 0.035)},,{\\fad(400,0)}${assEsc(foot).slice(0, 70)}`);
+  if (!events.length) return null;
+  // BorderStyle 3 paints BackColour behind the text, which is how the label pill and the headline plate are drawn.
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n${ASS_FORMAT}\n`
+    + `Style: Kick,${font},${kick},${assColor("#111111")},${assColor("#111111")},${assColor(accent)},${assColor(accent)},-1,0,0,0,100,100,${Math.round(kick * 0.1)},0,3,${Math.round(kick * 0.34)},0,7,${pad},${pad},0,1\n`
+    + `Style: Head,${font},${head},${assColor("#ffffff")},${assColor("#ffffff")},${assColor(primary, "18")},${assColor(primary, "18")},-1,0,0,0,100,100,0,0,3,${Math.round(head * 0.34)},0,7,${pad},${vertical ? pad : Math.round(width * 0.34)},0,1\n`
+    + `Style: Foot,${font},${small},${assColor("#ffffff", "50")},${assColor("#ffffff", "50")},${assColor("#000000", "60")},${assColor("#000000", "90")},0,0,0,0,100,100,${Math.round(small * 0.08)},0,1,${Math.max(1, Math.round(small * 0.08))},0,1,${pad},${pad},0,1\n`
+    + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
+  const f = tmpPath("ass"); await writeFile(f, ass); return f;
+}
 const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
 // Landscape footage in a vertical frame without cropping: the whole picture (TV chyrons included) over a blurred fill.
 const VF_VERTICAL_BLURPAD = "split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:4,eq=brightness=-0.18[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=0:(H-h)/2,setsar=1";
@@ -1298,7 +1362,9 @@ const duckUnder = (mi, vi, dur) =>
   `[${mi}:a]${AFMT},volume=0.22,afade=t=in:st=0:d=1.5,afade=t=out:st=${Math.max(0, dur - 2.5).toFixed(2)}:d=2.5[bed];` +
   `[${vi}:a]${AFMT},asplit=2[voice][key];` +
   `[bed][key]sidechaincompress=threshold=0.03:ratio=12:attack=15:release=350[duck];` +
-  `[voice][duck]amix=inputs=2:duration=first:dropout_transition=0,alimiter=limit=0.95[mix]`;
+  // normalize=0 matters: amix divides every input by their number by default, so mixing a bed in would quietly drop
+  // the narration 6 dB. The bed's level is set by its own volume filter, and alimiter catches whatever peaks.
+  `[voice][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]`;
 async function cutClip(input, start, end, { vertical = true, ass = null, layout = "crop" } = {}) {
   const vf = [vertical ? (layout === "blurpad" ? VF_VERTICAL_BLURPAD : VF_VERTICAL) : VF_LANDSCAPE];
   if (ass) vf.push(assVf(ass));
@@ -1460,7 +1526,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
   },
   // durations (seconds per picture) follow the narration section by section; without them the pictures share it equally.
-  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [], niche = null }) {
+  async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [], niche = null, headline = null, kicker = null, credit = null }) {
     if (!images.length) throw new Error("slideshow needs at least one image");
     const a = await toTmpFile(audio.url, "mp3"); const dur = (await ffprobeDuration(a)) || audio.duration_seconds || images.length * 4;
     const per = durations?.length === images.length ? durations.map((x) => Math.max(0.5, Number(x) || 0)) : images.map(() => dur / images.length);
@@ -1486,16 +1552,19 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
       const list = tmpPath("txt"); await writeFile(list, segs.map((s) => `file '${s.replace(/\\/g, "/")}'`).join("\n"));
       let ass = null; if (captions.length) ass = await writeCaptionsAss(captions, 0, dur, { width: w, height: h });
       // The brand's music, if it has any. A slideshow with nothing under the voice sounds like a slideshow.
-      const music = niche ? await studioBrand(niche).then((s) => s.music, () => undefined) : undefined;
+      // The brand's music and the brand's own colours, if the render was told which program it is for.
+      const { brand, music } = niche ? await studioBrand(niche).catch(() => ({ brand: {} })) : { brand: {} };
+      const chrome = await writeBrandAss({ headline, kicker, handle: brand.handle, credit, width: w, height: h, seconds: dur, primary: brand.primary, accent: brand.accent });
       const out = tmpPath("mp4");
       const run = async (bed) => {
-        const fc = [...(ass ? [`[0:v]${assVf(ass)}[v]`] : []), ...(bed ? [duckUnder(2, 1, dur)] : [])];
+        const vf = [...(chrome ? [assVf(chrome)] : []), ...(ass ? [assVf(ass)] : [])].join(",");
+        const fc = [...(vf ? [`[0:v]${vf}[v]`] : []), ...(bed ? [duckUnder(2, 1, dur)] : [])];
         await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", a, ...(bed ? ["-stream_loop", "-1", "-i", bed] : []),
-          ...(fc.length ? ["-filter_complex", fc.join(";")] : []), "-map", ass ? "[v]" : "0:v", "-map", bed ? "[mix]" : "1:a", "-shortest", ...X264, out]);
+          ...(fc.length ? ["-filter_complex", fc.join(";")] : []), "-map", vf ? "[v]" : "0:v", "-map", bed ? "[mix]" : "1:a", "-shortest", ...X264, out]);
       };
       // An ffmpeg without sidechaincompress or alimiter must still produce the video, just without the bed.
       try { await run(music).catch((e) => { if (!music) throw e; warn(`music bed: ${e.message.slice(0, 140)}`); return run(null); }); }
-      finally { await cleanup(list, ass, music); }
+      finally { await cleanup(list, ass, chrome, music); }
       return publishRender(out, contentItemId, { method: "SLIDESHOW", orientation, slides: images.length });
     } finally { await cleanup(a, ...files, ...segs); }
   },
@@ -1816,32 +1885,39 @@ async function routeSourceItem(item) {
 // are reached through Google News (site search). A new program with country Bangladesh gets the entries in its language
 // linked automatically (video programs get the TV channels); anything else can be added from the Sources page.
 const gn = (key, name, language, site, weight = 1) => ({ key, name, language, adapter: "google_news", config: { site, language }, weight, poll: 20 });
-const rss = (key, name, language, url, weight = 1) => ({ key, name, language, adapter: "rss", config: { url }, weight, poll: 10 });
+// `site` is the outlet's domain: the feed is read directly where the server can reach it, and through Google News where
+// it cannot. Direct is worth insisting on — it is the difference between a headline and a story with a photo.
+const rss = (key, name, language, url, weight = 1, site = null) => ({ key, name, language, adapter: "rss", config: { url, ...(site ? { via_site: site } : {}) }, weight, poll: 10 });
 const ytc = (key, name, channel_id, weight = 1) => ({ key, name, language: "bn", adapter: "youtube_rss", config: { channel_id }, weight, poll: 15, kind: "VIDEO" });
 const BD_CATALOG = [
-  rss("bd-en-dailystar", "The Daily Star", "en", "https://www.thedailystar.net/news/bangladesh/rss.xml", 1.2),
-  // Prothom Alo's English feed is served empty, and Dhaka Tribune's answers 403 to datacenter IPs (it opens fine from a
-  // home connection, which is why it looked healthy when the catalog was built). Both are read through Google News.
-  gn("bd-en-prothomalo", "Prothom Alo English", "en", "en.prothomalo.com", 1.1),
-  gn("bd-en-dhakatribune", "Dhaka Tribune", "en", "dhakatribune.com", 1),
-  rss("bd-en-tbs", "The Business Standard", "en", "https://www.tbsnews.net/top-news/rss.xml", 1),
+  // Every one of these feeds was checked: the ones listed with a domain serve their own items — with the summary, the
+  // real article url and the photo the outlet ran — and fall back to Google News only if the server cannot reach them.
+  // The remaining outlets have no working feed at all and are read through Google News, which gives a headline only.
+  rss("bd-en-dailystar", "The Daily Star", "en", "https://www.thedailystar.net/news/bangladesh/rss.xml", 1.2, "thedailystar.net"),
+  rss("bd-en-prothomalo", "Prothom Alo English", "en", "https://en.prothomalo.com/feed", 1.1, "en.prothomalo.com"),
+  rss("bd-en-dhakatribune", "Dhaka Tribune", "en", "https://www.dhakatribune.com/feed/", 1, "dhakatribune.com"),
+  rss("bd-en-tbs", "The Business Standard", "en", "https://www.tbsnews.net/top-news/rss.xml", 1, "tbsnews.net"),
+  rss("bd-en-observer", "The Daily Observer", "en", "https://www.observerbd.com/rss", 0.8, "observerbd.com"),
+  rss("bd-en-bss", "BSS (state news agency)", "en", "https://www.bssnews.net/rss/rss.xml", 0.8, "bssnews.net"),
   gn("bd-en-bdnews24", "bdnews24.com", "en", "bdnews24.com", 1.1),
   gn("bd-en-fe", "The Financial Express", "en", "thefinancialexpress.com.bd", 0.9),
   gn("bd-en-newage", "New Age", "en", "newagebd.net", 0.9),
   gn("bd-en-unb", "UNB", "en", "unb.com.bd", 0.8),
-  gn("bd-en-bss", "BSS (state news agency)", "en", "bssnews.net", 0.8),
   { key: "bd-en-gnews", name: "Google News: Bangladesh", language: "en", adapter: "google_news", config: { query: "Bangladesh", language: "en" }, weight: 0.7, poll: 20 },
-  rss("bd-bn-prothomalo", "প্রথম আলো", "bn", "https://www.prothomalo.com/feed/", 1.3),
+  rss("bd-bn-prothomalo", "প্রথম আলো", "bn", "https://www.prothomalo.com/feed", 1.3, "prothomalo.com"),
   rss("bd-bn-bbc", "বিবিসি বাংলা", "bn", "https://feeds.bbci.co.uk/bengali/rss.xml", 1.2),
-  rss("bd-bn-banglatribune", "বাংলা ট্রিবিউন", "bn", "https://www.banglatribune.com/feed/", 1),
-  rss("bd-bn-dhakapost", "ঢাকা পোস্ট", "bn", "https://www.dhakapost.com/rss/rss.xml", 0.9),
+  rss("bd-bn-banglatribune", "বাংলা ট্রিবিউন", "bn", "https://www.banglatribune.com/feed/", 1, "banglatribune.com"),
+  rss("bd-bn-samakal", "সমকাল", "bn", "https://www.samakal.com/rss", 1, "samakal.com"),
+  rss("bd-bn-ittefaq", "ইত্তেফাক", "bn", "https://www.ittefaq.com.bd/feed/", 1, "ittefaq.com.bd"),
+  rss("bd-bn-deshrupantor", "দেশ রূপান্তর", "bn", "https://www.deshrupantor.com/feed/", 0.95, "deshrupantor.com"),
+  rss("bd-bn-banglanews24", "বাংলানিউজ২৪", "bn", "https://banglanews24.com/rss.xml", 0.95, "banglanews24.com"),
+  rss("bd-bn-dhakapost", "ঢাকা পোস্ট", "bn", "https://www.dhakapost.com/rss/rss.xml", 0.9, "dhakapost.com"),
+  rss("bd-bn-inqilab", "দৈনিক ইনকিলাব", "bn", "https://www.dailyinqilab.com/rss/rss.xml", 0.85, "dailyinqilab.com"),
   rss("bd-bn-dw", "ডয়চে ভেলে বাংলা", "bn", "https://rss.dw.com/xml/rss-ben-all", 0.9),
-  rss("bd-bn-risingbd", "রাইজিংবিডি", "bn", "https://www.risingbd.com/rss/rss.xml", 0.8),
+  rss("bd-bn-risingbd", "রাইজিংবিডি", "bn", "https://www.risingbd.com/rss/rss.xml", 0.8, "risingbd.com"),
   gn("bd-bn-bdnews24", "বিডিনিউজ টোয়েন্টিফোর", "bn", "bangla.bdnews24.com", 1.1),
   gn("bd-bn-kalerkantho", "কালের কণ্ঠ", "bn", "kalerkantho.com", 1),
-  gn("bd-bn-samakal", "সমকাল", "bn", "samakal.com", 1),
   gn("bd-bn-jugantor", "যুগান্তর", "bn", "jugantor.com", 1),
-  gn("bd-bn-ittefaq", "ইত্তেফাক", "bn", "ittefaq.com.bd", 1),
   gn("bd-bn-jagonews24", "জাগো নিউজ", "bn", "jagonews24.com", 0.9),
   gn("bd-bn-kalbela", "কালবেলা", "bn", "kalbela.com", 0.9),
   gn("bd-bn-bdpratidin", "বাংলাদেশ প্রতিদিন", "bn", "bd-pratidin.com", 0.9),
@@ -2112,7 +2188,10 @@ function styleBlock(style, niche = null) {
 async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
   const brand = await one(`SELECT name, brand_kit FROM brands WHERE id = $1`, [niche.brand_id]);
   const kit = P(brand?.brand_kit) || {}, own = P(niche.image_specs) || {}, lang = (niche.language || "en").slice(0, 2);
-  const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", lang, kit, ...own };
+  // The kit's colours are lifted out of it, because the overlay composer reads them at the top level — without this a
+  // brand's own accent is quietly replaced by a default blue on every headline burned over a picture.
+  const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", lang, kit,
+    accent_color: kit.accent_color, text_color: kit.text_color, photo: m.photo || null, photo_outlet: m.photo_outlet || null, ...own };
   if (specs.layout === "photocard") {
     const outlets = [...new Set((m.versions?.length ? m.versions.map((v) => v.outlet) : [m.raw?.outlet]).filter(Boolean))].slice(0, 2);
     specs.card_meta = { date: cardDate(lang, /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC"), credit: kit.credit_sources === false || !outlets.length ? null : `${lang === "bn" ? "সূত্র" : "Source"}: ${outlets.join(", ")}` };
@@ -2124,7 +2203,12 @@ async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
 // The little label on a text card: news says "latest" in the program's language, anything else says which program it is.
 const cardLabel = (niche) => (/^NEWS/.test(niche.content_type || "") ? undefined : niche.display_name);
 const llmFor = async (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks"), fn);
-const imageFor = async (niche, fn) => withFallbacks("IMAGE", niche.image_adapter || "image_mock", await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks"), fn);
+// `lead` puts an adapter in front of the program's own, without disturbing what the program is configured to use: the
+// story's own photo is tried first when it has one, and what the program would have drawn is the fallback.
+const imageFor = async (niche, fn, lead = null) => {
+  const own = niche.image_adapter || "image_mock", fb = await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks");
+  return withFallbacks("IMAGE", lead || own, lead ? [own, ...fb] : fb, fn);
+};
 // The hero picture — or, when every image adapter fails (no key, a plan without image generation, an outage), a text
 // card in the brand's colours so the post still goes out. The reason is kept on the media row and raised once as an
 // alert rather than per item. `backdrop` asks for the card without text (a reel section's background), `skipApi` says
@@ -2132,7 +2216,10 @@ const imageFor = async (niche, fn) => withFallbacks("IMAGE", niche.image_adapter
 async function imageOrCard(niche, itemId, { prompt, headline, specs, label = undefined, backdrop = false, skipApi = null }) {
   let err = skipApi;
   if (!err) {
-    try { return await imageFor(niche, (ia) => ia.generate({ prompt, headline, specs, contentItemId: itemId })); }
+    // A real photo of the story beats any illustration of it, and costs nothing. Programs that would rather not run an
+    // outlet's picture turn it off with method_config.source_photos = false.
+    const lead = specs.photo && methodCfg(niche).source_photos !== false ? "source_photo" : null;
+    try { return await imageFor(niche, (ia) => ia.generate({ prompt, headline, specs, contentItemId: itemId }), lead); }
     catch (e) { if (!(await setting("image.text_card_fallback", true))) throw e; err = e; }
   }
   const kit = specs.kit || P((await one(`SELECT brand_kit FROM brands WHERE id=$1`, [niche.brand_id]))?.brand_kit) || {};
@@ -2167,17 +2254,30 @@ function extractArticleText(html) {
   const text = paras.join("\n\n").trim();
   return text.length > 200 ? text.slice(0, ARTICLE_TEXT_MAX) : "";
 }
+// The picture the outlet ran with the story, taken off the page it is already fetching for the text: og:image is what
+// every newsroom CMS writes for Facebook, so it is the same photo the outlet's own post uses.
+const ogImage = (html) => {
+  for (const re of [/<meta[^>]+property=["']og:image(?::url)?["'][^>]+content=["']([^"']+)["']/i,
+                    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::url)?["']/i,
+                    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i]) {
+    const m = re.exec(html); if (m && /^https?:\/\//i.test(m[1])) return decodeXml(m[1]);
+  }
+  return "";
+};
+// The story's own photo: what the feed carried, else what the article page declared.
+const leadPhoto = (sourceItem) => sourceItem.thumbnail_url || P(sourceItem.raw)?.lead_image || null;
 async function articleText(sourceItem) {
   const raw = P(sourceItem.raw) || {};
   if (typeof raw.article_text === "string") return raw.article_text;                       // cached (may be "" = tried, nothing usable)
   if (!(await setting("ingest.fetch_article_text", true)) || !/^https?:/.test(sourceItem.url || "")) return "";
   if (/^https?:\/\/news\.google\.com\//.test(sourceItem.url)) return "";                   // redirect page, no article text
-  let text = "";
+  let text = "", image = "";
   try {
     const res = await fetch(sourceItem.url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "user-agent": FEED_UA, accept: "text/html,*/*" } });
-    if (res.ok && /html/i.test(res.headers.get("content-type") || "")) text = extractArticleText((await res.text()).slice(0, 1.5e6));
+    if (res.ok && /html/i.test(res.headers.get("content-type") || "")) { const html = (await res.text()).slice(0, 1.5e6); text = extractArticleText(html); image = ogImage(html); }
   } catch (e) { warn(`article fetch ${sourceItem.url}: ${e.message.slice(0, 120)}`); }
-  await q(`UPDATE source_items SET raw = COALESCE(raw, '{}'::jsonb) || $2::jsonb WHERE id = $1`, [sourceItem.id, JSON.stringify({ article_text: text })]).catch(() => {});
+  await q(`UPDATE source_items SET raw = COALESCE(raw, '{}'::jsonb) || $2::jsonb WHERE id = $1`, [sourceItem.id, JSON.stringify({ article_text: text, ...(image ? { lead_image: image } : {}) })]).catch(() => {});
+  if (image) sourceItem.raw = { ...raw, lead_image: image };                               // so the caller can use it without re-reading
   return text;
 }
 // A news-desk item's material: up to four outlets' versions of the story (the program's lead source first), each with
@@ -2188,11 +2288,16 @@ async function clusterMaterial(item) {
   const versions = [], seen = new Set();
   for (const r of rows) {
     const outlet = P(r.raw)?.outlet || r.source_name; if (seen.has(outlet)) continue; seen.add(outlet);
-    versions.push({ outlet, title: r.title, summary: r.summary || "", text: r.kind === "ARTICLE" ? await articleText(r) : "", url: r.url, published_at: r.published_at });
+    const text = r.kind === "ARTICLE" ? await articleText(r) : "";                       // also fills in the page's own photo
+    versions.push({ outlet, title: r.title, summary: r.summary || "", text, url: r.url, published_at: r.published_at, photo: leadPhoto(r) });
     if (versions.length >= 4) break;
   }
   const lead = versions[0];
-  return { title: lead.title, summary: lead.summary, text: lead.text, url: lead.url, published_at: lead.published_at, raw: { outlets: versions.map((v) => v.outlet) }, versions };
+  // The heaviest outlet that ran a picture: the lead's own if it has one, otherwise a corroborating outlet's, since the
+  // story is the same story. Which outlet it came from is kept, because the credit on the card has to be true.
+  const withPhoto = versions.find((v) => v.photo);
+  return { title: lead.title, summary: lead.summary, text: lead.text, url: lead.url, published_at: lead.published_at,
+    photo: withPhoto?.photo || null, photo_outlet: withPhoto?.outlet || null, raw: { outlets: versions.map((v) => v.outlet) }, versions };
 }
 // The material as prompt text. Several outlets' versions are each clipped so the total stays near ARTICLE_TEXT_MAX, and
 // the writer is told how to treat agreement and conflict between them.
@@ -2208,7 +2313,7 @@ const richMaterial = (m) => (m.versions?.length ? m.versions.some((v) => v.text)
 // Resolve the raw material for a text item: a news-desk story cluster, a routed source_item, or a legacy TOPIC adapter pull.
 async function materialFor(item, niche) {
   if (item.cluster_id) { const m = await clusterMaterial(item); if (m) return m; }
-  if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); const text = s.kind === "ARTICLE" ? await articleText(s) : ""; return { title: s.title, summary: s.summary, text, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, raw: P(s.raw) }; }
+  if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); const text = s.kind === "ARTICLE" ? await articleText(s) : ""; return { title: s.title, summary: s.summary, text, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, photo: leadPhoto(s), photo_outlet: P(s.raw)?.outlet || null, raw: P(s.raw) }; }
   const src = P(item.source_data_ref); if (item.topic && src && src.provider !== "topic_adapter_pending") return { title: item.topic, summary: src.description || src.summary || "", url: src.url || null, raw: src };
   const past = (await q(`SELECT topic FROM content_items WHERE niche_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 100`, [niche.id, item.id])).map((r) => r.topic);
   const ts = await resolve("TOPIC", niche.topic_source_adapter || "newsapi_mock");
@@ -2222,7 +2327,7 @@ async function generateStatic(item, niche, style) {
   const m = await materialFor(item, niche);
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id);
   if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}" (score ${dedup.best.score.toFixed(2)})`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
     system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. Language: ${lang}. Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style, niche)}${item._series || ""}`,
@@ -2267,7 +2372,7 @@ async function generateReel(item, niche, style) {
   const m = await materialFor(item, niche); const type = item.content_type || niche.content_type, spec = REEL_SPEC[type] || REEL_SPEC.IMAGE_SLIDESHOW, mc = methodCfg(niche);
   const long = type === "LONG_FORM_VIDEO", orientation = long ? "16:9" : mc.orientation || "9:16", vertical = orientation !== "16:9", lang = niche.language || "en";
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
     system: `${spec.system} Channel: "${niche.display_name}". Language: ${lang}. Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
@@ -2295,8 +2400,11 @@ async function generateReel(item, niche, style) {
         images.push({ ...media, kind: "VIDEO", cost: 0 }); footage++; continue;
       }
     }
+    // The story's own photo opens the video and nothing else: a news reel where every section is the same press photo
+    // is a slideshow of one picture. The rest of the sections run on footage or the brand's backdrop.
     const img = await imageOrCard(niche, item.id, { prompt: s.image_prompt, headline: title, backdrop: true, skipApi: noPics,
-      specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false, ...(P(niche.image_specs) || {}), style: style2 } });
+      specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false,
+        ...(i === 0 ? { photo: m.photo || null, photo_outlet: m.photo_outlet || null } : {}), ...(P(niche.image_specs) || {}), style: style2 } });
     noPics = noPics || img.fallbackError; await addCost(item.id, img.cost); images.push(img);
   }
   if (footage) log(`reel ${item.id}: ${footage} of ${sections.length} sections on stock footage`);
@@ -2311,7 +2419,8 @@ async function generateReel(item, niche, style) {
       sections: sections.map((s, i) => ({ image: images[i].url, video: images[i].kind === "VIDEO", narration: s.narration, seconds: narr.durations[i] + 0.15 })) });
   } else {
     let t = 0; const captions = sections.map((s, i) => { const c = { start: t, end: t + narr.durations[i], text: s.narration }; t += narr.durations[i]; return c; });
-    video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation, captions: mc.captions === false ? [] : captions, niche });
+    video = await renderer.renderSlideshow({ images, audio: narr.audio, durations: narr.durations, contentItemId: item.id, orientation,
+      captions: mc.captions === false ? [] : captions, niche, headline: title, kicker: d.kicker, credit });
   }
   // A landscape video is a YouTube video, and a YouTube video without a thumbnail is a grey frame in a list of covers.
   if (!vertical) await makeThumbnail(item.id, niche, images[0], title).catch((e) => warn(`thumbnail: ${e.message.slice(0, 140)}`));
@@ -2334,7 +2443,7 @@ async function generateExplainer(item, niche, style) {
   const m = await materialFor(item, niche); const mc = methodCfg(niche), lang = niche.language || "en";
   const orientation = mc.orientation === "9:16" ? "9:16" : "16:9", vertical = orientation === "9:16", minutes = Number(mc.explainer_minutes) || 3;
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
     prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
@@ -2506,7 +2615,7 @@ async function runGeneration(itemId) {
 async function regenerate(itemId, part) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
-  if (part === "image") { const specs = await cardSpecs(niche, { versions: (P(item.source_data_ref)?.outlets || []).map((outlet) => ({ outlet })) }); const img = await imageOrCard(niche, itemId, { prompt: item.image_prompt, headline: item.headline || item.topic, specs, label: cardLabel(niche) }); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
+  if (part === "image") { const sdr = P(item.source_data_ref) || {}; const specs = await cardSpecs(niche, { versions: (sdr.outlets || []).map((outlet) => ({ outlet })), photo: sdr.photo, photo_outlet: sdr.photo_outlet }); const img = await imageOrCard(niche, itemId, { prompt: item.image_prompt, headline: item.headline || item.topic, specs, label: cardLabel(niche) }); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
   if (part === "all") { await setItem(itemId, { headline: null, summary: null, body: null, hero_media_id: null }); return runGeneration(itemId); }
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500, system: `You are the editor of "${niche.display_name}". Language: ${niche.language || "en"}. Tone: ${niche.tone}.${styleBlock(style, niche)}`,
     prompt: `Current headline: ${item.headline}\nSummary: ${item.summary}\nBody: ${(item.body || "").slice(0, 3000)}\n\nRewrite ONLY the ${part} to be stronger, keeping the facts identical. Return JSON: ${part === "headline" ? '{"headline": "..."}' : part === "captions" ? '{"captions": {"facebook": "...", "instagram": "...", "x": "...", "linkedin": "..."}, "hashtags": ["..."]}' : '{"body": "..."}'}`,
@@ -3081,7 +3190,7 @@ async function upgradeExistingPrograms() {
 // Catalog entries get corrected as outlets change — a feed starts refusing datacenter IPs, another is served empty. A
 // source that came from the catalog follows the correction instead of failing quietly until someone reads the logs.
 // Sources a person added themselves have no catalog_key and are never touched. Bump CATALOG_VERSION to roll out a fix.
-const CATALOG_VERSION = 2;
+const CATALOG_VERSION = 3;
 async function syncCatalogSources() {
   if (Number(await setting("upgrade.catalog_sync", 0)) >= CATALOG_VERSION) return;
   for (const e of SOURCE_CATALOG) {
@@ -3089,6 +3198,15 @@ async function syncCatalogSources() {
     if (!row || (row.adapter_key === e.adapter && JSON.stringify(P(row.config) || {}) === JSON.stringify(e.config))) continue;
     await q(`UPDATE sources SET adapter_key = $2, config = $3::jsonb, poll_interval_minutes = $4, last_error = NULL WHERE id = $1`, [row.id, e.adapter, JSON.stringify(e.config), e.poll || row.poll_interval_minutes]);
     log(`catalog: "${row.name}" now reads through ${e.adapter}`);
+  }
+  // An outlet added to the catalog has to reach the programs that already exist, or the catalog only ever describes
+  // programs created after it. Only programs that took their sources from the catalog are touched; one whose sources
+  // were chosen by hand keeps exactly what was chosen.
+  for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
+    const have = new Set((await q(`SELECT s.catalog_key FROM niche_sources ns JOIN sources s ON s.id = ns.source_id WHERE ns.niche_id = $1 AND s.catalog_key IS NOT NULL`, [n.id])).map((r) => r.catalog_key));
+    if (!have.size) continue;
+    const missing = catalogFor(n).filter((e) => !have.has(e.key));
+    if (missing.length) { await installCatalogSources(missing, [n.id]); log(`catalog: ${missing.length} new source${missing.length > 1 ? "s" : ""} linked to "${n.display_name}" (${missing.map((e) => e.name).join(", ")})`); }
   }
   await putSetting("upgrade.catalog_sync", CATALOG_VERSION);
 }

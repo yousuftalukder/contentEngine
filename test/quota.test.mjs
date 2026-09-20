@@ -197,6 +197,60 @@ test("stock photos: the photo is fetched, composed into the card, and credited",
   } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
 });
 
+// What every Bangladeshi news page on Facebook is actually built from: the photo the outlet ran with the story. It is
+// the real people and the real place, it costs nothing, and no generated illustration competes with it. The feed
+// carries it, or the article page declares it as og:image; either way it goes in front of whatever the program would
+// have drawn.
+test("the story's own photo is what the post uses, credited to the outlet that ran it", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const photo = join(dir, "press.jpg");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1600x900", "-frames:v", "1", photo]);
+  const tiny = join(dir, "badge.png");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=120x120", "-frames:v", "1", tiny]);
+  const { readFileSync } = await import("node:fs");
+  const http = await import("node:http");
+  let port = 0;
+  const stub = http.createServer((req, res) => {
+    if (req.url === "/press.jpg") { res.writeHead(200, { "content-type": "image/jpeg" }); return res.end(readFileSync(photo)); }
+    if (req.url === "/badge.png") { res.writeHead(200, { "content-type": "image/png" }); return res.end(readFileSync(tiny)); }
+    if (req.url === "/feed.xml") {
+      res.writeHead(200, { "content-type": "application/rss+xml" });
+      return res.end(`<?xml version="1.0"?><rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
+        <item><title>Rickshaw drivers block Mirpur road over fare rules</title><link>http://127.0.0.1:${port}/story</link>
+          <media:content url="http://127.0.0.1:${port}/press.jpg" /><description>Traffic stopped for three hours.</description>
+          <pubDate>${new Date().toUTCString()}</pubDate></item></channel></rss>`);
+    }
+    // The article page, for the text and for the og:image a feed without one would fall back to.
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(`<html><head><meta property="og:image" content="http://127.0.0.1:${port}/press.jpg"></head><body><article><p>${"Drivers stopped traffic for three hours on Wednesday. ".repeat(12)}</p></article></body></html>`);
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  port = stub.address().port;
+  try {
+    const src = await eng.api("POST", "/api/sources", { name: "Mirpur Times", adapterKey: "rss", config: { url: `http://127.0.0.1:${port}/feed.xml` } });
+    const p = await program("own_photo", { sourceIds: [src.id], methodConfig: { desk: { settle_minutes: 0, min_sources: 1, min_gap_minutes: 0, per_sweep: 3 } } });
+    await eng.api("POST", `/api/sources/${src.id}/poll`);
+    await eng.api("POST", "/api/desk/run", {});
+    const item = await waitFor(async () => {
+      const [x] = await eng.api("GET", `/api/content-items?nicheId=${p.id}`);
+      if (x?.status === "FAILED") throw new Error(x.rejection_note);
+      return x?.status === "PENDING_REVIEW" && (await eng.api("GET", `/api/content-items/${x.id}`));
+    }, { timeout: 60000, interval: 1000, what: "a draft built on the outlet's photo" });
+
+    assert.equal(item.hero_media.meta.provider, "source", "the picture is the one the story came with");
+    assert.equal(item.hero_media.meta.overlay, "photocard", "composed into the brand's card, not posted raw");
+    assert.match(item.hero_media.meta.compose_specs.photo_credit, /Photo: Mirpur Times/, "and the outlet is credited");
+
+    // A 120x120 badge is a section icon or a tracking pixel, not a news picture. A story that came with only that one
+    // must fall back to the brand's card rather than post it.
+    await eng.query(`UPDATE source_items SET thumbnail_url = $1, raw = raw - 'lead_image'`, [`http://127.0.0.1:${port}/badge.png`]);
+    const { id: badgeId } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Rickshaw drivers block Mirpur road over fare rules" });
+    await eng.query(`UPDATE content_items SET source_item_id = (SELECT id FROM source_items LIMIT 1), cluster_id = NULL WHERE id = $1`, [badgeId]);
+    await eng.api("POST", `/api/content-items/${badgeId}/regenerate`, { part: "image" }).catch(() => {});
+    const redrawn = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${badgeId}`); return it.hero_media && it; }, { timeout: 40000, interval: 800, what: "the badge story redrawn" });
+    assert.notEqual(redrawn.hero_media.meta.provider, "source", "a badge-sized image is refused");
+  } finally { await new Promise((r) => stub.close(r)); }
+});
+
 // Stock footage is the difference between a video and a slideshow, and it is free. Sections take a clip where the
 // library has one; a section the writer marks as needing the real event keeps a picture, and the reel still renders.
 test("reels: sections run on stock footage, and a section that must not use it keeps a picture", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
