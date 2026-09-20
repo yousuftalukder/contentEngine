@@ -1271,6 +1271,43 @@ async function brandFinish(file, niche, { vertical = true } = {}) {
 // blurred still while the commentary is spoken, the reactor large beside the frozen frame, with captions. Without a
 // reactor clip the "unique video" is the commentary's own waveform beside the brand logo. Segments share one format and
 // are joined without re-encoding. beats: [{type:"play", start, end} | {type:"comment", text, audio:{url, duration_seconds}}]
+// A reaction is the commentary, not the clip. A planner left to itself drifts towards long unbroken playback, which is
+// both duller to watch and the shape that gets a channel claimed, so the plan is shaped before it is rendered: no clip
+// runs longer than max_play_seconds, the source stays inside its total budget, the whole thing opens and closes on the
+// host's voice, and if commentary is thinner than min_commentary_share the clips are trimmed until it is not.
+function shapeReaction(beats, cfg = {}) {
+  // `?? ` rather than `||`: a program that deliberately sets one of these to zero means zero.
+  const num = (v, dflt) => (v === undefined || v === null || Number.isNaN(Number(v)) ? dflt : Number(v));
+  const maxClip = num(cfg.max_play_seconds, 45);
+  const budget = num(cfg.max_play_minutes, 6) * 60;
+  const minShare = num(cfg.min_commentary_share, 0.35);
+  const spoken = (b) => Math.max(2, String(b.text || "").split(/\s+/).filter(Boolean).length / 2.4);
+  let out = beats.map((b) => (b.type === "play" ? { ...b, end: Math.min(b.end, b.start + maxClip) } : b)).filter((b) => b.type !== "play" || b.end - b.start >= 2);
+  // Keep the source inside its budget, oldest first, so a long video does not become a re-upload.
+  let used = 0;
+  out = out.filter((b) => { if (b.type !== "play") return true; if (used >= budget) return false; const d = Math.min(b.end - b.start, budget - used); used += d; b.end = b.start + d; return d >= 2; });
+  // Open and close on the host: a reaction that starts on someone else's footage is someone else's video.
+  const firstComment = out.findIndex((b) => b.type === "comment");
+  if (firstComment > 0) out = [out[firstComment], ...out.filter((_, i) => i !== firstComment)];
+  // Closing on the host too — but never by moving the comment that is now the opening hook: with a single remark, the
+  // hook is the one worth keeping in place.
+  if (out.length && out[out.length - 1].type !== "comment" && out.filter((b) => b.type === "comment").length > 1) {
+    const lastComment = [...out].reverse().find((b) => b.type === "comment" && b !== out[0]);
+    if (lastComment) out = [...out.filter((b) => b !== lastComment), lastComment];
+  }
+  const commentSeconds = out.filter((b) => b.type === "comment").reduce((a, b) => a + spoken(b), 0);
+  let playSeconds = out.filter((b) => b.type === "play").reduce((a, b) => a + (b.end - b.start), 0);
+  // Too little commentary for the amount of source: trim every clip by the same proportion rather than dropping any,
+  // so the plan keeps its shape and each moment still gets its remark.
+  const allowed = commentSeconds * (1 - minShare) / minShare;
+  if (playSeconds > allowed && allowed > 0) {
+    const k = allowed / playSeconds;
+    out = out.map((b) => (b.type === "play" ? { ...b, end: b.start + Math.max(3, (b.end - b.start) * k) } : b));
+    playSeconds = out.filter((b) => b.type === "play").reduce((a, b) => a + (b.end - b.start), 0);
+  }
+  const total = commentSeconds + playSeconds;
+  return { beats: out, stats: { comments: out.filter((b) => b.type === "comment").length, plays: out.filter((b) => b.type === "play").length, commentSeconds, playSeconds, commentShare: total ? commentSeconds / total : 1 } };
+}
 async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
   const W = 1920, H = 1080, FMT = ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"];
   const { brand } = await studioBrand(niche); const reactor = reactorUrl ? await toTmpFile(reactorUrl, "mp4") : null;
@@ -2305,11 +2342,27 @@ async function renderClipItem(itemId, clipId) {
     const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 110000);
     const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 5000,
       system: `You host a reaction and commentary show for "${niche.display_name}". Language of the commentary: ${niche.language || "en"}. Tone: ${niche.tone || "sharp, fair, engaging"}.${styleBlock(style, niche)} You react with context, analysis and opinion clearly framed as opinion; you never invent facts about the video.`,
-      prompt: `Source video: "${cand.title}" (${Math.round((cand.duration_seconds || c.end) / 60)} min)\nTimestamped transcript:\n${lines}\n\nPlan a reaction video: alternate "play" segments of the source (each 15-90 s, ${maxPlay} min of source at most in total, in order) with "comment" segments where we pause and talk (1-4 spoken sentences each). Open with a comment that hooks the viewer, end with a comment giving the verdict and a call to action. Commentary must be at least 30% of the total runtime. Mark 3+ chapters.\nJSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "chapter": "optional chapter name"}, {"type": "play", "start": seconds, "end": seconds, "chapter": "optional"}], "description": "YouTube description", "hashtags": ["..."]}`,
+      prompt: `Source video: "${cand.title}" (${Math.round((cand.duration_seconds || c.end) / 60)} min)
+Timestamped transcript:
+${lines}
+
+Plan a reaction video: alternate "play" segments of the source (each 15-45 s, ${maxPlay} min of source at most in total, in order) with "comment" segments where we pause and talk (1-4 spoken sentences each).
+
+What makes the commentary worth watching:
+- Every comment answers the moment it follows. Quote or name the thing just said or shown, then add what the viewer does not already have: the background, the number, what it means, where it is wrong, what happens next.
+- Vary what you are doing — context, a correction, a prediction, a disagreement you argue for, a comparison to something the audience knows. Never two of the same kind in a row.
+- No empty reactions. "Wow", "that’s crazy", "let that sink in" and anything that would fit any video at all are worth nothing; cut them.
+- Opinion is welcome and must be framed as yours. Never assert a fact the transcript does not support.
+- Open on a hook under 15 words that says why this clip matters. Close on your verdict.
+Commentary must be at least 35% of the total runtime. Mark 3+ chapters.
+JSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "chapter": "optional chapter name"}, {"type": "play", "start": seconds, "end": seconds, "chapter": "optional"}], "description": "YouTube description", "hashtags": ["..."]}`,
       mock: { title: `Reacting to ${cand.title}`, beats: [{ type: "comment", text: `Let's watch ${cand.title}.`, chapter: "Intro" }, { type: "play", start: 0, end: Math.min(20, c.end), chapter: "The clip" }, { type: "comment", text: "That is our take.", chapter: "Verdict" }], description: `Our reaction to ${cand.title}`, hashtags: ["reaction"] } }));
     await addCost(itemId, r.cost); const d = r.data || {};
     const beats = (d.beats || []).filter((b) => (b.type === "comment" && b.text) || (b.type === "play" && Number(b.end) > Number(b.start))).map((b) => (b.type === "play" ? { ...b, start: clamp(Number(b.start), 0, c.end), end: clamp(Number(b.end), 0, c.end) } : b));
     if (!beats.some((b) => b.type === "play") || !beats.some((b) => b.type === "comment")) throw new Error("The reaction plan needs both play and comment segments");
+    const shaped = shapeReaction(beats, mcfg);
+    log(`reaction ${itemId}: ${shaped.stats.comments} comments over ${Math.round(shaped.stats.commentSeconds)}s, ${shaped.stats.plays} clips totalling ${Math.round(shaped.stats.playSeconds)}s (${Math.round(shaped.stats.commentShare * 100)}% commentary)`);
+    beats.length = 0; beats.push(...shaped.beats);
     const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); let at = 0; const chapters = [];
     for (const b of beats) {
       if (b.type === "comment") { b.audio = await voice.synthesize({ script: b.text, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, b.audio.cost); }
@@ -2318,6 +2371,9 @@ async function renderClipItem(itemId, clipId) {
     }
     if (chapters.length && !chapters[0].startsWith("0:00 ")) chapters.unshift("0:00 Intro");
     extras.beats = beats; script = beats.filter((b) => b.type === "comment").map((b) => b.text).join("\n\n");
+    // The plan is kept with the item: a reviewer can see how the video is built, and how much of it is someone else's
+    // footage, without opening the file.
+    await setItem(itemId, { script_meta: { beats, reaction: shaped.stats } });
     await setItem(itemId, { headline: d.title || clip.title, script, summary: d.description || "", hashtags: d.hashtags || [], captions: { youtube: [d.description || "", chapters.length >= 3 ? `\n${chapters.join("\n")}` : ""].join("\n").trim(), default: d.description || d.title || "" } });
   }
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
