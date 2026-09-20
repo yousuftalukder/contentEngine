@@ -949,7 +949,7 @@ async function composeHeadline(inPath, headline, specs = {}) {
   // The brand tag sits at the top. It used to be pinned just above the middle of the frame, where a headline set large
   // enough to be read at thumbnail size grows straight through it.
   const mL = Math.round(w * 0.06), mV = Math.round(h * 0.075), accent = assColor(specs.accent_color || "#6c8cff"), fg = assColor(specs.text_color || "#ffffff");
-  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${mV})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
+  const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${w}\nPlayResY: ${h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Head,${OVERLAY_FONT},${size},${fg},${fg},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(size * 0.03))},${Math.round(size * 0.04)},1,${mL},${mL},${mV},1\nStyle: Tag,${OVERLAY_FONT},${small},${accent},${accent},&H00000000,&H00000000,-1,0,0,0,100,100,${/[ঀ-৿]/.test(String(specs.brand || "")) ? 0 : Math.round(small * 0.08)},0,1,0,0,1,${mL},${mL},${mV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${specs.brand ? `Dialogue: 0,0:00:00.00,0:00:10.00,Tag,,0,0,0,,{\\an7\\pos(${mL},${mV})}${assEsc(specs.brand).toUpperCase()}\n` : ""}Dialogue: 1,0:00:00.00,0:00:10.00,Head,,0,0,0,,${assEsc(headline)}\n`;
   const assPath = tmpPath("ass"), out = tmpPath("jpg"); await writeFile(assPath, ass);
   // A gradient, not three steps: at three the seams are visible straight lines across the picture. Twelve overlapping
   // boxes of low alpha compound into a smooth ramp from the middle of the frame to the bottom.
@@ -1282,6 +1282,29 @@ impl("VOICE", "openai_tts", { label: "OpenAI TTS", configSchema: { voice: { type
 
 // Gemini native TTS: uses the Gemini key the rest of the pipeline already has and speaks Bangla (bn-BD) as well as English.
 // Returns raw 24 kHz PCM, converted to MP3 here. Long scripts are split at sentence ends and joined.
+// Any speech engine that writes a file, run as a command. Piper and espeak-ng are free, run on the worker, speak
+// Bangla, and cost no quota at all — which on a free Gemini key is the difference between a handful of videos a day
+// and as many as the machine can render. {out} is the file to write, {text} the line to say; without {text} the line
+// goes in on stdin. The result is levelled to the same -16 LUFS the narration joiner uses, so a local engine
+// and a hosted one are the same loudness under the same music bed.
+impl("VOICE", "tts_command", { label: "Local speech engine (piper, espeak, any command)",
+  configSchema: { command: { type: "string", required: true }, args: { type: "array" }, format: { type: "string", default: "wav" }, voice: { type: "string" }, timeout_seconds: { type: "number", default: 300 } },
+  create: (cfg) => ({
+    async synthesize({ script, voiceId, contentItemId }) {
+      const command = cfg.command; if (!command) throw new Error("tts_command needs config.command — the speech engine to run");
+      const raw = tmpPath(cfg.format || "wav"), mp3 = tmpPath("mp3");
+      const voice = voiceId || cfg.voice || "";
+      const args = (cfg.args || []).map((a) => String(a).replace(/\{out\}/g, raw).replace(/\{voice\}/g, voice).replace(/\{text\}/g, script));
+      const onStdin = !(cfg.args || []).some((a) => String(a).includes("{text}"));
+      try {
+        await exec(command, args, { input: onStdin ? script : null, timeoutMs: (cfg.timeout_seconds || 300) * 1000 });
+        await exec("ffmpeg", ["-y", "-i", raw, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-b:a", "128k", mp3]);
+        const dur = await ffprobeDuration(mp3);
+        if (!dur) throw new Error(`${command} produced no audible speech`);
+        const url = await storeLocal(mp3, `audio/${newId()}.mp3`, "audio/mpeg");
+        return { ...(await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur, meta: { provider: "command", command, voice: voice || null, chars: script.length } })), units: 1, cost: 0 };
+      } finally { await cleanup(raw, mp3); }
+    } }) });
 impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSchema: { voice: { type: "string", default: DEFAULTS.GEMINI_TTS_VOICE }, model: { type: "string", default: DEFAULTS.GEMINI_TTS_MODELS[0] }, style: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async synthesize({ script, voiceId, contentItemId }) {
     const voice = voiceId || cfg.voice || DEFAULTS.GEMINI_TTS_VOICE;
@@ -1366,6 +1389,9 @@ async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1
 // decides whether to stay, and then gets out of the way of the captions.
 async function writeBrandAss({ headline, hook, kicker, handle, credit, width, height, seconds, primary = "#b3121f", accent = "#ffc400", font = OVERLAY_FONT }) {
   const vertical = height > width, pad = Math.round(width * 0.055);
+  // Letter-spacing pulls Bangla conjuncts apart into separate glyphs — "সূত্র" comes out as five loose letters. It is a
+  // Latin typographic nicety, so it is only applied to Latin text.
+  const track = (text, px) => (/[ঀ-৿]/.test(String(text || "")) ? 0 : px);
   const head = Math.round(height * (vertical ? 0.036 : 0.05)), kick = Math.round(head * 0.62), small = Math.round(head * 0.46);
   const hold = Math.max(3.5, Math.min(7.5, seconds * 0.35)), events = [];
   const top = Math.round(height * (vertical ? 0.085 : 0.07));
@@ -1380,10 +1406,10 @@ async function writeBrandAss({ headline, hook, kicker, handle, credit, width, he
   if (!events.length) return null;
   // BorderStyle 3 paints BackColour behind the text, which is how the label pill and the headline plate are drawn.
   const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n${ASS_FORMAT}\n`
-    + `Style: Kick,${font},${kick},${assColor("#111111")},${assColor("#111111")},${assColor(accent)},${assColor(accent)},-1,0,0,0,100,100,${Math.round(kick * 0.1)},0,3,${Math.round(kick * 0.34)},0,7,${pad},${pad},0,1\n`
+    + `Style: Kick,${font},${kick},${assColor("#111111")},${assColor("#111111")},${assColor(accent)},${assColor(accent)},-1,0,0,0,100,100,${track(kicker, Math.round(kick * 0.1))},0,3,${Math.round(kick * 0.34)},0,7,${pad},${pad},0,1\n`
     + `Style: Head,${font},${head},${assColor("#ffffff")},${assColor("#ffffff")},${assColor(primary, "18")},${assColor(primary, "18")},-1,0,0,0,100,100,0,0,3,${Math.round(head * 0.34)},0,7,${pad},${vertical ? pad : Math.round(width * 0.34)},0,1\n`
     + `Style: Hook,${font},${Math.round(head * 1.45)},${assColor("#111111")},${assColor("#111111")},${assColor(accent, "08")},${assColor(accent, "08")},-1,0,0,0,100,100,0,0,3,${Math.round(head * 0.38)},0,7,${pad},${vertical ? pad : Math.round(width * 0.42)},0,1\n`
-    + `Style: Foot,${font},${small},${assColor("#ffffff", "50")},${assColor("#ffffff", "50")},${assColor("#000000", "60")},${assColor("#000000", "90")},0,0,0,0,100,100,${Math.round(small * 0.08)},0,1,${Math.max(1, Math.round(small * 0.08))},0,1,${pad},${pad},0,1\n`
+    + `Style: Foot,${font},${small},${assColor("#ffffff", "50")},${assColor("#ffffff", "50")},${assColor("#000000", "60")},${assColor("#000000", "90")},0,0,0,0,100,100,${track(`${handle || ""} ${credit || ""}`, Math.round(small * 0.08))},0,1,${Math.max(1, Math.round(small * 0.08))},0,1,${pad},${pad},0,1\n`
     + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
   const f = tmpPath("ass"); await writeFile(f, ass); return f;
 }
@@ -1591,9 +1617,27 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
             "-vf", `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1,fps=30,format=yuv420p`,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
         } else {
-          const z = i % 2 ? `if(eq(on,0),1.12,max(zoom-0.0008,1.0))` : `min(zoom+0.0008,1.12)`;
-          await exec("ffmpeg", ["-y", "-i", f, "-vf", `scale=${Math.round(w * 1.25)}:${Math.round(h * 1.25)}:force_original_aspect_ratio=increase,crop=${Math.round(w * 1.25)}:${Math.round(h * 1.25)},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,format=yuv420p`,
-            "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+          // A press photo is landscape and a reel is not. Cropping a 16:9 photograph to 9:16 throws away two thirds of
+          // it — usually including whoever the story is about — and an infographic cropped that way is unreadable.
+          // When the shapes are far apart the picture is fitted whole, over a blurred enlargement of itself; when they
+          // are close it fills the frame with the slow push that makes a still look alive.
+          const { width: iw, height: ih } = await imageDims(f).catch(() => ({ width: w, height: h }));
+          const shapeGap = Math.abs(Math.log((iw / ih) / (w / h)));
+          if (shapeGap > 0.4) {
+            // A fitted picture that does not move is a freeze-frame, and a news reel that returns to the same photo
+            // twice would show it frozen twice. It is pushed in slowly instead, re-centred every frame.
+            const grow = (i % 2 ? -0.00035 : 0.00035).toFixed(5);
+            await exec("ffmpeg", ["-y", "-loop", "1", "-t", per[i].toFixed(2), "-i", f, "-filter_complex",
+              `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=28:2,eq=brightness=-0.18:saturation=0.7,fps=30[bg];`
+              + `[0:v]scale=${Math.round(w * 0.95)}:${Math.round(h * 0.95)}:force_original_aspect_ratio=decrease,fps=30,`
+              + `scale=w='iw*(1${i % 2 ? "+0.035" : ""}${grow >= 0 ? "+" : ""}${grow}*n)':h=-2:eval=frame[fg];`
+              + `[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,setsar=1,format=yuv420p[v]`,
+              "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+          } else {
+            const z = i % 2 ? `if(eq(on,0),1.12,max(zoom-0.0008,1.0))` : `min(zoom+0.0008,1.12)`;
+            await exec("ffmpeg", ["-y", "-i", f, "-vf", `scale=${Math.round(w * 1.25)}:${Math.round(h * 1.25)}:force_original_aspect_ratio=increase,crop=${Math.round(w * 1.25)}:${Math.round(h * 1.25)},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,format=yuv420p`,
+              "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", seg]);
+          }
         }
         segs.push(seg);
       }
@@ -1886,7 +1930,10 @@ const DESK_NOISE = {
     "live stream", "livestream", "where to watch", "start 'em", "sit 'em", "fantasy start", "waiver wire", "dfs picks",
     "best bets", "prediction", "predictions", "preview:", "over/under", "player props", "how to bet", "against the spread",
     "picks and prediction", "prediction, picks", "picks, preview", "expert picks", "top picks", "picks against",
-    "gameday", "injury report", "final score:", "recap and highlights", "fight card:", "what channel"],
+    "gameday", "injury report", "final score:", "recap and highlights", "fight card:", "what channel",
+    // The football-preview family, which is most of what a soccer wire carries: who might play, not what happened.
+    "match preview", "team news", "predicted lineup", "predicted xi", "starting lineups", "confirmed lineups",
+    "probable lineups", "preview and team news", "how to watch and stream"],
   entertainment: ["deal of the day", "best deals", "where to buy", "shop now", "shopping", "horoscope", "sponsored",
     "where to watch", "how to watch", "watch online", "streaming guide", "best vpn", "promo code", "gift guide",
     "everything coming to netflix", "what to watch this weekend"],
@@ -2279,9 +2326,10 @@ const cardLabel = (niche) => (/^NEWS/.test(niche.content_type || "") ? undefined
 const llmFor = async (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks"), fn);
 // `lead` puts an adapter in front of the program's own, without disturbing what the program is configured to use: the
 // story's own photo is tried first when it has one, and what the program would have drawn is the fallback.
-const imageFor = async (niche, fn, lead = null) => {
+const imageFor = async (niche, fn, lead = null, tail = null) => {
   const own = niche.image_adapter || "image_mock", fb = await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks");
-  return withFallbacks("IMAGE", lead || own, lead ? [own, ...fb] : fb, fn);
+  const chain = [...(lead ? [own] : []), ...fb, ...(tail ? [tail] : [])];
+  return withFallbacks("IMAGE", lead || own, chain, fn);
 };
 // The hero picture — or, when every image adapter fails (no key, a plan without image generation, an outage), a text
 // card in the brand's colours so the post still goes out. The reason is kept on the media row and raised once as an
@@ -2290,10 +2338,13 @@ const imageFor = async (niche, fn, lead = null) => {
 async function imageOrCard(niche, itemId, { prompt, headline, specs, label = undefined, backdrop = false, skipApi = null }) {
   let err = skipApi;
   if (!err) {
-    // A real photo of the story beats any illustration of it, and costs nothing. Programs that would rather not run an
-    // outlet's picture turn it off with method_config.source_photos = false.
-    const lead = specs.photo && methodCfg(niche).source_photos !== false ? "source_photo" : null;
-    try { return await imageFor(niche, (ia) => ia.generate({ prompt, headline, specs, contentItemId: itemId }), lead); }
+    // A real photo of the story beats any illustration of it, and costs nothing, so it goes first — except on a reel's
+    // later sections, where `photo_lead: false` puts it last instead: footage or a generated picture gives the video
+    // somewhere new to look, and the story's photo coming back a second time is still better than an empty colour field.
+    const wantPhoto = specs.photo && methodCfg(niche).source_photos !== false;
+    const lead = wantPhoto && specs.photo_lead !== false ? "source_photo" : null;
+    const tail = wantPhoto && specs.photo_lead === false ? "source_photo" : null;
+    try { return await imageFor(niche, (ia) => ia.generate({ prompt, headline, specs, contentItemId: itemId }), lead, tail); }
     catch (e) { if (!(await setting("image.text_card_fallback", true))) throw e; err = e; }
   }
   const kit = specs.kit || P((await one(`SELECT brand_kit FROM brands WHERE id=$1`, [niche.brand_id]))?.brand_kit) || {};
@@ -2508,7 +2559,7 @@ async function generateReel(item, niche, style) {
     // is a slideshow of one picture. The rest of the sections run on footage or the brand's backdrop.
     const img = await imageOrCard(niche, item.id, { prompt: s.image_prompt, headline: title, backdrop: true, skipApi: noPics,
       specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false,
-        ...(i === 0 ? { photo: m.photo || null, photo_outlet: m.photo_outlet || null } : {}), ...(P(niche.image_specs) || {}), style: style2 } });
+        photo: m.photo || null, photo_outlet: m.photo_outlet || null, photo_lead: i === 0, ...(P(niche.image_specs) || {}), style: style2 } });
     noPics = noPics || img.fallbackError; await addCost(item.id, img.cost); images.push(img);
   }
   if (footage) log(`reel ${item.id}: ${footage} of ${sections.length} sections on stock footage`);
