@@ -1863,8 +1863,25 @@ async function checkDuplicate(text, niche, seriesId = null, excludeId = null) {
   }
   return { isDuplicate: !!best && best.score >= Number(niche.dedup_threshold || 0.82), best, embedding: vec };
 }
+// What a sports or entertainment desk carries that is not a story: betting promos, streaming guides, shopping posts,
+// score tickers. A program should not have to be told about any of it — the user creates a brand and a program, not a
+// blocklist — so the desk it is on supplies the floor, and topic_filters.exclude adds to it rather than replacing it.
+// A program that genuinely wants this sets topic_filters.desk_noise = false.
+const DESK_NOISE = {
+  sports: ["promo code", "betting", "odds", "parlay", "draftkings", "fanduel", "bet365", "sportsbook", "how to watch",
+    "live stream", "livestream", "where to watch", "start 'em", "sit 'em", "fantasy start", "waiver wire", "dfs picks",
+    "best bets", "prediction, odds", "spread pick", "gameday", "injury report", "final score:", "recap and highlights"],
+  entertainment: ["deal of the day", "best deals", "where to buy", "shop now", "shopping", "horoscope", "sponsored",
+    "where to watch", "how to watch", "watch online", "streaming guide", "best vpn", "promo code", "gift guide",
+    "everything coming to netflix", "what to watch this weekend"],
+  general: ["deal of the day", "best deals", "sponsored", "promo code", "gift guide"],
+};
 function passesFilters(item, niche) {
   const f = P(niche.topic_filters) || {}; const hay = `${item.title} ${item.summary || ""}`.toLowerCase();
+  if (f.desk_noise !== false) {
+    const noise = (methodCfg(niche).topics || []).flatMap((t) => DESK_NOISE[String(t).toLowerCase()] || []);
+    if (noise.some((k) => hay.includes(k))) return false;
+  }
   if (f.exclude?.length && f.exclude.some((k) => hay.includes(String(k).toLowerCase()))) return false;
   if (f.include?.length && !f.include.some((k) => hay.includes(String(k).toLowerCase()))) return false;
   if (f.max_age_hours && item.published_at && Date.now() - Date.parse(item.published_at) > f.max_age_hours * 3600e3) return false;

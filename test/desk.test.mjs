@@ -158,3 +158,31 @@ test("feeds: an outlet's own labels come off the headline, except the ones that 
     assert.ok(titles.includes("Election results from across the country"), "the section name after the pipe goes too");
   } finally { await new Promise((r) => stub.close(r)); }
 });
+
+// A sports desk carries betting promos and streaming guides alongside the games, and a program should not have to be
+// told about any of it: the user creates a brand and a program, not a blocklist. The desk supplies the floor.
+test("a sports program rejects the betting and streaming noise without being told to", async () => {
+  const http = await import("node:http");
+  const now = new Date().toUTCString();
+  const item = (t, u) => `<item><title>${t}</title><link>https://s.example/${u}</link><pubDate>${now}</pubDate></item>`;
+  const rss = `<?xml version="1.0"?><rss version="2.0"><channel>
+    ${item("Ole Miss vs. LSU prediction, odds, time for Week 3", "1")}
+    ${item("How to watch Vanderbilt vs Alabama: live stream and start time", "2")}
+    ${item("Vanderbilt beats Alabama in Tuscaloosa for the first time", "3")}
+    ${item("Waiver wire pickups for fantasy managers this week", "4")}</channel></rss>`;
+  const stub = http.createServer((_, res) => { res.writeHead(200, { "content-type": "application/rss+xml" }); res.end(rss); });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  try {
+    const src = await eng.api("POST", "/api/sources", { name: "Sports wire", adapterKey: "rss", config: { url: `http://127.0.0.1:${stub.address().port}/s.xml` } });
+    const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "us_noise", displayName: "US Sport", contentType: "NEWS_STATIC",
+      country: "United States", language: "en", useMocks: true, autoStyle: false, autoSources: false, sourceIds: [src.id],
+      methodConfig: { topics: ["sports"], desk: { settle_minutes: 0, min_sources: 1, min_gap_minutes: 0, per_sweep: 5 } } });
+    await eng.api("POST", `/api/sources/${src.id}/poll`);
+    await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id=$1`, [src.id])).length === 4, { what: "the wire ingested" });
+    await eng.api("POST", "/api/desk/run");
+
+    const topics = await waitFor(async () => { const r = await eng.api("GET", `/api/content-items?nicheId=${p.id}`); return r.length ? r.map((x) => x.topic) : null; }, { what: "the desk to pick" });
+    assert.ok(topics.some((t) => /Vanderbilt beats Alabama/.test(t)), `the game is written — got ${JSON.stringify(topics)}`);
+    for (const junk of [/prediction, odds/i, /how to watch/i, /waiver wire/i]) assert.ok(!topics.some((t) => junk.test(t)), `${junk} stays off the channel`);
+  } finally { await new Promise((r) => stub.close(r)); }
+});
