@@ -71,6 +71,33 @@ test("a studio program on an instance too small for the studio still renders, th
   } finally { await small.stop(); }
 });
 
+// A semi-long video is watched on a television-shaped screen, picked out of a list of covers, and judged in its first
+// second. So the ffmpeg path — the one every instance can run — has to produce both a cover and a sound bed, not just
+// pictures over a voice. The mock voice is a silent track, which makes the bed easy to hear: anything above silence in
+// the finished audio came from the brand's music.
+test("landscape reel: a 1280x720 cover and the brand's music under the narration", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  ff("-f", "lavfi", "-i", "sine=frequency=880:duration=20", "-q:a", "4", join(dir, "bed.mp3"));
+  const b = await eng.api("POST", "/api/brands", { name: "Music brand", brandKit: { primary_color: "#0b3d91", accent_color: "#ffb300", music_urls: [join(dir, "bed.mp3")] } });
+  // No key for the image adapter, so the sections fall back to text cards: real JPEGs, no network.
+  await eng.api("POST", "/api/adapter-configs", { key: "image_unkeyed", stage: "IMAGE", impl: "gemini_image", config: {} });
+  const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "semilong", displayName: "Semi long", contentType: "NEWS_REEL", useMocks: true, autoStyle: false, autoSources: false,
+    renderAdapter: "ffmpeg", voiceAdapter: "tts_mock", imageAdapter: "image_unkeyed", methodConfig: { slides: 2, orientation: "16:9" } });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "The city opens its new line" });
+  const done = await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { timeout: 180000, interval: 1000, what: "a landscape reel" });
+
+  const file = join(dir, "semilong.mp4");
+  (await import("node:fs")).writeFileSync(file, Buffer.from(await (await fetch(done.hero_media.url.replace(/^https?:\/\/[^/]+/, eng.base))).arrayBuffer()));
+  const v = probe(file).streams.find((s) => s.codec_type === "video");
+  assert.deepEqual([v.width, v.height], [1920, 1080]);
+  const loud = spawnSync("ffmpeg", ["-hide_banner", "-i", file, "-af", "volumedetect", "-f", "null", "-"], { encoding: "utf8" });
+  const mean = Number(/mean_volume:\s*(-?[\d.]+) dB/.exec(loud.stderr)?.[1] ?? -99);
+  assert.ok(mean > -50, `the music bed is in the mix (mean volume ${mean} dB, silence is about -91)`);
+
+  const thumb = (await eng.query(`SELECT width, height, meta FROM media_assets WHERE content_item_id=$1 AND kind='THUMBNAIL' AND deleted_at IS NULL`, [id]))[0];
+  assert.ok(thumb, "a landscape video gets a thumbnail");
+  assert.deepEqual([thumb.width, thumb.height], [1280, 720]);
+});
+
 // A planner left to itself drifts towards long unbroken playback — duller to watch, and the shape that gets a channel
 // claimed. Whatever it returns, the plan is shaped before it renders.
 test("reaction: the plan is shaped so the host carries it, not the source", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
