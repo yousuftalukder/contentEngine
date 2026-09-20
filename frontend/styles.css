@@ -13,8 +13,11 @@
   --red: #e2645c;
   --blue: #6ea7e0;
   --violet: #b494e6;
-  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  /* "Anek Bangla" and "Nirmala UI" are in every stack because half the headlines this dashboard shows are Bangla and
+     neither IBM Plex nor any of the system fallbacks has a Bengali glyph — the text renders as boxes without them. */
+  --sans: "IBM Plex Sans", "Anek Bangla", "Nirmala UI", "Noto Sans Bengali", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --serif: "IBM Plex Serif", "Anek Bangla", "Nirmala UI", "Noto Sans Bengali", Georgia, "Times New Roman", serif;
+  --mono-stack: ui-monospace, Menlo, Consolas, "Anek Bangla", "Nirmala UI", monospace;
   --r-sm: 4px;
   --r: 8px;
   --rail: 232px;
@@ -60,7 +63,7 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 6px; }
 .muted { color: var(--paper-dim); }
 .mute { color: var(--paper-mute); }
 .small { font-size: 12px; }
-.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.mono { font-family: var(--mono-stack); font-size: 12px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .grow { flex: 1; }
 .right { margin-left: auto; }
