@@ -1315,10 +1315,11 @@ impl("VOICE", "openai_tts", { label: "OpenAI TTS", configSchema: { voice: { type
 impl("VOICE", "tts_command", { label: "Local speech engine (piper, espeak, any command)",
   configSchema: { command: { type: "string", required: true }, args: { type: "array" }, format: { type: "string", default: "wav" }, voice: { type: "string" }, timeout_seconds: { type: "number", default: 300 } },
   create: (cfg) => ({
-    async synthesize({ script, voiceId, contentItemId }) {
+    async synthesize({ script, voiceId, contentItemId, lang }) {
       const command = cfg.command; if (!command) throw new Error("tts_command needs config.command — the speech engine to run");
       const raw = tmpPath(cfg.format || "wav"), mp3 = tmpPath("mp3");
-      const voice = voiceId || cfg.voice || "";
+      // {voice} falls back to the language, because an engine with one voice file per language needs to be told which.
+      const voice = voiceId || cfg.voice || String(lang || "").slice(0, 2) || "";
       const args = (cfg.args || []).map((a) => String(a).replace(/\{out\}/g, raw).replace(/\{voice\}/g, voice).replace(/\{text\}/g, script));
       const onStdin = !(cfg.args || []).some((a) => String(a).includes("{text}"));
       try {
@@ -1803,7 +1804,9 @@ async function voiceFor(niche) {
   const opts = { lang: (niche.language || "en").slice(0, 2), map: { ...((P(brand?.brand_kit) || {}).pronounce || {}), ...((P(niche.method_config) || {}).pronounce || {}) } };
   return { ...a, synthesize: async (args) => {
     const spoken = sayable(args.script, opts);
-    const out = await a.synthesize({ ...args, script: spoken });
+    // The language travels with the request: a local engine has one voice file per language and no way to guess which
+    // one a line is in, so without this a Bangla narration comes out read by an English voice.
+    const out = await a.synthesize({ lang: opts.lang, ...args, script: spoken });
     return { ...out, spoken };                                   // what the voice was actually given, for the record
   } };
 }

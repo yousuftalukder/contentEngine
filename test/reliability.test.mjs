@@ -1,5 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { startEngine, waitFor } from "./harness.mjs";
 
 let eng, brand;
@@ -183,4 +185,24 @@ test("an account out of credit fails at once with an alert that names the fix", 
     { timeout: 20000, what: "the alert that names the fix" });
   assert.match(alert.title, /ElevenLabs/i, "and it names the provider, not a url");
   assert.match(alert.body, /Top it up|fall back/i);
+});
+
+// A local speech engine has one voice file per language and no way to guess which one a line is in. Without the
+// program's language travelling with the request, a Bangla narration is read by an English voice.
+test("the program's language reaches the voice, so a local engine picks the right one", async () => {
+  const tone = "-hide_banner -loglevel error -y -f lavfi -i sine=frequency=220:duration=2".split(" ");
+  await eng.api("POST", "/api/adapter-configs", { key: "tts_spy", stage: "VOICE", impl: "tts_command", config: {
+    command: "ffmpeg", args: [...tone, "{out}"], voice: "", format: "wav" } });
+  const b = await eng.api("POST", "/api/brands", { name: "Language" });
+  const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "lang_voice", displayName: "বাংলা ডেস্ক", contentType: "NEWS_REEL",
+    country: "Bangladesh", useMocks: true, autoStyle: false, autoSources: false, renderAdapter: "render_mock",
+    voiceAdapter: "tts_spy", methodConfig: { slides: 1 } });
+  assert.equal(p.language, "bn", "a Bangladesh program is in Bangla");
+
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "একটি বাংলা খবর" });
+  const audio = await waitFor(async () => (await eng.query(`SELECT meta FROM media_assets WHERE content_item_id=$1 AND kind='AUDIO' LIMIT 1`, [id]))[0],
+    { timeout: 90000, interval: 1000, what: "the narration" });
+  const meta = typeof audio.meta === "string" ? JSON.parse(audio.meta) : audio.meta;
+  assert.equal(meta.provider, "command", "it went through the local engine");
+  assert.equal(meta.voice, "bn", "and the engine was told the line is Bangla, not left to guess");
 });
