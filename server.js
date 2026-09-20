@@ -1482,8 +1482,37 @@ function wordTimings(text, frames, offset = 0) {
   return words.map((w) => { const d = (frames * (w.length + 1)) / total, o = { text: w, from: Math.round(t), to: Math.round(t + d) }; t += d; return o; });
 }
 // Narration spoken part by part, so each part's duration is measured rather than guessed, then joined into one track.
+// ---- Saying it properly. A speech model reads "BNP" as a word and "ACC" as a syllable, which is the most audible
+// thing wrong with machine narration in Bangladeshi and American news alike. Any short run of capitals is spelled out
+// letter by letter instead — in Bangla letter names for a Bangla voice — except the ones that really are read as words
+// (NASA, UNESCO, RAB). A brand or a program can add its own spellings for names the voice keeps getting wrong:
+// brand_kit.pronounce or method_config.pronounce, as {"written": "how to say it"}.
+const SAID_AS_WORD = new Set(["NASA", "UNESCO", "UNICEF", "OPEC", "NATO", "RAB", "BRAC", "SAARC", "FIFA", "UEFA", "NCAA", "NASCAR", "ESPN", "AIDS", "COVID", "LASER", "RADAR", "SWAT", "PIN", "ZIP"]);
+const BN_LETTER = { A: "এ", B: "বি", C: "সি", D: "ডি", E: "ই", F: "এফ", G: "জি", H: "এইচ", I: "আই", J: "জে", K: "কে", L: "এল", M: "এম", N: "এন", O: "ও", P: "পি", Q: "কিউ", R: "আর", S: "এস", T: "টি", U: "ইউ", V: "ভি", W: "ডাব্লিউ", X: "এক্স", Y: "ওয়াই", Z: "জেড" };
+function sayable(text, { lang = "en", map = {} } = {}) {
+  let out = String(text || "");
+  // A person's own spellings win, and are applied first so they are not then broken up letter by letter.
+  for (const [written, spoken] of Object.entries(map)) {
+    if (!written) continue;
+    const quoted = written.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`(^|[^\\p{L}\\p{N}])${quoted}(?=$|[^\\p{L}\\p{N}])`, "giu"), (_, pre) => `${pre}${spoken}`);
+  }
+  return out.replace(/(^|[^\p{L}\p{N}])([A-Z]{2,5})(?=$|[^\p{L}\p{N}])/gu, (whole, pre, acr) =>
+    SAID_AS_WORD.has(acr) ? whole : `${pre}${acr.split("").map((c) => (lang === "bn" ? BN_LETTER[c] || c : c)).join(" ")}`);
+}
+// The program's voice, with everything it is asked to say run through the spellings first.
+async function voiceFor(niche) {
+  const a = await resolve("VOICE", niche.voice_adapter || "tts_mock");
+  const brand = niche.brand_id ? await one(`SELECT brand_kit FROM brands WHERE id = $1`, [niche.brand_id]) : null;
+  const opts = { lang: (niche.language || "en").slice(0, 2), map: { ...((P(brand?.brand_kit) || {}).pronounce || {}), ...((P(niche.method_config) || {}).pronounce || {}) } };
+  return { ...a, synthesize: async (args) => {
+    const spoken = sayable(args.script, opts);
+    const out = await a.synthesize({ ...args, script: spoken });
+    return { ...out, spoken };                                   // what the voice was actually given, for the record
+  } };
+}
 async function narrateParts(niche, parts, contentItemId) {
-  const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); const made = []; let cost = 0;
+  const voice = await voiceFor(niche); const made = []; let cost = 0;
   for (const text of parts) { const a = await voice.synthesize({ script: text, voiceId: niche.voice_id, contentItemId }); cost += a.cost || 0; made.push(a); }
   if (made.some((a) => !a.url || a.url.startsWith("mock://"))) {
     const durations = made.map((a) => Number(a.duration_seconds) || 2);
@@ -1493,10 +1522,17 @@ async function narrateParts(niche, parts, contentItemId) {
   const durations = []; for (const [i, f] of files.entries()) durations.push((await ffprobeDuration(f)) || Number(made[i].duration_seconds) || 2);
   const list = tmpPath("txt"), joined = tmpPath("mp3");
   await writeFile(list, files.map((f) => `file '${f.replace(/\\/g, "/")}'`).join("\n"));
-  try { await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c:a", "libmp3lame", "-b:a", "160k", joined]); }
+  // Levelled as it is joined: speech models drift in loudness between calls, so a reel narrated in six pieces arrives
+  // with six volumes. -16 LUFS with a 1.5 dB ceiling is what a phone speaker and a platform both expect of speech.
+  try { await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-c:a", "libmp3lame", "-b:a", "160k", joined]); }
+  catch (e) {
+    warn(`narration loudness pass failed (${e.message.slice(0, 120)}); joining as recorded`);
+    await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-c:a", "libmp3lame", "-b:a", "160k", joined]);
+  }
   finally { await cleanup(list, ...files); }
   const url = await storeLocal(joined, `audio/${newId()}.mp3`, "audio/mpeg"); const total = await ffprobeDuration(joined); await cleanup(joined);
-  const audio = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: total, meta: { parts: parts.length, voice: niche.voice_adapter } });
+  const audio = await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: total,
+    meta: { parts: parts.length, voice: niche.voice_adapter, levelled: true, spoken: made.map((m) => m.spoken).filter(Boolean) } });
   return { audio, durations, cost };
 }
 impl("RENDER", "remotion", { label: "Studio (Remotion) for made videos, ffmpeg for footage", create: (cfg, ctx) => {
@@ -2330,7 +2366,7 @@ async function renderClipItem(itemId, clipId) {
       mock: recap ? { title: cand.title, beats: [{ narration: `Mock recap of ${cand.title}.`, start: 0, end: 10 }, { narration: "And then everything changes.", start: 30, end: 40 }], hashtags: ["recap"] } : { title: clip.title, narration: `Mock narration: ${script.slice(0, 200)}`, hashtags: ["clip"] } }));
     await addCost(itemId, r.cost); const d = r.data || {};
     script = recap ? (d.beats || []).map((b) => b.narration).join(" ") : d.narration || script;
-    const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, audio.cost);
+    const voice = await voiceFor(niche); const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, audio.cost);
     extras.audio = audio; extras.script = script;
     if (recap && d.beats?.length) { const total = d.beats.reduce((s, b) => s + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)), 0) || 1; const k = (audio.duration_seconds || total) / total; extras.scenes = d.beats.map((b) => ({ start: Number(b.start) || 0, end: (Number(b.start) || 0) + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)) * k })); }
     await setItem(itemId, { headline: d.title || clip.title, script, voice_asset_url: audio.url, hashtags: d.hashtags || [] });
@@ -2363,7 +2399,7 @@ JSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "cha
     const shaped = shapeReaction(beats, mcfg);
     log(`reaction ${itemId}: ${shaped.stats.comments} comments over ${Math.round(shaped.stats.commentSeconds)}s, ${shaped.stats.plays} clips totalling ${Math.round(shaped.stats.playSeconds)}s (${Math.round(shaped.stats.commentShare * 100)}% commentary)`);
     beats.length = 0; beats.push(...shaped.beats);
-    const voice = await resolve("VOICE", niche.voice_adapter || "tts_mock"); let at = 0; const chapters = [];
+    const voice = await voiceFor(niche); let at = 0; const chapters = [];
     for (const b of beats) {
       if (b.type === "comment") { b.audio = await voice.synthesize({ script: b.text, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, b.audio.cost); }
       if (b.chapter) chapters.push(`${Math.floor(at / 60)}:${String(Math.floor(at % 60)).padStart(2, "0")} ${b.chapter}`);
