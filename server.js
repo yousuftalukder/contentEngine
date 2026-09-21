@@ -3143,7 +3143,13 @@ async function processCandidate(candidateId) {
   let clips;
   // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
   if (niche.content_type === "MOVIE_RECAP" || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
-  else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand, signals })); clips = clips.slice(0, methodCfg(niche).clips_per_video); }
+  else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand, signals }));
+    // Take every moment worth taking, not a fixed three. A count is the wrong control: on one video it throws away
+    // something good, and on the next it scrapes the barrel to fill the quota. min_clip_score is the bar, and
+    // clips_per_video is only the ceiling that stops a long rambling video producing twenty mediocre reels.
+    const mc = methodCfg(niche), bar = Number(mc.min_clip_score ?? 0);
+    clips = clips.filter((c) => Number(c.score ?? 1) >= bar).slice(0, mc.clips_per_video || 1);
+  }
   if (!clips.length) throw new Error("no clip-worthy moments found");
   for (const cl of clips) {
     const clipId = newId(); const text = transcript.segments.filter((s) => s.end > cl.start && s.start < cl.end).map((s) => s.text).join(" ");
