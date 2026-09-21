@@ -14,16 +14,23 @@
 # which compiles for whatever machine built the image; the machine that runs it is a different one, and production
 # died with SIGILL on its first real transcription — an instruction the host does not have. Nothing catches this in
 # a build: the smoke test below runs on the builder's own CPU, and so does CI's, so both pass and production still
-# falls over. A baseline binary is slower and it runs everywhere, which is the trade worth making on a shared vCPU.
+# falls over. So neither guess is made here: both are built, a baseline one that runs on any x86-64 and one using
+# AVX2/FMA/F16C, and server.js reads what the host's own /proc/cpuinfo reports and runs the fitting one. Render's
+# current host has avx2, fma and f16c and no avx512, which is worth a few times the speed on a shared vCPU — but
+# the host can change, and a binary that is merely probably safe is what put SIGILL in production in the first place.
 FROM debian:bookworm-slim AS whisper
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates; \
     curl -fsSL https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.4.tar.gz | tar -xz -C /tmp; \
-    cmake -S /tmp/whisper.cpp-1.9.4 -B /tmp/b -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF \
-      -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF; \
-    cmake --build /tmp/b --config Release -j "$(nproc)" --target whisper-cli; \
-    install -Dm755 "$(find /tmp/b -name whisper-cli -type f | head -1)" /out/whisper-cli; \
+    for v in base avx2; do \
+      if [ "$v" = avx2 ]; then EXT="-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"; else EXT="-DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF"; fi; \
+      cmake -S /tmp/whisper.cpp-1.9.4 -B "/tmp/b-$v" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF \
+        -DGGML_NATIVE=OFF -DGGML_BMI2=OFF $EXT; \
+      cmake --build "/tmp/b-$v" --config Release -j "$(nproc)" --target whisper-cli; \
+      install -Dm755 "$(find "/tmp/b-$v" -name whisper-cli -type f | head -1)" "/out/whisper-cli-$v"; \
+    done; \
+    cp /out/whisper-cli-base /out/whisper-cli; \
     /out/whisper-cli --help >/dev/null 2>&1 || true
 
 FROM node:22-bookworm-slim
@@ -55,7 +62,7 @@ RUN set -eux; \
     echo "the engine is installed" | piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/piper-check.wav; \
     test -s /tmp/piper-check.wav; rm -f /tmp/piper-check.wav
 ENV WHISPER_DIR=/opt/whisper
-COPY --from=whisper /out/whisper-cli /usr/local/bin/whisper-cli
+COPY --from=whisper /out/whisper-cli /out/whisper-cli-base /out/whisper-cli-avx2 /usr/local/bin/
 # The multilingual models rather than the .en ones: the clips come from English video, but a Bangladeshi programme has
 # Bangla sources too, and one model that handles both beats a better English one that handles nothing else. Both sizes
 # ship because the machine decides: base is 141 MB and needs a few hundred more to run in, which a 512 MB instance

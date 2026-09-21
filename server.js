@@ -979,6 +979,19 @@ const WHISPER_DIR = ENV.WHISPER_DIR || "/opt/whisper";
 // first time production was asked to transcribe anything. tiny is 74 MB and hears less well, and hearing less well
 // beats not hearing at all. A bigger worker gets base without being told, the way the studio and the render size
 // already work; an adapter instance that names a model gets the one it names.
+// Which of the two builds this host can run. The image carries a baseline one that works on any x86-64 and one
+// compiled for AVX2/FMA/F16C, which is several times faster and dies with SIGILL where those are missing — so the
+// choice is made from what /proc/cpuinfo reports here rather than from what was true on the machine that built it.
+let whisperBin;
+function whisperCli() {
+  if (whisperBin === undefined) {
+    const have = new Set(cpuFeatures());
+    const fast = ["avx2", "fma", "f16c"].every((f) => have.has(f)) && existsSync("/usr/local/bin/whisper-cli-avx2");
+    whisperBin = fast ? "whisper-cli-avx2" : "whisper-cli";
+    log(`whisper: using ${whisperBin}${fast ? " (this host has avx2, fma and f16c)" : " (baseline build: no avx2 here)"}`);
+  }
+  return whisperBin;
+}
 const WHISPER_BIG_MEMORY_MB = Number(ENV.WHISPER_BIG_MEMORY_MB) || 1024;
 const whisperModelFor = (cfg) => cfg?.model || (memoryLimitMb() >= WHISPER_BIG_MEMORY_MB ? "ggml-base.bin" : "ggml-tiny.bin");
 const whisperInstalled = () => { try { return existsSync(join(WHISPER_DIR, whisperModelFor())); } catch { return false; } };
@@ -996,7 +1009,7 @@ impl("TRANSCRIBE", "whisper_cpp", { label: "whisper.cpp (on this machine, free)"
         // Fewer threads on a small box: each one carries its own scratch, and a fraction of a CPU does not go faster
         // for being divided into four.
         const threads = cfg.threads || (memoryLimitMb() < WHISPER_BIG_MEMORY_MB ? 2 : null);
-        await exec("whisper-cli", ["-m", model, "-f", wav, "-oj", "-of", base, "-nt",
+        await exec(whisperCli(), ["-m", model, "-f", wav, "-oj", "-of", base, "-nt",
           ...(threads ? ["-t", String(threads)] : []),
           ...(lang && lang !== "auto" ? ["-l", lang] : ["-l", "auto"])], { timeoutMs: 90 * 60000 });
         const data = JSON.parse(await readFile(`${base}.json`, "utf8"));
