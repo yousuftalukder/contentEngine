@@ -3268,14 +3268,22 @@ JSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "cha
   const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
   const video = await renderer.renderClip({ clip: c, sourcePath: cand.local_path, transcript, niche, contentItemId: itemId, extras });
   await q(`UPDATE clips SET render_url=$2, status='RENDERED' WHERE id=$1`, [clipId, video.url]);
-  const cap = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 600,
+  // The video is the product and the caption is its label. The first reel this service ever rendered was thrown away
+  // as FAILED because the writer's quota was spent when it came time to caption it — a finished file sat in storage
+  // under an item that said nothing had happened. A writer that refuses now costs the reel a nicer caption, not
+  // its existence: it goes to review with the clip's own words as its caption and a note saying so.
+  const plain = { headline: c.title, captions: { facebook: c.hook || c.title, instagram: c.hook || c.title, youtube: `Clip from ${cand.title}` }, hashtags: [] };
+  let cap, captionNote = null;
+  try { cap = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 600,
     system: `You write social captions for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
     prompt: `Clip title: ${c.title}\nHook: ${c.hook}\nWhat is said: ${script.slice(0, 1500)}\nSource: ${cand.title}\nReturn JSON: {"headline": "video title max 90 chars", "captions": {"facebook": "...", "instagram": "...", "youtube": "description with credit to the source"}, "hashtags": ["..."]}`,
-    mock: { headline: c.title, captions: { facebook: c.hook || c.title, instagram: c.hook || c.title, youtube: `Clip from ${cand.title}` }, hashtags: ["shorts"] } }));
+    mock: { ...plain, hashtags: ["shorts"] } })); }
+  catch (e) { captionNote = `Caption not written — the writer refused (${String(e.message).slice(0, 160)}). The clip's own words stand in; rewrite it before posting.`; warn(`caption for ${itemId}: ${e.message}`); cap = { data: plain, cost: 0 }; }
   await addCost(itemId, cap.cost); const cd = cap.data || {};
   // A long reaction already has its title and a YouTube description with chapters from its plan; keep those.
   const planned = niche.production_method === "REACTION_LONG" ? await one(`SELECT headline, captions, summary FROM content_items WHERE id=$1`, [itemId]) : null;
-  await setItem(itemId, { hero_media_id: video.id, headline: planned?.headline || cd.headline || c.title, captions: { ...(cd.captions || {}), ...(planned ? { youtube: P(planned.captions)?.youtube } : {}) }, hashtags: cd.hashtags || [], summary: planned?.summary || c.hook || "" });
+  await setItem(itemId, { hero_media_id: video.id, headline: planned?.headline || cd.headline || c.title, captions: { ...(cd.captions || {}), ...(planned ? { youtube: P(planned.captions)?.youtube } : {}) }, hashtags: cd.hashtags || [], summary: planned?.summary || c.hook || "",
+    ...(captionNote ? { rejection_note: captionNote } : {}) });
   await finishGeneration(itemId, niche);
 }
 // ---- 8e. entry point for every text/slideshow item
