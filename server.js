@@ -3131,8 +3131,11 @@ async function processCandidate(candidateId) {
     [candidateId, audioOnly ? null : file.path, file.duration || null]);
   let transcript = P(cand.transcript);
   if (!transcript?.segments?.length) {
-    const tr = await resolve("TRANSCRIBE", niche.transcript_adapter || "transcribe_mock");
-    transcript = await tr.transcribe({ path: file.path, duration: file.duration, language: niche.language });
+    // A hosted transcriber first where there is one, and the local engine behind it. whisper.cpp never runs out and
+    // never costs anything, but a tenth of a CPU hears three minutes of speech in nineteen — so the free daily
+    // allowance of a hosted model is worth spending first, and the slow one is what the day looks like after it.
+    transcript = await withFallbacks("TRANSCRIBE", niche.transcript_adapter || "transcribe_mock", niche.transcript_adapter_fallbacks,
+      (tr) => tr.transcribe({ path: file.path, duration: file.duration, language: niche.language }));
     await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments })]);
   }
   // One pass over the soundtrack for what the words do not say: where it got loud, and where nobody was speaking.
@@ -4144,10 +4147,10 @@ app.get("/api/uploads", async (ctx) => { const p = ctx.query.get("purpose"); jso
 app.delete("/api/uploads/:id", async (ctx) => { const m = await one(`SELECT * FROM media_assets WHERE id=$1 AND kind='UPLOAD'`, [ctx.params.id]); if (m) { await deleteStored(m.url).catch(() => {}); await q(`UPDATE media_assets SET deleted_at = now() WHERE id=$1`, [m.id]); } json(ctx, 200, { ok: true }); });
 app.delete("/api/brands/:id", async (ctx) => { const dep = await one(`SELECT (SELECT COUNT(*) FROM niches WHERE brand_id=$1)::int + (SELECT COUNT(*) FROM channels WHERE brand_id=$1)::int AS n`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, "Brand still has programs or channels"); await q(`DELETE FROM brands WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 // ---- niches (programs)
-const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks", "voice_adapter_fallbacks"];
+const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks", "voice_adapter_fallbacks", "transcript_adapter_fallbacks"];
 const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visual_mode", topicSourceAdapter: "topic_source_adapter", scriptAdapter: "script_adapter", voiceAdapter: "voice_adapter", renderAdapter: "render_adapter", voiceId: "voice_id", factCheckStrict: "fact_check_strict", dedupThreshold: "dedup_threshold", isActive: "is_active",
   contentType: "content_type", productionMethod: "production_method", methodConfig: "method_config", language: "language", country: "country", approvalMode: "approval_mode", reviewWindowMinutes: "review_window_minutes", styleProfileId: "style_profile_id", publishToPortal: "publish_to_portal", imageAdapter: "image_adapter", imageSpecs: "image_specs", topicFilters: "topic_filters", maxItemsPerDay: "max_items_per_day", priority: "priority",
-  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
+  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", transcriptAdapterFallbacks: "transcript_adapter_fallbacks", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 // Adapters a new program starts with when the request doesn't name them: the live ones whose provider has a key (vault or
