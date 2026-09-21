@@ -1802,10 +1802,14 @@ async function writeBrandAss({ headline, hook, kicker, handle, credit, width, he
     + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
   const f = tmpPath("ass"); await writeFile(f, ass); return f;
 }
-const VF_VERTICAL = "crop=min(iw\\,ih*9/16):ih,scale=1080:1920";
+// Sized to the machine, like everything else that renders here. These were fixed at 1080x1920 and 1920x1080, so a
+// clip was encoded at full HD with its subtitles burned in on whatever instance happened to pick it up — and on a
+// 512 MB, tenth-of-a-CPU box that took the whole process down with it, over and over, leaving the job locked and
+// the service restarting. renderSize() already knew to drop to 1280 on a small instance; this path never asked it.
+const vfVertical = () => { const [w, h] = renderSize("9:16"); return `crop=min(iw\\,ih*9/16):ih,scale=${w}:${h}`; };
+const vfVerticalBlurpad = () => { const [w, h] = renderSize("9:16"); return `split[a][b];[a]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=24:4,eq=brightness=-0.18[bg];[b]scale=${w}:-2[fg];[bg][fg]overlay=0:(H-h)/2,setsar=1`; };
+const vfLandscape = () => { const [w, h] = renderSize("16:9"); return `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black`; };
 // Landscape footage in a vertical frame without cropping: the whole picture (TV chyrons included) over a blurred fill.
-const VF_VERTICAL_BLURPAD = "split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:4,eq=brightness=-0.18[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=0:(H-h)/2,setsar=1";
-const VF_LANDSCAPE = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black";
 // A slideshow's segments are concatenated and then re-encoded with the captions and the brand on top, so whatever
 // quality they are written at is thrown away. Encoding them at ultrafast and a loose CRF costs nothing in the finished
 // video and is most of the render time on a small instance.
@@ -1835,7 +1839,7 @@ const duckUnder = (mi, vi, dur) =>
   // the narration 6 dB. The bed's level is set by its own volume filter, and alimiter catches whatever peaks.
   `[voice][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]`;
 async function cutClip(input, start, end, { vertical = true, ass = null, layout = "crop" } = {}) {
-  const vf = [vertical ? (layout === "blurpad" ? VF_VERTICAL_BLURPAD : VF_VERTICAL) : VF_LANDSCAPE];
+  const vf = [vertical ? (layout === "blurpad" ? vfVerticalBlurpad() : vfVertical()) : vfLandscape()];
   if (ass) vf.push(assVf(ass));
   const out = tmpPath("mp4");
   await exec("ffmpeg", ["-y", "-ss", String(start), "-t", String(Math.max(1, end - start)), "-i", input, "-vf", vf.join(","), ...X264, out]);
@@ -1906,7 +1910,7 @@ async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
       if (b.type === "play") {
         const dur = Math.max(1, b.end - b.start); lastT = b.end;
         const inputs = ["-ss", String(b.start), "-t", String(dur), "-i", sourcePath, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : []), ...(srcAudio ? [] : ["-f", "lavfi", "-t", String(dur), "-i", "anullsrc=r=48000:cl=stereo"])];
-        const fc = `[0:v]${VF_LANDSCAPE},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=520:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-40:H-h-40:shortest=1[v]` : ";[m]null[v]");
+        const fc = `[0:v]${vfLandscape()},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=520:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-40:H-h-40:shortest=1[v]` : ";[m]null[v]");
         const aIn = srcAudio ? "0:a" : `${reactor ? 2 : 1}:a`;
         await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", aIn, "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
       } else {
@@ -1951,7 +1955,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
     if (media.kind !== "VIDEO" || channel.format !== "SHORT_FORM_VOICEOVER") return { url: media.url, kind: media.kind };
     const meta = P(media.meta) || {}; if (meta.orientation === "9:16") return { url: media.url, kind: "VIDEO" };
     const src = await toTmpFile(media.url, "mp4"); const out = tmpPath("mp4");
-    await exec("ffmpeg", ["-y", "-i", src, "-vf", VF_VERTICAL, ...X264, out]); await cleanup(src);
+    await exec("ffmpeg", ["-y", "-i", src, "-vf", vfVertical(), ...X264, out]); await cleanup(src);
     const url = await storeLocal(out, `video/${newId()}.mp4`, "video/mp4"); await cleanup(out);
     await recordMedia({ contentItemId: item.id, kind: "VIDEO", url, mime: "video/mp4", meta: { orientation: "9:16", derived_from: media.id } });
     return { url, kind: "VIDEO" };
@@ -2003,7 +2007,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const said = extras.audio?.spoken || extras.script || "";
         const recapAss = c.captions === false || !said ? null
           : caps[caps.push(await writeCaptionsAss([{ start: 0, end: nd, text: said }], 0, nd, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, accent: (await studioBrand(niche)).brand.accent })) - 1];
-        const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? VF_VERTICAL : VF_LANDSCAPE}${recapAss ? `,${assVf(recapAss)}` : ""}[v]`;
+        const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? vfVertical() : vfLandscape()}${recapAss ? `,${assVf(recapAss)}` : ""}[v]`;
         await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
       }
       default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical)) - 1] });
