@@ -37,7 +37,14 @@ echo "== whisper.cpp hears it back =="
 printf '%s' 'The quick brown fox jumps over the lazy dog near the river bank.' \
   | piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/say.wav
 ffmpeg -hide_banner -loglevel error -y -i /tmp/say.wav -ar 16000 -ac 1 -c:a pcm_s16le /tmp/in.wav
+# Both builds are exercised, because the runner's CPU has AVX2 and some of Render's may not: this proves each
+# binary exists and works, not that either one is safe on a machine this check never runs on.
+for b in whisper-cli-base whisper-cli-avx2; do
+  echo "-- $b"
+  "$b" -m /opt/whisper/ggml-tiny.bin -f /tmp/in.wav -oj -of "/tmp/out-$b" -nt -l en
+  grep -qi 'fox' "/tmp/out-$b.json" || { echo "FAIL: $b did not hear the word"; exit 1; }
+done
 whisper-cli -m /opt/whisper/ggml-base.bin -f /tmp/in.wav -oj -of /tmp/out -nt -l en
 cat /tmp/out.json
 grep -qi 'fox' /tmp/out.json
-echo "ok: the word survived the round trip"
+echo "ok: the word survived the round trip, on both builds"

@@ -979,6 +979,19 @@ const WHISPER_DIR = ENV.WHISPER_DIR || "/opt/whisper";
 // first time production was asked to transcribe anything. tiny is 74 MB and hears less well, and hearing less well
 // beats not hearing at all. A bigger worker gets base without being told, the way the studio and the render size
 // already work; an adapter instance that names a model gets the one it names.
+// Which of the two builds this host can run. The image carries a baseline one that works on any x86-64 and one
+// compiled for AVX2/FMA/F16C, which is several times faster and dies with SIGILL where those are missing — so the
+// choice is made from what /proc/cpuinfo reports here rather than from what was true on the machine that built it.
+let whisperBin;
+function whisperCli() {
+  if (whisperBin === undefined) {
+    const have = new Set(cpuFeatures());
+    const fast = ["avx2", "fma", "f16c"].every((f) => have.has(f)) && existsSync("/usr/local/bin/whisper-cli-avx2");
+    whisperBin = fast ? "whisper-cli-avx2" : "whisper-cli";
+    log(`whisper: using ${whisperBin}${fast ? " (this host has avx2, fma and f16c)" : " (baseline build: no avx2 here)"}`);
+  }
+  return whisperBin;
+}
 const WHISPER_BIG_MEMORY_MB = Number(ENV.WHISPER_BIG_MEMORY_MB) || 1024;
 const whisperModelFor = (cfg) => cfg?.model || (memoryLimitMb() >= WHISPER_BIG_MEMORY_MB ? "ggml-base.bin" : "ggml-tiny.bin");
 const whisperInstalled = () => { try { return existsSync(join(WHISPER_DIR, whisperModelFor())); } catch { return false; } };
@@ -996,7 +1009,7 @@ impl("TRANSCRIBE", "whisper_cpp", { label: "whisper.cpp (on this machine, free)"
         // Fewer threads on a small box: each one carries its own scratch, and a fraction of a CPU does not go faster
         // for being divided into four.
         const threads = cfg.threads || (memoryLimitMb() < WHISPER_BIG_MEMORY_MB ? 2 : null);
-        await exec("whisper-cli", ["-m", model, "-f", wav, "-oj", "-of", base, "-nt",
+        await exec(whisperCli(), ["-m", model, "-f", wav, "-oj", "-of", base, "-nt",
           ...(threads ? ["-t", String(threads)] : []),
           ...(lang && lang !== "auto" ? ["-l", lang] : ["-l", "auto"])], { timeoutMs: 90 * 60000 });
         const data = JSON.parse(await readFile(`${base}.json`, "utf8"));
@@ -1139,6 +1152,22 @@ const SUBSTANCE = [
   /(?:সবচেয়ে|প্রথম|কখনো|আসলে|সত্যি|কেবল)/,
 ];
 const FILLER = /\b(?:u[mh]+|er+|you know|i mean|sort of|kind of|basically|literally)\b/gi;
+// Rhetoric, which is what people actually clip. The list above sees facts, and on a real speech that made it rank
+// the most quoted passage in the language fourth: "we choose to go to the moon… not because they are easy, but
+// because they are hard" states no fact whatsoever. Saying a phrase three times is a refrain and setting one thing
+// against another is antithesis, and both are a speaker marking their own punchline — in any register, any language.
+const ANTITHESIS = [/\bnot because\b[\s\S]{0,100}?\bbut because\b/i, /\bit'?s not\b[\s\S]{0,80}?\bit'?s\b/i, /\bnot only\b[\s\S]{0,80}?\bbut\b/i];
+function hasRefrain(text) {
+  const words = String(text).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
+  if (words.length < 12) return false;
+  const seen = new Set();
+  for (let i = 0; i + 3 <= words.length; i++) {
+    const three = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
+    if (seen.has(three)) return true;
+    seen.add(three);
+  }
+  return false;
+}
 // Everything a window can earn: the neutral half, a clean opening, a clean finish, and a full house of substance.
 const MEANING_MAX = 0.5 + 0.2 + 0.1 + 0.35;
 impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no key)", create: () => ({
@@ -1166,8 +1195,9 @@ impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no
         if (OPENS_MID_THOUGHT.test(run[0].text)) { meaning -= 0.35; why.push("starts mid-thought"); }
         else if (STRONG_OPENER.test(run[0].text)) { meaning += 0.2; why.push("opens on its own feet"); }
         if (/[.!?।]$/.test(text)) meaning += 0.1; else { meaning -= 0.15; why.push("trails off"); }
-        const hits = SUBSTANCE.filter((re) => re.test(text)).length;
-        if (hits) { meaning += Math.min(0.35, hits * 0.12); why.push(`${hits} thing${hits > 1 ? "s" : ""} actually said`); }
+        const refrain = hasRefrain(text), antithesis = ANTITHESIS.some((re) => re.test(text));
+        const hits = SUBSTANCE.filter((re) => re.test(text)).length + (refrain ? 1 : 0) + (antithesis ? 1 : 0);
+        if (hits) { meaning += Math.min(0.35, hits * 0.12); why.push(`${hits} thing${hits > 1 ? "s" : ""} actually said${refrain ? ", one of them twice" : ""}${antithesis ? ", one set against another" : ""}`); }
         const filler = (text.match(FILLER) || []).length;
         if (filler) { meaning -= Math.min(0.25, (filler / Math.max(words, 1)) * 2); why.push(`${filler} filler`); }
         if (words / span < 1.2) { meaning -= 0.2; why.push("barely a word in it"); }
@@ -3101,8 +3131,11 @@ async function processCandidate(candidateId) {
     [candidateId, audioOnly ? null : file.path, file.duration || null]);
   let transcript = P(cand.transcript);
   if (!transcript?.segments?.length) {
-    const tr = await resolve("TRANSCRIBE", niche.transcript_adapter || "transcribe_mock");
-    transcript = await tr.transcribe({ path: file.path, duration: file.duration, language: niche.language });
+    // A hosted transcriber first where there is one, and the local engine behind it. whisper.cpp never runs out and
+    // never costs anything, but a tenth of a CPU hears three minutes of speech in nineteen — so the free daily
+    // allowance of a hosted model is worth spending first, and the slow one is what the day looks like after it.
+    transcript = await withFallbacks("TRANSCRIBE", niche.transcript_adapter || "transcribe_mock", niche.transcript_adapter_fallbacks,
+      (tr) => tr.transcribe({ path: file.path, duration: file.duration, language: niche.language }));
     await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments })]);
   }
   // One pass over the soundtrack for what the words do not say: where it got loud, and where nobody was speaking.
@@ -3113,7 +3146,13 @@ async function processCandidate(candidateId) {
   let clips;
   // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
   if (niche.content_type === "MOVIE_RECAP" || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
-  else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand, signals })); clips = clips.slice(0, methodCfg(niche).clips_per_video); }
+  else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand, signals }));
+    // Take every moment worth taking, not a fixed three. A count is the wrong control: on one video it throws away
+    // something good, and on the next it scrapes the barrel to fill the quota. min_clip_score is the bar, and
+    // clips_per_video is only the ceiling that stops a long rambling video producing twenty mediocre reels.
+    const mc = methodCfg(niche), bar = Number(mc.min_clip_score ?? 0);
+    clips = clips.filter((c) => Number(c.score ?? 1) >= bar).slice(0, mc.clips_per_video || 1);
+  }
   if (!clips.length) throw new Error("no clip-worthy moments found");
   for (const cl of clips) {
     const clipId = newId(); const text = transcript.segments.filter((s) => s.end > cl.start && s.start < cl.end).map((s) => s.text).join(" ");
@@ -4108,10 +4147,10 @@ app.get("/api/uploads", async (ctx) => { const p = ctx.query.get("purpose"); jso
 app.delete("/api/uploads/:id", async (ctx) => { const m = await one(`SELECT * FROM media_assets WHERE id=$1 AND kind='UPLOAD'`, [ctx.params.id]); if (m) { await deleteStored(m.url).catch(() => {}); await q(`UPDATE media_assets SET deleted_at = now() WHERE id=$1`, [m.id]); } json(ctx, 200, { ok: true }); });
 app.delete("/api/brands/:id", async (ctx) => { const dep = await one(`SELECT (SELECT COUNT(*) FROM niches WHERE brand_id=$1)::int + (SELECT COUNT(*) FROM channels WHERE brand_id=$1)::int AS n`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, "Brand still has programs or channels"); await q(`DELETE FROM brands WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 // ---- niches (programs)
-const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks", "voice_adapter_fallbacks"];
+const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks", "voice_adapter_fallbacks", "transcript_adapter_fallbacks"];
 const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visual_mode", topicSourceAdapter: "topic_source_adapter", scriptAdapter: "script_adapter", voiceAdapter: "voice_adapter", renderAdapter: "render_adapter", voiceId: "voice_id", factCheckStrict: "fact_check_strict", dedupThreshold: "dedup_threshold", isActive: "is_active",
   contentType: "content_type", productionMethod: "production_method", methodConfig: "method_config", language: "language", country: "country", approvalMode: "approval_mode", reviewWindowMinutes: "review_window_minutes", styleProfileId: "style_profile_id", publishToPortal: "publish_to_portal", imageAdapter: "image_adapter", imageSpecs: "image_specs", topicFilters: "topic_filters", maxItemsPerDay: "max_items_per_day", priority: "priority",
-  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
+  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", transcriptAdapterFallbacks: "transcript_adapter_fallbacks", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 // Adapters a new program starts with when the request doesn't name them: the live ones whose provider has a key (vault or
