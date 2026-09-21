@@ -476,6 +476,16 @@ function exec(cmd, args, { timeoutMs = 45 * 60000, input = null } = {}) {
 }
 async function ffprobeDuration(file) { try { const { out } = await exec("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file]); return Number(out.trim()) || 0; } catch { return 0; } }
 async function hasVideoStream(file) { try { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file]); return /video/.test(out); } catch { return false; } }
+// Which tools this image has, worked out once at boot. /health used to ask by spawning ffmpeg and yt-dlp on every
+// probe, and on a tenth of a CPU — with the instance already busy the moment it starts — that is enough to miss the
+// deploy's health check and have the whole release killed, which is what happened. Neither tool appears or vanishes
+// while the process is alive, so asking more than once was never worth anything.
+const TOOLS = { ffmpeg: null, ytdlp: null };
+async function checkTools() {
+  TOOLS.ffmpeg = await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false);
+  TOOLS.ytdlp = await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false);
+  log(`tools: ffmpeg ${TOOLS.ffmpeg ? "yes" : "NO"}, yt-dlp ${TOOLS.ytdlp ? "yes" : "NO"}`);
+}
 const cleanup = (...files) => Promise.all(files.filter(Boolean).map((f) => unlink(f).catch(() => {})));
 
 // === 5. adapter registry ==============================================
@@ -3979,6 +3989,7 @@ function startWorkers() {
   every(15 * 60000, sweepHealth);
   upgradeExistingPrograms().then(upgradeAdapters).then(syncCatalogSources).catch((e) => warn("upgrade", e.message));
   reportFonts().catch(() => {});
+  checkTools().catch(() => {});
   every(30 * 60000, async function recoverStale() { await recoverAbandonedWork(); });
   every(60 * 60000, sweepStorageCleanup);
 }
@@ -4025,7 +4036,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- routes: meta / health
-app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, fonts: fontsDirFor(null), lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: (await storageBackend()).name, vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false), ytdlp: await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false) }); });
+app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(() => true).catch(() => false); json(ctx, db ? 200 : 503, { ok: db, worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, fonts: fontsDirFor(null), lanes: LANES, sweeps: RUN_SWEEPS, spentTodayUsd: db ? await spentTodayUsd() : null, storage: storageCache.backend?.name || "checking", vault: vaultReady(), studio: studioReady(), memoryMb: memoryLimitMb(), ffmpeg: TOOLS.ffmpeg, ytdlp: TOOLS.ytdlp }); });
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {

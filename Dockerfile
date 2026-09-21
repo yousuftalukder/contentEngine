@@ -93,5 +93,7 @@ COPY frontend ./frontend
 COPY fonts ./fonts
 ENV NODE_ENV=production PORT=4000 WORK_DIR=/tmp
 EXPOSE 4000
-HEALTHCHECK --interval=60s --timeout=10s CMD curl -fsS http://localhost:4000/health || exit 1
+# The port comes from the environment: Render runs this on 10000, and a healthcheck hardcoded to 4000 reported the
+# container unhealthy for its entire life while the service was in fact fine.
+HEALTHCHECK --interval=60s --timeout=10s CMD curl -fsS "http://localhost:${PORT:-4000}/health" || exit 1
 CMD ["node", "server.js"]
