@@ -1139,6 +1139,22 @@ const SUBSTANCE = [
   /(?:সবচেয়ে|প্রথম|কখনো|আসলে|সত্যি|কেবল)/,
 ];
 const FILLER = /\b(?:u[mh]+|er+|you know|i mean|sort of|kind of|basically|literally)\b/gi;
+// Rhetoric, which is what people actually clip. The list above sees facts, and on a real speech that made it rank
+// the most quoted passage in the language fourth: "we choose to go to the moon… not because they are easy, but
+// because they are hard" states no fact whatsoever. Saying a phrase three times is a refrain and setting one thing
+// against another is antithesis, and both are a speaker marking their own punchline — in any register, any language.
+const ANTITHESIS = [/\bnot because\b[\s\S]{0,100}?\bbut because\b/i, /\bit'?s not\b[\s\S]{0,80}?\bit'?s\b/i, /\bnot only\b[\s\S]{0,80}?\bbut\b/i];
+function hasRefrain(text) {
+  const words = String(text).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
+  if (words.length < 12) return false;
+  const seen = new Set();
+  for (let i = 0; i + 3 <= words.length; i++) {
+    const three = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
+    if (seen.has(three)) return true;
+    seen.add(three);
+  }
+  return false;
+}
 // Everything a window can earn: the neutral half, a clean opening, a clean finish, and a full house of substance.
 const MEANING_MAX = 0.5 + 0.2 + 0.1 + 0.35;
 impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no key)", create: () => ({
@@ -1166,8 +1182,9 @@ impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no
         if (OPENS_MID_THOUGHT.test(run[0].text)) { meaning -= 0.35; why.push("starts mid-thought"); }
         else if (STRONG_OPENER.test(run[0].text)) { meaning += 0.2; why.push("opens on its own feet"); }
         if (/[.!?।]$/.test(text)) meaning += 0.1; else { meaning -= 0.15; why.push("trails off"); }
-        const hits = SUBSTANCE.filter((re) => re.test(text)).length;
-        if (hits) { meaning += Math.min(0.35, hits * 0.12); why.push(`${hits} thing${hits > 1 ? "s" : ""} actually said`); }
+        const refrain = hasRefrain(text), antithesis = ANTITHESIS.some((re) => re.test(text));
+        const hits = SUBSTANCE.filter((re) => re.test(text)).length + (refrain ? 1 : 0) + (antithesis ? 1 : 0);
+        if (hits) { meaning += Math.min(0.35, hits * 0.12); why.push(`${hits} thing${hits > 1 ? "s" : ""} actually said${refrain ? ", one of them twice" : ""}${antithesis ? ", one set against another" : ""}`); }
         const filler = (text.match(FILLER) || []).length;
         if (filler) { meaning -= Math.min(0.25, (filler / Math.max(words, 1)) * 2); why.push(`${filler} filler`); }
         if (words / span < 1.2) { meaning -= 0.2; why.push("barely a word in it"); }
