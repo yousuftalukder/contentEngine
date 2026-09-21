@@ -898,7 +898,11 @@ impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "st
     // --force-keyframes-at-cuts re-encodes the edges so the range is exactly the range; without it a cut lands on
     // whatever keyframe happens to be nearby, which on a long video can be seconds out.
     await exec("yt-dlp", [...ytdlpCommon(cfg), "-f", cfg.format || VIDEO_FORMAT, "--merge-output-format", "mp4",
-      "--download-sections", `*${hhmmss(start)}-${hhmmss(end)}`, "--force-keyframes-at-cuts", "-o", `${base}.%(ext)s`, url], { timeoutMs: 30 * 60000 });
+      // The container is named, not inferred. A plain file URL that answers with application/octet-stream and hides
+      // its name in a query parameter — a GitHub release asset, most object stores, plenty of CDNs — leaves yt-dlp
+      // calling the extension "unknown_video", and ffmpeg cannot write a container it has no name for. Everything
+      // here is asked for as mp4 anyway, so it is asked for by name.
+      "--download-sections", `*${hhmmss(start)}-${hhmmss(end)}`, "--force-keyframes-at-cuts", "-o", `${base}.mp4`, url], { timeoutMs: 30 * 60000 });
     const path = ["mp4", "mkv", "webm"].map((e) => `${base}.${e}`).find((p) => existsSync(p));
     if (!path) throw new Error(`yt-dlp produced no file for ${hhmmss(start)}–${hhmmss(end)} of this link`);
     // A section that came back as sound alone (a video format the site would not serve) went on to be rendered and
@@ -909,7 +913,9 @@ impl("DOWNLOAD", "ytdlp", { label: "yt-dlp", configSchema: { format: { type: "st
   async download(url) {
     await mkdir(TMP, { recursive: true });
     const base = join(TMP, randomUUID());
-    const args = ["-f", cfg.format || VIDEO_FORMAT, "--merge-output-format", "mp4", "--no-playlist", "--no-warnings", "-o", `${base}.%(ext)s`, url];
+    // Named rather than inferred, for the same reason the section fetch names it: a URL that does not carry its
+    // extension leaves yt-dlp writing to ".unknown_video", which ffmpeg refuses.
+    const args = ["-f", cfg.format || VIDEO_FORMAT, "--merge-output-format", "mp4", "--no-playlist", "--no-warnings", "-o", `${base}.mp4`, url];
     if (cfg.max_minutes) args.unshift("--match-filter", `duration<=${cfg.max_minutes * 60}`);
     if (ENV.YTDLP_COOKIES_FILE) args.unshift("--cookies", ENV.YTDLP_COOKIES_FILE);
     await exec("yt-dlp", args, { timeoutMs: 40 * 60000 });
