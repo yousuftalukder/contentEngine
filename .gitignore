@@ -4,5 +4,8 @@ data/
 .env
 .env.*
 !.env.example
+!.env.pc.example
 *.log
 studio/.bundle/
+# the PC worker's own tools (pc/setup.ps1)
+.tools/

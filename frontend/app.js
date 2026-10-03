@@ -393,6 +393,15 @@ pages.programs = async () => {
       h("button", { class: "btn primary", disabled: !brands.length, onclick: () => programDialog(null, brands, sources, adapters, styles, route) }, "New program")));
   if (!brands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "Create a brand first"), "Programs and channels belong to a brand. ", h("button", { class: "btn sm", onclick: () => brandDialog(brands) }, "Add brand")));
   else if (!programs.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No programs yet"), "Create one, or use the starter setup on the Overview page."));
+  // Whether your PC is on, shown only when something actually runs there — and what is waiting for it if it is off.
+  if (programs.some((p) => p.compute_where === "pc")) {
+    const w = await get("/api/workers").catch(() => null);
+    if (w) root.appendChild(h("div", { class: `panel ${w.pc.online ? "" : "warn"}`, style: "margin-bottom:12px" },
+      h("b", null, w.pc.online ? "Your PC is on" : "Your PC is off"), " — ",
+      w.pc.online ? `doing video work (last seen ${w.pc.seen_seconds_ago}s ago)` : w.pc.seen_seconds_ago != null ? `last seen ${Math.round(w.pc.seen_seconds_ago / 60)} min ago` : "it has never connected",
+      w.pc.waiting ? h("span", null, " · ", h("b", null, `${w.pc.waiting} job${w.pc.waiting > 1 ? "s" : ""} waiting for it`)) : null,
+      w.pc.online ? null : h("div", { class: "small mute" }, "Start it with pc\\start.ps1 in the project folder. Work routed to it waits until then.")));
+  }
   for (const p of programs) root.appendChild(programCard(p, brands, sources, channels, adapters, styles));
   return root;
 };
@@ -402,7 +411,8 @@ function programCard(p, brands, sources, channels, adapters, styles) {
   return h("div", { class: "panel" },
     h("div", { class: "row" },
       h("div", null, h("h3", { style: "margin:0" }, p.display_name, " ", yes(p.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
-        h("div", { class: "small mute" }, nice(p.content_type), " · ", p.language, "/", p.country || "—", " · review: ", nice(p.approval_mode), p.approval_mode === "AUTO_AFTER_WINDOW" ? ` (${p.review_window_minutes || 60} min)` : "", " · ", p.max_items_per_day ? `${p.max_items_per_day}/day` : "no daily cap", yes(p.publish_to_portal) ? " · portal" : "")),
+        h("div", { class: "small mute" }, nice(p.content_type), " · ", p.language, "/", p.country || "—", " · review: ", nice(p.approval_mode), p.approval_mode === "AUTO_AFTER_WINDOW" ? ` (${p.review_window_minutes || 60} min)` : "",
+          isVideo ? h("span", { class: `tag ${p.compute_where === "pc" ? "blue" : ""}`, style: "margin-left:6px" }, p.compute_where === "pc" ? "runs on my PC" : "runs on server") : null, " · ", p.max_items_per_day ? `${p.max_items_per_day}/day` : "no daily cap", yes(p.publish_to_portal) ? " · portal" : "")),
       h("div", { class: "right row" },
         h("button", { class: "btn sm", onclick: () => programDialog(p, brands, sources, adapters, styles, route) }, "Edit"),
         h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/programs/${p.id}`, { isActive: !yes(p.is_active) }), yes(p.is_active) ? "Program paused" : "Program active").then(route) }, yes(p.is_active) ? "Pause" : "Activate"),
@@ -475,6 +485,8 @@ async function programDialog(p, brands, sources, adapters, styles, done) {
       field("Language", text("language", p?.language || "en")),
       field("Country", text("country", p?.country || "Bangladesh")),
       field("Review", select("approvalMode", [["MANUAL", "Manual — waits for me"], ["AUTO_AFTER_WINDOW", "Auto-approve after a window"], ["AUTO", "Auto — publish immediately"]], p?.approval_mode || "MANUAL")),
+      field("Video work runs on", select("computeWhere", [["server", "Server — always on, slower, YouTube blocked"], ["pc", "My PC — fast, free, YouTube works; waits while it's off"]], p?.compute_where || "server"),
+        "Only video steps move. News, review and publishing stay on the server."),
       field("Review window (minutes)", num("reviewWindowMinutes", p?.review_window_minutes ?? 60)),
       field("Max items per day", num("maxItemsPerDay", p?.max_items_per_day), "Leave empty for no cap."),
       field("Style profile", select("styleProfileId", [["", "(none)"], ...styles.map((s) => [s.id, s.name])], p?.style_profile_id || ""))),

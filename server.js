@@ -93,7 +93,13 @@ const tmpPath = (ext) => join(TMP, `${randomUUID()}.${ext}`);
 // and a Render Background Worker with LANES=video (ffmpeg/yt-dlp memory stays away from the dashboard). The periodic sweeps
 // (polling sources, publishing due assets, review deadlines, metrics, cleanup) run where "ingest" runs unless RUN_SWEEPS overrides.
 const ALL_QUEUES = ["ingest", "text", "image", "video", "publish", "metrics"];
-const LANES = (ENV.LANES ? ENV.LANES.split(",").map((s) => s.trim()).filter((s) => ALL_QUEUES.includes(s)) : ALL_QUEUES);
+// Your own computer as a worker. It is fast, it costs nothing, and YouTube serves it where it refuses a datacenter —
+// but it is on a few hours a day. A programme set to run on the PC queues its video work here, and only a process
+// started with LANES=video_local claims it. It is deliberately not in the default set: a server started without a
+// LANES override must never pick up work that was routed to your machine.
+const PC_LANE = "video_local";
+const LANES = (ENV.LANES ? ENV.LANES.split(",").map((s) => s.trim()).filter((s) => [...ALL_QUEUES, PC_LANE].includes(s)) : ALL_QUEUES);
+const videoQueueFor = (niche) => (niche?.compute_where === "pc" ? PC_LANE : "video");
 const RUN_SWEEPS = ENV.RUN_SWEEPS != null ? flag(ENV.RUN_SWEEPS) : LANES.includes("ingest");
 function tokenCost(model, inTok = 0, outTok = 0) {
   const hit = Object.entries(PRICES).find(([k]) => String(model || "").startsWith(k));
@@ -2435,7 +2441,7 @@ async function routeSourceItem(item) {
       await q(`INSERT INTO video_candidates (id, source_id, source_item_id, niche_id, platform, external_id, source_url, title, duration_seconds, view_count, published_at, thumbnail_url, license, score, score_reason, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
         [cid, item.source_id, item.id, niche.id, item.platform || null, item.external_id, item.url, item.title, item.duration || null, item.views || null, item.published_at, item.thumbnail || null, item.license || "UNKNOWN", score, reason, "NEW"]);
       const f = P(niche.topic_filters) || {};
-      if (score >= (f.min_score ?? methodCfg(niche).min_score) && await underDailyCap(niche)) { await q(`UPDATE video_candidates SET status='QUEUED' WHERE id=$1`, [cid]); await enqueue("PROCESS_CANDIDATE", { candidateId: cid }, { queue: "video", priority: niche.priority, dedupeKey: `cand:${cid}` }); }
+      if (score >= (f.min_score ?? methodCfg(niche).min_score) && await underDailyCap(niche)) { await q(`UPDATE video_candidates SET status='QUEUED' WHERE id=$1`, [cid]); await enqueue("PROCESS_CANDIDATE", { candidateId: cid }, { queue: videoQueueFor(niche), priority: niche.priority, dedupeKey: `cand:${cid}` }); }
       routed++;
     } else {
       if (VIDEO_TYPES.has(niche.content_type)) continue;
@@ -3179,7 +3185,7 @@ async function processCandidate(candidateId) {
     await q(`INSERT INTO clips (id, video_candidate_id, niche_id, start_seconds, end_seconds, title, hook, score, reason, transcript_text) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [clipId, candidateId, niche.id, cl.start, cl.end, cl.title, cl.hook, cl.score, cl.reason, text]);
     const itemId = await createQueuedItem(niche, { topic: cl.title || cand.title, candidateId, clipId, status: "QUEUED", sourceDataRef: { provider: "video_candidate", url: cand.source_url, title: cand.title, clip: cl } });
     await q(`UPDATE clips SET content_item_id=$2 WHERE id=$1`, [clipId, itemId]);
-    await enqueue("RENDER_CLIP", { itemId, clipId }, { queue: "video", contentItemId: itemId, priority: niche.priority });
+    await enqueue("RENDER_CLIP", { itemId, clipId }, { queue: videoQueueFor(niche), contentItemId: itemId, priority: niche.priority });
   }
   await q(`UPDATE video_candidates SET status='PROCESSED' WHERE id=$1`, [candidateId]);
 }
@@ -4000,6 +4006,12 @@ async function sweepRetention() {
 function startWorkers() {
   if (!LANES.length) { warn("LANES is set but names no known lane — this process serves HTTP only"); return; }
   for (const qn of LANES) workerLoop(qn);
+  // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
+  // leaving routed work to look stuck.
+  if (LANES.includes(PC_LANE)) {
+    const beat = () => putSetting("worker.pc", { at: new Date().toISOString(), worker: WORKER_ID, lanes: LANES }).catch((e) => warn("pc heartbeat", e.message));
+    beat(); setInterval(beat, 30000);
+  }
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
   every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
@@ -4179,7 +4191,7 @@ app.delete("/api/brands/:id", async (ctx) => { const dep = await one(`SELECT (SE
 const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks", "voice_adapter_fallbacks", "transcript_adapter_fallbacks"];
 const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visual_mode", topicSourceAdapter: "topic_source_adapter", scriptAdapter: "script_adapter", voiceAdapter: "voice_adapter", renderAdapter: "render_adapter", voiceId: "voice_id", factCheckStrict: "fact_check_strict", dedupThreshold: "dedup_threshold", isActive: "is_active",
   contentType: "content_type", productionMethod: "production_method", methodConfig: "method_config", language: "language", country: "country", approvalMode: "approval_mode", reviewWindowMinutes: "review_window_minutes", styleProfileId: "style_profile_id", publishToPortal: "publish_to_portal", imageAdapter: "image_adapter", imageSpecs: "image_specs", topicFilters: "topic_filters", maxItemsPerDay: "max_items_per_day", priority: "priority",
-  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", transcriptAdapterFallbacks: "transcript_adapter_fallbacks", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
+  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", transcriptAdapterFallbacks: "transcript_adapter_fallbacks", computeWhere: "compute_where", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 // Adapters a new program starts with when the request doesn't name them: the live ones whose provider has a key (vault or
@@ -4206,8 +4218,10 @@ async function smartAdapterDefaults() {
     renderAdapter: studioInstalled() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",
   };
 }
+const checkComputeWhere = (b) => { if (b?.computeWhere != null && !["server", "pc"].includes(b.computeWhere)) throw new ApiError(400, null, "computeWhere must be \"server\" or \"pc\""); };
 app.post("/api/niches", async (ctx) => {
   const b = { ...(ctx.body.useMocks ? {} : await smartAdapterDefaults()), ...ctx.body }; for (const r of ["brandId", "key", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
+  checkComputeWhere(b);
   // A country implies the language its audience reads, and getting that wrong is not a small default: a Bangladeshi
   // news page writing in English is writing for the wrong people. Say `language` explicitly to override it.
   if (!b.language && b.country) b.language = COUNTRY_LANGUAGE[String(b.country).trim().toLowerCase()] || undefined;
@@ -4222,8 +4236,21 @@ app.post("/api/niches", async (ctx) => {
   json(ctx, 201, rowJson(row, NICHE_JSON));
 });
 app.post("/api/programs", async (ctx) => { ctx.req.url = "/api/niches"; const r = app.routes.find((x) => x.method === "POST" && x.re.test("/api/niches")); return r.handler(ctx); });
-app.patch("/api/niches/:id", async (ctx) => json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)));
-app.patch("/api/programs/:id", async (ctx) => json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)));
+app.patch("/api/niches/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
+app.patch("/api/programs/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
+// Who is doing the work right now: the server's own record of its build, and whether your PC is on. The PC beats every
+// 30 seconds, so a heartbeat older than 90 means it is off — and anything routed to it is waiting, not stuck.
+app.get("/api/workers", async (ctx) => {
+  // Read straight from the table, not through setting(): these records are written by *other* processes — the PC
+  // beats from your machine — and the settings cache is per-process for ten seconds, so it would go on reporting
+  // the PC as off for a while after it came on.
+  const rows = await q(`SELECT key, value FROM settings WHERE key IN ('boot.last', 'worker.pc', 'boot.pc')`);
+  const read = (k) => { const r = rows.find((x) => x.key === k); return r ? (typeof r.value === "string" ? r.value : P(r.value)) : null; };
+  const server = read("boot.last"), pc = read("worker.pc"), pcBoot = read("boot.pc");
+  const age = pc?.at ? (Date.now() - new Date(pc.at).getTime()) / 1000 : null;
+  const waiting = (await one(`SELECT count(*)::int AS n FROM jobs WHERE queue = $1 AND status = 'PENDING'`, [PC_LANE])).n;
+  json(ctx, 200, { server, pc: { online: age != null && age < 90, seen_seconds_ago: age == null ? null : Math.round(age), boot: pcBoot, waiting } });
+});
 app.delete("/api/niches/:id", async (ctx) => { const dep = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE niche_id=$1`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, `Program has ${dep.n} content items — deactivate it instead (PATCH isActive:false)`); await q(`DELETE FROM series WHERE niche_id=$1`, [ctx.params.id]); await q(`DELETE FROM niches WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), ctx.params.id, ctx.params.sourceId]); json(ctx, 200, { ok: true }); });
 app.delete("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`DELETE FROM niche_sources WHERE niche_id=$1 AND source_id=$2`, [ctx.params.id, ctx.params.sourceId]); json(ctx, 200, { ok: true }); });
@@ -4388,8 +4415,8 @@ app.post("/api/source-items/:id/route", async (ctx) => { const it = await one(`S
 // ---- video candidates & clips
 app.get("/api/video-candidates", async (ctx) => { const st = ctx.query.get("status"), n = ctx.query.get("nicheId"); json(ctx, 200, (await q(`SELECT vc.*, n.display_name AS program_name, (SELECT COUNT(*)::int FROM clips c WHERE c.video_candidate_id=vc.id) AS clip_count FROM video_candidates vc LEFT JOIN niches n ON n.id=vc.niche_id WHERE ($1::text IS NULL OR vc.status=$1) AND ($2::text IS NULL OR vc.niche_id=$2) ORDER BY vc.score DESC, vc.created_at DESC LIMIT 200`, [st, n])).map((r) => ({ ...r, transcript: undefined, has_transcript: !!r.transcript }))); });
 app.get("/api/video-candidates/:id", async (ctx) => { const r = await one(`SELECT * FROM video_candidates WHERE id=$1`, [ctx.params.id]); if (!r) throw new ApiError(404, null, "Not found"); json(ctx, 200, { ...rowJson(r, ["transcript"]), clips: await q(`SELECT * FROM clips WHERE video_candidate_id=$1 ORDER BY score DESC`, [r.id]) }); });
-app.post("/api/video-candidates", async (ctx) => { const b = ctx.body; if (!b.nicheId || !b.url) throw new ApiError(400, null, "nicheId and url are required"); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [b.nicheId]); if (!niche) throw new ApiError(404, null, "Program not found"); const id = newId(); await q(`INSERT INTO video_candidates (id, niche_id, source_url, title, platform, license, score, score_reason, status) VALUES ($1,$2,$3,$4,$5,$6,1,'manual','QUEUED')`, [id, b.nicheId, b.url, b.title || b.url, b.platform || null, b.license || "UNKNOWN"]); await enqueue("PROCESS_CANDIDATE", { candidateId: id }, { queue: "video", priority: 10, dedupeKey: `cand:${id}` }); json(ctx, 202, await one(`SELECT * FROM video_candidates WHERE id=$1`, [id])); });
-app.post("/api/video-candidates/:id/process", async (ctx) => { await q(`UPDATE video_candidates SET status='QUEUED', error_message=NULL WHERE id=$1`, [ctx.params.id]); await enqueue("PROCESS_CANDIDATE", { candidateId: ctx.params.id }, { queue: "video", priority: 10, dedupeKey: `cand:${ctx.params.id}` }); json(ctx, 202, { ok: true }); });
+app.post("/api/video-candidates", async (ctx) => { const b = ctx.body; if (!b.nicheId || !b.url) throw new ApiError(400, null, "nicheId and url are required"); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [b.nicheId]); if (!niche) throw new ApiError(404, null, "Program not found"); const id = newId(); await q(`INSERT INTO video_candidates (id, niche_id, source_url, title, platform, license, score, score_reason, status) VALUES ($1,$2,$3,$4,$5,$6,1,'manual','QUEUED')`, [id, b.nicheId, b.url, b.title || b.url, b.platform || null, b.license || "UNKNOWN"]); await enqueue("PROCESS_CANDIDATE", { candidateId: id }, { queue: videoQueueFor(niche), priority: 10, dedupeKey: `cand:${id}` }); json(ctx, 202, await one(`SELECT * FROM video_candidates WHERE id=$1`, [id])); });
+app.post("/api/video-candidates/:id/process", async (ctx) => { await q(`UPDATE video_candidates SET status='QUEUED', error_message=NULL WHERE id=$1`, [ctx.params.id]); const owner = await one(`SELECT n.* FROM niches n JOIN video_candidates c ON c.niche_id = n.id WHERE c.id = $1`, [ctx.params.id]); await enqueue("PROCESS_CANDIDATE", { candidateId: ctx.params.id }, { queue: videoQueueFor(owner), priority: 10, dedupeKey: `cand:${ctx.params.id}` }); json(ctx, 202, { ok: true }); });
 app.post("/api/video-candidates/:id/ignore", async (ctx) => { await q(`UPDATE video_candidates SET status='IGNORED' WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.get("/api/clips", async (ctx) => json(ctx, 200, await q(`SELECT c.*, vc.title AS source_title, vc.source_url FROM clips c JOIN video_candidates vc ON vc.id=c.video_candidate_id ORDER BY c.created_at DESC LIMIT 200`)));
 // ---- media / portal / research
@@ -4430,7 +4457,7 @@ app.post("/api/review/approve-clean", async (ctx) => {
 });
 app.post("/api/content-items/:id/approve", async (ctx) => { if (rateLimited(`appr:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many approve requests"); json(ctx, 200, await itemWithMedia(await approveItem(ctx.params.id, { scheduledFor: ctx.body.scheduledFor || null }))); });
 app.post("/api/content-items/:id/reject", async (ctx) => json(ctx, 200, await rejectItem(ctx.params.id, ctx.body.note)));
-app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); if (VIDEO_TYPES.has(it.content_type) && part === "all") { await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: "video", contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : queueFor(it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
+app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); if (VIDEO_TYPES.has(it.content_type) && part === "all") { const owner = await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]); await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: videoQueueFor(owner), contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : queueFor(it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
 // Reviewer edits to an AI draft are logged as style feedback, and a changed headline redraws the photocard.
 app.patch("/api/content-items/:id", async (ctx) => {
   const b = ctx.body; const map = { script: "script", headline: "headline", summary: "summary", body: "body", captions: "captions", hashtags: "hashtags", imagePrompt: "image_prompt", scheduledFor: "scheduled_for", heroMediaId: "hero_media_id" };
@@ -4490,7 +4517,9 @@ app.post("/api/seed", async (ctx) => {
     // URL Render hands the process, and what the image turned out to contain. A fix was merged at 14:31 today, redrawn
     // from the queue at 14:36, 14:47 and 15:10, and came out byte-identical every time — and nothing in the database
     // could say whether the new image was running at all.
-    putSetting("boot.last", { at: new Date().toISOString(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
+    // A PC worker boots against the same database, and it must not overwrite the server's record of itself — that
+    // record is how anyone tells which build the server is running. The PC writes its own.
+    putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: new Date().toISOString(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
       url: ENV.RENDER_EXTERNAL_URL || null, lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
       memory_mb: memoryLimitMb(), cpu: cpuFeatures() }).catch((e) => warn("boot.last", e.message));
     // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
