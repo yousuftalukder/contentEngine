@@ -1537,23 +1537,54 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
 // ---- Stock footage (Pexels, the same free key). A narrated section over real moving footage is the difference between
 // a slideshow and a video, and it costs nothing. Returns a clip long enough for the section, in the right shape, or
 // null — a section with no footage falls back to its picture, so a reel is never held up by a missing clip.
+// The library is shot mostly in America and Europe: "government inspection" comes back as American flags on buildings,
+// "shop owner" as a café in Lisbon. For a programme about one country, a clip is taken only when its own description
+// names that country or one of its places — "Dhaka street" returns rickshaws and Shahbag, and that is what a Bangladeshi
+// viewer recognises. The search is tried with the place added, then as the capital's own streets; nothing local, nothing.
+const STOCK_PLACES = {
+  bangladesh: ["dhaka", "bangladesh", "bangladeshi", "chittagong", "chattogram", "sylhet", "khulna", "rajshahi", "barisal", "cox-s-bazar", "sundarbans"],
+  india: ["delhi", "india", "indian", "mumbai", "kolkata", "bengaluru", "bangalore", "chennai", "hyderabad", "jaipur", "varanasi"],
+  pakistan: ["karachi", "pakistan", "pakistani", "lahore", "islamabad", "peshawar"],
+  nepal: ["kathmandu", "nepal", "nepali", "pokhara"],
+};
+function stockPlace(country) {
+  const c = String(country || "").trim().toLowerCase();
+  if (!c || /^(global|world|international|none)$/.test(c)) return null;
+  const words = STOCK_PLACES[c] || [c.replace(/[^a-z0-9]+/g, "-")];
+  return { country: String(country).trim(), city: words[0], words };
+}
+const stockIsLocal = (text, place) => !place || place.words.some((w) => String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").includes(w));
+// A section with no footage phrase falls back to its picture prompt, whose style words ("editorial illustration, cinematic
+// light") are noise to a library search and pull in whatever is tagged "illustration".
+const STOCK_NOISE = /^(editorial|illustration|illustrated|cinematic|digital|painting|style|modern|showing|shows|depicting|image|picture|photo|photograph|with|and|the|for|from|into|light|scene|view)$/i;
+const stockWords = (s, n) => String(s || "").trim().split(/[\s,.;:]+/).filter((w) => w.length > 2 && !STOCK_NOISE.test(w)).slice(0, n);
+// The searches to try, in order, for one phrase in one place.
+function stockSearches(query, place, n) {
+  const words = stockWords(query, n); if (!words.length) return [];
+  const q = words.join(" ");
+  if (!place) return [q];
+  const named = stockIsLocal(q, place);
+  return [...new Set([named ? q : `${q} ${place.country}`, `${place.city} ${words.slice(0, 2).join(" ")}`, `${place.city} street`])];
+}
 const pexelsClipUsed = new Map();
-async function pexelsFootage(query, { vertical = true, seconds = 6, ctx = {} } = {}) {
-  const q = String(query || "").trim().split(/\s+/).filter((w) => w.length > 2).slice(0, 5).join(" ");
-  if (!q) return null;
+async function pexelsFootage(query, { vertical = true, seconds = 6, country = null, ctx = {} } = {}) {
+  const place = stockPlace(country), searches = stockSearches(query, place, 5);
+  if (!searches.length) return null;
   const base = await setting("footage.api_base", "https://api.pexels.com/videos");
   return withKey("pexels", async (key) => {
-    const r = await fetchJson(`${base}/search?${form({ query: q, per_page: 12, orientation: vertical ? "portrait" : "landscape", size: "medium" })}`, { headers: { Authorization: key } });
     const want = vertical ? { w: 720, h: 1080 } : { w: 1280, h: 720 };
-    const pool = (r.videos || []).filter((v) => v.duration >= Math.min(seconds, 4) && Date.now() - (pexelsClipUsed.get(v.id) || 0) > 14 * 86400e3);
-    for (const v of pool.slice(0, 6)) {
-      const file = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.width >= want.w && f.height >= want.h).sort((a, b) => a.width * a.height - b.width * b.height)[0];
-      if (!file) continue;
-      pexelsClipUsed.set(v.id, Date.now());
-      return { url: file.link, seconds: v.duration, photographer: v.user?.name || "Pexels", id: v.id, page: v.url };
+    for (const q of searches) {
+      const r = await fetchJson(`${base}/search?${form({ query: q, per_page: 15, orientation: vertical ? "portrait" : "landscape", size: "medium" })}`, { headers: { Authorization: key } });
+      const pool = (r.videos || []).filter((v) => v.duration >= Math.min(seconds, 4) && Date.now() - (pexelsClipUsed.get(v.id) || 0) > 14 * 86400e3 && stockIsLocal(v.url, place));
+      for (const v of pool.slice(0, 6)) {
+        const file = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.width >= want.w && f.height >= want.h).sort((a, b) => a.width * a.height - b.width * b.height)[0];
+        if (!file) continue;
+        pexelsClipUsed.set(v.id, Date.now());
+        return { url: file.link, seconds: v.duration, photographer: v.user?.name || "Pexels", id: v.id, page: v.url, query: q };
+      }
     }
     return null;
-  }, ctx.pin).catch((e) => { warn(`stock footage "${q}": ${e.message.slice(0, 120)}`); return null; });
+  }, ctx.pin).catch((e) => { warn(`stock footage "${searches[0]}": ${e.message.slice(0, 120)}`); return null; });
 }
 // ---- Stock photography (Pexels, free key, commercial use). A real photo behind the headline where a generated
 // picture is not available or not worth paying for. Two rules keep it honest: the writer decides whether a generic
@@ -1565,14 +1596,21 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
     // An explicit null is the writer's judgement that a library photo would mislead here: the post takes a text card
     // instead. An absent phrase (a program that doesn't produce one) falls back to what it was going to draw.
     if (specs.photo_query === null) { const e = new Error("A library photo could mislead for this story, so it has none"); e.editorial = true; throw e; }
-    const query = String(specs.photo_query || prompt || headline || "").trim().split(/\s+/).filter((w) => w.length > 2).slice(0, 6).join(" ");
-    if (!query) throw new Error("No stock photo search phrase for this story");
+    const place = stockPlace(specs.country), searches = stockSearches(specs.photo_query || prompt || headline, place, 6);
+    if (!searches.length) throw new Error("No stock photo search phrase for this story");
     return withKey("pexels", async (key) => {
-      const r = await fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" })}`, { headers: { Authorization: key } });
       const wide = specs.width && specs.height ? specs.width / specs.height : 1;
-      const fresh = (r.photos || []).filter((p) => p?.src && Date.now() - (pexelsUsed.get(p.id) || 0) > 14 * 86400e3);
-      const pool = (fresh.length ? fresh : r.photos || []).filter((p) => p.width >= 1000 && (wide < 1 || p.width >= p.height));
-      if (!pool.length) throw new Error(`No usable stock photo for "${query}"`);
+      let pool = [], query = searches[0];
+      for (const s of searches) {
+        query = s;
+        const r = await fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" })}`, { headers: { Authorization: key } });
+        // A photo of another country is never the stand-in for this one, so the place filter comes before freshness.
+        const usable = (r.photos || []).filter((p) => p?.src && p.width >= 1000 && (wide < 1 || p.width >= p.height) && stockIsLocal(`${p.url} ${p.alt || ""}`, place));
+        const fresh = usable.filter((p) => Date.now() - (pexelsUsed.get(p.id) || 0) > 14 * 86400e3);
+        pool = fresh.length ? fresh : usable;
+        if (pool.length) break;
+      }
+      if (!pool.length) throw new Error(`No usable stock photo for "${searches[0]}"${place ? ` that shows ${place.country}` : ""}`);
       const photo = pool[Math.floor(Math.random() * Math.min(5, pool.length))];   // vary the pick so a topic isn't always the same picture
       pexelsUsed.set(photo.id, Date.now());
       const bytes = await fetchBytes(photo.src.large2x || photo.src.large || photo.src.original);
@@ -2833,7 +2871,7 @@ async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
   // The kit's colours are lifted out of it, because the overlay composer reads them at the top level — without this a
   // brand's own accent is quietly replaced by a default blue on every headline burned over a picture.
   const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", lang, kit,
-    accent_color: kit.accent_color, text_color: kit.text_color, photo: m.photo || null, photo_outlet: m.photo_outlet || null, ...own };
+    accent_color: kit.accent_color, text_color: kit.text_color, photo: m.photo || null, photo_outlet: m.photo_outlet || null, country: niche.country || null, ...own };
   if (specs.layout === "photocard") {
     const outlets = [...new Set((m.versions?.length ? m.versions.map((v) => v.outlet) : [m.raw?.outlet]).filter(Boolean))].slice(0, 2);
     specs.card_meta = { date: cardDate(lang, /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC"), credit: kit.credit_sources === false || !outlets.length ? null : `${lang === "bn" ? "সূত্র" : "Source"}: ${outlets.join(", ")}` };
@@ -3055,7 +3093,7 @@ async function generateReel(item, niche, style) {
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
     system: `${spec.system} Channel: "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
-    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"hook": "3-7 words that stop a scroll: the most surprising concrete thing in this story, stated as a claim — not a tease, not a question", "title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section (a place, an action, a scene) — or null where only a specific real event would do"}], "description": "post caption / video description", "hashtags": ["..."]}`,
+    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"hook": "3-7 words that stop a scroll: the most surprising concrete thing in this story, stated as a claim — not a tease, not a question", "title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section: an everyday scene${niche.country ? ` as it looks in ${niche.country}` : ""} (a street, a market, a kitchen, traffic) — not officials, offices or government buildings, which stock libraries fill with other countries' flags; null where only a specific real event would do"}], "description": "post caption / video description", "hashtags": ["..."]}`,
     mock: { hook: m.title.split(/\s+/).slice(0, 5).join(" "), title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
   if (!sections.length) throw new Error("The script came back without sections");
@@ -3077,10 +3115,10 @@ async function generateReel(item, niche, style) {
     if (broll && query && !ownPhoto) {
       // Narration length is only measured later, so the clip is chosen against a reading-speed estimate of this section.
       const spoken = Math.max(4, Math.round(String(s.narration).split(/\s+/).filter(Boolean).length / 2.2));
-      const clip = await pexelsFootage(query, { vertical, seconds: spoken + 1 });
+      const clip = await pexelsFootage(query, { vertical, seconds: spoken + 1, country: niche.country });
       if (clip) {
         const media = await recordMedia({ contentItemId: item.id, kind: "VIDEO", url: clip.url, mime: "video/mp4",
-          meta: { provider: "pexels", clip_id: clip.id, photographer: clip.photographer, page: clip.page, section: i, purpose: "b-roll" } });
+          meta: { provider: "pexels", clip_id: clip.id, photographer: clip.photographer, page: clip.page, query: clip.query, section: i, purpose: "b-roll" } });
         images.push({ ...media, kind: "VIDEO", cost: 0 }); footage++; continue;
       }
     }
@@ -3088,7 +3126,7 @@ async function generateReel(item, niche, style) {
     // is a slideshow of one picture. The rest of the sections run on footage or the brand's backdrop.
     const img = await imageOrCard(niche, item.id, { prompt: s.image_prompt, headline: title, backdrop: true, skipApi: noPics,
       specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false,
-        photo: m.photo || null, photo_outlet: m.photo_outlet || null, photo_lead: i === 0, ...(P(niche.image_specs) || {}), style: style2 } });
+        photo: m.photo || null, photo_outlet: m.photo_outlet || null, photo_lead: i === 0, country: niche.country || null, ...(P(niche.image_specs) || {}), style: style2 } });
     noPics = noPics || img.fallbackError; await addCost(item.id, img.cost); images.push(img);
   }
   if (footage) log(`reel ${item.id}: ${footage} of ${sections.length} sections on stock footage`);

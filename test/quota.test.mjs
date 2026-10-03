@@ -288,6 +288,50 @@ test("reels: sections run on stock footage, and a section that must not use it k
   } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
 });
 
+// The library is shot mostly in America: "government inspection" comes back as flags on buildings, and one of those
+// once opened a reel about gas prices in Bangladesh. A programme about one country takes a clip only when the clip's own
+// description names that country; it searches with the country added, then the capital's streets, then gives up.
+test("reels: a programme about one country never takes a clip of another", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const clipFile = join(dir, "broll_local.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30", "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p", clipFile]);
+  const { readFileSync } = await import("node:fs");
+  const bytes = readFileSync(clipFile);
+  const asked = [];
+  const http = await import("node:http");
+  const stub = http.createServer((req, res) => {
+    if (req.url.startsWith("/videos/search")) {
+      asked.push(new URL(req.url, "http://x").searchParams.get("query"));
+      const link = `http://127.0.0.1:${stub.address().port}/clip.mp4`;
+      const files = [{ file_type: "video/mp4", width: 720, height: 1280, link }];
+      res.writeHead(200, { "content-type": "application/json" });
+      // The foreign clip comes first, as it does for real: the filter, not the ranking, has to keep it out.
+      return res.end(JSON.stringify({ videos: [
+        { id: 9101, duration: 8, url: "https://www.pexels.com/video/american-flag-waving-by-urban-skyscraper-9101/", user: { name: "Elsewhere" }, video_files: files },
+        { id: 9102, duration: 8, url: "https://www.pexels.com/video/bustling-street-life-near-dhaka-university-9102/", user: { name: "Local" }, video_files: files }] }));
+    }
+    res.writeHead(200, { "content-type": "video/mp4" }); res.end(bytes);
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  try {
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_reel_local", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Write the video in exactly", json: {
+      title: "Raids on gas cylinder dealers", kicker: "News", description: "d", hashtags: ["bd"],
+      sections: [{ narration: "Inspectors fined thirty nine gas cylinder dealers across the country.", image_prompt: "Editorial illustration of a gas shop", footage_query: "gas cylinder shop" },
+                 { narration: "The raids covered sixteen districts on Saturday.", image_prompt: "inspectors", footage_query: "government inspection" }] } }] } });
+    await eng.api("PUT", "/api/settings/footage.api_base", { value: `http://127.0.0.1:${stub.address().port}/videos` });
+    const p = await program("reel_local", { contentType: "NEWS_REEL", country: "Bangladesh", scriptAdapter: "llm_reel_local", imageAdapter: "image_no_key", voiceAdapter: "tts_mock", renderAdapter: "ffmpeg", methodConfig: { slides: 2 } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Raids on gas cylinder dealers" });
+    await waitFor(async () => { const it = await eng.api("GET", `/api/content-items/${id}`); if (it.status === "FAILED") throw new Error(it.rejection_note); return it.status === "PENDING_REVIEW" && it; }, { timeout: 120000, interval: 500, what: "a reel on local footage" });
+
+    const clips = (await eng.query(`SELECT meta FROM media_assets WHERE content_item_id = $1 AND kind = 'VIDEO' AND meta->>'provider' = 'pexels'`, [id])).map((r) => r.meta);
+    assert.equal(clips.length, 1, `one section found local footage — got ${JSON.stringify(clips)}`);
+    assert.equal(clips[0].clip_id, 9102, "the Dhaka clip, not the flag that was ranked above it");
+    assert.equal(clips[0].query, "gas cylinder shop Bangladesh", "the search that found it is on record");
+    // The second section: the Dhaka clip is already used, the flag is never allowed, so it tries the capital and then
+    // keeps its picture rather than fall back to something foreign.
+    assert.deepEqual(asked.slice(1), ["government inspection Bangladesh", "dhaka government inspection", "dhaka street"]);
+  } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
+});
+
 // A speech model reads "BNP" as a word and drifts in loudness between calls. Both are audible, and both are handled
 // before the audio is joined: the spoken text is kept on the track, so what the voice was asked to say is on record.
 test("narration: acronyms are spelled out for the voice, and a brand's own spellings win", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
