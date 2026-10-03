@@ -61,7 +61,10 @@ export async function startEngine({ env = {} } = {}) {
     await waitFor(async () => { if (exited !== null) throw new Error(`server exited with ${exited}`); return (await fetch(`${base}/health`)).ok; }, { timeout: 60000, what: "server boot" });
   } catch (e) { child.kill(); await pgServer.stop(); await db.close(); throw new Error(`${e.message}\n--- server log ---\n${logs}`); }
 
-  const sql = new pg.Pool({ connectionString: databaseUrl, max: 2 });
+  // A test that points this engine at another engine's database (env.DATABASE_URL) must also query that database —
+  // otherwise query() reads this engine's own empty one and the test looks at tables that are not there.
+  const usedUrl = env.DATABASE_URL || databaseUrl;
+  const sql = new pg.Pool({ connectionString: usedUrl, max: 2 });
   async function api(method, path, body) {
     const res = await fetch(base + path, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
     const data = await res.json().catch(() => null);
@@ -71,7 +74,7 @@ export async function startEngine({ env = {} } = {}) {
   const query = async (text, params) => (await sql.query(text, params)).rows;
 
   return {
-    base, api, query, logs: () => logs, pid: child.pid, databaseUrl,
+    base, api, query, logs: () => logs, pid: child.pid, databaseUrl: usedUrl,
     // The in-process database is left open on purpose: closing PGlite while the socket server is still draining a query
     // from the killed server crashes it asynchronously. The test process exits right after, which releases it.
     async stop() {

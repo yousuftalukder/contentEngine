@@ -48,3 +48,13 @@ whisper-cli -m /opt/whisper/ggml-base.bin -f /tmp/in.wav -oj -of /tmp/out -nt -l
 cat /tmp/out.json
 grep -qi 'fox' /tmp/out.json
 echo "ok: the word survived the round trip, on both builds"
+
+echo "== edge-tts speaks Bangla =="
+# Proves the install inside the image and that a Bangla voice produces real speech. It proves nothing about whether
+# Microsoft answers Render's address — that is checked from production with POST /api/voices/test.
+printf '%s' 'সোনারগাঁয়ে মেঘনা নদীতে আজ দুপুরে একটি নৌকাডুবির ঘটনা ঘটেছে।' > /tmp/bn.txt
+edge-tts --voice bn-BD-NabanitaNeural --file /tmp/bn.txt --write-media /tmp/bn.mp3
+bndur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/bn.mp3)
+echo "bangla narration: ${bndur}s"
+awk -v d="$bndur" 'BEGIN { exit (d > 2 ? 0 : 1) }'
+echo "ok: edge-tts produced ${bndur}s of Bangla speech"
