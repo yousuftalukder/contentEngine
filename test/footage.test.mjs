@@ -54,6 +54,35 @@ test("voice-over reel: vertical blur-pad layout covering the whole narration", {
   assert.ok(item.script?.length > 0, "the narration is stored as the script");
 });
 
+// The split-screen reaction: the source on top, the host's own clip below, the source played 1.1× so the upload is not
+// the original frame for frame. Duration follows the speed, and both sounds are in the mix.
+test("reaction split-screen: source over host at 1.1×, vertical, shorter by the speed", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const p = await eng.api("POST", "/api/programs", { ...base(), key: "react_stack", displayName: "Stacked reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY",
+    methodConfig: { overlay_video_url: join(dir, "reactor.mp4"), speed: 1.1, clips_per_video: 1 } });
+  const { item, info } = await renderFrom(p);
+  const v = info.streams.find((s) => s.codec_type === "video");
+  assert.equal(v.width * 16, v.height * 9, `a vertical frame (${v.width}×${v.height})`);
+  assert.ok(info.streams.some((s) => s.codec_type === "audio"), "with sound");
+  const clip = item.hero_media.meta.clip, expected = (clip.end - clip.start) / 1.1;
+  assert.ok(Math.abs(Number(info.format.duration) - expected) < 0.6, `${info.format.duration}s for a ${clip.end - clip.start}s moment at 1.1× (expected ≈${expected.toFixed(1)}s)`);
+});
+
+// On an instance the size of Render's free one, the reaction renders at the size that machine can encode — a fixed
+// 1080×1920 is what used to take such an instance past its memory — and the host can sit in a corner instead.
+test("reaction picture-in-picture renders at the small instance's size", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const small = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999" } });
+  try {
+    await small.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const b = await small.api("POST", "/api/brands", { name: "Small reactions", brandKit: { primary_color: "#0b3d91", logo_url: join(dir, "logo.png") } });
+    const p = await small.api("POST", "/api/programs", { ...base(), brandId: b.id, key: "react_pip", displayName: "PiP reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY",
+      methodConfig: { overlay_video_url: join(dir, "reactor.mp4"), reaction_layout: "pip", clips_per_video: 1 } });
+    await small.api("POST", "/api/video-candidates", { nicheId: p.id, url: join(dir, "source.mp4"), title: "Test broadcast" });
+    const it = await waitFor(async () => { const x = (await small.api("GET", `/api/content-items?nicheId=${p.id}`))[0]; if (x?.status === "FAILED") throw new Error(x.rejection_note); return x?.status === "PENDING_REVIEW" && x; }, { timeout: 240000, interval: 1000, what: "a PiP reaction rendered" });
+    const full = await small.api("GET", `/api/content-items/${it.id}`);
+    assert.deepEqual([full.hero_media.width, full.hero_media.height], [720, 1280]);
+  } finally { await small.stop(); }
+});
+
 // The studio renderer is picked for any program that makes its own videos, on whatever machine the video lane runs on.
 // An instance too small for Chromium must still produce the reel through ffmpeg rather than fail the item.
 test("a studio program on an instance too small for the studio still renders, through ffmpeg", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {

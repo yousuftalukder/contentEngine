@@ -1940,7 +1940,8 @@ const hasAudio = async (file) => { try { const { out } = await exec("ffprobe", [
 // Last pass on every footage video: the brand logo in a corner and loudness normalised for social platforms (-14 LUFS).
 async function brandFinish(file, niche, { vertical = true } = {}) {
   const { brand } = await studioBrand(niche); const out = tmpPath("mp4"), audio = await hasAudio(file);
-  const logoW = Math.round((vertical ? 1080 : 1920) * (vertical ? 0.2 : 0.12)), margin = vertical ? 48 : 40;
+  const fw = renderSize(vertical ? "9:16" : "16:9")[0];
+  const logoW = Math.round(fw * (vertical ? 0.2 : 0.12)), margin = Math.round(fw * (vertical ? 0.044 : 0.021));
   try {
     const args = ["-y", "-i", file, ...(brand.logo ? ["-i", brand.logo] : [])];
     const fc = brand.logo ? `[1:v]scale=${logoW}:-1,format=rgba,colorchannelmixer=aa=0.88[lg];[0:v][lg]overlay=${margin}:${margin}[v]` : "[0:v]null[v]";
@@ -1991,7 +1992,7 @@ function shapeReaction(beats, cfg = {}) {
   return { beats: out, stats: { comments: out.filter((b) => b.type === "comment").length, plays: out.filter((b) => b.type === "play").length, commentSeconds, playSeconds, commentShare: total ? commentSeconds / total : 1 } };
 }
 async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
-  const W = 1920, H = 1080, FMT = ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"];
+  const [W, H] = renderSize("16:9"), FMT = ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"];
   const { brand } = await studioBrand(niche); const reactor = reactorUrl ? await toTmpFile(reactorUrl, "mp4") : null;
   const accent = (brand.accent || "#ffc400").replace("#", "0x"), srcAudio = await hasAudio(sourcePath), segs = [], temp = [];
   try {
@@ -2001,7 +2002,7 @@ async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
       if (b.type === "play") {
         const dur = Math.max(1, b.end - b.start); lastT = b.end;
         const inputs = ["-ss", String(b.start), "-t", String(dur), "-i", sourcePath, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : []), ...(srcAudio ? [] : ["-f", "lavfi", "-t", String(dur), "-i", "anullsrc=r=48000:cl=stereo"])];
-        const fc = `[0:v]${vfLandscape()},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=520:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-40:H-h-40:shortest=1[v]` : ";[m]null[v]");
+        const fc = `[0:v]${vfLandscape()},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=${Math.round((W * 0.27) / 2) * 2}:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-${Math.round(W * 0.02)}:H-h-${Math.round(W * 0.02)}:shortest=1[v]` : ";[m]null[v]");
         const aIn = srcAudio ? "0:a" : `${reactor ? 2 : 1}:a`;
         await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", aIn, "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
       } else {
@@ -2014,7 +2015,7 @@ async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
         // the clip: during commentary the person talking is not a thumbnail of themselves.
         const panel = Math.round(H * 0.56), py = Math.round((H - panel) / 2), mx = Math.round(W * 0.05);
         const side = reactor ? `[1:v]scale=-2:${panel},fps=30,setsar=1,pad=iw+10:ih+10:5:5:color=${accent}[r]`
-          : `[2:a]showwaves=s=640x${panel}:mode=cline:colors=${accent}:rate=30,format=yuva420p[r]`;
+          : `[2:a]showwaves=s=${Math.round(W / 6) * 2}x${panel}:mode=cline:colors=${accent}:rate=30,format=yuva420p[r]`;
         const fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:3,eq=brightness=-0.3[bg];`
           + `[0:v]scale=-2:${panel},pad=iw+10:ih+10:5:5:color=black@0.6[fz];[bg][fz]overlay=${mx}:${py}[a];`
           + `${side};[a][r]overlay=W-w-${mx}:${py}[b];[b]${assVf(ass)},fps=30,format=yuv420p[v]`;
@@ -2064,17 +2065,32 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         file = await renderReactionLong({ beats: extras.beats, sourcePath, niche, reactorUrl: c.reactor_url || extras.reactorUrl || null }); break;
       }
       case "REACTION_OVERLAY": {
-        // The captions go on after the stack, not into the clip before it. Burned in first they are sized for a
-        // 1920-wide frame and then squashed into a half-height box, which halves the type and leaves it unreadable
-        // on a phone — which is the only place a 9:16 video is watched.
+        // The source and the host's own reaction in one vertical frame: stacked (source on top, host below) or the
+        // host in a corner over the whole source. `speed` (up to 1.5) plays the source a little faster — 1.1 is the
+        // usual choice — so the upload is not the original frame for frame. The frame is this machine's render size:
+        // a fixed 1080×1920 once took a free instance past its memory and killed the job.
+        const ovUrl = c.overlay_video_url || c.reactor_url; if (!ovUrl) throw new Error("REACTION_OVERLAY needs method_config.overlay_video_url (your own reaction clip)");
+        const speed = Math.min(1.5, Math.max(1, Number(c.speed) || 1)), len = (clip.end - clip.start) / speed;
         const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false });
-        const ovUrl = c.overlay_video_url; if (!ovUrl) throw new Error("REACTION_OVERLAY needs method_config.overlay_video_url (your own reaction clip)");
         const ov = await toTmpFile(ovUrl, "mp4"); file = tmpPath("mp4");
-        const stackAss = caps[caps.push(await assFor(true, false)) - 1];
-        const box = "scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=black";
-        const fc = `[0:v]${box}[m];[1:v]${box}[o];[m][o]vstack=inputs=2,${assVf(stackAss)}[v]`;
-        try { await exec("ffmpeg", ["-y", "-i", main, "-stream_loop", "-1", "-i", ov, "-filter_complex", `${fc};[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]`, "-map", "[v]", "-map", "[a]", "-t", String(clip.end - clip.start), ...X264, file]); }
-        catch { await exec("ffmpeg", ["-y", "-i", main, "-stream_loop", "-1", "-i", ov, "-filter_complex", fc, "-map", "[v]", "-map", "0:a", "-t", String(clip.end - clip.start), ...X264, file]); }
+        const [W, H] = renderSize("9:16"), half = Math.round(H / 4) * 2, margin = Math.round(W * 0.045);
+        // The captions go on after the stack, not into the clip before it: burned in first they are sized for a wide
+        // frame and then squashed into a half-height box, which leaves them unreadable on a phone. Their times follow
+        // the faster playback.
+        const at = (t) => clip.start + (t - clip.start) / speed;
+        const fastSegs = segs.map((x) => ({ ...x, start: at(x.start), end: at(x.end), words: x.words?.map((w) => ({ ...w, start: at(w.start), end: at(w.end) })) }));
+        const stackAss = caps[caps.push(await assFor(true, false, fastSegs, clip.start, clip.start + len)) - 1];
+        const fast = speed !== 1 ? `setpts=PTS/${speed},` : "";
+        const box = (w, h) => `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+        const pip = c.reaction_layout === "pip", hostW = Math.round((W * 0.38) / 2) * 2;
+        const vfc = pip
+          ? `[0:v]${fast}${vfVerticalBlurpad()}[m];[1:v]scale=${hostW}:-2,setsar=1,pad=iw+8:ih+8:4:4:color=white[o];[m][o]overlay=W-w-${margin}:${Math.round(H * 0.1)}:shortest=0,${assVf(stackAss)}[v]`
+          : `[0:v]${fast}${box(W, half)}[m];[1:v]${box(W, H - half)}[o];[m][o]vstack=inputs=2,${assVf(stackAss)}[v]`;
+        // The source's sound at the new speed with the host's on top; whichever side has no audio track is left out.
+        const [mainA, hostA] = [await hasAudio(main), await hasAudio(ov)], hostVol = Number(c.reactor_volume ?? 1);
+        const afc = mainA && hostA ? `;[0:a]${speed !== 1 ? `atempo=${speed},` : ""}${AFMT}[ma];[1:a]volume=${hostVol},${AFMT}[ra];[ma][ra]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[a]`
+          : mainA ? `;[0:a]${speed !== 1 ? `atempo=${speed},` : ""}anull[a]` : hostA ? `;[1:a]volume=${hostVol}[a]` : "";
+        await exec("ffmpeg", ["-y", "-i", main, "-stream_loop", "-1", "-i", ov, "-filter_complex", vfc + afc, "-map", "[v]", ...(afc ? ["-map", "[a]"] : []), "-t", String(len), ...X264, file], { timeoutMs: 30 * 60000 });
         await cleanup(main, ov); break;
       }
       case "VOICEOVER": {
