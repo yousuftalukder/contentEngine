@@ -452,10 +452,13 @@ async function sweepStorageCleanup() {
 async function toTmpFile(url, ext) {
   if (!url || url.startsWith("mock://")) throw new Error(`Cannot download mock/empty media "${url}" — a live render needs a real file`);
   const out = tmpPath(ext || (extname(url.split("?")[0]).slice(1) || "bin"));
-  const localPrefix = `/media/`;
-  const i = url.indexOf(localPrefix);
   if (!/^https?:/.test(url)) { await writeFile(out, await readFile(url)); return out; }
-  if (i > 0 && (await storageBackend()).name === "local") { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, url.slice(i + localPrefix.length)))); return out; }
+  // This engine's own files, read from disk — matched on the whole media path, because an outlet's photo under
+  // /uploads/media/ is somebody else's file, not one of ours.
+  if ((await storageBackend()).name === "local") {
+    const path = new URL(url).pathname, own = `${new URL(await STORAGE.local.publicBase()).pathname}/`;
+    if (path.startsWith(own)) { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, decodeURIComponent(path.slice(own.length))))); return out; }
+  }
   const gone = await one(`SELECT id FROM media_assets WHERE url=$1 AND deleted_at IS NOT NULL`, [url]);
   if (gone) throw new Error("This media file was already deleted by storage cleanup after publishing — regenerate the item to produce a new file");
   await writeFile(out, await fetchBytes(url));
@@ -1553,6 +1556,8 @@ function stockPlace(country) {
   const words = STOCK_PLACES[c] || [c.replace(/[^a-z0-9]+/g, "-")];
   return { country: String(country).trim(), city: words[0], words };
 }
+// Background must stay background: a wall of slogans or a march says something the story did not.
+const STOCK_LOADED = /(graffiti|protest|rally|riot|demonstrat|slogan|election|campaign|police|military|army|funeral|mosque|temple|church)/;
 const stockIsLocal = (text, place) => !place || place.words.some((w) => String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").includes(w));
 // A section with no footage phrase falls back to its picture prompt, whose style words ("editorial illustration, cinematic
 // light") are noise to a library search and pull in whatever is tagged "illustration".
@@ -1575,7 +1580,7 @@ async function pexelsFootage(query, { vertical = true, seconds = 6, country = nu
     const want = vertical ? { w: 720, h: 1080 } : { w: 1280, h: 720 };
     for (const q of searches) {
       const r = await fetchJson(`${base}/search?${form({ query: q, per_page: 15, orientation: vertical ? "portrait" : "landscape", size: "medium" })}`, { headers: { Authorization: key } });
-      const pool = (r.videos || []).filter((v) => v.duration >= Math.min(seconds, 4) && Date.now() - (pexelsClipUsed.get(v.id) || 0) > 14 * 86400e3 && stockIsLocal(v.url, place));
+      const pool = (r.videos || []).filter((v) => v.duration >= Math.min(seconds, 4) && Date.now() - (pexelsClipUsed.get(v.id) || 0) > 14 * 86400e3 && stockIsLocal(v.url, place) && !STOCK_LOADED.test(v.url || ""));
       for (const v of pool.slice(0, 6)) {
         const file = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.width >= want.w && f.height >= want.h).sort((a, b) => a.width * a.height - b.width * b.height)[0];
         if (!file) continue;
@@ -1605,7 +1610,7 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
         query = s;
         const r = await fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" })}`, { headers: { Authorization: key } });
         // A photo of another country is never the stand-in for this one, so the place filter comes before freshness.
-        const usable = (r.photos || []).filter((p) => p?.src && p.width >= 1000 && (wide < 1 || p.width >= p.height) && stockIsLocal(`${p.url} ${p.alt || ""}`, place));
+        const usable = (r.photos || []).filter((p) => p?.src && p.width >= 1000 && (wide < 1 || p.width >= p.height) && stockIsLocal(`${p.url} ${p.alt || ""}`, place) && !STOCK_LOADED.test(`${p.url} ${p.alt || ""}`.toLowerCase()));
         const fresh = usable.filter((p) => Date.now() - (pexelsUsed.get(p.id) || 0) > 14 * 86400e3);
         pool = fresh.length ? fresh : usable;
         if (pool.length) break;
@@ -1625,18 +1630,25 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
 // Small images are refused: a byline portrait, a section badge or a tracking pixel is worse than no picture at all.
 impl("IMAGE", "source_photo", { label: "The story's own photo", configSchema: { min_width: { type: "number", default: 600 }, min_height: { type: "number", default: 340 } }, create: (cfg) => ({
   async generate({ headline, specs = {}, contentItemId }) {
-    const url = specs.photo;
-    if (!url) { const e = new Error("The story came without a photo of its own"); e.editorial = true; throw e; }
-    const file = await toTmpFile(url);
-    try {
-      const { width, height } = await imageDims(file);
-      if (width < (cfg.min_width || 600) || height < (cfg.min_height || 340)) throw new Error(`The story's photo is only ${width}×${height} — a badge or a byline portrait, not a news picture`);
-      const outlet = specs.photo_outlet || null;
-      const credit = outlet ? `${specs.lang === "bn" ? "ছবি" : "Photo"}: ${outlet}` : undefined;
-      const media = await storeImage(await readFile(file), "image/jpeg", contentItemId, { provider: "source", photo_url: url, outlet, width, height },
-        {}, { headline, specs: { ...specs, ...(credit ? { photo_credit: credit } : {}) } });
-      return { ...media, cost: 0, units: 1 };
-    } finally { await cleanup(file); }
+    // Every outlet's picture, heaviest outlet first: one outlet's feed carries a 300×300 thumbnail of the same story
+    // another outlet ran at 1200×630, and the first picture found is not the first one worth using.
+    const photos = specs.photos?.length ? specs.photos : specs.photo ? [{ url: specs.photo, outlet: specs.photo_outlet || null }] : [];
+    if (!photos.length) { const e = new Error("The story came without a photo of its own"); e.editorial = true; throw e; }
+    const refused = [];
+    for (const { url, outlet = null } of photos) {
+      let file;
+      try {
+        file = await toTmpFile(url);
+        const { width, height } = await imageDims(file);
+        if (width < (cfg.min_width || 600) || height < (cfg.min_height || 340)) { refused.push(`${outlet || "photo"} ${width}×${height}`); continue; }
+        const credit = outlet ? `${specs.lang === "bn" ? "ছবি" : "Photo"}: ${outlet}` : undefined;
+        const media = await storeImage(await readFile(file), "image/jpeg", contentItemId, { provider: "source", photo_url: url, outlet, width, height },
+          {}, { headline, specs: { ...specs, photo_outlet: outlet, ...(credit ? { photo_credit: credit } : {}) } });
+        return { ...media, cost: 0, units: 1 };
+      } catch (e) { refused.push(`${outlet || "photo"}: ${e.message.slice(0, 60)}`); }
+      finally { if (file) await cleanup(file); }
+    }
+    throw new Error(`The story's photos are all too small or unreadable (${refused.join("; ")}) — a badge or a byline portrait is not a news picture`);
   } }) });
 impl("IMAGE", "openai_image", { label: "OpenAI image generation", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_IMAGE_MODEL }, quality: { type: "string", default: "medium" } }, create: (cfg, ctx = {}) => ({
   async generate({ prompt, headline, specs = {}, contentItemId }) {
@@ -2871,7 +2883,7 @@ async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
   // The kit's colours are lifted out of it, because the overlay composer reads them at the top level — without this a
   // brand's own accent is quietly replaced by a default blue on every headline burned over a picture.
   const specs = { width, height, brand: kit.display_name || brand?.name || niche.display_name, layout: "photocard", lang, kit,
-    accent_color: kit.accent_color, text_color: kit.text_color, photo: m.photo || null, photo_outlet: m.photo_outlet || null, country: niche.country || null, ...own };
+    accent_color: kit.accent_color, text_color: kit.text_color, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [], country: niche.country || null, ...own };
   if (specs.layout === "photocard") {
     const outlets = [...new Set((m.versions?.length ? m.versions.map((v) => v.outlet) : [m.raw?.outlet]).filter(Boolean))].slice(0, 2);
     specs.card_meta = { date: cardDate(lang, /bangladesh/i.test(niche.country || "") ? "Asia/Dhaka" : "UTC"), credit: kit.credit_sources === false || !outlets.length ? null : `${lang === "bn" ? "সূত্র" : "Source"}: ${outlets.join(", ")}` };
@@ -2948,8 +2960,25 @@ const ogImage = (html) => {
   }
   return "";
 };
-// The story's own photo: what the feed carried, else what the article page declared.
-const leadPhoto = (sourceItem) => sourceItem.thumbnail_url || P(sourceItem.raw)?.lead_image || null;
+// Some outlets' og:image is an overlay service that burns their logo band over the photo, with the photo itself as a
+// parameter (og.ajkerpatrika.com/api/overlay/?image=…). The photo is theirs either way and is credited to them; their
+// watermark on another page's video is not something to carry.
+const unwrapPhoto = (u) => { try { const inner = new URL(u).searchParams.get("image"); return inner && /^https?:\/\/\S+$/i.test(inner) ? inner : u; } catch { return u; } };
+// Feeds carry thumbnails, and several outlets refuse the server's address when it asks for the article page that names
+// the full-size photo. The full size sits at a predictable address beside the thumbnail, checked outlet by outlet:
+// Ittefaq, Desh Rupantor, Bangla Tribune and Dhaka Tribune share a CMS whose share image is the 1200×630 cache of the
+// same upload; Banglanews24 keeps a thumbnail folder beside the original; BBC's image server takes the width in the path.
+// A wrong guess is only a refused fetch, and the thumbnail is still tried after it.
+const FULL_SIZE = [
+  [/\/contents\/cache\/images\/(?!1200x630)\d+x\d+[^/]*\//, "/contents/cache/images/1200x630x1xxxxx1/"],
+  [/(banglanews24\.com\/.*)\/thumbnail\//, "$1/"],
+  [/(ichef\.bbci\.co\.uk\/(?:ace\/ws|news))\/\d{2,3}\//, "$1/976/"],
+];
+const fullSize = (u) => FULL_SIZE.reduce((s, [re, to]) => s.replace(re, to), u);
+// The story's own photos, best first: what the article page declared for Facebook (full size), then what the feed
+// carried, raised to its full size where the outlet keeps one.
+const photoCandidates = (sourceItem) => [...new Set([P(sourceItem.raw)?.lead_image, sourceItem.thumbnail_url].filter(Boolean).map(unwrapPhoto).flatMap((u) => [fullSize(u), u]))];
+const leadPhoto = (sourceItem) => photoCandidates(sourceItem)[0] || null;
 async function articleText(sourceItem) {
   const raw = P(sourceItem.raw) || {};
   if (typeof raw.article_text === "string") return raw.article_text;                       // cached (may be "" = tried, nothing usable)
@@ -2973,7 +3002,7 @@ async function clusterMaterial(item) {
   for (const r of rows) {
     const outlet = P(r.raw)?.outlet || r.source_name; if (seen.has(outlet)) continue; seen.add(outlet);
     const text = r.kind === "ARTICLE" ? await articleText(r) : "";                       // also fills in the page's own photo
-    versions.push({ outlet, title: r.title, summary: r.summary || "", text, url: r.url, published_at: r.published_at, photo: leadPhoto(r) });
+    versions.push({ outlet, title: r.title, summary: r.summary || "", text, url: r.url, published_at: r.published_at, photo: leadPhoto(r), photos: photoCandidates(r) });
     if (versions.length >= 4) break;
   }
   // The heaviest outlet is not always the one with anything to read. An outlet read through Google News gives a
@@ -2983,9 +3012,9 @@ async function clusterMaterial(item) {
   const lead = versions.find((v) => v.text) || versions.find((v) => v.summary) || versions[0];
   // The heaviest outlet that ran a picture: the lead's own if it has one, otherwise a corroborating outlet's, since the
   // story is the same story. Which outlet it came from is kept, because the credit on the card has to be true.
-  const withPhoto = versions.find((v) => v.photo);
+  const photos = versions.flatMap((v) => v.photos.map((url) => ({ url, outlet: v.outlet }))).slice(0, 6);
   return { title: lead.title, summary: lead.summary, text: lead.text, url: lead.url, published_at: lead.published_at,
-    photo: withPhoto?.photo || null, photo_outlet: withPhoto?.outlet || null, raw: { outlets: versions.map((v) => v.outlet) }, versions };
+    photo: photos[0]?.url || null, photo_outlet: photos[0]?.outlet || null, photos, raw: { outlets: versions.map((v) => v.outlet) }, versions };
 }
 // The material as prompt text. Several outlets' versions are each clipped so the total stays near ARTICLE_TEXT_MAX, and
 // the writer is told how to treat agreement and conflict between them.
@@ -3012,7 +3041,7 @@ const richMaterial = (m) => (m.versions?.length ? m.versions.some((v) => v.text)
 // Resolve the raw material for a text item: a news-desk story cluster, a routed source_item, or a legacy TOPIC adapter pull.
 async function materialFor(item, niche) {
   if (item.cluster_id) { const m = await clusterMaterial(item); if (m) return m; }
-  if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); const text = s.kind === "ARTICLE" ? await articleText(s) : ""; return { title: s.title, summary: s.summary, text, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, photo: leadPhoto(s), photo_outlet: P(s.raw)?.outlet || null, raw: P(s.raw) }; }
+  if (item.source_item_id) { const s = await one(`SELECT * FROM source_items WHERE id = $1`, [item.source_item_id]); const text = s.kind === "ARTICLE" ? await articleText(s) : ""; return { title: s.title, summary: s.summary, text, url: s.url, published_at: s.published_at, thumbnail: s.thumbnail_url, photo: leadPhoto(s), photo_outlet: P(s.raw)?.outlet || null, photos: photoCandidates(s).map((url) => ({ url, outlet: P(s.raw)?.outlet || null })), raw: P(s.raw) }; }
   const src = P(item.source_data_ref); if (item.topic && src && src.provider !== "topic_adapter_pending") return { title: item.topic, summary: src.description || src.summary || "", url: src.url || null, raw: src };
   const past = (await q(`SELECT topic FROM content_items WHERE niche_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 100`, [niche.id, item.id])).map((r) => r.topic);
   const ts = await resolve("TOPIC", niche.topic_source_adapter || "newsapi_mock");
@@ -3026,7 +3055,7 @@ async function generateStatic(item, niche, style) {
   const m = await materialFor(item, niche);
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id);
   if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}" (score ${dedup.best.score.toFixed(2)})`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
     system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. ${langLine(lang)} Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style, niche)}${item._series || ""}`,
@@ -3089,7 +3118,7 @@ async function generateReel(item, niche, style) {
   const m = await materialFor(item, niche); const type = item.content_type || niche.content_type, spec = REEL_SPEC[type] || REEL_SPEC.IMAGE_SLIDESHOW, mc = methodCfg(niche);
   const long = type === "LONG_FORM_VIDEO", orientation = long ? "16:9" : mc.orientation || "9:16", vertical = orientation !== "16:9", lang = niche.language || "en";
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
     system: `${spec.system} Channel: "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
@@ -3126,7 +3155,7 @@ async function generateReel(item, niche, style) {
     // is a slideshow of one picture. The rest of the sections run on footage or the brand's backdrop.
     const img = await imageOrCard(niche, item.id, { prompt: s.image_prompt, headline: title, backdrop: true, skipApi: noPics,
       specs: { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, brand: niche.display_name, render_text: false, overlay: false,
-        photo: m.photo || null, photo_outlet: m.photo_outlet || null, photo_lead: i === 0, country: niche.country || null, ...(P(niche.image_specs) || {}), style: style2 } });
+        photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [], photo_lead: i === 0, country: niche.country || null, ...(P(niche.image_specs) || {}), style: style2 } });
     noPics = noPics || img.fallbackError; await addCost(item.id, img.cost); images.push(img);
   }
   if (footage) log(`reel ${item.id}: ${footage} of ${sections.length} sections on stock footage`);
@@ -3167,7 +3196,7 @@ async function generateExplainer(item, niche, style) {
   const m = await materialFor(item, niche); const mc = methodCfg(niche), lang = niche.language || "en";
   const orientation = mc.orientation === "9:16" ? "9:16" : "16:9", vertical = orientation === "9:16", minutes = Number(mc.explainer_minutes) || 3;
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
     prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
@@ -3386,7 +3415,7 @@ async function runGeneration(itemId) {
 async function regenerate(itemId, part) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
-  if (part === "image") { const sdr = P(item.source_data_ref) || {}; const specs = await cardSpecs(niche, { versions: (sdr.outlets || []).map((outlet) => ({ outlet })), photo: sdr.photo, photo_outlet: sdr.photo_outlet }); const img = await imageOrCard(niche, itemId, { prompt: item.image_prompt, headline: item.headline || item.topic, specs, label: cardLabel(niche) }); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
+  if (part === "image") { const sdr = P(item.source_data_ref) || {}; const specs = await cardSpecs(niche, { versions: (sdr.outlets || []).map((outlet) => ({ outlet })), photo: sdr.photo, photo_outlet: sdr.photo_outlet, photos: sdr.photos }); const img = await imageOrCard(niche, itemId, { prompt: item.image_prompt, headline: item.headline || item.topic, specs, label: cardLabel(niche) }); await addCost(itemId, img.cost); await setItem(itemId, { hero_media_id: img.id, status: "PENDING_REVIEW" }); return; }
   if (part === "all") { await setItem(itemId, { headline: null, summary: null, body: null, hero_media_id: null }); return runGeneration(itemId); }
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 1500, system: `You are the editor of "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
     prompt: `Current headline: ${item.headline}\nSummary: ${item.summary}\nBody: ${(item.body || "").slice(0, 3000)}\n\nRewrite ONLY the ${part} to be stronger, keeping the facts identical. Return JSON: ${part === "headline" ? '{"headline": "..."}' : part === "captions" ? '{"captions": {"facebook": "...", "instagram": "...", "x": "...", "linkedin": "..."}, "hashtags": ["..."]}' : '{"body": "..."}'}`,

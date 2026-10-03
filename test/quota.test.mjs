@@ -251,6 +251,49 @@ test("the story's own photo is what the post uses, credited to the outlet that r
   } finally { await new Promise((r) => stub.close(r)); }
 });
 
+// What production saw: Ittefaq's feed carries a 300×300 thumbnail, and its article page refuses the server's address,
+// so the full-size photo it names for Facebook is out of reach. The same CMS keeps that photo at a fixed address beside
+// the thumbnail, and the post is built on it instead of falling back to a stock picture.
+test("a feed thumbnail is raised to the outlet's full-size photo when the article page refuses the server", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const big = join(dir, "cms_big.jpg"), small = join(dir, "cms_small.jpg");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1200x630", "-frames:v", "1", big]);
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=300x300", "-frames:v", "1", small]);
+  const { readFileSync } = await import("node:fs");
+  const http = await import("node:http");
+  let port = 0;
+  const stub = http.createServer((req, res) => {
+    if (req.url.startsWith("/contents/cache/images/1200x630x1xxxxx1/")) { res.writeHead(200, { "content-type": "image/jpeg" }); return res.end(readFileSync(big)); }
+    if (req.url.startsWith("/contents/cache/images/300x300x1/")) { res.writeHead(200, { "content-type": "image/jpeg" }); return res.end(readFileSync(small)); }
+    if (req.url === "/feed.xml") {
+      res.writeHead(200, { "content-type": "application/rss+xml" });
+      return res.end(`<?xml version="1.0"?><rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
+        <item><title>Gas cylinder dealers fined in sixteen districts</title><link>http://127.0.0.1:${port}/story</link>
+          <media:content url="http://127.0.0.1:${port}/contents/cache/images/300x300x1/uploads/media/2026/10/04/cyl.jpg?jadewits_media_id=1" />
+          <description>Inspectors fined thirty nine dealers for selling above the set price.</description>
+          <pubDate>${new Date().toUTCString()}</pubDate></item></channel></rss>`);
+    }
+    res.writeHead(403, { "content-type": "text/html" }); res.end("<html>Access denied</html>");
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  port = stub.address().port;
+  try {
+    const src = await eng.api("POST", "/api/sources", { name: "CMS Daily", adapterKey: "rss", config: { url: `http://127.0.0.1:${port}/feed.xml` } });
+    const p = await program("cms_photo", { sourceIds: [src.id], methodConfig: { desk: { settle_minutes: 0, min_sources: 1, min_gap_minutes: 0, per_sweep: 3 } } });
+    await eng.api("POST", `/api/sources/${src.id}/poll`);
+    await eng.api("POST", "/api/desk/run", {});
+    const item = await waitFor(async () => {
+      const [x] = await eng.api("GET", `/api/content-items?nicheId=${p.id}`);
+      if (x?.status === "FAILED") throw new Error(x.rejection_note);
+      return x?.status === "PENDING_REVIEW" && (await eng.api("GET", `/api/content-items/${x.id}`));
+    }, { timeout: 60000, interval: 1000, what: "a draft built on the full-size photo" });
+
+    assert.equal(item.hero_media.meta.provider, "source", `the outlet's own photo, not a stand-in — got ${JSON.stringify(item.hero_media.meta).slice(0, 600)}`);
+    assert.match(item.hero_media.meta.photo_url, /\/1200x630x1xxxxx1\/uploads\/media\/2026\/10\/04\/cyl\.jpg/, "at its full size");
+    assert.equal(item.hero_media.meta.width, 1200);
+    assert.match(item.hero_media.meta.compose_specs.photo_credit, /Photo: CMS Daily/);
+  } finally { await new Promise((r) => stub.close(r)); }
+});
+
 // Stock footage is the difference between a video and a slideshow, and it is free. Sections take a clip where the
 // library has one; a section the writer marks as needing the real event keeps a picture, and the reel still renders.
 test("reels: sections run on stock footage, and a section that must not use it keeps a picture", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
