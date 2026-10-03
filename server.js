@@ -3878,8 +3878,10 @@ async function sweepHealth() {
   if (backlog.n >= 30) await notify("review", `${backlog.n} drafts have waited over 12 hours in Review`, "Approve them, or let clean drafts publish on their own (Programs → Review: auto-approve after a window).", { key: "review", cooldownHours: 24 });
   // A lane with claimable work that nothing has picked up for an hour has no process behind it: the video lane usually,
   // because rendering runs on a worker service of its own, and a deployment without that worker queues video forever.
+  // Not the PC lane: work routed to your PC waiting while the PC is off is the design, not an incident, and the
+  // programmes page already says how many jobs are waiting for it. Alerting on it would page you every evening.
   for (const lane of await q(`SELECT queue, COUNT(*)::int AS waiting, min(created_at) AS oldest FROM jobs
-      WHERE status = 'PENDING' AND (run_after IS NULL OR run_after <= now()) AND created_at < now() - interval '45 minutes' GROUP BY queue`)) {
+      WHERE status = 'PENDING' AND queue <> $1 AND (run_after IS NULL OR run_after <= now()) AND created_at < now() - interval '45 minutes' GROUP BY queue`, [PC_LANE])) {
     const touched = await one(`SELECT COUNT(*)::int AS n FROM jobs WHERE queue = $1 AND (locked_at > now() - interval '1 hour' OR finished_at > now() - interval '1 hour')`, [lane.queue]);
     if (touched.n) continue;
     const off = (await setting("queues.enabled", {}))[lane.queue] === false;
