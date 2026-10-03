@@ -1,0 +1,51 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { startEngine, waitFor, sleep } from "./harness.mjs";
+
+// Your own computer as a worker: fast, free, and served by YouTube where a datacenter is refused — but on only a few
+// hours a day. A programme set to run on the PC must queue its video work for the PC; the server must leave that work
+// alone however long it waits; and a PC worker on the same database must pick it up and finish it. Two real engines,
+// one database, exactly as it runs: the server on Render, the PC at home.
+test("work routed to your PC waits for your PC, and your PC does it", async () => {
+  const server = await startEngine();
+  let pc;
+  try {
+    await server.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const brand = await server.api("POST", "/api/brands", { name: "PC brand" });
+    await server.api("POST", "/api/adapter-configs", { key: "talk_words", stage: "TRANSCRIBE", impl: "transcribe_mock", label: "Talk",
+      config: { segments: [0, 8, 16, 24, 32, 40].map((t) => ({ start: t, end: t + 8, text: `We spent ${t + 3} years learning the one thing nobody tells you about this.` })) } });
+    const p = await server.api("POST", "/api/programs", { brandId: brand.id, key: "on_my_pc", displayName: "On my PC",
+      contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", useMocks: true, autoStyle: false, autoSources: false,
+      computeWhere: "pc", downloadAdapter: "download_mock", transcriptAdapter: "talk_words", clipAdapter: "clip_signal", renderAdapter: "render_mock",
+      methodConfig: { clips_per_video: 1, clip_min_seconds: 10, clip_max_seconds: 30, min_score: 0 } });
+    assert.equal(p.compute_where, "pc", "the programme remembers where it runs");
+
+    await server.api("POST", "/api/video-candidates", { nicheId: p.id, url: "https://example.invalid/long-talk.mp4", title: "A long talk" });
+    const [job] = await server.query(`SELECT queue, status FROM jobs WHERE type = 'PROCESS_CANDIDATE'`);
+    assert.equal(job.queue, "video_local", "the work is queued for the PC, not the server");
+
+    // The server is running every lane it normally does. Give it time to make the mistake if it is going to.
+    await sleep(3000);
+    const [still] = await server.query(`SELECT status FROM jobs WHERE type = 'PROCESS_CANDIDATE'`);
+    assert.equal(still.status, "PENDING", "the server leaves PC work alone");
+    const before = await server.api("GET", "/api/workers");
+    assert.equal(before.pc.online, false, "and the dashboard can say the PC is off");
+    assert.equal(before.pc.waiting, 1, "with one job waiting for it");
+
+    // Now the PC comes on: same database, only the PC lane, no sweeps of its own.
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false" } });
+    const item = await waitFor(async () => {
+      const [x] = await server.query(`SELECT status, rejection_note FROM content_items WHERE niche_id = $1`, [p.id]);
+      if (x?.status === "FAILED") throw new Error(x.rejection_note);
+      return x?.status === "PENDING_REVIEW" && x;
+    }, { timeout: 120000, interval: 500, what: "the PC to clip it and land it in review" });
+    assert.ok(item, "the clip reached review");
+
+    const renders = await server.query(`SELECT queue, status FROM jobs WHERE type = 'RENDER_CLIP'`);
+    assert.ok(renders.length && renders.every((r) => r.queue === "video_local"), "the render step was routed to the PC too");
+    const after = await server.api("GET", "/api/workers");
+    assert.equal(after.pc.online, true, "the dashboard sees the PC is on");
+    const serverBoot = await server.query(`SELECT value FROM settings WHERE key = 'boot.last'`);
+    assert.ok(serverBoot.length, "the server's own boot record is still there");
+  } finally { await pc?.stop(); await server.stop(); }
+});
