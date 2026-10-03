@@ -35,7 +35,7 @@ RUN set -eux; \
 
 FROM node:22-bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg python3 curl ca-certificates fontconfig fonts-dejavu-core fonts-noto-core \
+ && apt-get install -y --no-install-recommends ffmpeg python3 python3-venv curl ca-certificates fontconfig fonts-dejavu-core fonts-noto-core \
       libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libgbm1 libasound2 libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 \
       libxdamage1 libpango-1.0-0 libcairo2 libcups2 libdrm2 libxshmfence1 \
  && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
@@ -61,6 +61,16 @@ RUN set -eux; \
     test -s /opt/piper/voices/en_US-lessac-medium.onnx; \
     echo "the engine is installed" | piper --model /opt/piper/voices/en_US-lessac-medium.onnx --output_file /tmp/piper-check.wav; \
     test -s /tmp/piper-check.wav; rm -f /tmp/piper-check.wav
+# edge-tts: Microsoft's neural voices, free and without a key, and the only free voice found that speaks Bangladeshi
+# Bangla properly (bn-BD-NabanitaNeural, bn-BD-PradeepNeural). In a venv of its own, because Debian's Python is
+# externally managed and nothing else in the image should be disturbed; only its command is linked onto PATH, the way
+# Piper's is. The build checks the install, not the service: whether Microsoft answers the address this runs from is
+# only knowable from there, which is what POST /api/voices/test is for.
+RUN set -eux; \
+    python3 -m venv /opt/edge-tts; \
+    /opt/edge-tts/bin/pip install --no-cache-dir edge-tts; \
+    ln -sf /opt/edge-tts/bin/edge-tts /usr/local/bin/edge-tts; \
+    edge-tts --version
 ENV WHISPER_DIR=/opt/whisper
 COPY --from=whisper /out/whisper-cli /out/whisper-cli-base /out/whisper-cli-avx2 /usr/local/bin/
 # The multilingual models rather than the .en ones: the clips come from English video, but a Bangladeshi programme has

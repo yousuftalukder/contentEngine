@@ -1010,7 +1010,10 @@ function whisperCli() {
     const have = new Set(cpuFeatures());
     const fast = ["avx2", "fma", "f16c"].every((f) => have.has(f)) && existsSync("/usr/local/bin/whisper-cli-avx2");
     whisperBin = fast ? "whisper-cli-avx2" : "whisper-cli";
-    log(`whisper: using ${whisperBin}${fast ? " (this host has avx2, fma and f16c)" : " (baseline build: no avx2 here)"}`);
+    // Three different situations, said as they are: an empty feature list means /proc/cpuinfo could not be read (a
+    // Windows PC, where the official build picks its own fast path at run time) — not that the CPU lacks AVX2.
+    const why = fast ? "this host has avx2, fma and f16c" : have.size ? "baseline build: this CPU lacks avx2" : "CPU features unreadable here; the build chooses its own code path";
+    log(`whisper: using ${whisperBin} (${why})`);
   }
   return whisperBin;
 }
@@ -1680,6 +1683,38 @@ impl("VOICE", "tts_command", { label: "Local speech engine (piper, espeak, any c
 // a voice is named. Free, unlimited, and it runs where the render runs — which is what makes it the right last resort
 // behind a hosted voice that can run out of characters or out of credit.
 const PIPER_DIR = ENV.PIPER_DIR || "/opt/piper";
+// edge-tts: Microsoft's neural voices through the Edge read-aloud service. Free, no key, no character limit worth the
+// name — and the only free source found that speaks Bangladeshi Bangla properly: Gemini TTS gave nothing on the free
+// tier, ElevenLabs wants paying, and Piper's Bangla voice is silent with the build in this image. It is an unofficial
+// use of that service, so it is free until it isn't, which is what the chain behind it is for.
+const EDGE_TTS = ENV.EDGE_TTS || "edge-tts";
+const EDGE_VOICES = { bn: "bn-BD-NabanitaNeural", en: "en-US-AriaNeural", hi: "hi-IN-SwaraNeural", ur: "ur-PK-UzmaNeural", ar: "ar-SA-ZariyahNeural" };
+// A script path (.mjs/.js) is run with node: that is how the tests stand in for edge-tts without reaching Microsoft.
+const edgeExec = (args, opts) => (/\.m?js$/.test(EDGE_TTS) ? exec(process.execPath, [EDGE_TTS, ...args], opts) : exec(EDGE_TTS, args, opts));
+let edgeChecked;
+const edgeInstalled = async () => {
+  if (edgeChecked === undefined) edgeChecked = await edgeExec(["--version"], { timeoutMs: 15000 }).then(() => true).catch(() => false);
+  return edgeChecked;
+};
+impl("VOICE", "tts_edge", { label: "Edge neural voices (free, no key, Bangla + English)",
+  configSchema: { voice: { type: "string" }, rate: { type: "string", default: "+0%" } },
+  create: (cfg) => ({
+    async synthesize({ script, voiceId, contentItemId, lang }) {
+      // A programme's voice_id may belong to another provider (an ElevenLabs id, say); only a name Edge knows is used.
+      const edgeName = (v) => (v && /Neural$/.test(v) ? v : null);
+      const voice = edgeName(voiceId) || edgeName(cfg.voice) || EDGE_VOICES[String(lang || "en").slice(0, 2).toLowerCase()] || EDGE_VOICES.en;
+      const txt = tmpPath("txt"), raw = tmpPath("mp3"), mp3 = tmpPath("mp3");
+      try {
+        // From a file rather than an argument: no length limit, and nothing in the script can be read as an option.
+        await writeFile(txt, String(script || ""), "utf8");
+        await edgeExec(["--voice", voice, "--file", txt, "--write-media", raw, ...(cfg.rate && cfg.rate !== "+0%" ? ["--rate", cfg.rate] : [])], { timeoutMs: 180000 });
+        await exec("ffmpeg", ["-y", "-i", raw, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-b:a", "128k", mp3]);
+        const dur = await ffprobeDuration(mp3);
+        if (!dur) throw new Error(`edge-tts returned no audible speech for ${voice}`);
+        const url = await storeLocal(mp3, `audio/${newId()}.mp3`, "audio/mpeg");
+        return { ...(await recordMedia({ contentItemId, kind: "AUDIO", url, mime: "audio/mpeg", duration: dur, meta: { provider: "edge", voice, chars: String(script || "").length } })), units: 1, cost: 0 };
+      } finally { await cleanup(txt, raw, mp3); }
+    } }) });
 const PIPER_VOICES = { bn: "bn_BD-google-medium", en: "en_US-lessac-medium" };
 const piperInstalled = () => { try { return Object.values(PIPER_VOICES).some((v) => existsSync(join(PIPER_DIR, "voices", `${v}.onnx`))); } catch { return false; } };
 impl("VOICE", "tts_piper", { label: "Piper (on this machine, free, Bangla + English)",
@@ -1944,9 +1979,11 @@ async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
   } finally { await cleanup(reactor, brand.logo, brand.fontUrl, ...segs, ...temp); }
 }
 async function publishRender(file, contentItemId, meta = {}) {
-  const dur = await ffprobeDuration(file);
+  // The frame size goes on the record too: a rendered clip used to be stored with no width or height, so nothing
+  // downstream could tell a vertical reel from a landscape one without fetching the file.
+  const dur = await ffprobeDuration(file), { width, height } = await imageDims(file);
   const url = await storeLocal(file, `video/${newId()}.mp4`, "video/mp4"); await cleanup(file);
-  return recordMedia({ contentItemId, kind: "VIDEO", url, mime: "video/mp4", duration: dur, meta });
+  return recordMedia({ contentItemId, kind: "VIDEO", url, mime: "video/mp4", duration: dur, width, height, meta });
 }
 impl("RENDER", "render_mock", { label: "Mock renderer", create: () => ({
   async renderForChannel({ media }) { return media ? { url: media.url, kind: media.kind } : { url: null, kind: "TEXT" }; },
@@ -3962,6 +3999,7 @@ async function adapterUsable(key) {
 // on ffmpeg.
 async function upgradeAdapters() {
   const migrate = !(await setting("upgrade.adapters_v3", false));
+  const voiceEdgeOnce = !(await setting("upgrade.voice_edge_v1", false));
   const d = await smartAdapterDefaults(), changed = [];
   for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
     const fix = {};
@@ -3979,6 +4017,18 @@ async function upgradeAdapters() {
     }
     for (const [col, want] of [["script_adapter", d.scriptAdapter], ["image_adapter", d.imageAdapter], ["voice_adapter", d.voiceAdapter], ["embed_adapter", d.embedAdapter], ["transcript_adapter", d.transcriptAdapter]])
       if (n[col] && n[col] !== want && !/_mock$/.test(want) && !(await adapterUsable(n[col]))) fix[col] = want;
+    // Once: edge-tts to the front of each voice chain. The rules above only ever append a fallback, and only replace
+    // a primary that is unusable — and a Gemini voice with a key counts as usable while giving nothing on the free
+    // tier — so edge-tts would otherwise have landed at the back, behind Piper, whose Bangla is silent.
+    // One ordered list, whatever the rules above did: edge-tts, then the programme's own voice even if it has no key
+    // yet (it is still what they chose), then everything else, each once.
+    if (voiceEdgeOnce && d.voiceAdapter === "tts_edge" && !/_mock$/.test(n.voice_adapter || "")) {
+      const curVoiceFb = fix.voice_adapter_fallbacks ? JSON.parse(fix.voice_adapter_fallbacks) : (P(n.voice_adapter_fallbacks) || []);
+      const ordered = [...new Set(["tts_edge", n.voice_adapter, fix.voice_adapter, ...curVoiceFb].filter((k) => k && !/_mock$/.test(k)))];
+      if (ordered[0] !== n.voice_adapter || JSON.stringify(ordered.slice(1)) !== JSON.stringify(P(n.voice_adapter_fallbacks) || [])) {
+        fix.voice_adapter = ordered[0]; fix.voice_adapter_fallbacks = JSON.stringify(ordered.slice(1));
+      }
+    }
     if (migrate && n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
     if (!Object.keys(fix).length) continue;
     await q(`UPDATE niches SET ${Object.keys(fix).map((k, i) => `${k} = $${i + 2}`).join(", ")} WHERE id = $1`, [n.id, ...Object.values(fix)]);
@@ -3989,6 +4039,9 @@ async function upgradeAdapters() {
     await notify("upgrade", "Programs moved onto the keys and tools this deployment has", `${changed.join("\n")}\n\nChange any of them on the program's Edit screen.`, { level: "info", key: `upgrade:${changed.join("|").slice(0, 80)}`, cooldownHours: 168 }).catch(() => {});
   }
   if (migrate) await putSetting("upgrade.adapters_v3", true);
+  // Recorded only once edge-tts was actually there to move to the front, so a deployment that boots without it
+  // reorders on the first boot that has it.
+  if (voiceEdgeOnce && d.voiceAdapter === "tts_edge") await putSetting("upgrade.voice_edge_v1", true);
 }
 
 // Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
@@ -4209,9 +4262,13 @@ async function smartAdapterDefaults() {
     // A library photo is the step between a generated picture and a text card: free, and better than no picture at all.
     imageAdapterFallbacks: (await has("pexels")) ? ["pexels_stock"] : [],
     embedAdapter: gem ? "gemini_embed" : "embed_mock",
-    voiceAdapter: gem ? "gemini_tts" : el ? "elevenlabs" : oai ? "openai_tts" : "tts_mock",
-    voiceAdapterFallbacks: [gem && "gemini_tts", el && "elevenlabs", oai && "openai_tts"].filter(Boolean).slice(1)
-      .concat(piperInstalled() ? ["tts_piper"] : []),                       // last, because it cannot refuse
+    // edge-tts first where it is installed: free, and it actually speaks. The paid voices follow, then Piper last,
+    // because it cannot refuse.
+    ...(await (async () => {
+      const paid = [gem && "gemini_tts", el && "elevenlabs", oai && "openai_tts"].filter(Boolean);
+      const chain = [(await edgeInstalled()) && "tts_edge", ...paid, piperInstalled() && "tts_piper"].filter(Boolean);
+      return { voiceAdapter: chain[0] || "tts_mock", voiceAdapterFallbacks: chain.slice(1) };
+    })()),
     // The local one first when it is there. A hosted transcriber is faster, but transcription is per-minute-of-video
     // rather than per-post, so it is the step most likely to exhaust a free tier or run up a bill — and the one whose
     // slowness nobody sees, because it happens before anything is published.
@@ -4242,6 +4299,17 @@ app.patch("/api/niches/:id", async (ctx) => { checkComputeWhere(ctx.body); json(
 app.patch("/api/programs/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
 // Who is doing the work right now: the server's own record of its build, and whether your PC is on. The PC beats every
 // 30 seconds, so a heartbeat older than 90 means it is off — and anything routed to it is waiting, not stuck.
+// Hear a voice before choosing it. It is also the only honest way to know whether a voice works from where this
+// server actually runs: edge-tts succeeding in a Docker build or in CI says nothing about whether Microsoft answers
+// this datacenter's address — YouTube, for one, does not.
+app.post("/api/voices/test", async (ctx) => {
+  const b = ctx.body || {}, key = b.adapter || "tts_edge", lang = String(b.lang || "en");
+  const text = String(b.text || (lang.startsWith("bn") ? "সোনারগাঁয়ে মেঘনা নদীতে আজ দুপুরে একটি নৌকাডুবির ঘটনা ঘটেছে।" : "This is how the narration on your videos will sound.")).slice(0, 600);
+  const v = await resolve("VOICE", key);
+  const started = Date.now();
+  const out = await v.synthesize({ script: text, voiceId: b.voice || null, contentItemId: null, lang });
+  json(ctx, 200, { adapter: key, url: out.url, duration_seconds: out.duration_seconds, voice: b.voice || null, ms: Date.now() - started });
+});
 app.get("/api/workers", async (ctx) => {
   // Read straight from the table, not through setting(): these records are written by *other* processes — the PC
   // beats from your machine — and the settings cache is per-process for ten seconds, so it would go on reporting

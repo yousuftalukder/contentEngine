@@ -8,7 +8,7 @@ $envFile = Join-Path $root ".env.pc"
 if (-not (Test-Path (Join-Path $tools "bin\ffmpeg.exe"))) { Write-Error "Tools are missing. Run pc\setup.ps1 first."; exit 1 }
 if (-not (Test-Path $envFile)) { Write-Error "Missing .env.pc. Copy .env.pc.example to .env.pc and fill it in from Render's Environment tab."; exit 1 }
 
-$env:PATH = "$tools\bin;$tools\whisper\bin;$env:PATH"
+$env:PATH = "$tools\bin;$tools\whisper\bin;$tools\edge\Scripts;$env:PATH"
 $env:WHISPER_DIR = Join-Path $tools "whisper"
 # Set here rather than read from the file, so a stray line in .env.pc can never turn this into a second server.
 $env:LANES = "video_local"

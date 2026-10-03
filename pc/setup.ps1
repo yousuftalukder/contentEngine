@@ -49,13 +49,22 @@ if (-not (Test-Path (Join-Path $wdir "ggml-base.bin"))) {
   Fetch "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin" (Join-Path $wdir "ggml-base.bin")
 } else { Write-Host "whisper model: already present" }
 
+# edge-tts: free neural voices, Bangla included. A venv of its own in .tools\edge, so nothing goes into your system
+# Python. Needs Python installed (python.org); everything else here does not.
+$edge = Join-Path $tools "edge"
+if (-not (Test-Path (Join-Path $edge "Scripts\edge-tts.exe"))) {
+  Write-Host "edge-tts"
+  python -m venv $edge
+  & (Join-Path $edge "Scripts\python.exe") -m pip install --quiet --disable-pip-version-check edge-tts
+} else { Write-Host "edge-tts: already present" }
+
 Write-Host ""
 Write-Host "Checking the tools run:"
 # Judged by exit code. These programs print banners on stderr, and Windows PowerShell turns any stderr line into an
 # error under "Stop" — which would report a working tool as broken.
 $ErrorActionPreference = "Continue"
 $bad = @()
-foreach ($t in @(@((Join-Path $bin "ffmpeg.exe"), "-version"), @((Join-Path $bin "yt-dlp.exe"), "--version"), @((Join-Path $wbin "whisper-cli.exe"), "--help"))) {
+foreach ($t in @(@((Join-Path $bin "ffmpeg.exe"), "-version"), @((Join-Path $bin "yt-dlp.exe"), "--version"), @((Join-Path $wbin "whisper-cli.exe"), "--help"), @((Join-Path $edge "Scripts\edge-tts.exe"), "--version"))) {
   $null = & $t[0] $t[1] 2>$null
   if ($LASTEXITCODE -eq 0) { Write-Host "  ok   $(Split-Path $t[0] -Leaf)" } else { Write-Host "  FAIL $(Split-Path $t[0] -Leaf) (exit $LASTEXITCODE)"; $bad += $t[0] }
 }
