@@ -108,6 +108,21 @@ test("baked-in black bars are cropped off before the vertical layout", { skip: !
   assert.ok(yavg > 150, `the left edge of the picture is the picture, not a bar (brightness ${yavg}; black is about 16)`);
 });
 
+// A TV report with a narrated headline card in front (3c): what a news page puts before a broadcast clip. The finished
+// video is the card and then the report, longer than the moment alone by the length of the intro.
+test("telecast with intro: a narrated headline card, then the report", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const p = await eng.api("POST", "/api/programs", { ...base(), key: "telecast", displayName: "Telecast", contentType: "PODCAST_CLIP", productionMethod: "TELECAST_INTRO",
+    methodConfig: { vertical_layout: "blurpad", clips_per_video: 1 } });
+  const { item, info } = await renderFrom(p);
+  const v = info.streams.find((s) => s.codec_type === "video");
+  assert.equal(v.width * 16, v.height * 9, `a vertical frame (${v.width}×${v.height})`);
+  assert.ok(info.streams.some((s) => s.codec_type === "audio"), "with sound");
+  const clip = item.hero_media.meta.clip;
+  assert.ok(Number(info.format.duration) > clip.end - clip.start + 0.5, `the card comes first: ${info.format.duration}s for a ${clip.end - clip.start}s moment`);
+  assert.ok(item.headline, "the card's headline is the item's headline");
+  assert.equal(item.hero_media.meta.brand_finish, "done");
+});
+
 // The studio renderer is picked for any program that makes its own videos, on whatever machine the video lane runs on.
 // An instance too small for Chromium must still produce the reel through ffmpeg rather than fail the item.
 test("a studio program on an instance too small for the studio still renders, through ffmpeg", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
