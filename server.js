@@ -3887,8 +3887,11 @@ async function nextEpisode(seriesId) {
 
 // === 9. worker lanes =====================================================
 const QUEUES = ALL_QUEUES;
-async function enqueue(type, payload, { queue = "text", priority = 0, runAfter = null, contentItemId = null, dedupeKey = null, maxAttempts = 3 } = {}) {
-  if (dedupeKey) { const dup = await one(`SELECT id FROM jobs WHERE dedupe_key=$1 AND status IN ('PENDING','RUNNING')`, [dedupeKey]); if (dup) return dup.id; }
+// `dedupeRunning: false` merges only with a job that has not started. A person asking for something now wants it done on
+// the state of things now: "Poll now" pressed while a scheduled poll was halfway through used to be folded into that
+// poll — which had already read the feed — and so did nothing.
+async function enqueue(type, payload, { queue = "text", priority = 0, runAfter = null, contentItemId = null, dedupeKey = null, maxAttempts = 3, dedupeRunning = true } = {}) {
+  if (dedupeKey) { const dup = await one(`SELECT id FROM jobs WHERE dedupe_key=$1 AND status IN ('PENDING'${dedupeRunning ? ",'RUNNING'" : ""})`, [dedupeKey]); if (dup) return dup.id; }
   const id = newId();
   await q(`INSERT INTO jobs (id, type, status, payload, queue, priority, run_after, content_item_id, dedupe_key, max_attempts) VALUES ($1,$2,'PENDING',$3,$4,$5,$6,$7,$8,$9)`, [id, type, JSON.stringify(payload), queue, priority, runAfter, contentItemId, dedupeKey, maxAttempts]);
   return id;
@@ -4671,7 +4674,7 @@ app.get("/api/sources", async (ctx) => json(ctx, 200, (await q(`SELECT s.*, (SEL
 app.post("/api/sources", async (ctx) => { const b = ctx.body; if (!b.name || !b.adapterKey) throw new ApiError(400, null, "name and adapterKey are required"); const id = newId(); await q(`INSERT INTO sources (id, brand_id, name, kind, adapter_key, config, poll_interval_minutes, license_policy) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`, [id, b.brandId || null, b.name, b.kind || b.adapterKey.toUpperCase(), b.adapterKey, JSON.stringify(b.config || {}), b.pollIntervalMinutes ?? 30, b.licensePolicy || "ANY"]); if (Array.isArray(b.nicheIds)) for (const n of b.nicheIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), n, id]); json(ctx, 201, rowJson(await one(`SELECT * FROM sources WHERE id=$1`, [id]), ["config"])); });
 app.patch("/api/sources/:id", async (ctx) => json(ctx, 200, rowJson(await patchRow("sources", ctx.params.id, ctx.body, { name: "name", kind: "kind", adapterKey: "adapter_key", config: "config", pollIntervalMinutes: "poll_interval_minutes", isActive: "is_active", licensePolicy: "license_policy" }), ["config"])));
 app.delete("/api/sources/:id", async (ctx) => { await q(`DELETE FROM sources WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
-app.post("/api/sources/:id/poll", async (ctx) => { const jobId = await enqueue("INGEST_SOURCE", { sourceId: ctx.params.id }, { queue: "ingest", dedupeKey: `ingest:${ctx.params.id}`, priority: 10, maxAttempts: 1 }); json(ctx, 202, { jobId }); });
+app.post("/api/sources/:id/poll", async (ctx) => { const jobId = await enqueue("INGEST_SOURCE", { sourceId: ctx.params.id }, { queue: "ingest", dedupeKey: `ingest:${ctx.params.id}`, priority: 10, maxAttempts: 1, dedupeRunning: false }); json(ctx, 202, { jobId }); });
 app.post("/api/sources/:id/preview", async (ctx) => { const s = await one(`SELECT * FROM sources WHERE id=$1`, [ctx.params.id]); if (!s) throw new ApiError(404, null, "Source not found"); const ing = await resolve("INGEST", s.adapter_key); json(ctx, 200, (await ing.fetchItems(s)).slice(0, 10)); });
 // ---- schedule: what goes out where and when (next days), and what just went out
 app.get("/api/schedule", async (ctx) => json(ctx, 200, {
