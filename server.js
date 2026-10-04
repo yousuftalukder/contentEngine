@@ -3642,19 +3642,9 @@ async function cutOut(url) {
       for (const j of [i - w, i + w, x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1]) if (j >= 0 && j < n && !gone[j] && dist(j) < T) { gone[j] = 1; queue[tail++] = j; }
     }
     if (tail > n * 0.97 || tail < n * 0.05) throw new Error("no clear background to remove");
-    // Free models like to put the character on a pale disc however they are asked not to. When what now borders the
-    // removed area is one even colour (a disc's rim, not the varied edge of a figure), that colour is filled away too —
-    // but only if it is a large region, so a figure's own outline or a patch of its clothes is never taken for one.
-    const rim = []; for (let i = 0; i < n; i++) { if (gone[i]) continue; const x = i % w; if ((x > 0 && gone[i - 1]) || (x < w - 1 && gone[i + 1]) || (i >= w && gone[i - w]) || (i + w < n && gone[i + w])) rim.push(i); }
-    const disc = [0, 1, 2].map((c) => rim.map((i) => px[i * 4 + c]).sort((a, b) => a - b)[rim.length >> 1] ?? 0);
-    const dd = (i) => Math.abs(px[i * 4] - disc[0]) + Math.abs(px[i * 4 + 1] - disc[1]) + Math.abs(px[i * 4 + 2] - disc[2]);
-    if (rim.length && rim.filter((i) => dd(i) < 40).length > rim.length * 0.7) {
-      const more = []; const seen = new Uint8Array(n); let h2 = 0;
-      for (const i of rim) if (dd(i) < 40) { seen[i] = 1; more.push(i); }
-      while (h2 < more.length) { const i = more[h2++], x = i % w;
-        for (const j of [i - w, i + w, x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1]) if (j >= 0 && j < n && !gone[j] && !seen[j] && dd(j) < 40) { seen[j] = 1; more.push(j); } }
-      if (more.length > n * 0.15 && more.length < n * 0.7) for (const i of more) gone[i] = 1;
-    }
+    // A pale disc the model may draw behind the character stays: removing it by colour was tried (2026-10-04) and leaks
+    // into the figure through its soft painted edges. It reads as a sticker backing; telling them apart needs a
+    // segmentation model.
     for (let i = 0; i < n; i++) {
       if (gone[i]) { px[i * 4 + 3] = 0; continue; }
       const x = i % w, near = (x > 0 && gone[i - 1]) || (x < w - 1 && gone[i + 1]) || (i >= w && gone[i - w]) || (i + w < n && gone[i + w]);

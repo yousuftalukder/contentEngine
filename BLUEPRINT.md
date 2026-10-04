@@ -177,8 +177,13 @@ is off. Its first test before building: one video through the API, to see whethe
 
 - Gemini video input on a long file *(5a)*: built as 360p, one-frame-a-second proxies read at low media resolution
   (about 100 tokens a second), forty minutes per request; a longer video goes in pieces. Not yet run on a real film.
-- Pollinations, the free picture service *(6c)*: answered in 4 s for a 768×768 picture, 2026-10-04. Without an account
-  its pictures carry a small corner logo.
+- Pollinations, the free picture service *(6c)*, measured 2026-10-04: about 4 s a picture; without a token it turns
+  away many requests with an empty 402 (every other one when quiet, six in a row when busy) and serves a later one, so
+  the engine asks again for up to two minutes; it caps pictures at about 768 px and puts a small logo in a corner.
+- An illustrated scene rendered end to end on the PC (Pollinations → cut-out → studio, edge-tts voice): 16 s of 1080p in
+  about 6 minutes. The character is cut out of its background cleanly, white clothes kept; the pale disc the model tends
+  to draw behind a character stays (removing it by colour leaked into the figure), and two drawings of the same
+  character from the same description and seed look alike but not identical.
 
 ## Built, not yet proven on real material (2026-10-04)
 

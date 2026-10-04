@@ -18,9 +18,7 @@ test("illustrated series: the cast reaches the planner and each scene is drawn, 
   // A figure the way the service draws one: on white. A dark ring stands for the outline, with white inside it (a white
   // vest) that must survive the cut-out while the white outside goes.
   const fig = join(dir, "f.jpg");
-  // Around it, the pale disc free models draw behind a character however they are told not to: it goes as well.
-  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=white:s=512x512", "-vf",
-    "drawbox=x=56:y=56:w=400:h=400:color=0xb8dcb0:t=fill,drawbox=x=156:y=156:w=200:h=200:color=0x202020:t=30", "-frames:v", "1", fig]);
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=white:s=512x512", "-vf", "drawbox=x=156:y=156:w=200:h=200:color=0x202020:t=30", "-frames:v", "1", fig]);
   const picture = readFileSync(jpg), figure = readFileSync(fig), drawn = []; let calls = 0;
   const stub = http.createServer((req, res) => {
     const url = new URL(req.url, "http://x");
@@ -58,7 +56,6 @@ test("illustrated series: the cast reaches the planner and each scene is drawn, 
     const png = join(dir, "cut.png"); writeFileSync(png, Buffer.from(await (await fetch(cut.url)).arrayBuffer()));
     const alpha = (x, y) => spawnSync("ffmpeg", ["-v", "error", "-i", png, "-vf", `crop=1:1:${x}:${y}`, "-f", "rawvideo", "-pix_fmt", "rgba", "-"]).stdout[3];
     assert.equal(alpha(10, 10), 0, "the background is gone");
-    assert.equal(alpha(90, 90), 0, "and the pale disc behind the figure with it");
     assert.equal(alpha(256, 256), 255, "the white inside the outline stays");
     assert.equal(alpha(170, 256), 255, "and so does the outline");
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
