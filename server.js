@@ -3304,17 +3304,18 @@ async function generateReel(item, niche, style) {
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
     system: `${spec.system} Channel: "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
-    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"hook": "3-7 words that stop a scroll: the most surprising concrete thing in this story, stated as a claim — not a tease, not a question", "title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section: an everyday scene${niche.country ? ` as it looks in ${niche.country}` : ""} (a street, a market, a kitchen, traffic) — not officials, offices or government buildings, which stock libraries fill with other countries' flags; null where only a specific real event would do"}], "description": "post caption / video description", "hashtags": ["..."]}`,
+    prompt: `${materialBlock(m)}\nWrite the video in exactly ${count} sections. JSON: {"hook": "3-7 words that stop a scroll: the most surprising concrete thing in this story, stated as a claim — not a tease, not a question", "title": "on-screen headline, max 12 words", "kicker": "1-2 word label in ${lang}, e.g. Breaking / Politics / Sports", "place": "the country where the events of the story happen, in English (e.g. ${niche.country || "Bangladesh"}, Saudi Arabia, India)", "sections": [{"narration": "${spec.words}", "image_prompt": "what the viewer sees: an editorial illustration, no text, no real faces", "footage_query": "2-4 words to find real stock footage for this section: an everyday scene as it looks where the story happens (a street, a market, a kitchen, traffic) — not officials, offices or government buildings, which stock libraries fill with other countries' flags; null where only a specific real event would do (an attack, a disaster, a named event)"}], "description": "post caption / video description", "hashtags": ["..."]}`,
     mock: { hook: m.title.split(/\s+/).slice(0, 5).join(" "), title: m.title, kicker: "News", sections: Array.from({ length: Math.min(count, 3) }, (_, i) => ({ narration: `Mock narration ${i + 1} about ${m.title}.`, image_prompt: `Illustration ${i + 1} for ${m.title}` })), description: m.title, hashtags: ["news"] } }));
   await addCost(item.id, r.cost); const d = r.data || {}; const sections = (d.sections || []).filter((s) => s && s.narration);
   if (!sections.length) throw new Error("The script came back without sections");
   const title = d.title || m.title, script = sections.map((s) => s.narration).join("\n\n");
   const hook = tidyHook(d.hook);
-  await setItem(item.id, { script_meta: { ...(P(item.script_meta) || {}), ...(hook ? { hook } : {}) }, headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: d.hashtags || [] });
+  await setItem(item.id, { script_meta: { ...(P(item.script_meta) || {}), ...(hook ? { hook } : {}) }, headline: title, script, summary: d.description || "", captions: { default: d.description || title, facebook: d.description || title, instagram: d.description || title, youtube: d.description || "" }, hashtags: currentYearTags(d.hashtags) });
   const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
   // Each section is backed by real footage where the library has some — a narrated section over moving pictures is the
   // difference between a video and a slideshow, and the clips are free. A section with no clip keeps its picture.
   const broll = mc.broll !== false && (await credentialsFor("pexels")).length > 0;
+  const storyPlace = String(d.place || "").trim() || niche.country;
   const images = []; let noPics = null, footage = 0;
   for (const [i, s] of sections.entries()) {
     // An explicit null is the writer saying only the real event would do here; that section keeps a picture.
@@ -3326,7 +3327,9 @@ async function generateReel(item, niche, style) {
     if (broll && query && !ownPhoto) {
       // Narration length is only measured later, so the clip is chosen against a reading-speed estimate of this section.
       const spoken = Math.max(4, Math.round(String(s.narration).split(/\s+/).filter(Boolean).length / 2.2));
-      const clip = await pexelsFootage(query, { vertical, seconds: spoken + 1, country: niche.country });
+      // Footage of the place the story happens, not of the programme's country: a reel about an attack in Medina on
+      // Dhaka street footage told the viewer something false about where it was.
+      const clip = await pexelsFootage(query, { vertical, seconds: spoken + 1, country: storyPlace });
       if (clip) {
         const media = await recordMedia({ contentItemId: item.id, kind: "VIDEO", url: clip.url, mime: "video/mp4",
           meta: { provider: "pexels", clip_id: clip.id, photographer: clip.photographer, page: clip.page, query: clip.query, section: i, purpose: "b-roll" } });
@@ -3778,7 +3781,8 @@ function withCaptions(captions, { headline, summary }) {
 }
 function currentYearTags(tags) {
   const year = String(new Date().getUTCFullYear());
-  return (Array.isArray(tags) ? tags : []).map((t) => String(t).replace(/(19|20)\d\d/g, (y) => (y === year ? y : ""))).filter((t) => t.replace(/^#/, "").trim());
+  // One form for every tag: some writers return "BangladeshNews", some "#BangladeshNews"; a post shows them side by side.
+  return [...new Set((Array.isArray(tags) ? tags : []).map((t) => String(t).trim().replace(/\s+/g, "").replace(/(19|20)\d\d/g, (y) => (y === year ? y : "")).replace(/^#*/, "#")).filter((t) => t.length > 1))];
 }
 const MIXED_WORD = /[\u0980-\u09FF]+[A-Za-z]+[\u0980-\u09FF]*|[A-Za-z]+[\u0980-\u09FF]+/g;
 const mixedWords = (text) => [...new Set(String(text || "").match(MIXED_WORD) || [])].slice(0, 5);
