@@ -677,12 +677,20 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
         generationConfig: { maxOutputTokens: maxTokens, responseMimeType: json && !useSearch ? "application/json" : undefined },
         tools: useSearch ? [{ google_search: {} }] : undefined,
       };
-      const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, {
-        method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(req) }) }));
+      const call = (m, r) => fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(r) });
+      let { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }));
+      // Stopped at the length limit, mid-answer: Bangla takes several times the tokens of English, and the newer Flash
+      // models spend part of the budget thinking before they write. A JSON answer cut off there is unreadable — about
+      // one Bangla news draft in fifty was lost to it — so it is asked once more, on the same model, with twice the room.
+      let extra = 0;
+      if (json && body.candidates?.[0]?.finishReason === "MAX_TOKENS") {
+        const first = body.usageMetadata || {}; extra = tokenCost(model, first.promptTokenCount, first.candidatesTokenCount);
+        body = await call(model, { ...req, generationConfig: { ...req.generationConfig, maxOutputTokens: Math.min(16000, Math.max(2048, maxTokens * 2)) } });
+      }
       const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
       const u = body.usageMetadata || {};
       const cites = (body.candidates?.[0]?.groundingMetadata?.groundingChunks || []).map((c) => c.web?.uri).filter(Boolean);
-      return { text, data: json ? extractJson(text) : null, cost: tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), model, citations: cites, units: 1 };
+      return { text, data: json ? extractJson(text) : null, cost: extra + tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), model, citations: cites, units: 1 };
     }, ctx.pin);
   } }) });
 impl("SCRIPT", "openai", { label: "OpenAI (GPT)", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_MODEL }, temperature: { type: "number", default: 0.7 } }, create: (cfg, ctx = {}) => ({

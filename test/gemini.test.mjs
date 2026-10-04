@@ -46,3 +46,34 @@ test("Gemini: when the free allowance is spent, the job waits for the reset and 
     assert.equal(asked.filter((m) => /pro/.test(m)).length, 1, "and not asked again by the next job");
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
+
+// One Bangla news draft in fifty was lost to an answer cut off at the length limit: unreadable JSON. Gemini says when
+// that happened (finishReason MAX_TOKENS); the writer asks once more with twice the room and the draft is written.
+test("Gemini: an answer cut off at the length limit is asked for again with more room", async () => {
+  const budgets = [];
+  const full = JSON.stringify({ headline: "নৌ চলাচল আবার শুরু", summary: "তিন দিন পর পাটুরিয়ায় ফেরি চলাচল শুরু হয়েছে।", captions: { facebook: "ফেরি চলাচল আবার শুরু" }, hashtags: ["খবর"] });
+  const stub = http.createServer((req, res) => {
+    let raw = ""; req.on("data", (d) => (raw += d)); req.on("end", () => {
+      const url = new URL(req.url, "http://x");
+      if (!/:generateContent$/.test(url.pathname)) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ models: [] })); }
+      // Only the news writer's request is followed; any other call in the pipeline gets a plain complete answer.
+      const body = JSON.parse(raw), writer = /Produce JSON/.test(JSON.stringify(body.contents));
+      if (writer) budgets.push(body.generationConfig?.maxOutputTokens);
+      const cut = writer && budgets.length === 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ candidates: [{ finishReason: cut ? "MAX_TOKENS" : "STOP", content: { parts: [{ text: cut ? full.slice(0, 40) : full }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50 } }));
+    });
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  const eng = await startEngine({ env: { GEMINI_API_KEY: "not-a-real-key", GEMINI_API_BASE: `http://127.0.0.1:${stub.address().port}` } });
+  try {
+    const brand = await eng.api("POST", "/api/brands", { name: "Cut off" });
+    const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "cut_off", displayName: "Cut off", contentType: "NEWS_STATIC", language: "bn",
+      useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "gemini_live", scriptAdapterFallbacks: [], methodConfig: { qa: { enabled: false } } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "পাটুরিয়ায় ফেরি চলাচল" });
+    const it = await waitFor(async () => { const x = await eng.api("GET", `/api/content-items/${id}`); if (x.status === "FAILED") throw new Error(x.rejection_note); return x.status === "PENDING_REVIEW" && x; }, { timeout: 60000, what: "the draft" });
+    assert.equal(it.headline, "নৌ চলাচল আবার শুরু", "the draft is the second, complete answer");
+    assert.equal(budgets.length, 2, `the writer was asked twice, not once and then retried as a failure (${budgets.join(" → ")})`);
+    assert.ok(budgets[1] > budgets[0], `the second time with more room (${budgets.join(" → ")})`);
+  } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
+});
