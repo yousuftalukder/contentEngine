@@ -66,6 +66,8 @@ test("reaction split-screen: source over host at 1.1×, vertical, shorter by the
   assert.ok(info.streams.some((s) => s.codec_type === "audio"), "with sound");
   const clip = item.hero_media.meta.clip, expected = (clip.end - clip.start) / 1.1;
   assert.ok(Math.abs(Number(info.format.duration) - expected) < 0.6, `${info.format.duration}s for a ${clip.end - clip.start}s moment at 1.1× (expected ≈${expected.toFixed(1)}s)`);
+  // The brand pass reports whether it ran. It once failed on every video on Render and the only trace was a log line.
+  assert.equal(item.hero_media.meta.brand_finish, "done", "the logo and loudness pass ran");
 });
 
 // On an instance the size of Render's free one, the reaction renders at the size that machine can encode — a fixed
@@ -81,6 +83,7 @@ test("reaction picture-in-picture renders at the small instance's size", { skip:
     const it = await waitFor(async () => { const x = (await small.api("GET", `/api/content-items?nicheId=${p.id}`))[0]; if (x?.status === "FAILED") throw new Error(x.rejection_note); return x?.status === "PENDING_REVIEW" && x; }, { timeout: 240000, interval: 1000, what: "a PiP reaction rendered" });
     const full = await small.api("GET", `/api/content-items/${it.id}`);
     assert.deepEqual([full.hero_media.width, full.hero_media.height], [720, 1280]);
+    assert.equal(full.hero_media.meta.brand_finish, "done", "the logo and loudness pass ran");
   } finally { await small.stop(); }
 });
 
