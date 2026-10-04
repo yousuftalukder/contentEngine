@@ -4412,6 +4412,57 @@ app.post("/api/voices/test", async (ctx) => {
   const out = await v.synthesize({ script: text, voiceId: b.voice || null, contentItemId: null, lang });
   json(ctx, 200, { adapter: key, url: out.url, duration_seconds: out.duration_seconds, voice: b.voice || null, ms: Date.now() - started });
 });
+// ---- What the engine makes: every variant in BLUEPRINT.md, where it runs, what it needs, and whether those needs are
+// met right now. The status is the blueprint's own word for it — "proven" means made in production from real material,
+// "built" means it passes its tests but has not yet been run on real footage, "to build" means it does not exist.
+// Kept beside the code rather than in the dashboard so a variant that is built or proven is updated in one place.
+const CATALOG = [
+  { id: "1a", type: "Clip", name: "Laptop clip", what: "Your link → the moment that matters, cut to a captioned 9:16 reel", runs: "pc", needs: ["pc"], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc" } },
+  { id: "1b", type: "Clip", name: "Rented clip", what: "A clipping service does the cut while your PC is off", runs: "rented", needs: ["clip_service"], status: "to build" },
+  { id: "1c", type: "Clip", name: "Claude-picked clip", what: "An LLM reads the transcript and chooses the moment", runs: "pc", needs: ["pc", "writer"], status: "built", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "llm_clipper" } },
+  { id: "1d", type: "Clip", name: "Server clip", what: "As 1a, on the server at 720p, for links that are not YouTube", runs: "server", needs: [], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "server" } },
+  { id: "2a", type: "News card", name: "Photo card", what: "Headline and caption over the outlet's own photo, branded", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
+  { id: "2b", type: "News card", name: "Text card", what: "Typographic card for a story without a photo", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
+  { id: "2c", type: "News card", name: "Stock card", what: "A Pexels photo of the story's country behind the headline", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
+  { id: "3a", type: "News reel", name: "Photo reel", what: "The outlet's photo, local footage, Bangla narration, burned captions", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "NEWS_REEL" } },
+  { id: "3b", type: "News reel", name: "Telecast clip", what: "A TV report cut to its moment — nothing written, nothing narrated", runs: "pc", needs: ["pc"], status: "built", note: "English telecasts work today; Bangla speech needs hosted transcription (Gemini billing)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT" } },
+  { id: "3c", type: "News reel", name: "Telecast + intro", what: "3b with a narrated headline card in front", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
+  { id: "4a", type: "Reaction", name: "Silent reaction", what: "The moment at 1.1× with your clip — split-screen or in the corner", runs: "server or pc", needs: ["persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY" } },
+  { id: "4b", type: "Reaction", name: "Summary voiceover", what: "A few sentences of summary over the clip, its sound ducked", runs: "pc", needs: ["writer", "voice"], status: "built", setup: { contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER" } },
+  { id: "4c", type: "Reaction", name: "Long-form reaction", what: "Play / comment beats: the source in segments, your commentary between", runs: "pc", needs: ["pc", "writer", "voice", "persona"], status: "built", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG" } },
+  { id: "5a", type: "Recap", name: "Scene recap", what: "Gemini watches the video, picks scenes, the recap is cut and narrated", runs: "pc", needs: ["pc", "writer", "voice", "gemini_video"], status: "to build" },
+  { id: "5b", type: "Recap", name: "Transcript recap", what: "A dialogue-led video retold from its transcript, cut by timestamp", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", setup: { contentType: "MOVIE_RECAP", productionMethod: "MOVIE_RECAP" } },
+  { id: "5c", type: "Recap", name: "Twelve Labs recap", what: "Moment retrieval by a video-search API, same assembly", runs: "pc", needs: ["pc", "writer", "voice", "twelve_labs"], status: "to build" },
+  { id: "6a", type: "Animation", name: "Explainer", what: "Script → motion graphics, type and transitions (Remotion)", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", setup: { contentType: "ANIMATED_EXPLAINER" } },
+  { id: "6b", type: "Animation", name: "Data / research", what: "Animated charts and diagrams", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
+  { id: "6c", type: "Animation", name: "Illustrated series", what: "AI character images composited and moved in code", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
+  { id: "7a", type: "Script → video", name: "Own footage", what: "Your footage library matched to each sentence, narrated", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
+  { id: "7b", type: "Script → video", name: "Stock footage", what: "A script narrated over stock footage of the right country", runs: "server", needs: ["writer", "voice"], status: "built", setup: { contentType: "IMAGE_SLIDESHOW" } },
+  { id: "7c", type: "Script → video", name: "Photo sequence", what: "Stills with motion, narrated", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
+];
+app.get("/api/catalog", async (ctx) => {
+  const [gemini, anthropic, voice, beat, persona, programs] = await Promise.all([
+    credentialsFor("gemini"), credentialsFor("anthropic"), edgeInstalled(),
+    one(`SELECT EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key = 'worker.pc'`),
+    one(`SELECT count(*)::int AS n FROM media_assets WHERE kind = 'UPLOAD' AND deleted_at IS NULL AND meta->>'purpose' = 'reactor'`),
+    q(`SELECT content_type, production_method, compute_where, clip_adapter, display_name FROM niches`)]);
+  const pcOnline = beat ? Number(beat.age) < 90 : false, writers = [gemini.length && "Gemini", anthropic.length && "Claude"].filter(Boolean);
+  const needs = {
+    pc: { ok: pcOnline, label: "your PC on", detail: pcOnline ? "online now" : beat ? "off — work waits for it" : "never connected — run pc\\start.ps1" },
+    writer: { ok: writers.length > 0, label: "a writer key", detail: writers.length ? writers.join(" + ") : "add a Gemini or Claude key" },
+    voice: { ok: voice, label: "a voice", detail: voice ? "edge-tts (free)" : "edge-tts is not installed here" },
+    persona: { ok: persona.n > 0, label: "your reactor clip", detail: persona.n ? `${persona.n} uploaded` : "upload one under Brands → Media library" },
+    clip_service: { ok: false, label: "a clipping subscription", detail: "not built yet" },
+    gemini_video: { ok: false, label: "Gemini video input", detail: "not built yet" },
+    twelve_labs: { ok: false, label: "a Twelve Labs key", detail: "not built yet" },
+  };
+  json(ctx, 200, CATALOG.map((v) => {
+    const st = v.setup, used = st ? programs.filter((p) => p.content_type === st.contentType && (!st.productionMethod || (p.production_method || "") === st.productionMethod)
+      && (!st.computeWhere || (p.compute_where || "server") === st.computeWhere) && (!st.clipAdapter || p.clip_adapter === st.clipAdapter)) : [];
+    const missing = v.needs.filter((n) => !needs[n]?.ok);
+    return { ...v, needs: v.needs.map((n) => ({ key: n, ...needs[n] })), ready: v.status !== "to build" && !missing.length, programs: used.map((p) => p.display_name) };
+  }));
+});
 app.get("/api/workers", async (ctx) => {
   // Read straight from the table, not through setting(): these records are written by *other* processes — the PC
   // beats from your machine — and the settings cache is per-process for ten seconds, so it would go on reporting
