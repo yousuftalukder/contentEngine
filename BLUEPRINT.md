@@ -137,7 +137,10 @@ stock pool, and a library of your own footage is the difference.
 - The same job on the free server with the tiny model: over **50 minutes**, unfinished.
 - **YouTube refuses the server** ("Sign in to confirm you're not a bot") and serves your PC without complaint.
 - **Local whisper cannot do Bangla.** A clean Bangla sentence came back in Urdu script from `base`; `tiny`
-  produced nothing. Bangla speech needs hosted ASR.
+  produced nothing. Bangla speech needs hosted ASR. Re-checked 2026-10-04 with `large-v3-turbo` (q5, 550 MB) on a
+  75-second Jamuna TV report: Bengali script and the first sentence right, then repetition loops ("পারে পারে পারে…"),
+  one segment per 30 s, and 200 s to transcribe 75 s on the PC (beam search and no-context changed nothing; 10-second
+  chunks stopped the loops but came back mostly empty and took 527 s). Still hosted ASR.
 - **edge-tts speaks Bangladeshi Bangla, free, no key** — `bn-BD-NabanitaNeural`, `bn-BD-PradeepNeural`.
 - Remotion renders on this laptop. The 512 MB server cannot run it at all (Chromium needs ~2 GB).
 - Free-server video renders must be 720p. At 1080p the process is killed with no error recorded.
