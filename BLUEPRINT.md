@@ -141,13 +141,23 @@ stock pool, and a library of your own footage is the difference.
 - **edge-tts speaks Bangladeshi Bangla, free, no key** — `bn-BD-NabanitaNeural`, `bn-BD-PradeepNeural`.
 - Remotion renders on this laptop. The 512 MB server cannot run it at all (Chromium needs ~2 GB).
 - Free-server video renders must be 720p. At 1080p the process is killed with no error recorded.
+- **The server runs ffmpeg 5.1, the PC 6.1.** Two filter graphs that worked on the PC failed only on the server: a
+  stack of a 30 fps and a 24 fps picture never finished, and the brand pass (logo + loudness) was refused on every
+  video. Any new filter graph is checked on 5.1 before it ships.
+- **Several outlets refuse the server's address** as YouTube does: Ittefaq, Desh Rupantor, Bangla Tribune and Dhaka
+  Tribune article pages fail from Render every time and open from the PC. Their full-size photos are recovered from
+  the feed thumbnail's address; their article text is not.
+- **Stock footage is American unless told otherwise.** "government inspection" put a US flag in a Bangladesh reel;
+  clips are now taken only when Pexels' own description names the programme's country.
+- Split-screen reaction on the free server, 21 s at 720p: **about 4–5 minutes** once both fixes above were in.
 
 ## Still to verify before its own build
 
 - The clipping service API: shape, polling, price *(1b)*.
 - Gemini video input on a long file: chunking and cost *(5a)*.
-- The persona overlay on real footage — it passes tests, it has never run on a real video *(4a)*.
 
 ## Proven working
 
-1a, 1d, 2a–c, 7c, 6a, edge-tts voice, and the whole of 2 live in production.
+1a, 1d, 2a–c, 7c, 6a, edge-tts voice, and the whole of 2 live in production. 3a (Bangla news reel on edge-tts,
+the outlet's own photo, local footage) and 4a (split-screen and picture-in-picture, rendered by the server from a
+real speech, with a stock stand-in for the host until there is a real persona clip) since 2026-10-04.
