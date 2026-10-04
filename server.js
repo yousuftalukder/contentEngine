@@ -3870,7 +3870,9 @@ async function deferForQuota(job, payload, quota, msg) {
     log(`quota: dropped stale story ${item.id} ("${(item.topic || "").slice(0, 60)}")`);
     return true;
   }
-  await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=$3, attempts=GREATEST(attempts-1,0), locked_by=NULL WHERE id=$1`, [job.id, msg, back.toISOString()]);
+  // Due time on the database's clock: a worker whose own clock is off (the PC's ran 56 minutes fast) would otherwise park
+  // the job for that much longer, or not at all.
+  await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, attempts=GREATEST(attempts-1,0), locked_by=NULL WHERE id=$1`, [job.id, msg, String(Math.round(quota.seconds))]);
   // The item is not being written after all: say it is queued again, so the dashboard doesn't count it as in progress.
   if (item && ["DRAFTING", "FETCHING_DATA", "RENDERING"].includes(item.status)) await q(`UPDATE content_items SET status='QUEUED' WHERE id=$1`, [item.id]);
   log(`quota: ${job.type} ${job.id} waits until ${back.toISOString()} (${quota.kind})`);
@@ -4414,10 +4416,12 @@ app.get("/api/workers", async (ctx) => {
   // Read straight from the table, not through setting(): these records are written by *other* processes — the PC
   // beats from your machine — and the settings cache is per-process for ten seconds, so it would go on reporting
   // the PC as off for a while after it came on.
-  const rows = await q(`SELECT key, value FROM settings WHERE key IN ('boot.last', 'worker.pc', 'boot.pc')`);
+  // The age is measured on the database's clock, not by comparing a time the PC wrote with this server's clock: a PC
+  // whose clock ran 56 minutes fast showed as online for an hour after it was switched off.
+  const rows = await q(`SELECT key, value, EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key IN ('boot.last', 'worker.pc', 'boot.pc')`);
   const read = (k) => { const r = rows.find((x) => x.key === k); return r ? (typeof r.value === "string" ? r.value : P(r.value)) : null; };
   const server = read("boot.last"), pc = read("worker.pc"), pcBoot = read("boot.pc");
-  const age = pc?.at ? (Date.now() - new Date(pc.at).getTime()) / 1000 : null;
+  const beat = rows.find((x) => x.key === "worker.pc"), age = beat ? Math.max(0, Number(beat.age)) : null;
   const waiting = (await one(`SELECT count(*)::int AS n FROM jobs WHERE queue = $1 AND status = 'PENDING'`, [PC_LANE])).n;
   json(ctx, 200, { server, pc: { online: age != null && age < 90, seen_seconds_ago: age == null ? null : Math.round(age), boot: pcBoot, waiting } });
 });
