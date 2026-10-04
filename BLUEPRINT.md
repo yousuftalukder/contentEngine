@@ -180,4 +180,5 @@ real speech, with a stock stand-in for the host until there is a real persona cl
 2026-10-04, made by the server: 1c (the LLM picker — first place for the famous line in 9 of 14 speeches, against 4
 for the free heuristic), 3b (an English TV report clipped on the PC), 4b (summary voice-over), 5b (transcript recap)
 7b (a Bangla explainer on Bangladesh-only stock footage) and 4c (a three-minute long-form reaction: five segments, seven
-commentary breaks, a stand-in host).
+commentary breaks, a stand-in host) and 3c (a Bangla narrated headline card, built today, in front of an English
+report).
