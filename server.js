@@ -3244,7 +3244,7 @@ async function generateStatic(item, niche, style) {
     prompt: `${materialBlock(m)}\nProduce JSON with:\n- "headline": a click-worthy but accurate headline (max 12 words)\n- "summary": 2-3 sentence summary\n${portal ? `- "article_html": a news article as simple HTML (<p>, <h2>) written strictly from the material (${richMaterial(m) ? "350-600 words" : "as long as the facts allow, 120-250 words"}), ending with a one-line credit naming the source outlet(s)\n` : ""}- "image_prompt": a vivid visual description for a generated hero image (no text instructions, no logos, no real faces)\n- "photo_query": 2-5 words to find a library photo that honestly illustrates this story (a place, an activity, an object) — or null when a generic photo could mislead a reader: a specific incident, crime, accident or death, a named person, or a claim a reader would take the photo as evidence for\n- "captions": {"facebook": engaging 2-4 sentence caption, "instagram": caption with line breaks and emoji sparingly, "x": <=240 chars, "linkedin": professional 2-3 sentences}\n- "hashtags": 4-8 relevant hashtags without spaces`,
     mock: { headline: m.title, summary: m.summary || `Quick take on: ${m.title}`, article_html: `<p>${m.summary || m.title}</p><p>Source: ${m.url || "mock"}</p>`, image_prompt: `Editorial illustration for: ${m.title}`, photo_query: "dhaka city", captions: { facebook: `${m.title} — here's what you need to know.`, instagram: `${m.title} ✨`, x: m.title.slice(0, 200), linkedin: m.title }, hashtags: ["news", niche.key] } }));
   const d = r.data || {}; await addCost(item.id, r.cost);
-  await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: d.captions || {}, hashtags: Array.isArray(d.hashtags) ? d.hashtags : [], image_prompt: d.image_prompt || null });
+  await setItem(item.id, { headline: d.headline || m.title, summary: d.summary || m.summary, body: portal ? d.article_html || null : null, captions: withCaptions(d.captions, { headline: d.headline || m.title, summary: d.summary || m.summary }), hashtags: currentYearTags(d.hashtags), image_prompt: d.image_prompt || null });
   // photo_query is the writer's judgement that a library photo can illustrate this story honestly; no phrase, no photo.
   const specs = { ...(await cardSpecs(niche, m)), photo_query: typeof d.photo_query === "string" ? d.photo_query : null };
   const img = await imageOrCard(niche, item.id, { prompt: d.image_prompt, headline: d.headline || m.title, specs, label: cardLabel(niche) });
@@ -3758,11 +3758,30 @@ async function runQa(itemId, niche) {
   if (rank[said] > rank[status]) status = said;
   // Checked here rather than believed from the model: publishing a Bangladeshi story in English is not a small slip.
   const offLanguage = wrongScript(`${item.headline || ""} ${item.summary || item.script || ""}`, lang);
+  const mixed = mixedWords(`${item.headline || ""} ${item.summary || ""} ${Object.values(P(item.captions) || {}).join(" ")}`);
+  if (mixed.length) { (d.language_issues || (d.language_issues = [])).push(`Letters from two scripts inside one word: ${mixed.join(", ")}. Write each word wholly in one script.`); if (rank[status] < 1) status = "REVIEW"; }
   if (offLanguage) { (d.language_issues || (d.language_issues = [])).unshift(`The draft is not written in ${LANG_NAMES[lang] || lang}. This channel publishes in ${LANG_NAMES[lang] || lang}: rewrite every field in it, translating the sources rather than copying them.`); if (rank[status] < 1) status = "REVIEW"; }
   const report = { summary: d.summary || "", score, fact_issues: facts, headline_ok: d.headline_ok !== false, headline_issue: d.headline_issue || "", safety_flags: flags, language_issues: (d.language_issues || []).filter(Boolean), verdict: status, model: r.model || null, checked_at: nowIso() };
   await q(`UPDATE content_items SET qa_status=$2, qa_score=$3, qa_report=$4::jsonb WHERE id=$1`, [itemId, status, report.score, JSON.stringify(report)]);
   return { status, report };
 }
+// Three slips found by reading production drafts as a reviewer would (2026-10-04), each cheap to catch in code:
+// - captions missing: one draft in eleven came back with none — the writer's fallback models return leaner JSON — and
+//   a revision that answered "captions": {} replaced good ones with nothing. A post always has its words.
+// - a hashtag carrying the wrong year: #DurgaPuja2024 on this year's Puja. A year in a tag that is not this year goes.
+// - a word in two scripts: "জামin" (Latin letters inside a Bangla word) is a model glitch, put to the editor below.
+const hasWords = (c) => c && typeof c === "object" && Object.values(c).some((v) => typeof v === "string" && v.trim());
+function withCaptions(captions, { headline, summary }) {
+  if (hasWords(captions)) return captions;
+  const text = String(summary || headline || "").trim();
+  return text ? { default: headline || text, facebook: text, instagram: text } : captions || {};
+}
+function currentYearTags(tags) {
+  const year = String(new Date().getUTCFullYear());
+  return (Array.isArray(tags) ? tags : []).map((t) => String(t).replace(/(19|20)\d\d/g, (y) => (y === year ? y : ""))).filter((t) => t.replace(/^#/, "").trim());
+}
+const MIXED_WORD = /[\u0980-\u09FF]+[A-Za-z]+[\u0980-\u09FF]*|[A-Za-z]+[\u0980-\u09FF]+/g;
+const mixedWords = (text) => [...new Set(String(text || "").match(MIXED_WORD) || [])].slice(0, 5);
 async function reviseFromQa(itemId, niche, report) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const m = await qaMaterial(item, niche);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
@@ -3774,7 +3793,8 @@ async function reviseFromQa(itemId, niche, report) {
     prompt: `${materialBlock(m)}\nCURRENT DRAFT\n${draftText(item)}\n\nSTANDARDS EDITOR'S NOTES\n${notes.join("\n")}\n\nReturn JSON with the corrected fields: {"headline": "...", "summary": "..."${item.body ? ', "body": "... (same HTML format)"' : ""}${Object.keys(caps).length ? `, "captions": {${Object.keys(caps).map((k) => `"${k}": "..."`).join(", ")}}` : ""}}`,
     mock: {} }));
   await addCost(itemId, r.cost); const d = r.data || {}, upd = {};
-  for (const k of ["headline", "summary", "body", "captions"]) if (d[k] && (k !== "body" || item.body)) upd[k] = d[k];
+  for (const k of ["headline", "summary", "body"]) if (d[k] && (k !== "body" || item.body)) upd[k] = d[k];
+  if (hasWords(d.captions)) upd.captions = { ...caps, ...Object.fromEntries(Object.entries(d.captions).filter(([, v]) => typeof v === "string" && v.trim())) };
   if (!Object.keys(upd).length) return false;
   await setItem(itemId, upd);
   if (upd.headline && upd.headline !== item.headline) await recomposeCard(itemId).catch((e) => warn(`card recompose ${itemId}: ${e.message}`));
