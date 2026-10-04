@@ -4214,6 +4214,7 @@ async function adapterUsable(key) {
 async function upgradeAdapters() {
   const migrate = !(await setting("upgrade.adapters_v3", false));
   const voiceEdgeOnce = !(await setting("upgrade.voice_edge_v1", false));
+  const clipLlmOnce = !(await setting("upgrade.clip_llm_v1", false));
   const d = await smartAdapterDefaults(), changed = [];
   for (const n of await q(`SELECT * FROM niches WHERE is_active::int = 1`)) {
     const fix = {};
@@ -4243,6 +4244,14 @@ async function upgradeAdapters() {
         fix.voice_adapter = ordered[0]; fix.voice_adapter_fallbacks = JSON.stringify(ordered.slice(1));
       }
     }
+    // Once: the LLM picker to the front of each clip chain, the programme's own picker kept right behind it, and the
+    // free pickers after that — so a spent writer allowance moves the choice down the chain instead of failing the video.
+    if (clipLlmOnce && d.clipAdapter === "llm_clipper" && !/_mock$/.test(n.clip_adapter || "")) {
+      const ordered = [...new Set(["llm_clipper", n.clip_adapter, ...(P(n.clip_adapter_fallbacks) || []), "clip_meaning", "clip_signal"].filter((k) => k && !/_mock$/.test(k)))];
+      if (ordered[0] !== n.clip_adapter || JSON.stringify(ordered.slice(1)) !== JSON.stringify(P(n.clip_adapter_fallbacks) || [])) {
+        fix.clip_adapter = ordered[0]; fix.clip_adapter_fallbacks = JSON.stringify(ordered.slice(1));
+      }
+    }
     if (migrate && n.render_adapter === "ffmpeg" && d.renderAdapter === "remotion") fix.render_adapter = "remotion";
     if (!Object.keys(fix).length) continue;
     await q(`UPDATE niches SET ${Object.keys(fix).map((k, i) => `${k} = $${i + 2}`).join(", ")} WHERE id = $1`, [n.id, ...Object.values(fix)]);
@@ -4256,6 +4265,7 @@ async function upgradeAdapters() {
   // Recorded only once edge-tts was actually there to move to the front, so a deployment that boots without it
   // reorders on the first boot that has it.
   if (voiceEdgeOnce && d.voiceAdapter === "tts_edge") await putSetting("upgrade.voice_edge_v1", true);
+  if (clipLlmOnce && d.clipAdapter === "llm_clipper") await putSetting("upgrade.clip_llm_v1", true);
 }
 
 // Keeps the database small enough for Supabase's free tier while polling dozens of feeds around the clock: the ingest
@@ -4489,6 +4499,12 @@ async function smartAdapterDefaults() {
     transcriptAdapter: whisperInstalled() ? "whisper_cpp" : gem ? "gemini_transcribe" : oai ? "whisper_api" : "transcribe_mock",
     // "remotion" falls back to ffmpeg by itself when the rendering instance lacks the memory, so it's safe to pick here.
     renderAdapter: studioInstalled() && ffmpeg ? "remotion" : ffmpeg ? "ffmpeg" : "render_mock",
+    // Who chooses the moment. Measured on fourteen real speeches (eval/selection.mjs): an LLM reading the transcript put
+    // the line anyone would clip first in 9, the free heuristic in 4, loudness alone in 1. The LLM goes first where
+    // there is a writer, and the free pickers stay behind it for the day its allowance is spent — the schema default was
+    // the LLM with nothing behind it, so a spent allowance failed the whole video.
+    clipAdapter: gem || oai || ant ? "llm_clipper" : "clip_meaning",
+    clipAdapterFallbacks: gem || oai || ant ? ["clip_meaning", "clip_signal"] : ["clip_signal"],
   };
 }
 const checkComputeWhere = (b) => { if (b?.computeWhere != null && !["server", "pc"].includes(b.computeWhere)) throw new ApiError(400, null, "computeWhere must be \"server\" or \"pc\""); };
@@ -4531,7 +4547,7 @@ app.post("/api/voices/test", async (ctx) => {
 const CATALOG = [
   { id: "1a", type: "Clip", name: "Laptop clip", what: "Your link → the moment that matters, cut to a captioned 9:16 reel", runs: "pc", needs: ["pc"], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc" } },
   { id: "1b", type: "Clip", name: "Rented clip", what: "A clipping service does the cut while your PC is off", runs: "rented", needs: ["clip_service"], status: "to build" },
-  { id: "1c", type: "Clip", name: "Claude-picked clip", what: "An LLM reads the transcript and chooses the moment", runs: "pc", needs: ["pc", "writer"], status: "built", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "llm_clipper" } },
+  { id: "1c", type: "Clip", name: "LLM-picked clip", what: "An LLM reads the transcript and chooses the moment", runs: "server or pc", needs: ["writer"], status: "proven", note: "On fourteen real speeches it put the line anyone would clip first in 9 (the free picker: 4)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "llm_clipper" } },
   { id: "1d", type: "Clip", name: "Server clip", what: "As 1a, on the server at 720p, for links that are not YouTube", runs: "server", needs: [], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "server" } },
   { id: "2a", type: "News card", name: "Photo card", what: "Headline and caption over the outlet's own photo, branded", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
   { id: "2b", type: "News card", name: "Text card", what: "Typographic card for a story without a photo", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
