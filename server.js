@@ -2083,7 +2083,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         // the faster playback.
         const at = (t) => clip.start + (t - clip.start) / speed;
         const fastSegs = segs.map((x) => ({ ...x, start: at(x.start), end: at(x.end), words: x.words?.map((w) => ({ ...w, start: at(w.start), end: at(w.end) })) }));
-        const pip = c.reaction_layout === "pip", hostW = Math.round((W * 0.38) / 2) * 2;
+        const pip = c.reaction_layout === "pip", hostW = Math.round((W * 0.42) / 2) * 2;   // a square from the middle of the host's clip: a face, not a figure in a room
         const stackAss = caps[caps.push(pip ? await assFor(true, false, fastSegs, clip.start, clip.start + len)
           : await writeCaptionsAss(fastSegs, clip.start, clip.start + len, { width: 1080, height: 1920, middle: true })) - 1];
         // Both pictures are brought to one frame rate before they are combined. Debian's ffmpeg 5.1 — the one on Render —
@@ -2095,7 +2095,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         // trims the sides, which for a speaker or a face is the part nobody watches.
         const box = (w, h) => `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1`;
         const vfc = pip
-          ? `[0:v]${fast}${vfVerticalBlurpad()}[m];[1:v]fps=30,scale=${hostW}:-2,setsar=1,pad=iw+8:ih+8:4:4:color=white[o];[m][o]overlay=W-w-${margin}:${Math.round(H * 0.1)}:shortest=1,${assVf(stackAss)}[v]`
+          ? `[0:v]${fast}${vfVerticalBlurpad()}[m];[1:v]fps=30,crop=min(iw\\,ih):min(iw\\,ih),scale=${hostW}:${hostW},setsar=1,pad=iw+8:ih+8:4:4:color=white[o];[m][o]overlay=W-w-${margin}:${Math.round(H * 0.1)}:shortest=1,${assVf(stackAss)}[v]`
           : `[0:v]${fast}${box(W, half)}[m];[1:v]fps=30,${box(W, H - half)}[o];[m][o]vstack=inputs=2:shortest=1,${assVf(stackAss)}[v]`;
         // The source's sound at the new speed with the host's on top; whichever side has no audio track is left out.
         const [mainA, hostA] = [await hasAudio(sourcePath), await hasAudio(ov)], hostVol = Number(c.reactor_volume ?? 1);
