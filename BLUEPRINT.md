@@ -151,9 +151,22 @@ stock pool, and a library of your own footage is the difference.
   clips are now taken only when Pexels' own description names the programme's country.
 - Split-screen reaction on the free server, 21 s at 720p: **about 4–5 minutes** once both fixes above were in.
 
+## Clipping services, checked 2026-10-04 *(1b)*
+
+From the providers' own documentation; nothing bought or called yet.
+
+| service | API access | price | YouTube links | Bangla | notes |
+|---|---|---|---|---|---|
+| Vizard | Creator plan and up, no sales call | ~$14.50/month (annual), 600 upload minutes; 3 requests/min, 20/hour | yes — it fetches them itself | **no** (37 languages) | `POST …/open-api/v1/project/create` (header `VIZARDAI_API_KEY`, `videoType` 2 = YouTube, `preferLength`, `ratioOfClip`, `maxClipNumber`), poll `GET …/project/query/{id}`. Docs do not say whether clip start/end in the source are returned — decides whether we can re-render in our own style |
+| Klap | public, usage-based | $0.44 per video in + $0.32 per short + $0.48 per export ≈ **$2.84 for three clips** | — | — | `https://api.klap.app/v2` `/tasks`, `/projects`, `/exports`; endpoint detail not public |
+| OpusClip | Business / enterprise only | sales | — | — | not self-serve |
+| Submagic | Business+API tier | $69/month, 100 min, then $0.10–0.15/min | — | — | |
+
+Vizard is the fit for 1b: a flat monthly price, and it fetches YouTube itself, which is exactly the gap when the PC
+is off. Its first test before building: one video through the API, to see whether the clip times come back.
+
 ## Still to verify before its own build
 
-- The clipping service API: shape, polling, price *(1b)*.
 - Gemini video input on a long file: chunking and cost *(5a)*.
 
 ## Proven working
