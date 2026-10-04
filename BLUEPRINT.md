@@ -179,4 +179,5 @@ the outlet's own photo, local footage) and 4a (split-screen and picture-in-pictu
 real speech, with a stock stand-in for the host until there is a real persona clip) since 2026-10-04. Also proven on
 2026-10-04, made by the server: 1c (the LLM picker — first place for the famous line in 9 of 14 speeches, against 4
 for the free heuristic), 3b (an English TV report clipped on the PC), 4b (summary voice-over), 5b (transcript recap)
-and 7b (a Bangla explainer on Bangladesh-only stock footage).
+7b (a Bangla explainer on Bangladesh-only stock footage) and 4c (a three-minute long-form reaction: five segments, seven
+commentary breaks, a stand-in host).
