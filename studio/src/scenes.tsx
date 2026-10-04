@@ -287,10 +287,10 @@ export const Timeline: React.FC<SceneProps> = ({ data, cues, brand, vertical }) 
   );
 };
 
-// An illustrated scene (6c): a drawn place under a slow camera, and the series' character — drawn separately on white —
-// put into it. The white falls away under "multiply", which is exact for flat illustration on a white ground, so no
-// cut-out step is needed. The character walks in from its side on a spring, then never stands quite still: a small
-// breathing bob, and a lift when the narrator reaches them. The caption arrives last, from behind a moving edge.
+// An illustrated scene (6c): a drawn place under a slow camera, and the series' character — drawn separately and cut out
+// by the engine — put into it, with a soft shadow to stand on. The character walks in from its side on a spring, then
+// never stands quite still: a small breathing bob, and a lift when the narrator reaches them. The caption arrives last,
+// from behind a moving edge.
 export const Illustrated: React.FC<SceneProps> = ({ data, cues, brand, vertical, durationInFrames }) => {
   const frame = useCurrentFrame(); const { fps } = useVideoConfig();
   const fromLeft = String(data.enter || "left") !== "right";
@@ -305,8 +305,9 @@ export const Illustrated: React.FC<SceneProps> = ({ data, cues, brand, vertical,
       <AbsoluteFill style={{ background: "linear-gradient(180deg, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%)" }} />
       {data.figure ? (
         <div style={{ position: "absolute", bottom: vertical ? 300 : 40, [fromLeft ? "left" : "right"]: vertical ? 60 : 160, height: h, width: h,
-          transform: `translateX(${(1 - walk) * (fromLeft ? -1 : 1) * 700}px) translateY(${bob - lift * 18}px) scale(${1 + lift * 0.03})`, opacity: Math.min(1, walk * 1.4) }}>
-          <Img src={src(data.figure)!} style={{ width: "100%", height: "100%", objectFit: "contain", mixBlendMode: "multiply" }} />
+          transform: `translateX(${(1 - walk) * (fromLeft ? -1 : 1) * 700}px) translateY(${bob - lift * 18}px) scale(${1 + lift * 0.03})`, opacity: Math.min(1, walk * 1.4),
+          }}>
+          <Img src={src(data.figure)!} style={{ width: "100%", height: "100%", objectFit: "contain", filter: "drop-shadow(0 24px 30px rgba(0,0,0,.45))" }} />
         </div>
       ) : null}
       {data.caption ? (

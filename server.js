@@ -1776,14 +1776,14 @@ impl("IMAGE", "pollinations", { label: "Pollinations (free, no key)", configSche
     const token = (await credentialsFor("pollinations"))[0]?.secret;
     const base = ENV.POLLINATIONS_API_BASE || "https://image.pollinations.ai";
     const qs = form({ width: w, height: h, model: cfg.model || "flux", seed: Number.isFinite(Number(seed)) ? Number(seed) : parseInt(sha(full).slice(0, 7), 16), nologo: "true", private: "true" });
-    // Without a token the service turns away about every other request with an empty 402 and serves the next one
-    // (measured 2026-10-04: strict alternation, whatever the spacing), and it is busy now and then. So a 402, a 429 or
-    // a 5xx is asked again a few times before it counts; anything else is a real failure.
+    // Without a token the service turns away many requests with an empty 402 and serves a later one (measured
+    // 2026-10-04: every other request when quiet, six in a row when busy), and it is overloaded now and then. So a 402,
+    // a 429 or a 5xx is asked again, more patiently each time, for about two minutes; anything else is a real failure.
     const url = `${base}/prompt/${encodeURIComponent(full.slice(0, 1500))}?${qs}`;
     let bytes;
     for (let i = 1; ; i++) {
       try { bytes = await fetchBytes(url, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(120000) }); break; }
-      catch (e) { if (i >= 6 || !(e.status === 402 || e.status === 429 || e.status >= 500 || isTransient(e))) throw e; await sleep(Number(ENV.POLLINATIONS_RETRY_MS ?? 2500) * i); }
+      catch (e) { if (i >= 9 || !(e.status === 402 || e.status === 429 || e.status >= 500 || isTransient(e))) throw Object.assign(e, { transient: e.status === 402 || isTransient(e) }); await sleep(Number(ENV.POLLINATIONS_RETRY_MS ?? 3000) * i); }
     }
     if (bytes.length < 2000) throw new Error("Pollinations returned no picture");
     const media = await storeImage(bytes, "image/jpeg", contentItemId, { provider: "pollinations", prompt: full, seed }, { width: w, height: h }, specs.compose === false ? null : { headline, specs });
@@ -3620,24 +3620,79 @@ const EXPLAINER_LAYOUTS = {
 const ILLUSTRATED_STYLE = (cast) => `This is an ILLUSTRATED story: build most scenes (all but an opening TitleCard and at most one other) as Illustrated scenes. The cast:\n${cast.length ? cast.map((c) => `- ${c.name}: ${c.look}`).join("\n") : "- (no fixed cast: name at most two characters and describe them the same way every time)"}\nUse only these names for "character"; a scene of a place alone has character null.`;
 const castOf = (mc) => (Array.isArray(mc.characters) ? mc.characters : []).map((c) => ({ name: String(c.name || "").trim(), look: String(c.look || "").trim() })).filter((c) => c.name);
 const ART_STYLE = "flat vector illustration, clean lines, soft warm colours, gentle shading, storybook style";
-// Each Illustrated scene drawn: the place, and the character on white (the studio lets the white fall away). The
+// A drawn character cut out of its plain background, as a PNG with transparency. Free image models will not draw on
+// transparency, and blending the white away ("multiply") turns a character ghostly over a dark street. So the
+// background is removed the way a fill tool does it: starting from the picture's edges, every pixel close to the
+// edges' own colour that touches one already removed — so a white vest inside the outline stays, because the
+// outline separates it from the edge. The rim is softened by a pixel so the cut does not look cut.
+async function cutOut(url) {
+  const src = await toTmpFile(url, "jpg"), raw = tmpPath("rgba"), png = tmpPath("png");
+  try {
+    const dims = await exec("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", src], { timeoutMs: 30000 });
+    const [w, h] = String(dims.out).trim().split(",").map(Number); if (!(w > 0 && h > 0)) throw new Error("unreadable picture");
+    await exec("ffmpeg", ["-y", "-v", "error", "-i", src, "-f", "rawvideo", "-pix_fmt", "rgba", raw], { timeoutMs: 60000 });
+    const px = await readFile(raw), n = w * h;
+    const edge = []; for (let x = 0; x < w; x++) edge.push(x, (h - 1) * w + x); for (let y = 0; y < h; y++) edge.push(y * w, y * w + w - 1);
+    const med = [0, 1, 2].map((c) => edge.map((i) => px[i * 4 + c]).sort((a, b) => a - b)[edge.length >> 1]);
+    const dist = (i) => Math.abs(px[i * 4] - med[0]) + Math.abs(px[i * 4 + 1] - med[1]) + Math.abs(px[i * 4 + 2] - med[2]);
+    const T = 60, gone = new Uint8Array(n), queue = new Int32Array(n); let head = 0, tail = 0;
+    for (const i of edge) if (!gone[i] && dist(i) < T) { gone[i] = 1; queue[tail++] = i; }
+    while (head < tail) {
+      const i = queue[head++], x = i % w;
+      for (const j of [i - w, i + w, x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1]) if (j >= 0 && j < n && !gone[j] && dist(j) < T) { gone[j] = 1; queue[tail++] = j; }
+    }
+    if (tail > n * 0.97 || tail < n * 0.05) throw new Error("no clear background to remove");
+    // Free models like to put the character on a pale disc however they are asked not to. When what now borders the
+    // removed area is one even colour (a disc's rim, not the varied edge of a figure), that colour is filled away too —
+    // but only if it is a large region, so a figure's own outline or a patch of its clothes is never taken for one.
+    const rim = []; for (let i = 0; i < n; i++) { if (gone[i]) continue; const x = i % w; if ((x > 0 && gone[i - 1]) || (x < w - 1 && gone[i + 1]) || (i >= w && gone[i - w]) || (i + w < n && gone[i + w])) rim.push(i); }
+    const disc = [0, 1, 2].map((c) => rim.map((i) => px[i * 4 + c]).sort((a, b) => a - b)[rim.length >> 1] ?? 0);
+    const dd = (i) => Math.abs(px[i * 4] - disc[0]) + Math.abs(px[i * 4 + 1] - disc[1]) + Math.abs(px[i * 4 + 2] - disc[2]);
+    if (rim.length && rim.filter((i) => dd(i) < 40).length > rim.length * 0.7) {
+      const more = []; const seen = new Uint8Array(n); let h2 = 0;
+      for (const i of rim) if (dd(i) < 40) { seen[i] = 1; more.push(i); }
+      while (h2 < more.length) { const i = more[h2++], x = i % w;
+        for (const j of [i - w, i + w, x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1]) if (j >= 0 && j < n && !gone[j] && !seen[j] && dd(j) < 40) { seen[j] = 1; more.push(j); } }
+      if (more.length > n * 0.15 && more.length < n * 0.7) for (const i of more) gone[i] = 1;
+    }
+    for (let i = 0; i < n; i++) {
+      if (gone[i]) { px[i * 4 + 3] = 0; continue; }
+      const x = i % w, near = (x > 0 && gone[i - 1]) || (x < w - 1 && gone[i + 1]) || (i >= w && gone[i - w]) || (i + w < n && gone[i + w]);
+      if (near) px[i * 4 + 3] = Math.round(255 * Math.min(1, dist(i) / (T * 2)));
+    }
+    await writeFile(raw, px);
+    await exec("ffmpeg", ["-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", `${w}x${h}`, "-i", raw, "-frames:v", "1", png], { timeoutMs: 60000 });
+    return { bytes: await readFile(png), width: w, height: h, removed: tail / n };
+  } finally { await cleanup(src, raw, png); }
+}
+// Each Illustrated scene drawn: the place, and the character cut out of a plain background. The
 // character's seed comes from their name, so with the same description they are drawn the same way every time.
 async function drawIllustrated(scenes, niche, itemId, vertical) {
   const mc = methodCfg(niche), cast = castOf(mc), art = mc.art_style || ART_STYLE;
   const adapters = [mc.illustration_adapter || "pollinations", ...((await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks")).filter((k) => /gemini_image|openai_image|pollinations/.test(k)))];
   const draw = (prompt, specs, seed) => withFallbacks("IMAGE", adapters[0], adapters.slice(1), (img) => img.generate({ prompt, specs: { ...specs, compose: false, overlay: false }, contentItemId: itemId, seed }));
-  const cache = new Map();
+  // A picture the service would not draw costs its scene that picture — the layout plays without it, over the brand's
+  // backdrop — not the whole video. Only when most of them are missing is the video put off, to try again later.
+  const cache = new Map(); let asked = 0, missing = 0, last = null;
+  const tryDraw = async (...a) => { asked++; try { return (await draw(...a)).url; } catch (e) { missing++; last = e; warn(`illustration: ${String(e.message).slice(0, 140)}`); return null; } };
   for (const s of scenes.filter((x) => x.layout === "Illustrated")) {
     const d = s.data;
-    const bg = await draw(`${art}. ${d.setting || "a quiet street"}. Wide establishing shot, no people`, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080 });
-    d.background = bg.url;
+    d.background = await tryDraw(`${art}. ${d.setting || "a quiet street"}. Wide establishing shot, no people`, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080 });
     const who = cast.find((c) => c.name.toLowerCase() === String(d.character || "").toLowerCase());
     if (d.character) {
       const look = who?.look || d.character, key = `${look}|${d.action || ""}`;
-      if (!cache.has(key)) cache.set(key, await draw(`${art}. Full body character: ${look}, ${d.action || "standing"}. Centred, isolated on a plain pure white background, no shadow, no scenery`, { width: 1024, height: 1024 }, parseInt(sha(look).slice(0, 7), 16)));
-      d.figure = cache.get(key).url;
+      if (!cache.has(key)) {
+        let fig = await tryDraw(`${art}. Full body character: ${look}, ${d.action || "standing"}. Centred, alone, on a flat pure white background with nothing behind them: no circle, no frame, no backdrop shape, no shadow, no scenery`, { width: 1024, height: 1024 }, parseInt(sha(look).slice(0, 7), 16));
+        // Cut out where it can be; a picture whose background will not come away is left whole, as a card in the scene.
+        if (fig) try { const c = await cutOut(fig); fig = (await recordMedia({ contentItemId: itemId, kind: "IMAGE", url: await storeFile(`images/${newId()}-figure.png`, c.bytes, "image/png"), mime: "image/png", width: c.width, height: c.height, meta: { purpose: "illustration figure", cut_out: Number(c.removed.toFixed(2)) } })).url; }
+        catch (e) { warn(`figure cut-out: ${e.message}`); }
+        cache.set(key, fig);
+      }
+      d.figure = cache.get(key);
     }
+    for (const k of ["background", "figure"]) if (!d[k]) delete d[k];
   }
+  if (asked && missing * 2 > asked) throw Object.assign(new Error(`Only ${asked - missing} of ${asked} illustrations could be drawn (${String(last?.message || "").slice(0, 120)}); trying again later`), { transient: true });
 }
 
 // A data explainer (6b) is the same machine pointed at numbers: most of its scenes are charts, figures and timelines,
@@ -3691,7 +3746,7 @@ async function generateExplainer(item, niche, style) {
   await setItem(item.id, { captions: { youtube: description, default: p.description || title, facebook: p.description || title } });
   if (narr.audio.mock || !studioReady()) throw new Error("ANIMATED_EXPLAINER needs the video studio and a real voice adapter (the studio renders the animation)");
   const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(narr.audio.url, "mp3"), drawn = [];
-  for (const b of built) for (const k of ["background", "figure"]) if (b.data?.[k]) { b.data[k] = await toTmpFile(b.data[k], "jpg"); drawn.push(b.data[k]); }
+  for (const b of built) for (const k of ["background", "figure"]) if (b.data?.[k]) { b.data[k] = await toTmpFile(b.data[k], /\.png(\?|$)/i.test(b.data[k]) ? "png" : "jpg"); drawn.push(b.data[k]); }
   const props = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), brand, title, audio: audioFile, music, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built };
   try {
     const out = await studioRender("Explainer", props);
