@@ -239,6 +239,7 @@ test("the story's own photo is what the post uses, credited to the outlet that r
     assert.equal(item.hero_media.meta.provider, "source", "the picture is the one the story came with");
     assert.equal(item.hero_media.meta.overlay, "photocard", "composed into the brand's card, not posted raw");
     assert.match(item.hero_media.meta.compose_specs.photo_credit, /Photo: Mirpur Times/, "and the outlet is credited");
+    assert.ok(item.source_data_ref.article_chars > 200, `the writer had the outlet's article (${item.source_data_ref.article_chars} characters)`);
 
     // A 120x120 badge is a section icon or a tracking pixel, not a news picture. A story that came with only that one
     // must fall back to the brand's card rather than post it.
