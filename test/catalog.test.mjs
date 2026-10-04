@@ -24,12 +24,18 @@ test("the catalog lists every variant and says what is missing for each, from th
 
     await eng.api("POST", "/api/credentials", { provider: "gemini", label: "test", envVar: "CATALOG_TEST_KEY" });
     const brand = await eng.api("POST", "/api/brands", { name: "Catalog brand" });
-    await eng.api("POST", "/api/programs", { brandId: brand.id, key: "pc_clips", displayName: "PC clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc", useMocks: true, autoStyle: false, autoSources: false });
+    await eng.api("POST", "/api/programs", { brandId: brand.id, key: "pc_clips", displayName: "PC clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc", clipAdapter: "clip_meaning", useMocks: true, autoStyle: false, autoSources: false });
+    await eng.api("POST", "/api/programs", { brandId: brand.id, key: "llm_clips", displayName: "LLM clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "server", clipAdapter: "llm_clipper", useMocks: true, autoStyle: false, autoSources: false });
     const after = await eng.api("GET", "/api/catalog");
     assert.equal(need("2a", "writer", after).ok, true, "a writer key, once added, is seen");
     assert.match(need("2a", "writer", after).detail, /Gemini/);
     assert.deepEqual(by("1a", after).programs, ["PC clips"], "a programme set to run on the PC counts as a laptop clip");
     assert.deepEqual(by("1d", after).programs, [], "and not as a server clip");
+    assert.deepEqual(by("1c", after).programs, ["LLM clips"], "one whose moments an LLM picks is an LLM-picked clip");
+    // Each programme says which variant it makes, so the Programmes page can show it.
+    const programs = await eng.api("GET", "/api/programs"), variants = (name) => programs.find((p) => p.display_name === name).variants;
+    assert.deepEqual(variants("PC clips"), ["1a"]);
+    assert.deepEqual(variants("LLM clips"), ["1c"]);
   } finally { await eng.stop(); }
 });
 

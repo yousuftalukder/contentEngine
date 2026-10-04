@@ -6,9 +6,9 @@
 // element keeps a slow drift after it lands, and whatever the narrator is naming right now is lifted while the rest
 // dims. The timing comes from the narration, so the emphasis always lands on the word being spoken.
 import React from "react";
-import { AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
+import { AbsoluteFill, Img, interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
 import * as Lucide from "lucide-react";
-import { Brand, MOTION, EASE, shade, drift } from "./theme";
+import { Brand, MOTION, EASE, shade, drift, src } from "./theme";
 
 export type SceneProps = { data: any; cues: number[]; brand: Brand; vertical: boolean; durationInFrames: number };
 
@@ -287,4 +287,36 @@ export const Timeline: React.FC<SceneProps> = ({ data, cues, brand, vertical }) 
   );
 };
 
-export const LAYOUTS: Record<string, React.FC<SceneProps>> = { TitleCard, BulletReveal, IconGrid, Comparison, DataChart, FullQuote, BigNumber, Timeline };
+// An illustrated scene (6c): a drawn place under a slow camera, and the series' character — drawn separately and cut out
+// by the engine — put into it, with a soft shadow to stand on. The character walks in from its side on a spring, then
+// never stands quite still: a small breathing bob, and a lift when the narrator reaches them. The caption arrives last,
+// from behind a moving edge.
+export const Illustrated: React.FC<SceneProps> = ({ data, cues, brand, vertical, durationInFrames }) => {
+  const frame = useCurrentFrame(); const { fps } = useVideoConfig();
+  const fromLeft = String(data.enter || "left") !== "right";
+  const zoom = interpolate(frame, [0, durationInFrames], [1.04, 1.14], { extrapolateRight: "clamp" });
+  const pan = interpolate(frame, [0, durationInFrames], fromLeft ? [-2, 2] : [2, -2], { extrapolateRight: "clamp" });
+  const walk = spring({ frame: frame - 6, fps, config: MOTION.enter, durationInFrames: 28 });
+  const bob = Math.sin(frame / 9) * 6, lift = useCue(cue(cues, 0, 10));
+  const h = vertical ? 1150 : 820;
+  return (
+    <AbsoluteFill style={{ overflow: "hidden", background: shade(brand.primary, -0.6) }}>
+      {data.background ? <AbsoluteFill style={{ transform: `scale(${zoom}) translateX(${pan}%)` }}><Img src={src(data.background)!} style={{ width: "100%", height: "100%", objectFit: "cover" }} /></AbsoluteFill> : null}
+      <AbsoluteFill style={{ background: "linear-gradient(180deg, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%)" }} />
+      {data.figure ? (
+        <div style={{ position: "absolute", bottom: vertical ? 300 : 40, [fromLeft ? "left" : "right"]: vertical ? 60 : 160, height: h, width: h,
+          transform: `translateX(${(1 - walk) * (fromLeft ? -1 : 1) * 700}px) translateY(${bob - lift * 18}px) scale(${1 + lift * 0.03})`, opacity: Math.min(1, walk * 1.4),
+          }}>
+          <Img src={src(data.figure)!} style={{ width: "100%", height: "100%", objectFit: "contain", filter: "drop-shadow(0 24px 30px rgba(0,0,0,.45))" }} />
+        </div>
+      ) : null}
+      {data.caption ? (
+        <AbsoluteFill style={{ justifyContent: "flex-start", alignItems: fromLeft ? "flex-end" : "flex-start", padding: vertical ? "240px 70px" : "120px 150px" }}>
+          <Reveal at={cue(cues, 0, 10) + 8} style={{ maxWidth: vertical ? 900 : 860, background: "rgba(0,0,0,.6)", borderLeft: `10px solid ${brand.accent}`, color: "#fff", fontSize: vertical ? 54 : 50, fontWeight: 700, lineHeight: 1.2, padding: "18px 26px", borderRadius: 8 }}>{data.caption}</Reveal>
+        </AbsoluteFill>
+      ) : null}
+    </AbsoluteFill>
+  );
+};
+
+export const LAYOUTS: Record<string, React.FC<SceneProps>> = { TitleCard, BulletReveal, IconGrid, Comparison, DataChart, FullQuote, BigNumber, Timeline, Illustrated };
