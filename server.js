@@ -299,6 +299,24 @@ async function recordUsage(credId, provider, units = 1, cost = 0) {
     [newId(), credId, provider, units, cost]).catch((e) => warn("usage record failed", e.message));
 }
 // Runs fn(secret) against the best key; on 429/quota errors cools that key down and tries the next one.
+// Whether a provider is refusing for money or quota, kept where every process and the dashboard can see it. A writer
+// that fails inside a step with a fallback (a caption the clip's own words stand in for) never fails the job, so no
+// alert fires, and a key that exists looked like a key that works. Written only when the state changes: refused on
+// the first billing or quota refusal, cleared by the first success after it.
+const refusedState = new Map();                                                   // provider -> true (refused) | false (clear)
+const refusalOf = (e) => {
+  const text = `${e?.message || ""} ${JSON.stringify(e?.body || "")}`;
+  if (/credit balance|insufficient_quota|payment required|\b402\b/i.test(text) || e?.status === 402) return "out of credit";
+  if (/free_tier|FreeTier/i.test(text)) return "free-tier limit reached";
+  if (e?.status === 429 || /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(text)) return "quota reached";
+  return null;
+};
+async function markProvider(provider, reason) {
+  if (reason ? refusedState.get(provider) === reason : refusedState.get(provider) === false) return;
+  refusedState.set(provider, reason || false);
+  if (reason) await putSetting(`provider.refused.${provider}`, { reason }).catch(() => {});
+  else await q(`DELETE FROM settings WHERE key = $1`, [`provider.refused.${provider}`]).catch(() => {});
+}
 async function withKey(provider, fn, pin = null) {
   const creds = await credentialsFor(provider, pin);
   if (!creds.length) throw new Error(`No API key for "${provider}". Add one on the API keys page${DEFAULT_ENV[provider] ? ` (or set ${DEFAULT_ENV[provider]} on Render)` : ""}.`);
@@ -307,9 +325,11 @@ async function withKey(provider, fn, pin = null) {
     try {
       const out = await fn(c.secret, c);
       await recordUsage(c.id, provider, out?.units ?? 1, out?.cost ?? 0);
+      await markProvider(provider, null);
       return out;
     } catch (e) {
       last = e;
+      const refused = refusalOf(e); if (refused) await markProvider(provider, refused);
       const quota = e.status === 429 || (e.status === 403 && /quota|limit/i.test(JSON.stringify(e.body || "")));
       if (!quota) throw e;
       warn(`key ${c.label} for ${provider} hit quota; rotating`);
@@ -4441,15 +4461,22 @@ const CATALOG = [
   { id: "7c", type: "Script → video", name: "Photo sequence", what: "Stills with motion, narrated", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
 ];
 app.get("/api/catalog", async (ctx) => {
-  const [gemini, anthropic, voice, beat, persona, programs] = await Promise.all([
+  const [gemini, anthropic, voice, beat, persona, programs, refusals] = await Promise.all([
     credentialsFor("gemini"), credentialsFor("anthropic"), edgeInstalled(),
     one(`SELECT EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key = 'worker.pc'`),
     one(`SELECT count(*)::int AS n FROM media_assets WHERE kind = 'UPLOAD' AND deleted_at IS NULL AND meta->>'purpose' = 'reactor'`),
-    q(`SELECT content_type, production_method, compute_where, clip_adapter, display_name FROM niches`)]);
-  const pcOnline = beat ? Number(beat.age) < 90 : false, writers = [gemini.length && "Gemini", anthropic.length && "Claude"].filter(Boolean);
+    q(`SELECT content_type, production_method, compute_where, clip_adapter, display_name FROM niches`),
+    // A quota resets within the day; a refusal that old says nothing about now. Out of credit stays until a success clears it.
+    q(`SELECT substring(key from 18) AS provider, value, EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key LIKE 'provider.refused.%'`)]);
+  const pcOnline = beat ? Number(beat.age) < 90 : false;
+  const refusing = (prov) => { const r = refusals.find((x) => x.provider === prov); const why = r ? (typeof r.value === "string" ? P(r.value) : r.value)?.reason : null;
+    return why && (why === "out of credit" || Number(r.age) < 12 * 3600) ? why : null; };
+  const writerKeys = [["gemini", "Gemini", gemini], ["anthropic", "Claude", anthropic]].filter(([, , c]) => c.length);
+  const writers = writerKeys.filter(([prov]) => !refusing(prov)).map(([, name]) => name);
+  const refusedWriters = writerKeys.filter(([prov]) => refusing(prov)).map(([prov, name]) => `${name}: ${refusing(prov)}`);
   const needs = {
     pc: { ok: pcOnline, label: "your PC on", detail: pcOnline ? "online now" : beat ? "off — work waits for it" : "never connected — run pc\\start.ps1" },
-    writer: { ok: writers.length > 0, label: "a writer key", detail: writers.length ? writers.join(" + ") : "add a Gemini or Claude key" },
+    writer: { ok: writers.length > 0, label: "a writer that works", detail: [writers.join(" + "), ...refusedWriters].filter(Boolean).join("; ") || "add a Gemini or Claude key" },
     voice: { ok: voice, label: "a voice", detail: voice ? "edge-tts (free)" : "edge-tts is not installed here" },
     persona: { ok: persona.n > 0, label: "your reactor clip", detail: persona.n ? `${persona.n} uploaded` : "upload one under Brands → Media library" },
     clip_service: { ok: false, label: "a clipping subscription", detail: "not built yet" },
