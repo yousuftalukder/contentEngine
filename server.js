@@ -2977,7 +2977,12 @@ async function rejectItem(itemId, note) {
 async function finishGeneration(itemId, niche) {
   const mode = niche.approval_mode || "MANUAL";
   if (await setting(`quota.pause.${niche.id}`, null)) await putSetting(`quota.pause.${niche.id}`, null);   // the writer answered: take stories again
-  const qa = await qualityGate(itemId, niche), clean = qa.status === "PASS" || qa.status === "SKIPPED";
+  // A news story written from a headline and a one-line summary — no outlet's article could be read — is never clean
+  // enough to publish without a person, whatever the quality check thought of the writing: the check can only compare
+  // the draft with what the writer had, and the writer had almost nothing.
+  const row = await one(`SELECT source_data_ref, clip_id FROM content_items WHERE id = $1`, [itemId]), sdr = P(row?.source_data_ref) || {};
+  const headlineOnly = sdr.article_chars === 0 && !row?.clip_id && !!(sdr.outlets?.length || sdr.url);
+  const qa = await qualityGate(itemId, niche), clean = (qa.status === "PASS" || qa.status === "SKIPPED") && !headlineOnly;
   if (mode === "AUTO" && qa.status === "REJECT") return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, `Quality gate: ${qa.report?.summary || "flagged as unsafe to publish"}`]);
   if (mode === "AUTO" && clean) { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
   const deadline = mode === "AUTO_AFTER_WINDOW" && clean ? new Date(Date.now() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;

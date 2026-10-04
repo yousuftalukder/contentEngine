@@ -30,6 +30,22 @@ test("quality gate: a clean draft on an AUTO program publishes without a person"
   assert.equal(done.auto_approved, 1);
 });
 
+// Two news drafts in five were written from a headline and a summary because the outlets refuse the server. The quality
+// check can only compare a draft with what the writer had; with almost nothing, it cannot vouch for it.
+test("quality gate: a news story written from headlines only waits for a person, even on AUTO", async () => {
+  const src = await eng.api("POST", "/api/sources", { name: "Unreadable Daily", adapterKey: "ingest_mock",
+    config: { items: [{ title: "River ferry crossing reopens after three days", url: "https://unreadable.example/ferry", summary: "Vehicles crossed at dawn." }] } });
+  const p = await program("auto_headline_only", { approvalMode: "AUTO", autoSources: false, sourceIds: [src.id], methodConfig: { desk: { settle_minutes: 0, min_sources: 1, min_gap_minutes: 0, per_sweep: 3 } } });
+  await eng.api("POST", `/api/sources/${src.id}/poll`);
+  await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id = $1 AND cluster_id IS NOT NULL`, [src.id])).length, { what: "clustered" });
+  await eng.api("POST", "/api/desk/run");
+  const id = await waitFor(async () => (await eng.api("GET", `/api/content-items?nicheId=${p.id}`))[0]?.id, { timeout: 60000, what: "the draft" });
+  const held = await settle(id, ["PENDING_REVIEW", "PUBLISHED", "APPROVED"]);
+  assert.equal(held.source_data_ref.article_chars, 0, "nothing of the article could be read");
+  assert.equal(held.status, "PENDING_REVIEW", "so it waits for a person instead of publishing");
+  assert.equal(held.review_deadline_at, null, "with no countdown to publish on its own");
+});
+
 test("quality gate: an unsupported claim holds an AUTO draft for review, with the report", async () => {
   const p = await program("auto_facts", { approvalMode: "AUTO", scriptAdapter: "llm_flags_facts", methodConfig: { qa: { auto_fix: false } } });
   const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Bus accident on the highway" });
