@@ -376,6 +376,43 @@ test("reels: a programme about one country never takes a clip of another", { ski
   } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
 });
 
+// A Bangladeshi page reports from abroad too. A reel about an attack in Medina ran on Dhaka street footage because
+// the search was anchored to the programme's country. The writer names where the story happens; that place is searched.
+test("reels: footage comes from where the story happens, not from the programme's country", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const clipFile = join(dir, "broll_abroad.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30", "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p", clipFile]);
+  const { readFileSync } = await import("node:fs");
+  const bytes = readFileSync(clipFile);
+  const asked = [];
+  const http = await import("node:http");
+  const stub = http.createServer((req, res) => {
+    if (req.url.startsWith("/videos/search")) {
+      asked.push(new URL(req.url, "http://x").searchParams.get("query"));
+      const link = `http://127.0.0.1:${stub.address().port}/clip.mp4`, files = [{ file_type: "video/mp4", width: 720, height: 1280, link }];
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ videos: [
+        { id: 9201, duration: 8, url: "https://www.pexels.com/video/bustling-street-life-near-dhaka-university-9201/", user: { name: "Dhaka" }, video_files: files },
+        { id: 9202, duration: 8, url: "https://www.pexels.com/video/pilgrims-walking-in-medina-saudi-arabia-9202/", user: { name: "Medina" }, video_files: files }] }));
+    }
+    res.writeHead(200, { "content-type": "video/mp4" }); res.end(bytes);
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  try {
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_reel_abroad", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Write the video in exactly", json: {
+      title: "Bangladesh condemns the attack in Medina", kicker: "World", place: "Saudi Arabia", description: "d", hashtags: ["BangladeshNews", "#BangladeshNews", "World News"],
+      sections: [{ narration: "Bangladesh has condemned the drone attack on a power station in Medina.", image_prompt: "city", footage_query: "city street" },
+                 { narration: "The station supplies power to the Prophet's Mosque.", image_prompt: "mosque", footage_query: null }] } }] } });
+    await eng.api("PUT", "/api/settings/footage.api_base", { value: `http://127.0.0.1:${stub.address().port}/videos` });
+    const p = await program("reel_abroad", { contentType: "NEWS_REEL", country: "Bangladesh", scriptAdapter: "llm_reel_abroad", imageAdapter: "image_no_key", voiceAdapter: "tts_mock", renderAdapter: "ffmpeg", methodConfig: { slides: 2 } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Medina attack condemned" });
+    const it = await waitFor(async () => { const x = await eng.api("GET", `/api/content-items/${id}`); if (x.status === "FAILED") throw new Error(x.rejection_note); return x.status === "PENDING_REVIEW" && x; }, { timeout: 120000, interval: 500, what: "the reel" });
+    assert.equal(asked[0], "city street Saudi Arabia", `the story's place is searched, not Bangladesh — asked ${JSON.stringify(asked)}`);
+    const [clip] = (await eng.query(`SELECT meta FROM media_assets WHERE content_item_id = $1 AND kind = 'VIDEO' AND meta->>'provider' = 'pexels'`, [id])).map((r) => r.meta);
+    assert.equal(clip?.clip_id, 9202, "the Medina clip, never the Dhaka one ranked above it");
+    assert.deepEqual(it.hashtags, ["#BangladeshNews", "#WorldNews"], "hashtags in one form, each once");
+  } finally { await new Promise((r) => stub.close(r)); await eng.api("PUT", "/api/settings/footage.api_base", { value: null }); }
+});
+
 // A speech model reads "BNP" as a word and drifts in loudness between calls. Both are audible, and both are handled
 // before the audio is joined: the spoken text is kept on the track, so what the voice was asked to say is on record.
 test("narration: acronyms are spelled out for the voice, and a brand's own spellings win", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
