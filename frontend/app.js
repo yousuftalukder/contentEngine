@@ -526,7 +526,7 @@ async function programDialog(p, brands, sources, adapters, styles, done) {
   }, { wide: true });
 }
 // Video options (production method + method_config video keys). Reactor clips and music come from the media library.
-const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["REACTION_OVERLAY", "Reaction short — reactor under the clip"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap — narrated summary"]];
+const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["REACTION_OVERLAY", "Reaction short — your clip with the source (split-screen or corner)"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap — narrated summary"]];
 function videoFields(p, uploads) {
   const mc = p?.method_config || {}, reactors = uploads.filter((u) => u.meta?.purpose === "reactor"), music = uploads.filter((u) => u.meta?.purpose === "music");
   return h("fieldset", null, h("legend", null, "Video"),
@@ -534,7 +534,9 @@ function videoFields(p, uploads) {
       field("Production method (clips)", select("productionMethod", PRODUCTION_METHODS, p?.production_method || "")),
       field("Orientation", select("_orientation", [["", "(default)"], ["9:16", "Vertical 9:16"], ["16:9", "Landscape 16:9"]], mc.orientation || "")),
       field("Vertical layout for landscape footage", select("_verticalLayout", [["crop", "Crop to fill"], ["blurpad", "Whole picture on a blurred fill"]], mc.vertical_layout || "crop")),
-      field("Reactor clip", select("_reactor", [["", reactors.length ? "(none — waveform instead)" : "(upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || "")),
+      field("Reactor clip", select("_reactor", [["", reactors.length ? "(none — waveform instead)" : "(upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || mc.overlay_video_url || "")),
+      field("Reaction short layout", select("_reactionLayout", [["stack", "Split-screen — source on top, you below"], ["pip", "Corner — you over the whole source"]], mc.reaction_layout || "stack")),
+      field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame."),
       field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
       field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 }))),
     h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
@@ -543,6 +545,8 @@ function readVideo(v, mc) {
   const out = { ...mc, captions: !!v._captions, brand_finish: !!v._brandFinish, vertical_layout: v._verticalLayout || "crop", explainer_minutes: v._explainerMinutes ?? 3 };
   if (v._orientation) out.orientation = v._orientation; else delete out.orientation;
   if (v._reactor) out.reactor_url = v._reactor; else delete out.reactor_url;
+  out.reaction_layout = v._reactionLayout || "stack";
+  const speed = Number(v._speed); if (speed > 1) out.speed = Math.min(1.5, speed); else delete out.speed;
   if (v._music === "none") out.music = false; else if (v._music) out.music = v._music; else delete out.music;
   return out;
 }
