@@ -180,3 +180,20 @@ test("a Bangladesh program writes in Bangla, and an English draft is held for re
   assert.ok(drafted.qa_report.language_issues.some((x) => /Bangla/i.test(x)), `the wrong language is caught — got ${JSON.stringify(drafted.qa_report.language_issues)}`);
   assert.notEqual(drafted.qa_status, "PASS", "and it does not pass on the mock reviewer's word");
 });
+
+// Three slips found reading real drafts: a writer that returns no captions (one draft in eleven went out with none), a
+// hashtag with last year's date, and a word in two scripts ("জামin"). The post gets words from its own summary, the
+// stale year comes off the tag, and the mixed word is put to the editor so a person or the fix-up pass sees it.
+test("drafts: missing captions are filled from the summary, a stale year leaves the hashtags, a two-script word is flagged", async () => {
+  const year = new Date().getUTCFullYear();
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_slips", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Produce JSON", json: {
+    headline: "ঢাকার আদালতে জামin শুনানিতে হট্টগোল", summary: "জামিন শুনানিকে কেন্দ্র করে আদালতে আইনজীবীদের মধ্যে হট্টগোল হয়েছে।",
+    hashtags: [`#DurgaPuja${year - 2}`, "#BangladeshNews", `#Dhaka${year}`], image_prompt: "court" } }] } });
+  const p = await program("slips", { scriptAdapter: "llm_slips", language: "bn", country: "Bangladesh" });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "আদালতে হট্টগোল" });
+  const it = await settle(id, ["PENDING_REVIEW"]);
+  assert.equal(it.captions.facebook, "জামিন শুনানিকে কেন্দ্র করে আদালতে আইনজীবীদের মধ্যে হট্টগোল হয়েছে।", "the post has its words, from its own summary");
+  assert.deepEqual(it.hashtags, ["#DurgaPuja", "#BangladeshNews", `#Dhaka${year}`], "last year's date comes off the tag; this year's stays");
+  assert.equal(it.qa_status, "REVIEW", "a word in two scripts holds the draft for a look");
+  assert.ok(it.qa_report.language_issues.some((x) => /জামin/.test(x)), `and says which word — got ${JSON.stringify(it.qa_report.language_issues)}`);
+});
