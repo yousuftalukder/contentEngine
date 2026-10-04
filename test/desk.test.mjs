@@ -238,6 +238,7 @@ test("a cluster leads on the outlet that has the story, not the one with the mos
     rows: await eng.query(`SELECT si.id, si.cluster_id, si.url, si.summary, s.name, s.weight, si.created_at FROM source_items si JOIN sources s ON s.id = si.source_id WHERE si.title ILIKE '%ferry%'`),
     drafts: await eng.query(`SELECT id, status, cluster_id, source_item_id, source_data_ref FROM content_items WHERE niche_id = $1`, [p.id]) });
   assert.equal(it.source_data_ref.url, "https://small.example/ferry", `the material comes from the outlet that published something ${why}`);
+  assert.equal(it.source_data_ref.article_chars, 0, "and no article could be read, which the review screen will say");
   assert.deepEqual([...it.source_data_ref.outlets].sort(), ["Heavy wire", "Small paper"], "and both outlets are still credited");
 });
 

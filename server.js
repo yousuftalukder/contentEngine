@@ -2977,7 +2977,12 @@ async function rejectItem(itemId, note) {
 async function finishGeneration(itemId, niche) {
   const mode = niche.approval_mode || "MANUAL";
   if (await setting(`quota.pause.${niche.id}`, null)) await putSetting(`quota.pause.${niche.id}`, null);   // the writer answered: take stories again
-  const qa = await qualityGate(itemId, niche), clean = qa.status === "PASS" || qa.status === "SKIPPED";
+  // A news story written from a headline and a one-line summary — no outlet's article could be read — is never clean
+  // enough to publish without a person, whatever the quality check thought of the writing: the check can only compare
+  // the draft with what the writer had, and the writer had almost nothing.
+  const row = await one(`SELECT source_data_ref, clip_id FROM content_items WHERE id = $1`, [itemId]), sdr = P(row?.source_data_ref) || {};
+  const headlineOnly = sdr.article_chars === 0 && !row?.clip_id && !!(sdr.outlets?.length || sdr.url);
+  const qa = await qualityGate(itemId, niche), clean = (qa.status === "PASS" || qa.status === "SKIPPED") && !headlineOnly;
   if (mode === "AUTO" && qa.status === "REJECT") return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, `Quality gate: ${qa.report?.summary || "flagged as unsafe to publish"}`]);
   if (mode === "AUTO" && clean) { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
   const deadline = mode === "AUTO_AFTER_WINDOW" && clean ? new Date(Date.now() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;
@@ -3170,6 +3175,9 @@ const langLine = (code) => {
     : `Language: ${name} — write EVERY word you produce in ${name}: headline, summary, narration, captions and hashtags. The source material is often in English; translate its facts into ${name} rather than copying its wording, and never answer in the language of the sources. Proper nouns keep their usual local spelling.`;
 };
 const richMaterial = (m) => (m.versions?.length ? m.versions.some((v) => v.text) : !!m.text);
+// article_chars goes on every draft: how much of an outlet's article the writer actually had. Several big outlets refuse
+// the server's address, and two drafts in five were written from a headline and a one-line summary — the reviewer
+// has to know which ones.
 // Resolve the raw material for a text item: a news-desk story cluster, a routed source_item, or a legacy TOPIC adapter pull.
 async function materialFor(item, niche) {
   if (item.cluster_id) { const m = await clusterMaterial(item); if (m) return m; }
@@ -3187,7 +3195,7 @@ async function generateStatic(item, niche, style) {
   const m = await materialFor(item, niche);
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id);
   if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}" (score ${dedup.best.score.toFixed(2)})`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, article_chars: String(m.text || "").length, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
   const portal = flag(niche.publish_to_portal); const lang = niche.language || "en";
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: portal ? 4000 : 1500,
     system: `You are the editor of "${niche.display_name}"${niche.country ? ` for ${niche.country}` : ""}. ${langLine(lang)} Tone: ${niche.tone || "clear and engaging"}. You never invent facts beyond the provided material${flag(niche.fact_check_strict) ? " and you attribute claims to the source" : ""}.${styleBlock(style, niche)}${item._series || ""}`,
@@ -3204,7 +3212,7 @@ async function generateStatic(item, niche, style) {
 async function generateLongPost(item, niche, style) {
   const m = await materialFor(item, niche);
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, article_chars: String(m.text || "").length }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts with sources. Never fabricate a citation.",
     prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
@@ -3250,7 +3258,7 @@ async function generateReel(item, niche, style) {
   const m = await materialFor(item, niche); const type = item.content_type || niche.content_type, spec = REEL_SPEC[type] || REEL_SPEC.IMAGE_SLIDESHOW, mc = methodCfg(niche);
   const long = type === "LONG_FORM_VIDEO", orientation = long ? "16:9" : mc.orientation || "9:16", vertical = orientation !== "16:9", lang = niche.language || "en";
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, article_chars: String(m.text || "").length, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
   const count = mc.slides || spec.sections;
   const r = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: long, maxTokens: long ? 6000 : 3000,
     system: `${spec.system} Channel: "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear"}.${styleBlock(style, niche)} Every sentence is spoken narration: short, natural, no stage directions, no invented facts.${item._series || ""}`,
@@ -3328,7 +3336,7 @@ async function generateExplainer(item, niche, style) {
   const m = await materialFor(item, niche); const mc = methodCfg(niche), lang = niche.language || "en";
   const orientation = mc.orientation === "9:16" ? "9:16" : "16:9", vertical = orientation === "9:16", minutes = Number(mc.explainer_minutes) || 3;
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
-  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
+  await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, article_chars: String(m.text || "").length, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
   const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
     prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,

@@ -321,7 +321,13 @@ function proofView(it, onDone) {
   const regen = (part) => run(async () => { await patch(`/api/content-items/${it.id}`, collect()); await post(`/api/content-items/${it.id}/regenerate`, { part }); onDone(); }, `Regenerating ${part}`);
 
   const src = it.source_data_ref || {};
+  // A story no outlet's article could be read for is written from the headline and a one-line summary. That is worth
+  // knowing before approving it, so it says so above everything else.
+  const headlineOnly = src.article_chars === 0 && !it.clip_id && (src.outlets?.length || src.url) ? h("div", { class: "panel", style: "border-color:var(--amber)" },
+    h("b", { style: "font-weight:500" }, "Written from headlines only"),
+    h("div", { class: "sub" }, "None of the outlets' articles could be read (several block the server), so the writer had the headline and a one-line summary. Check every fact against the source before approving.")) : null;
   return h("div", { class: "proof" },
+    headlineOnly,
     qaPanel(it),
     h("div", { class: "row small mute" }, tag(it.status), h("span", null, it.program_name), h("span", null, nice(it.content_type)), h("span", null, "created ", ago(it.created_at)), h("span", null, "cost ", usd(it.generation_cost_usd)),
       it.review_deadline_at ? h("span", { class: "deadline" }, untilText(it.review_deadline_at)) : null,
