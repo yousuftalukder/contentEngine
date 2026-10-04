@@ -24,7 +24,8 @@ Three places the work can happen, and the difference matters:
   publishing. Slow at video. YouTube refuses it (datacenter IP).
 - **Your PC** — fast, free, unlimited, and **YouTube works**. Available a few hours a day. Jobs queue and wait
   when it is off; the dashboard says so.
-- **Rented** — an API that does the expensive middle. Costs money, always available.
+- **Rented** — an API that does the expensive middle. Costs money, always available. **Optional everywhere:** every
+  variant has a free route, and a rented one only switches on when its key is added (agreed 2026-10-04: no billing).
 
 ---
 
@@ -111,12 +112,14 @@ stock pool, and a library of your own footage is the difference.
 | need | variants |
 |---|---|
 | nothing — free, no key | 1a, 1d, 3b, 4a |
-| a writer key | 1c, 2a–c, 3a, 3c, 4b, 4c, 5a–c, 6a–c, 7a–c |
+| a writer key — any free one: Gemini, Groq, Mistral, Cerebras, OpenRouter's free models, or Grok | 1c, 2a–c, 3a, 3c, 4b, 4c, 5a–c, 6a–c, 7a–c |
 | a voice (edge-tts, free) | 3a, 3c, 4b, 4c, 5a–c, 6a–d, 7a–c |
-| a clipping subscription | 1b only |
+| a clipping subscription *(optional, the only paid item)* | 1b only |
 | your PC switched on | 1a, 1c, 4a–c, 5a–c, 6a–d, 7a |
 | a persona from you | 4a–c |
-| Gemini video input | 5a |
+| Gemini video input (free tier) | 5a |
+| a Twelve Labs key *(optional)* | 5c |
+| your footage folder | 7a |
 
 ## Adapters
 
@@ -124,10 +127,12 @@ stock pool, and a library of your own footage is the difference.
 |---|---|---|
 | Source | rss, google_news, ytdlp, direct, uploads | — |
 | Transcribe | whisper.cpp (English), gemini_transcribe | — |
-| Clip | clip_meaning, clip_signal, llm_clipper | **clip_service** (rented) |
-| Video understanding | — | **gemini_video** (scenes for 5a) |
-| Script | gemini_live, anthropic_live (Claude) | — |
-| Voice | tts_piper (English), tts_command | **tts_edge** (free; bn-BD verified) |
+| Clip | clip_meaning, clip_signal, llm_clipper, vizard (rented, optional) | — |
+| Video understanding | gemini_video (scenes: what is seen and said, free tier), twelve_labs (optional) | — |
+| Script | gemini_live, anthropic_live, openai_live, and the free writers groq_live, mistral_live, cerebras_live, openrouter_live, grok_live — one chain, each taking over when the one before has spent its allowance | — |
+| Image | gemini_image, openai_image, pexels_stock, source_photo, pollinations (free, no key) | — |
+| Footage | Pexels (country-filtered), your own folder (7a) | — |
+| Voice | tts_edge (free; bn-BD verified), tts_piper (English), tts_command | — |
 | Render | ffmpeg, remotion | — |
 | Publish | meta_graph (FB/IG + first comment), youtube_upload | — |
 
@@ -170,7 +175,16 @@ is off. Its first test before building: one video through the API, to see whethe
 
 ## Still to verify before its own build
 
-- Gemini video input on a long file: chunking and cost *(5a)*.
+- Gemini video input on a long file *(5a)*: built as 360p, one-frame-a-second proxies read at low media resolution
+  (about 100 tokens a second), forty minutes per request; a longer video goes in pieces. Not yet run on a real film.
+- Pollinations, the free picture service *(6c)*: answered in 4 s for a 768×768 picture, 2026-10-04. Without an account
+  its pictures carry a small corner logo.
+
+## Built, not yet proven on real material (2026-10-04)
+
+5a (scene recap), 5c (Twelve Labs, optional), 6b (data explainer), 6c (illustrated series), 7a (own footage) and 1b
+(Vizard, optional) — each passes its tests against stand-ins for the services, and none has yet been made from real
+material in production. 6d (Blender) stays unbuilt, for the reason given under 6.
 
 ## Proven working
 

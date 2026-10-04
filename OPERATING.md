@@ -36,13 +36,20 @@ comment.
 
 ## Making clips from a long video
 
-1. **Video candidates → paste the link**, pick the clips programme (`yt_clips` runs on your PC; YouTube links need it).
+1. **Videos to clip → paste the link**, pick the clips programme (`yt_clips` runs on your PC; YouTube links need it).
 2. The engine transcribes it, an AI reads the transcript and picks the moments (on fourteen famous speeches it put the
    line anyone would clip first in nine), cuts each to a captioned vertical reel, adds the logo and levels the sound.
 3. The clips land in **Review**.
 
 Reaction videos, voice-overs, recaps and "telecast with intro" are the same flow with a different
-**Production method** on the programme (Programs → Edit → Video).
+**Production method** on the programme (Programmes → Edit → Video).
+
+## Starting a new kind of programme
+
+**What it makes** lists every variant in the blueprint with what each needs and whether that is in place now. Press
+**Make a programme** on any built variant: the form opens set up for it (content type, method, picker, where it runs),
+and everything stays editable. On the **Programmes** page each programme shows which variant it is, who writes for it
+and who stands in when that writer's allowance runs out (*Engine choices* in the form edits those chains).
 
 ## The PC worker
 
@@ -53,15 +60,19 @@ Reaction videos, voice-overs, recaps and "telecast with intro" are the same flow
 
 ## What adding each thing unlocks
 
+Nothing here needs a card. Every variant in the blueprint runs on free allowances; the two paid services are optional
+extras, never requirements.
+
 | you add | where | unlocks |
 |---|---|---|
 | your **Facebook Page** | dashboard → **Channels → Connect Facebook** | real publishing (today the channel is a mock) |
-| your **Gemini key** in the vault | dashboard → **API keys** (paste it there, not only on Render) | the AI picker and writer on your PC; animated explainers (6a, 6b) end to end |
-| **Gemini billing** | Google AI Studio → Billing | no more daily allowance stops; scene recap (5a); illustrated series (6c, needs image generation); Bangla speech transcription for TV clips |
+| a free **Gemini key** in the vault | dashboard → **API keys** (paste it there, not only on Render, so your PC can use it too) | the best free writer for Bangla; scene recaps (5a: Gemini watches the video); what Gemini sees in your own footage (7a) |
+| a free **Groq** or **Mistral** key (or OpenRouter, Cerebras, xAI Grok) | API keys | more writers in the chain: when Gemini's ~20 requests a day per model run out, the next one writes. Groq: console.groq.com, no card |
+| a **Pollinations** token (optional) | API keys | removes the small corner logo from free generated pictures (illustrated series, 6c). Pictures work without it |
 | a **reactor clip** of yourself | dashboard → Brands → Media library (purpose: reactor) | reaction videos you can publish (4a, 4c — proven with a stand-in) |
-| a **Vizard** subscription (~$14.50/month) | vizard.ai, then its key on API keys | clipping while your PC is off (1b) |
-| a **Twelve Labs** key | API keys | the Twelve Labs recap (5c) |
-| a folder of **your own footage** | tell me where | script-to-video on your footage (7a) |
+| a **footage folder** on your PC | the programme → Video → *Your footage folder* | script videos on your own footage (7a), with stock behind it unless you tick *own footage only* |
+| a **Vizard** key *(optional, paid ~$14.50/month)* | API keys, then a clips programme with clipper `vizard` | clipping while your PC is off (1b). Everything else clips for free on your PC or the server |
+| a **Twelve Labs** key *(optional)* | API keys, then a recap programme with transcriber `twelve_labs` | the Twelve Labs recap (5c); 5a does the same free on Gemini |
 
 ## Test programmes left from the proofs
 

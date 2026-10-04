@@ -16,7 +16,7 @@
 // =====================================================================
 
 import http from "node:http";
-import { readFile, writeFile, mkdir, unlink, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink, rm, readdir, stat } from "node:fs/promises";
 import { existsSync, createWriteStream, readFileSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
@@ -184,8 +184,8 @@ function quotaWait(e) {
   const freeTier = /free_tier|FreeTier/i.test(s), model = (/model: ([\w.-]+)/.exec(s) || [])[1] || null;
   if (/insufficient_quota/.test(s)) return { kind: "billing", seconds: null, freeTier, model };
   if (/limit: 0\b/.test(s)) return { kind: "plan", seconds: null, freeTier, model };
-  if (/PerDay|per day|\bRPD\b/i.test(s)) return { kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)), freeTier, model };
-  const d = Number((/retry(?:Delay"?:\s*"| in )(\d+(?:\.\d+)?)s/i.exec(s) || [])[1]);
+  if (/PerDay|per day|\bRPD\b|\bTPD\b/i.test(s)) return { kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)), freeTier, model };
+  const d = Number((/(?:retry(?:Delay"?:\s*"| in )|try again in )(\d+(?:\.\d+)?)s/i.exec(s) || [])[1]);
   return { kind: "minute", seconds: Math.max(30, Math.round(d || 60) + 5), freeTier, model };
 }
 // Short in-call retry for transient failures. 429 is left to withKey, which rotates to the next key instead.
@@ -268,7 +268,9 @@ const secretHint = (s) => { const t = String(s || "").trim(); return t.length > 
 const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
 const parseSecret = (provider, raw) => (MULTI_FIELD_PROVIDERS[provider] && raw ? (P(raw) || {}) : raw);
 
-const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", pexels: "PEXELS_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN" };
+const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", pexels: "PEXELS_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN",
+  groq: "GROQ_API_KEY", mistral: "MISTRAL_API_KEY", cerebras: "CEREBRAS_API_KEY", openrouter: "OPENROUTER_API_KEY", xai: "XAI_API_KEY", pollinations: "POLLINATIONS_TOKEN",
+  vizard: "VIZARDAI_API_KEY", twelve_labs: "TWELVE_LABS_API_KEY" };
 const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2"];
 // Resolve the usable secret of one credential row: vault first, then the named env var.
 function credSecret(r) {
@@ -708,6 +710,62 @@ impl("SCRIPT", "openai", { label: "OpenAI (GPT)", configSchema: { model: { type:
     }, ctx.pin);
   } }) });
 
+// Writers with a free allowance and no card. Gemini's free tier is about twenty requests a day per model, which a
+// news day spends by mid-morning; these stand behind it so one provider's limit never stops the pipeline. All of them
+// speak OpenAI's chat-completions dialect, so one adapter serves them, with a preset per provider. Each preset lists
+// models in order of preference; a model the provider has since renamed or retired is replaced from its live model
+// list, as Gemini's are. "<PROVIDER>_API_BASE" points one at a stand-in (tests).
+const OPENAI_COMPAT = {
+  groq: { label: "Groq", base: "https://api.groq.com/openai/v1", models: ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"] },
+  mistral: { label: "Mistral", base: "https://api.mistral.ai/v1", models: ["mistral-small-latest", "open-mistral-nemo"] },
+  cerebras: { label: "Cerebras", base: "https://api.cerebras.ai/v1", models: ["gpt-oss-120b", "llama-3.3-70b", "llama3.1-8b"] },
+  // OpenRouter's free models change week to week; "openrouter/free" is its own router over whichever are up. Not every
+  // free model honours JSON mode, so the answer is asked for in words and read with extractJson.
+  openrouter: { label: "OpenRouter (free models)", base: "https://openrouter.ai/api/v1", models: ["openrouter/free", "meta-llama/llama-3.3-70b-instruct:free"], jsonMode: false, free: (id) => /:free$/.test(id) },
+  xai: { label: "xAI Grok", base: "https://api.x.ai/v1", models: ["grok-4-fast-non-reasoning", "grok-3-mini"] },
+};
+const compatBase = (provider, cfg) => cfg.base_url || ENV[`${provider.toUpperCase()}_API_BASE`] || OPENAI_COMPAT[provider].base;
+const compatCatalog = new Map();                                                   // provider -> {at, list}
+async function compatReplacements(provider, base, key, tried) {
+  let c = compatCatalog.get(provider);
+  if (!c || Date.now() - c.at > 6 * 3600e3) {
+    const r = await fetchJson(`${base}/models`, { headers: { Authorization: `Bearer ${key}` } });
+    c = { at: Date.now(), list: (r.data || []).map((m) => m.id).filter(Boolean) }; compatCatalog.set(provider, c);
+  }
+  const ok = OPENAI_COMPAT[provider].free || (() => true);
+  return c.list.filter((id) => ok(id) && !tried.includes(id) && !isSpent(id) && !/embed|whisper|tts|guard|vision|image|audio|moderation|ocr|transcri/i.test(id)).slice(0, 3);
+}
+impl("SCRIPT", "openai_compat", { label: "Free writer (Groq, Mistral, Cerebras, OpenRouter, Grok)", configSchema: { provider: { type: "string", default: "groq" }, model: { type: "string" }, fallback_models: { type: "array" }, base_url: { type: "string" }, temperature: { type: "number", default: 0.7 } }, create: (cfg, ctx = {}) => ({
+  async complete({ system, prompt, json = false, maxTokens = 3000 }) {
+    const provider = cfg.provider || "groq", preset = OPENAI_COMPAT[provider];
+    if (!preset) throw new Error(`Unknown free writer "${provider}" — one of ${Object.keys(OPENAI_COMPAT).join(", ")}`);
+    const base = compatBase(provider, cfg), models = cfg.model ? [cfg.model, ...(cfg.fallback_models || [])] : preset.models;
+    return withKey(provider, async (key) => {
+      const messages = []; if (system) messages.push({ role: "system", content: system });
+      messages.push({ role: "user", content: prompt + (json ? "\n\nRespond with ONLY valid JSON, no prose, no code fences." : "") });
+      const ask = (model, jsonMode) => fetchJson(`${base}/chat/completions`, { method: "POST", headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: cfg.temperature ?? 0.7, response_format: jsonMode ? { type: "json_object" } : undefined }) });
+      const call = async (model) => {
+        try { return { model, body: await ask(model, json && preset.jsonMode !== false) }; }
+        // JSON mode refuses an answer that does not parse (Groq: json_validate_failed) and some models do not offer it at
+        // all; asked once more without it, the text usually still holds the JSON.
+        catch (e) { if (!(json && preset.jsonMode !== false && e.status === 400)) throw e; return { model, body: await ask(model, false) }; }
+      };
+      let out;
+      try { out = await withModelFallback(models, call); }
+      catch (e) {
+        if (e.status !== 404 && quotaWait(e)?.kind !== "day") throw e;
+        const alt = await compatReplacements(provider, base, key, models).catch(() => []); if (!alt.length) throw e;
+        warn(`${preset.label}: ${models.join(", ")} ${e.status === 404 ? "not found" : "spent for today"}; trying ${alt.join(", ")}`);
+        out = await withModelFallback(alt, call);
+      }
+      const text = out.body.choices?.[0]?.message?.content || "", u = out.body.usage || {};
+      // JSON mode always answers with an object; a prompt that asked for a list gets it wrapped in one ({"clips": [...]}).
+      let data = null; if (json) { data = extractJson(text); if (data && !Array.isArray(data) && Object.keys(data).length === 1 && Array.isArray(Object.values(data)[0])) data = Object.values(data)[0]; }
+      return { text, data, cost: tokenCost(out.model, u.prompt_tokens, u.completion_tokens), model: out.model, units: 1 };
+    }, ctx.pin);
+  } }) });
+
 // ---- 6b. Legacy topic sources (stage TOPIC). fetchCandidate({nicheKey, excludeTopics}) -> {topic, sourceDataRef}
 const MOCK_TOPICS = {
   newsapi_mock: ["A new open-weight model claims GPT-4-class reasoning at a tenth of the cost", "A major cloud provider cuts GPU instance prices after new chip competition",
@@ -1007,18 +1065,97 @@ impl("TRANSCRIBE", "transcribe_mock", { label: "Mock", configSchema: { segments:
   async transcribe({ duration = 600 }) { const given = P(cfg.segments) || []; if (given.length) return { segments: given, text: joinSegments(given) };
     const segs = []; for (let t = 0; t < Math.min(duration, 1800); t += 8) segs.push({ start: t, end: t + 8, text: `Mock transcript sentence covering seconds ${t} to ${t + 8}; the speaker makes a surprising point here.` }); return { segments: segs, text: joinSegments(segs) }; } }) });
 async function extractAudio(videoPath) { const out = tmpPath("mp3"); await exec("ffmpeg", ["-y", "-i", videoPath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", out]); return out; }
+// Gemini's Files API: a resumable upload, then a wait while the file is processed (video takes longer than audio).
+async function geminiUpload(key, bytes, mime, name) {
+  const start = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { "x-goog-api-key": key, "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start", "X-Goog-Upload-Header-Content-Length": String(bytes.length), "X-Goog-Upload-Header-Content-Type": mime, "Content-Type": "application/json" }, body: JSON.stringify({ file: { display_name: name } }) });
+  const uploadUrl = start.headers.get("x-goog-upload-url"); if (!uploadUrl) throw new ApiError(start.status, await start.text(), "Gemini file upload start failed");
+  const fin = await fetchJson(uploadUrl, { method: "POST", headers: { "Content-Length": String(bytes.length), "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize" }, body: bytes });
+  let file = fin.file;
+  for (let i = 0; i < 100 && file.state === "PROCESSING"; i++) { await sleep(3000); file = await fetchJson(`${GEMINI_BASE}/v1beta/${file.name}`, { headers: { "x-goog-api-key": key } }); }
+  if (file.state === "FAILED") throw new Error(`Gemini could not process the uploaded ${mime.split("/")[0]}`);
+  return file;
+}
+// "1:23", "01:02:03", "83.5" or 83.5 → seconds. Models asked for seconds still answer in clock time now and then.
+const toSeconds = (v) => { if (typeof v === "number") return v; const t = String(v ?? "").trim(); if (/^\d+(\.\d+)?$/.test(t)) return Number(t);
+  const m = /^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/.exec(t); return m ? Number(m[1] || 0) * 3600 + Number(m[2]) * 60 + Number(m[3]) : NaN; };
+// 5a — Gemini watches the video. A recap told from the transcript alone (5b) cannot see a chase, a look or a crowd;
+// where the story is visual the scenes have to be read from the picture. The free tier takes video, so this costs
+// nothing but the day's allowance: the video is shrunk to a 360p, one-frame-a-second proxy (Gemini samples at one frame
+// a second anyway) and read at low media resolution, about 100 tokens a second — forty minutes in one request. A
+// longer video goes in forty-minute pieces, their times put back on the video's own clock. Each scene comes back with
+// what is seen and what is said; the recap writer picks the scenes whose picture tells each beat.
+const SCENE_CHUNK_SECONDS = 40 * 60;
+impl("TRANSCRIBE", "gemini_video", { label: "Gemini watches the video (scenes: what is seen and said)", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, fallback_models: { type: "array", default: DEFAULTS.GEMINI_FALLBACK_MODELS }, chunk_minutes: { type: "number", default: 40 } }, create: (cfg, ctx = {}) => ({
+  async transcribe({ path, duration, language }) {
+    const total = Number(duration) || (await ffprobeDuration(path)) || 0, chunk = (Number(cfg.chunk_minutes) || 40) * 60 || SCENE_CHUNK_SECONDS;
+    const models = [cfg.model || DEFAULTS.GEMINI_MODEL, ...(Array.isArray(cfg.fallback_models) ? cfg.fallback_models : DEFAULTS.GEMINI_FALLBACK_MODELS)];
+    const segments = []; let cost = 0;
+    for (let from = 0; from < Math.max(total, 1); from += chunk) {
+      const len = total ? Math.min(chunk, total - from) : chunk, proxy = tmpPath("mp4");
+      try {
+        await exec("ffmpeg", ["-y", "-ss", String(from), "-i", path, "-t", String(len), "-vf", "scale=-2:360,fps=1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", "-b:a", "32k", "-ac", "1", "-movflags", "+faststart", proxy], { timeoutMs: 30 * 60000 });
+        const bytes = await readFile(proxy);
+        const got = await withKey("gemini", async (key) => {
+          const file = await geminiUpload(key, bytes, "video/mp4", "recap-source");
+          try {
+            const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
+              contents: [{ parts: [{ file_data: { file_uri: file.uri, mime_type: "video/mp4" } }, { text: `Watch this whole video (${Math.round(len)} seconds) and divide it into its scenes, in order, covering all of it. A scene is 3-20 seconds of one continuous action or shot.
+For each scene give what is SEEN (who, where, what happens, in English, one sentence, concrete — "a man in a red jacket runs across a rooftop", not "an exciting moment") and the words SAID in it, verbatim in their own language${language ? ` (expected: ${language})` : ""}, or "" if nobody speaks.
+Times are seconds from the start of this video, as numbers. JSON only: [{"start": 0, "end": 6.5, "seen": "...", "said": "..."}]` }] }],
+              generationConfig: { responseMimeType: "application/json", maxOutputTokens: 30000, mediaResolution: "MEDIA_RESOLUTION_LOW" } }) }) }));
+            const text = (body.candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join(""), u = body.usageMetadata || {};
+            const list = extractJson(text); return { scenes: Array.isArray(list) ? list : list?.scenes || [], cost: tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), units: 1 };
+          } finally { fetch(`${GEMINI_BASE}/v1beta/${file.name}`, { method: "DELETE", headers: { "x-goog-api-key": key } }).catch(() => {}); }
+        }, ctx.pin);
+        cost += got.cost || 0;
+        for (const sc of got.scenes) {
+          const a = toSeconds(sc.start), b = toSeconds(sc.end); if (!Number.isFinite(a) || !(b > a)) continue;
+          segments.push({ start: from + clamp(a, 0, len), end: from + clamp(b, 0, len), text: String(sc.said || "").trim(), visual: String(sc.seen || "").trim() });
+        }
+      } finally { await cleanup(proxy); }
+    }
+    if (!segments.length) throw new Error("Gemini returned no scenes for this video");
+    return { segments, scenes: true, text: joinSegments(segments), cost, units: 1 };
+  } }) });
+// 5c — Twelve Labs, a video-understanding API built for finding moments. Optional: it switches on with a key. The
+// video is indexed once (a 360p proxy is enough for it), then its chapters — each with a start, an end and a summary
+// of what happens — come back as the scenes a recap is cut from, the same assembly as 5a.
+impl("TRANSCRIBE", "twelve_labs", { label: "Twelve Labs (video chapters: what happens, when)", configSchema: { api_base: { type: "string", default: "https://api.twelvelabs.io/v1.3" }, max_wait_minutes: { type: "number", default: 30 } }, create: (cfg, ctx = {}) => ({
+  async transcribe({ path }) {
+    const base = ENV.TWELVE_LABS_API_BASE || cfg.api_base || "https://api.twelvelabs.io/v1.3", proxy = tmpPath("mp4");
+    await exec("ffmpeg", ["-y", "-i", path, "-vf", "scale=-2:360", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", proxy], { timeoutMs: 60 * 60000 });
+    try {
+      return await withKey("twelve_labs", async (key) => {
+        const h = { "x-api-key": key };
+        let index = await setting("twelve_labs.index_id", null);
+        if (!index) {
+          const r = await fetchJson(`${base}/indexes`, { method: "POST", headers: { ...h, "content-type": "application/json" }, body: JSON.stringify({ index_name: `content-engine-${Date.now()}`,
+            models: [{ model_name: "marengo2.7", model_options: ["visual", "audio"] }, { model_name: "pegasus1.2", model_options: ["visual", "audio"] }] }) });
+          index = r._id || r.id; await putSetting("twelve_labs.index_id", index);
+        }
+        const fd = new FormData(); fd.append("index_id", index); fd.append("video_file", new Blob([await readFile(proxy)], { type: "video/mp4" }), "source.mp4");
+        let task = await fetchJson(`${base}/tasks`, { method: "POST", headers: h, body: fd });
+        const id = task._id || task.id, until = Date.now() + (Number(cfg.max_wait_minutes) || 30) * 60000;
+        while (task.status !== "ready") {
+          if (task.status === "failed") throw new Error("Twelve Labs could not index this video");
+          if (Date.now() > until) throw Object.assign(new Error("Twelve Labs is still indexing this video"), { transient: true });
+          await sleep(ENV.TWELVE_LABS_POLL_MS ? Number(ENV.TWELVE_LABS_POLL_MS) : 10000); task = await fetchJson(`${base}/tasks/${id}`, { headers: h });
+        }
+        const sum = await fetchJson(`${base}/summarize`, { method: "POST", headers: { ...h, "content-type": "application/json" }, body: JSON.stringify({ video_id: task.video_id, type: "chapter" }) });
+        const segments = (sum.chapters || []).map((c) => ({ start: Number(c.start_sec ?? c.start) || 0, end: Number(c.end_sec ?? c.end) || 0, text: "", visual: [c.chapter_title, c.chapter_summary].filter(Boolean).join(": ") })).filter((x) => x.end > x.start);
+        if (!segments.length) throw new Error("Twelve Labs returned no chapters for this video");
+        return { segments, scenes: true, text: segments.map((x) => x.visual).join(" "), cost: 0, units: 1 };
+      }, ctx.pin);
+    } finally { await cleanup(proxy); }
+  } }) });
 impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped transcript)", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL } }, create: (cfg, ctx = {}) => ({
   async transcribe({ path, language }) {
     const audio = await extractAudio(path);
     try {
       const bytes = await readFile(audio);
       return await withKey("gemini", async (key) => {
-        // Files API resumable upload
-        const start = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { "x-goog-api-key": key, "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start", "X-Goog-Upload-Header-Content-Length": String(bytes.length), "X-Goog-Upload-Header-Content-Type": "audio/mpeg", "Content-Type": "application/json" }, body: JSON.stringify({ file: { display_name: "clip-audio" } }) });
-        const uploadUrl = start.headers.get("x-goog-upload-url"); if (!uploadUrl) throw new ApiError(start.status, await start.text(), "Gemini file upload start failed");
-        const fin = await fetchJson(uploadUrl, { method: "POST", headers: { "Content-Length": String(bytes.length), "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize" }, body: bytes });
-        let file = fin.file;
-        for (let i = 0; i < 60 && file.state === "PROCESSING"; i++) { await sleep(3000); file = await fetchJson(`${GEMINI_BASE}/v1beta/${file.name}`, { headers: { "x-goog-api-key": key } }); }
+        const file = await geminiUpload(key, bytes, "audio/mpeg", "clip-audio");
         const model = cfg.model || DEFAULTS.GEMINI_MODEL;
         const body = await fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
           contents: [{ parts: [{ file_data: { file_uri: file.uri, mime_type: "audio/mpeg" } }, { text: `Transcribe this audio${language ? ` (language: ${language})` : ""} into a JSON array of segments: [{"start": seconds, "end": seconds, "text": "..."}]. Segments should be 3-10 seconds each with accurate timestamps. Output ONLY the JSON array.` }] }],
@@ -1628,6 +1765,22 @@ impl("IMAGE", "image_mock", { label: "Mock image (flat card)", create: () => ({
       return storeImage(Buffer.from(svgCard(headline, specs)), "image/svg+xml", contentItemId, { mock: true }, { width: w, height: h });
     } finally { await cleanup(out); }
   } }) });
+// Pictures with no key and no bill: Pollinations draws from a prompt over a plain GET. Gemini's image models are not on
+// the free tier, so this is what makes generated pictures — and the illustrated series (6c) — free. Without an account
+// its pictures carry its small logo in a corner; a free account's token (pollinations.ai, on API keys) removes it.
+// The same seed and prompt give the same picture, which is what keeps a series' character looking like itself.
+impl("IMAGE", "pollinations", { label: "Pollinations (free, no key)", configSchema: { model: { type: "string", default: "flux" }, style: { type: "string" } }, create: (cfg) => ({
+  async generate({ prompt, headline, specs = {}, contentItemId, seed }) {
+    const w = Math.min(2048, specs.width || 1080), h = Math.min(2048, specs.height || 1080);
+    const full = [prompt || headline, specs.style || cfg.style || "", specs.render_text === true ? "" : "No text, letters or logos."].filter(Boolean).join(". ");
+    const token = (await credentialsFor("pollinations"))[0]?.secret;
+    const base = ENV.POLLINATIONS_API_BASE || "https://image.pollinations.ai";
+    const qs = form({ width: w, height: h, model: cfg.model || "flux", seed: Number.isFinite(Number(seed)) ? Number(seed) : parseInt(sha(full).slice(0, 7), 16), nologo: "true", private: "true" });
+    const bytes = await retryTransient(() => fetchBytes(`${base}/prompt/${encodeURIComponent(full.slice(0, 1500))}?${qs}`, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(120000) }), { tries: 3, baseMs: 6000 });
+    if (bytes.length < 2000) throw new Error("Pollinations returned no picture");
+    const media = await storeImage(bytes, "image/jpeg", contentItemId, { provider: "pollinations", prompt: full, seed }, { width: w, height: h }, specs.compose === false ? null : { headline, specs });
+    return { ...media, cost: 0, units: 1 };
+  } }) });
 impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_IMAGE_MODEL } }, create: (cfg, ctx = {}) => ({
   async generate({ prompt, headline, specs = {}, contentItemId }) {
     const model = cfg.model || DEFAULTS.GEMINI_IMAGE_MODEL;
@@ -1697,6 +1850,63 @@ async function pexelsFootage(query, { vertical = true, seconds = 6, country = nu
     }
     return null;
   }, ctx.pin).catch((e) => { warn(`stock footage "${searches[0]}": ${e.message.slice(0, 120)}`); return null; });
+}
+// ---- 7a. Your own footage. Commercial script-to-video tools all draw on the same stock pool; a library of your own
+// clips is what makes a video look like nobody else's. The library is a folder on the machine that does the video work
+// (your PC): every clip in it, found by what it is called and where it is filed ("dhaka/rickshaw-rain.mp4"), by a
+// note beside it with the same name (.txt) when you write one, and — where there is a Gemini key — by what Gemini sees
+// in it, a few clips a day, remembered so no clip is described twice. Each section's footage phrase is matched against
+// that; a clip used recently waits its turn, and a section nothing in the library fits falls back to stock footage
+// (unless the programme says own footage only).
+const FOOTAGE_EXT = /\.(mp4|mov|m4v|mkv|webm|avi)$/i;
+const footStem = (w) => w.replace(/(ings|ing|ed|es|s)$/, "");
+const footWords = (t) => new Set(String(t || "").toLowerCase().split(/[^\p{L}]+/u).filter((w) => w.length > 2 && !STOCK_NOISE.test(w)).map(footStem));
+const ownClipUsed = new Map();                                                     // path -> when it was last used
+async function footageIndex(dir, { describe = 0 } = {}) {
+  const list = [];
+  const walk = async (d, depth) => {
+    let entries = []; try { entries = await readdir(d, { withFileTypes: true }); } catch (e) { if (depth === 0) throw new Error(`The footage folder "${dir}" cannot be read here: ${e.message}`); return; }
+    for (const e of entries) {
+      const full = join(d, e.name);
+      if (e.isDirectory() && depth < 4 && !e.name.startsWith(".")) await walk(full, depth + 1);
+      else if (e.isFile() && FOOTAGE_EXT.test(e.name)) {
+        const rel = full.slice(dir.length).replace(/^[\\/]+/, ""), note = full.replace(FOOTAGE_EXT, ".txt");
+        const text = existsSync(note) ? (await readFile(note, "utf8").catch(() => "")).slice(0, 1000) : "";
+        const st = await stat(full).catch(() => null); if (!st) continue;
+        list.push({ path: full, rel, note: text, key: `footage.seen.${sha(`${rel}|${st.size}`).slice(0, 24)}`, seen: "" });
+      }
+    }
+  };
+  await walk(dir, 0);
+  // What Gemini saw in a clip, remembered by its name and size.
+  const known = list.length ? await q(`SELECT key, value FROM settings WHERE key = ANY($1)`, [list.map((c) => c.key)]) : [];
+  for (const r of known) { const c = list.find((x) => x.key === r.key); if (c) c.seen = String((typeof r.value === "string" ? P(r.value) ?? r.value : r.value)?.seen || ""); }
+  if (describe > 0 && (await credentialsFor("gemini")).length) {
+    const eyes = await resolve("TRANSCRIBE", "gemini_video").catch(() => null);
+    for (const c of list.filter((x) => !x.note && !x.seen).slice(0, describe)) {
+      try { const r = await eyes.transcribe({ path: c.path, duration: await ffprobeDuration(c.path) });
+        c.seen = r.segments.map((x) => x.visual).filter(Boolean).join(" ").slice(0, 800); await putSetting(c.key, { seen: c.seen, rel: c.rel }); }
+      catch (e) { warn(`describing ${c.rel}: ${e.message.slice(0, 120)}`); break; }
+    }
+  }
+  for (const c of list) c.words = footWords(`${c.rel.replace(FOOTAGE_EXT, "")} ${c.note} ${c.seen}`);
+  return list;
+}
+// The clip that fits a phrase best, cut to the section's length from a part of it the last use did not show. The cut
+// is kept beside the engine's work files, so a retried render finds it again.
+async function ownFootage(query, index, { seconds = 6 } = {}) {
+  const want = [...footWords(query)]; if (!want.length || !index.length) return null;
+  const scored = index.map((c) => ({ c, score: want.filter((w) => c.words.has(w)).length / want.length }))
+    .filter((x) => x.score > 0).sort((a, b) => b.score - a.score || (ownClipUsed.get(a.c.path) || 0) - (ownClipUsed.get(b.c.path) || 0));
+  const fresh = scored.filter((x) => Date.now() - (ownClipUsed.get(x.c.path) || 0) > 3600e3);
+  const pick = (fresh[0] || scored[0])?.c; if (!pick) return null;
+  const length = (await ffprobeDuration(pick.path)) || seconds, uses = (ownClipUsed.has(pick.path) ? 1 : 0) + (parseInt(sha(query).slice(0, 4), 16) % 3);
+  const from = length > seconds + 1 ? Math.min(length - seconds, ((length - seconds) / 3) * (uses % 3)) : 0;
+  ownClipUsed.set(pick.path, Date.now());
+  const dir = join(TMP, "footage-cuts"); await mkdir(dir, { recursive: true });
+  const out = join(dir, `${sha(`${pick.path}|${from.toFixed(1)}|${seconds}`).slice(0, 20)}.mp4`);
+  if (!existsSync(out)) await exec("ffmpeg", ["-y", "-ss", from.toFixed(2), "-i", pick.path, "-t", String(Math.min(seconds, length)), "-an", "-c:v", "libx264", ...SEG_ENCODE, out], { timeoutMs: 10 * 60000 });
+  return { url: out, seconds: Math.min(seconds, length), file: pick.rel, from, query };
 }
 // ---- Stock photography (Pexels, free key, commercial use). A real photo behind the headline where a generated
 // picture is not available or not worth paying for. Two rules keep it honest: the writer decides whether a generic
@@ -2262,6 +2472,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         else await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", file]);
         await cleanup(main, a); break;
       }
+      case "SCENE_RECAP":
       case "MOVIE_RECAP": {
         // extras.scenes = [{start,end}], extras.audio = narration. Concat scenes, put narration on top.
         const scenes = extras.scenes?.length ? extras.scenes : [{ start: clip.start, end: clip.end }];
@@ -2274,7 +2485,11 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const recapAss = c.captions === false || !said ? null
           : caps[caps.push(await writeCaptionsAss([{ start: 0, end: nd, text: said }], 0, nd, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, accent: (await studioBrand(niche)).brand.accent })) - 1];
         const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${await barsCrop(sourcePath)}${vertical ? vfVertical() : vfLandscape()}${recapAss ? `,${assVf(recapAss)}` : ""}[v]`;
-        await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
+        // A scene recap keeps the film's own sound low under the narration — the blueprint's "source audio ducked": the
+        // crowd, the music, the crash are half of what a visual scene is. Cut to the same scenes, in the same order.
+        const duck = niche.production_method === "SCENE_RECAP" && await hasAudio(sourcePath);
+        const afc = duck ? `;${scenes.map((s, i) => `[0:a]atrim=start=${s.start}:end=${s.end},asetpts=PTS-STARTPTS,${AFMT}[sa${i}]`).join(";")};${scenes.map((_, i) => `[sa${i}]`).join("")}concat=n=${scenes.length}:v=0:a=1,volume=0.15[bg];[1:a]${AFMT}[vo];[vo][bg]amix=inputs=2:duration=first:dropout_transition=0[a]` : "";
+        await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc + afc, "-map", "[v]", "-map", duck ? "[a]" : "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
       }
       default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical)) - 1] });
     }
@@ -2679,6 +2894,10 @@ const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", 
 const MADE_VIDEO_TYPES = new Set(["IMAGE_SLIDESHOW", "LONG_FORM_VIDEO", "NEWS_REEL", "ANIMATED_EXPLAINER"]);
 const CONTENT_TYPE_SET = new Set(["NEWS_STATIC", "NICHE_STATIC", "LONG_POST", ...MADE_VIDEO_TYPES, ...VIDEO_TYPES]);
 const queueFor = (contentType) => VIDEO_TYPES.has(contentType) || MADE_VIDEO_TYPES.has(contentType) ? "video" : "text";
+// Where a programme's drafts are made. A made video (an explainer, a script narrated over footage) is video work, and it
+// goes where the programme says its video work runs: an explainer needs the studio, and a script over your own footage
+// needs the folder it lives in — neither is on the server. Text drafts stay on the server either way.
+const genQueue = (niche, type = niche?.content_type) => (MADE_VIDEO_TYPES.has(type) && niche?.compute_where === "pc" ? PC_LANE : queueFor(type));
 function scoreCandidate(item, niche) {
   const c = methodCfg(niche); let s = 0.35; const reasons = [];
   if (item.views) { const v = Math.min(1, Math.log10(item.views + 1) / 6.5); s += 0.3 * v; reasons.push(`views ${item.views}`); }
@@ -2708,7 +2927,7 @@ async function routeSourceItem(item) {
       if (VIDEO_TYPES.has(niche.content_type)) continue;
       if (!(await underDailyCap(niche))) continue;
       const itemId = await createQueuedItem(niche, { sourceItemId: item.id, topic: item.title, sourceDataRef: { provider: "source_item", url: item.url, title: item.title, summary: item.summary, published_at: item.published_at, thumbnail: item.thumbnail } });
-      await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: niche.priority, contentItemId: itemId });
+      await enqueue("GENERATE_CONTENT", { itemId }, { queue: genQueue(niche), priority: niche.priority, contentItemId: itemId });
       routed++;
     }
   }
@@ -2916,7 +3135,7 @@ async function sweepNewsDesk() {
         WHERE si.cluster_id = $1 ORDER BY COALESCE(s.language = $3, false) DESC, s.weight DESC, si.created_at ASC LIMIT 1`, [c.id, niche.id, (niche.language || "en").slice(0, 2)]);
       if (!rep || !passesFilters({ title: c.title, summary: rep.summary, published_at: c.published_at }, niche)) continue;
       const itemId = await createQueuedItem(niche, { sourceItemId: rep.id, clusterId: c.id, topic: rep.title, sourceDataRef: { provider: "news_desk", url: rep.url, title: rep.title, summary: rep.summary, published_at: rep.published_at, outlets: (P(c.outlets) || []).map((o) => o.name) } });
-      await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: niche.priority, contentItemId: itemId });
+      await enqueue("GENERATE_CONTENT", { itemId }, { queue: genQueue(niche), priority: niche.priority, contentItemId: itemId });
       await q(`UPDATE source_items SET status = 'ROUTED' WHERE id = $1`, [rep.id]);
       taken++;
     }
@@ -3314,7 +3533,11 @@ async function generateReel(item, niche, style) {
   const style2 = (P(niche.image_specs) || {}).style || "Editorial illustration in a modern digital-painting style, cinematic light, clearly not a photograph, no text, no identifiable real people.";
   // Each section is backed by real footage where the library has some — a narrated section over moving pictures is the
   // difference between a video and a slideshow, and the clips are free. A section with no clip keeps its picture.
-  const broll = mc.broll !== false && (await credentialsFor("pexels")).length > 0;
+  // Your own footage first where the programme has a library (7a), the stock library behind it.
+  const library = mc.footage_dir ? await footageIndex(String(mc.footage_dir), { describe: Number(mc.describe_per_day ?? 5) }) : null;
+  if (library && !library.length) warn(`footage folder ${mc.footage_dir} has no clips in it`);
+  const stockOk = mc.broll !== false && !(library && mc.own_footage_only) && (await credentialsFor("pexels")).length > 0;
+  const broll = stockOk || !!library?.length;
   const storyPlace = String(d.place || "").trim() || niche.country;
   const images = []; let noPics = null, footage = 0;
   for (const [i, s] of sections.entries()) {
@@ -3329,7 +3552,12 @@ async function generateReel(item, niche, style) {
       const spoken = Math.max(4, Math.round(String(s.narration).split(/\s+/).filter(Boolean).length / 2.2));
       // Footage of the place the story happens, not of the programme's country: a reel about an attack in Medina on
       // Dhaka street footage told the viewer something false about where it was.
-      const clip = await pexelsFootage(query, { vertical, seconds: spoken + 1, country: storyPlace });
+      const own = library?.length ? await ownFootage(query, library, { seconds: spoken + 1 }) : null;
+      if (own) {
+        const media = await recordMedia({ contentItemId: item.id, kind: "VIDEO", url: own.url, mime: "video/mp4", meta: { provider: "own_footage", file: own.file, from: own.from, query: own.query, section: i, purpose: "b-roll" } });
+        images.push({ ...media, kind: "VIDEO", cost: 0 }); footage++; continue;
+      }
+      const clip = stockOk ? await pexelsFootage(query, { vertical, seconds: spoken + 1, country: storyPlace }) : null;
       if (clip) {
         const media = await recordMedia({ contentItemId: item.id, kind: "VIDEO", url: clip.url, mime: "video/mp4",
           meta: { provider: "pexels", clip_id: clip.id, photographer: clip.photographer, page: clip.page, query: clip.query, section: i, purpose: "b-roll" } });
@@ -3376,7 +3604,34 @@ const EXPLAINER_LAYOUTS = {
   FullQuote: '{"quote": "...", "attribution": "..."} — a real quote from the research only; parts: [one line]',
   BigNumber: '{"heading": "...", "value": 0, "prefix": "", "unit": "% / k / taka …", "label": "what the number counts", "context": "the comparison that makes it mean something"} — ONE number stated in the research; parts: [one line]',
   Timeline: '{"heading": "...", "events": [{"date": "...", "label": "2-5 words"}]} — 3-6 dated events from the research, in order; parts: one line per event',
+  Illustrated: '{"setting": "the place, drawn without people, in English, e.g. a busy Dhaka street market at dusk", "character": "a name from the cast, or null", "action": "what the character is doing, in English", "enter": "left|right", "caption": "a short on-screen line"} — an illustrated scene; parts: [1-2 lines]',
 };
+// An illustrated story (6c): the scenes are drawn — a background with nobody in it and the series' characters drawn
+// separately on white — and the studio puts the character into the scene and moves them, so one drawing of a place
+// carries a whole scene. The cast is the programme's, so the same characters come back episode after episode.
+const ILLUSTRATED_STYLE = (cast) => `This is an ILLUSTRATED story: build most scenes (all but an opening TitleCard and at most one other) as Illustrated scenes. The cast:\n${cast.length ? cast.map((c) => `- ${c.name}: ${c.look}`).join("\n") : "- (no fixed cast: name at most two characters and describe them the same way every time)"}\nUse only these names for "character"; a scene of a place alone has character null.`;
+const castOf = (mc) => (Array.isArray(mc.characters) ? mc.characters : []).map((c) => ({ name: String(c.name || "").trim(), look: String(c.look || "").trim() })).filter((c) => c.name);
+const ART_STYLE = "flat vector illustration, clean lines, soft warm colours, gentle shading, storybook style";
+// Each Illustrated scene drawn: the place, and the character on white (the studio lets the white fall away). The
+// character's seed comes from their name, so with the same description they are drawn the same way every time.
+async function drawIllustrated(scenes, niche, itemId, vertical) {
+  const mc = methodCfg(niche), cast = castOf(mc), art = mc.art_style || ART_STYLE;
+  const adapters = [mc.illustration_adapter || "pollinations", ...((await fallbacksFor(niche.image_adapter_fallbacks, "image.default_fallbacks")).filter((k) => /gemini_image|openai_image|pollinations/.test(k)))];
+  const draw = (prompt, specs, seed) => withFallbacks("IMAGE", adapters[0], adapters.slice(1), (img) => img.generate({ prompt, specs: { ...specs, compose: false, overlay: false }, contentItemId: itemId, seed }));
+  const cache = new Map();
+  for (const s of scenes.filter((x) => x.layout === "Illustrated")) {
+    const d = s.data;
+    const bg = await draw(`${art}. ${d.setting || "a quiet street"}. Wide establishing shot, no people`, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080 });
+    d.background = bg.url;
+    const who = cast.find((c) => c.name.toLowerCase() === String(d.character || "").toLowerCase());
+    if (d.character) {
+      const look = who?.look || d.character, key = `${look}|${d.action || ""}`;
+      if (!cache.has(key)) cache.set(key, await draw(`${art}. Full body character: ${look}, ${d.action || "standing"}. Centred, isolated on a plain pure white background, no shadow, no scenery`, { width: 1024, height: 1024 }, parseInt(sha(look).slice(0, 7), 16)));
+      d.figure = cache.get(key).url;
+    }
+  }
+}
+
 // A data explainer (6b) is the same machine pointed at numbers: most of its scenes are charts, figures and timelines,
 // and every number in them is one the research stated — a chart with an invented figure is worse than no chart.
 const DATA_STYLE = "This is a DATA explainer: build at least half of the scenes from DataChart, BigNumber and Timeline, using only numbers and dates that appear in the research notes, exactly as stated. If the notes do not hold enough numbers for a scene, use another layout rather than inventing one.";
@@ -3398,6 +3653,7 @@ async function generateExplainer(item, niche, style) {
   const plan = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
     system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(EXPLAINER_LAYOUTS).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
+` : ""}${mc.explainer_style === "illustrated" ? `${ILLUSTRATED_STYLE(castOf(mc))}
 ` : ""}Start with a TitleCard; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
     mock: { title: m.title, description: `About ${m.title}`, hashtags: ["explained"], scenes: [
       { layout: "TitleCard", chapter: "Intro", data: { title: m.title, subtitle: "Explained" }, parts: [`Here is ${m.title}, explained.`] },
@@ -3408,6 +3664,7 @@ async function generateExplainer(item, niche, style) {
   if (!scenes.length) throw new Error("The explainer plan came back without usable scenes");
   const texts = scenes.map((s) => [s.intro, ...s.parts].filter(Boolean).join(" "));
   const title = p.title || m.title;
+  if (scenes.some((s) => s.layout === "Illustrated")) await drawIllustrated(scenes, niche, item.id, vertical);
   await setItem(item.id, { headline: title, script: texts.join("\n\n"), summary: p.description || "", hashtags: p.hashtags || [] });
   const narr = await narrateParts(niche, texts, item.id); await addCost(item.id, narr.cost);
   await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
@@ -3425,7 +3682,8 @@ async function generateExplainer(item, niche, style) {
   const description = [p.description || "", chapters.length >= 3 ? `\n${chapters.join("\n")}` : ""].join("\n").trim();
   await setItem(item.id, { captions: { youtube: description, default: p.description || title, facebook: p.description || title } });
   if (narr.audio.mock || !studioReady()) throw new Error("ANIMATED_EXPLAINER needs the video studio and a real voice adapter (the studio renders the animation)");
-  const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(narr.audio.url, "mp3");
+  const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(narr.audio.url, "mp3"), drawn = [];
+  for (const b of built) for (const k of ["background", "figure"]) if (b.data?.[k]) { b.data[k] = await toTmpFile(b.data[k], "jpg"); drawn.push(b.data[k]); }
   const props = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), brand, title, audio: audioFile, music, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built };
   try {
     const out = await studioRender("Explainer", props);
@@ -3434,20 +3692,74 @@ async function generateExplainer(item, niche, style) {
       const j = await toJpeg(bytes, "image/png"); await recordMedia({ contentItemId: item.id, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: props.width, height: props.height, meta: { purpose: "youtube thumbnail" } }); }
     catch (e) { warn(`explainer thumbnail: ${e.message.slice(0, 160)}`); }
     await setItem(item.id, { hero_media_id: video.id });
-  } finally { await cleanup(audioFile, brand.logo, brand.fontUrl, music); }
+  } finally { await cleanup(audioFile, brand.logo, brand.fontUrl, music, ...drawn); }
+}
+// ---- 1b. A rented clipper: the service fetches the link itself, finds the moments and cuts them, so this works while
+// your PC is off and YouTube refuses the server. Optional — it switches on with a key (Vizard: Creator plan and up).
+// What comes back are finished clips; each goes to review like any other, with the brand pass on top.
+impl("CLIP", "vizard", { label: "Vizard (rented clipping, needs a key)", configSchema: { api_base: { type: "string", default: "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1" }, prefer_length: { type: "array", default: [0] }, max_clips: { type: "number", default: 3 } }, create: (cfg, ctx = {}) => ({
+  rented: true,
+  async selectClips() { throw new Error("Vizard cuts the clips itself; it is used as the programme's clipper, not as a picker over a transcript"); },
+  // Starts the project once per video, then asks how it is going; "not yet" is a transient error, so the job comes back.
+  async rentClips({ url, niche, candidateId }) {
+    const base = ENV.VIZARD_API_BASE || cfg.api_base, mc = methodCfg(niche), mark = `vizard.project.${candidateId}`;
+    return withKey("vizard", async (key) => {
+      const h = { VIZARDAI_API_KEY: key, "content-type": "application/json" };
+      let project = (await setting(mark, null))?.id;
+      if (!project) {
+        const youtube = /youtu\.?be/.test(url);
+        const r = await fetchJson(`${base}/project/create`, { method: "POST", headers: h, body: JSON.stringify({ videoUrl: url, videoType: youtube ? 2 : 1, ...(youtube ? {} : { ext: (extname(url.split("?")[0]).slice(1) || "mp4") }),
+          lang: (niche.language || "en").slice(0, 2), preferLength: cfg.prefer_length || [0], ratioOfClip: mc.orientation === "16:9" ? 4 : 1, maxClipNumber: mc.clips_per_video || cfg.max_clips || 3 }) });
+        if (String(r.code) !== "2000" || !r.projectId) throw new Error(`Vizard would not start the project: ${r.errMsg || r.code}`);
+        project = r.projectId; await putSetting(mark, { id: project });
+      }
+      const r = await fetchJson(`${base}/project/query/${project}`, { headers: h });
+      if (String(r.code) === "1000") throw Object.assign(new Error("Vizard is still cutting this video"), { waitMinutes: Number(ENV.VIZARD_POLL_MINUTES) || 2 });
+      if (String(r.code) !== "2000") throw new Error(`Vizard failed on this video: ${r.errMsg || r.code}`);
+      await q(`DELETE FROM settings WHERE key = $1`, [mark]);
+      return { clips: (r.videos || []).filter((v) => v.videoUrl).map((v) => ({ url: v.videoUrl, seconds: (Number(v.videoMsDuration) || 0) / 1000, title: v.title || "", text: v.transcript || "", score: Number(v.viralScore) / 10 || null, reason: v.viralReason || "chosen by Vizard" })), units: 1 };
+    }, ctx.pin);
+  } }) });
+async function rentedClips(cand, niche, clipper) {
+  const { clips } = await clipper.rentClips({ url: cand.source_url, niche, candidateId: cand.id });
+  if (!clips.length) throw new Error("the clipping service found no clips in this video");
+  const vertical = methodCfg(niche).orientation !== "16:9", style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
+  for (const cl of clips.slice(0, methodCfg(niche).clips_per_video || 3)) {
+    const clipId = newId();
+    await q(`INSERT INTO clips (id, video_candidate_id, niche_id, start_seconds, end_seconds, title, hook, score, reason, transcript_text) VALUES ($1,$2,$3,0,$4,$5,'',$6,$7,$8)`, [clipId, cand.id, niche.id, cl.seconds || 0, cl.title, cl.score, cl.reason, cl.text]);
+    const itemId = await createQueuedItem(niche, { topic: cl.title || cand.title, candidateId: cand.id, clipId, status: "RENDERING", sourceDataRef: { provider: "rented_clip", url: cand.source_url, title: cand.title, clip: cl } });
+    await q(`UPDATE clips SET content_item_id=$2 WHERE id=$1`, [clipId, itemId]);
+    let file = tmpPath("mp4"); await writeFile(file, await fetchBytes(cl.url));
+    let finish = "off"; if (methodCfg(niche).brand_finish !== false) ({ file, finish } = await brandFinish(file, niche, { vertical }));
+    const video = await publishRender(file, itemId, { method: "RENTED_CLIP", provider: "vizard", orientation: vertical ? "9:16" : "16:9", brand_finish: finish });
+    await q(`UPDATE clips SET render_url=$2, status='RENDERED' WHERE id=$1`, [clipId, video.url]);
+    const plain = { headline: cl.title || cand.title, captions: { facebook: cl.title || cand.title, instagram: cl.title || cand.title, youtube: `Clip from ${cand.title}` }, hashtags: [] };
+    let cap, note = null;
+    try { cap = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 600, system: `You write social captions for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
+      prompt: `Clip title: ${cl.title}\nWhat is said: ${String(cl.text).slice(0, 1500)}\nSource: ${cand.title}\nReturn JSON: {"headline": "video title max 90 chars", "captions": {"facebook": "...", "instagram": "...", "youtube": "description with credit to the source"}, "hashtags": ["..."]}`, mock: plain })); }
+    catch (e) { note = `Caption not written — the writer refused (${String(e.message).slice(0, 160)}). The clip's own title stands in; rewrite it before posting.`; cap = { data: plain, cost: 0 }; }
+    await addCost(itemId, cap.cost); const cd = cap.data || plain;
+    await setItem(itemId, { hero_media_id: video.id, headline: cd.headline || plain.headline, captions: withCaptions(cd.captions, { headline: cd.headline || plain.headline, summary: cl.title }), hashtags: currentYearTags(cd.hashtags), summary: cl.title || "", ...(note ? { rejection_note: note } : {}) });
+    await finishGeneration(itemId, niche);
+  }
+  await q(`UPDATE video_candidates SET status='PROCESSED' WHERE id=$1`, [cand.id]);
 }
 // ---- 8d. Video candidate: download → transcribe → pick clips → one content_item per clip → RENDER_CLIP jobs
 async function processCandidate(candidateId) {
   const cand = await one(`SELECT * FROM video_candidates WHERE id = $1`, [candidateId]); if (!cand) return;
   const niche = await one(`SELECT * FROM niches WHERE id = $1`, [cand.niche_id]); if (!niche) throw new Error("candidate has no program");
   await q(`UPDATE video_candidates SET status='PROCESSING', error_message=NULL WHERE id=$1`, [candidateId]);
+  // A rented clipper fetches and cuts the video itself: nothing is downloaded or transcribed here.
+  if (niche.clip_adapter) { const clipper = await resolve("CLIP", niche.clip_adapter).catch(() => null); if (clipper?.rented) return rentedClips(cand, niche, clipper); }
   const dl = await resolve("DOWNLOAD", niche.download_adapter || "ytdlp");
+  const sceneRecap = niche.production_method === "SCENE_RECAP";
   // Choosing the moment is done on the soundtrack. A ten-minute video is about five megabytes of audio and fourteen
   // seconds to fetch, against hundreds of megabytes and minutes for the video — and the picture is no help in
   // deciding what was said. The video itself is fetched later, one clip's worth at a time.
   const file = cand.local_path && existsSync(cand.local_path) ? { path: cand.local_path, duration: cand.duration_seconds }
-    : dl.audio ? await dl.audio(cand.source_url) : await dl.download(cand.source_url);
-  const audioOnly = !!dl.audio && !(cand.local_path && existsSync(cand.local_path));
+    : dl.audio && !sceneRecap ? await dl.audio(cand.source_url) : await dl.download(cand.source_url);
+  // A scene recap is the exception: its scenes are read from the picture, and it is cut from all over the video.
+  const audioOnly = !!dl.audio && !sceneRecap && !(cand.local_path && existsSync(cand.local_path));
   await q(`UPDATE video_candidates SET local_path=$2, duration_seconds=COALESCE($3, duration_seconds) WHERE id=$1`,
     [candidateId, audioOnly ? null : file.path, file.duration || null]);
   let transcript = P(cand.transcript);
@@ -3455,11 +3767,15 @@ async function processCandidate(candidateId) {
     // A hosted transcriber first where there is one, and the local engine behind it. whisper.cpp never runs out and
     // never costs anything, but a tenth of a CPU hears three minutes of speech in nineteen — so the free daily
     // allowance of a hosted model is worth spending first, and the slow one is what the day looks like after it.
-    transcript = await withFallbacks("TRANSCRIBE", niche.transcript_adapter || "transcribe_mock", niche.transcript_adapter_fallbacks,
-      (tr) => tr.transcribe({ path: file.path, duration: file.duration, language: niche.language }));
-    const clean = cleanTranscript(transcript.segments);
+    // A scene recap asks Gemini to watch first; on a day its allowance is spent the programme's own transcriber takes
+    // over and the recap is told from the dialogue, as 5b does, rather than not at all.
+    const own = niche.transcript_adapter || "transcribe_mock", ownFb = P(niche.transcript_adapter_fallbacks) || [];
+    const [trKey, trFb] = sceneRecap && !/gemini_video|twelve_labs/.test(own) ? ["gemini_video", [own, ...ownFb]] : [own, niche.transcript_adapter_fallbacks];
+    transcript = await withFallbacks("TRANSCRIBE", trKey, trFb, (tr) => tr.transcribe({ path: file.path, duration: file.duration, language: niche.language }));
+    // Scenes are kept whole — a scene where nobody speaks is often the one the recap needs.
+    const clean = transcript.scenes ? { segments: transcript.segments, events: [] } : cleanTranscript(transcript.segments);
     transcript = { ...transcript, segments: clean.segments, events: clean.events };
-    await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments, events: transcript.events })]);
+    await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments, events: transcript.events, scenes: !!transcript.scenes })]);
   } else if (!transcript.events) transcript = { ...transcript, ...cleanTranscript(transcript.segments) };   // stored before cleaning existed
   // One pass over the soundtrack for what the words do not say: where it got loud, and where nobody was speaking.
   const signals = existsSync(file.path) ? await audioSignals(file.path) : { loud: [], silences: [] };
@@ -3468,7 +3784,7 @@ async function processCandidate(candidateId) {
   if (audioOnly) await cleanup(file.path);
   let clips;
   // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
-  if (niche.content_type === "MOVIE_RECAP" || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
+  if (niche.content_type === "MOVIE_RECAP" || sceneRecap || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
   else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand, signals }));
     // Take every moment worth taking, not a fixed three. A count is the wrong control: on one video it throws away
     // something good, and on the next it scrapes the barrel to fill the quota. min_clip_score is the bar, and
@@ -3513,11 +3829,14 @@ async function renderClipItem(itemId, clipId) {
   // Everything downstream counts from the start of the file it was given, not from the start of the original video.
   if (cutOffset) { c.start -= cutOffset; c.end -= cutOffset; transcript.segments = transcript.segments.map((s) => ({ ...s, start: s.start - cutOffset, end: s.end - cutOffset })); }
   const extras = {}; let script = clip.transcript_text || "";
-  if (niche.production_method === "VOICEOVER" || niche.production_method === "MOVIE_RECAP") {
-    const recap = niche.production_method === "MOVIE_RECAP";
+  if (["VOICEOVER", "MOVIE_RECAP", "SCENE_RECAP"].includes(niche.production_method)) {
+    const recap = niche.production_method !== "VOICEOVER", seen = recap && transcript.segments.some((x) => x.visual);
+    // With scenes read from the picture, each line says what is on screen as well as what is said, and the beats are
+    // matched to the picture; without them (5b, or a day Gemini was out) to the dialogue.
+    const recapLines = transcript.segments.map((x) => (seen ? `[${x.start}-${x.end}] SEEN: ${x.visual || "?"}${x.text ? ` | SAID: ${x.text}` : ""}` : `[${x.start}-${x.end}] ${x.text}`)).join("\n").slice(0, 100000);
     const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: recap ? 4000 : 1200,
       system: `You write ${recap ? "gripping ~60 second movie recaps that preserve suspense and never spoil the ending" : "short punchy voice-over narration re-telling a clip in our own words"} for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
-      prompt: recap ? `Film: ${cand.title}\nTimestamped transcript:\n${transcript.segments.map((s) => `[${s.start}-${s.end}] ${s.text}`).join("\n").slice(0, 100000)}\n\nWrite a ${methodCfg(niche).recap_seconds || 60}-second narrated recap in ${Math.max(6, Math.round((methodCfg(niche).recap_seconds || 60) / 6))} beats. For each beat pick the source timestamps that visually match. Return JSON: {"title": "...", "beats": [{"narration": "...", "start": seconds, "end": seconds}], "hashtags": ["..."]}`
+      prompt: recap ? `Film: ${cand.title}\n${seen ? "Its scenes, with what is seen and said in each" : "Timestamped transcript"}:\n${recapLines}\n\nWrite a ${methodCfg(niche).recap_seconds || 60}-second narrated recap in ${Math.max(6, Math.round((methodCfg(niche).recap_seconds || 60) / 6))} beats. For each beat pick the source timestamps ${seen ? "of the scene whose picture shows what that beat narrates" : "that visually match"}. Return JSON: {"title": "...", "beats": [{"narration": "...", "start": seconds, "end": seconds}], "hashtags": ["..."]}`
         : `Clip transcript (${(c.end - c.start).toFixed(0)}s): ${script}\n\nWrite narration of the same length that re-tells this in our voice. Return JSON: {"title": "...", "narration": "...", "hashtags": ["..."]}`,
       mock: recap ? { title: cand.title, beats: [{ narration: `Mock recap of ${cand.title}.`, start: 0, end: 10 }, { narration: "And then everything changes.", start: 30, end: 40 }], hashtags: ["recap"] } : { title: clip.title, narration: `Mock narration: ${script.slice(0, 200)}`, hashtags: ["clip"] } }));
     await addCost(itemId, r.cost); const d = r.data || {};
@@ -3945,7 +4264,7 @@ async function acceptSuggestion(id) {
     const seriesId = s.series_id || (p.series_key ? (await one(`SELECT id FROM series WHERE niche_id=$1 AND key=$2`, [niche.id, p.series_key]))?.id : null) || null;
     const type = p.content_type && CONTENT_TYPE_SET.has(p.content_type) && !VIDEO_TYPES.has(p.content_type) ? p.content_type : null;
     out.itemId = await createQueuedItem(niche, { seriesId, contentType: type, topic: p.topic || s.title, sourceDataRef: { provider: "planner", summary: p.summary || s.rationale || "", suggestionId: s.id } });
-    await enqueue("GENERATE_CONTENT", { itemId: out.itemId }, { queue: queueFor(type || niche.content_type), priority: 3, contentItemId: out.itemId });
+    await enqueue("GENERATE_CONTENT", { itemId: out.itemId }, { queue: genQueue(niche, type || niche.content_type), priority: 3, contentItemId: out.itemId });
   } else if (s.kind === "NEW_SERIES") {
     out.seriesId = newId();
     await q(`INSERT INTO series (id, niche_id, key, display_name, premise, cadence_days, auto_generate, next_due_at) VALUES ($1,$2,$3,$4,$5,$6,1,now()) ON CONFLICT (niche_id, key) DO NOTHING`,
@@ -3984,7 +4303,7 @@ async function nextEpisode(seriesId) {
     mock: { topic: `${s.display_name}: episode ${s.episode_counter + 1}`, summary: "" } }));
   const d = r.data || {};
   const itemId = await createQueuedItem(niche, { seriesId: s.id, topic: d.topic || `${s.display_name} ${s.episode_counter + 1}`, sourceDataRef: { provider: "series", summary: d.summary || "" } });
-  await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: 2, contentItemId: itemId });
+  await enqueue("GENERATE_CONTENT", { itemId }, { queue: genQueue(niche), priority: 2, contentItemId: itemId });
   return { itemId };
 }
 
@@ -4111,6 +4430,9 @@ async function runJob(job) {
     await q(`UPDATE jobs SET status='SUCCEEDED', result=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, J(result ?? null)?.slice(0, 5000) ?? null]);
   } catch (e) {
     const msg = String(e?.message || e).slice(0, 1500);
+    // Waiting on an outside service that is still working (a rented clipper cutting the video): not a failure, so no
+    // attempt is spent; the job comes back when the service said it might be done.
+    if (e?.waitMinutes) { await deferJob(job, e.waitMinutes); await q(`UPDATE jobs SET error_message=$2 WHERE id=$1`, [job.id, msg]); return; }
     // A provider that has answered "overloaded" for the whole retry hour is not a job that failed, it is a provider
     // that is down — and failing there costs a day of news. Once the ordinary backoff has given up, an outage waits
     // the same way a quota does: no attempt spent, the program paused, stories that would go stale dropped.
@@ -4297,11 +4619,11 @@ async function syncCatalogSources() {
 // A program keeps the adapters it was created with, which go stale: a voice whose provider never got a key would fail the
 // first reel the program is asked for, and rendering stays on ffmpeg after the studio arrives. This repairs what cannot
 // work on this deployment and takes the studio when it is there. Deliberate choices that do work — including mocks — stay.
-const IMPL_PROVIDER = { anthropic: "anthropic", gemini: "gemini", openai: "openai", gemini_image: "gemini", openai_image: "openai", elevenlabs: "elevenlabs", openai_tts: "openai", gemini_tts: "gemini", gemini_embed: "gemini", gemini_transcribe: "gemini", whisper_api: "openai" };
+const IMPL_PROVIDER = { vizard: "vizard", twelve_labs: "twelve_labs", gemini_video: "gemini", anthropic: "anthropic", gemini: "gemini", openai: "openai", gemini_image: "gemini", openai_image: "openai", elevenlabs: "elevenlabs", openai_tts: "openai", gemini_tts: "gemini", gemini_embed: "gemini", gemini_transcribe: "gemini", whisper_api: "openai" };
 async function adapterUsable(key) {
-  const row = await one(`SELECT impl FROM adapter_configs WHERE key=$1 AND enabled::int=1`, [key]);
+  const row = await one(`SELECT impl, config FROM adapter_configs WHERE key=$1 AND enabled::int=1`, [key]);
   if (!row) return false;
-  const provider = IMPL_PROVIDER[row.impl];
+  const provider = row.impl === "openai_compat" ? (P(row.config)?.provider || "groq") : IMPL_PROVIDER[row.impl];
   return provider ? (await credentialsFor(provider)).length > 0 : true;                    // mocks and local tools need no key
 }
 // Runs on every boot. A key added today has to reach the programs that already exist — that is the whole point of
@@ -4570,16 +4892,24 @@ const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visu
   contentType: "content_type", productionMethod: "production_method", methodConfig: "method_config", language: "language", country: "country", approvalMode: "approval_mode", reviewWindowMinutes: "review_window_minutes", styleProfileId: "style_profile_id", publishToPortal: "publish_to_portal", imageAdapter: "image_adapter", imageSpecs: "image_specs", topicFilters: "topic_filters", maxItemsPerDay: "max_items_per_day", priority: "priority",
   downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", transcriptAdapterFallbacks: "transcript_adapter_fallbacks", computeWhere: "compute_where", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
-app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
+app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`);
+  json(ctx, 200, rows.map((r) => { const v = variantsOf(r); return { ...rowJson(r, NICHE_JSON), variants: v.map((x) => x.id), variant_name: v.map((x) => x.name).join(" / ") || null }; })); });
 // Adapters a new program starts with when the request doesn't name them: the live ones whose provider has a key (vault or
 // env), mocks otherwise — so "create a program" yields real output without visiting the Adapters page.
+// Every writer this install has a key for, in the order they are tried: Gemini first (the best Bangla of the free
+// ones), the paid ones, then the free writers. Each answers when the one before it has spent its allowance.
+const WRITERS = [["gemini", "gemini_live", "Gemini"], ["openai", "openai_live", "OpenAI"], ["anthropic", "anthropic_live", "Claude"],
+  ["groq", "groq_live", "Groq"], ["mistral", "mistral_live", "Mistral"], ["cerebras", "cerebras_live", "Cerebras"], ["openrouter", "openrouter_live", "OpenRouter"], ["xai", "grok_live", "Grok"]];
+async function writerKeys() { return (await Promise.all(WRITERS.map(async ([prov, key, name]) => ((await credentialsFor(prov)).length ? { prov, key, name } : null)))).filter(Boolean); }
+async function writerChain() { return (await writerKeys()).map((w) => w.key); }
 async function smartAdapterDefaults() {
   const has = async (p) => (await credentialsFor(p)).length > 0;
   const [gem, oai, ant, el] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("elevenlabs")]);
   const ffmpeg = await exec("ffmpeg", ["-version"], { timeoutMs: 10000 }).then(() => true).catch(() => false);
+  const writers = await writerChain();
   return {
-    scriptAdapter: gem ? "gemini_live" : oai ? "openai_live" : ant ? "anthropic_live" : "llm_mock",
-    scriptAdapterFallbacks: [gem && "gemini_live", oai && "openai_live", ant && "anthropic_live"].filter(Boolean).slice(1),
+    scriptAdapter: writers[0] || "llm_mock",
+    scriptAdapterFallbacks: writers.slice(1),
     imageAdapter: gem ? "gemini_image" : oai ? "openai_image" : "image_mock",
     // A library photo is the step between a generated picture and a text card: free, and better than no picture at all.
     imageAdapterFallbacks: (await has("pexels")) ? ["pexels_stock"] : [],
@@ -4601,8 +4931,8 @@ async function smartAdapterDefaults() {
     // the line anyone would clip first in 9, the free heuristic in 4, loudness alone in 1. The LLM goes first where
     // there is a writer, and the free pickers stay behind it for the day its allowance is spent — the schema default was
     // the LLM with nothing behind it, so a spent allowance failed the whole video.
-    clipAdapter: gem || oai || ant ? "llm_clipper" : "clip_meaning",
-    clipAdapterFallbacks: gem || oai || ant ? ["clip_meaning", "clip_signal"] : ["clip_signal"],
+    clipAdapter: writers.length ? "llm_clipper" : "clip_meaning",
+    clipAdapterFallbacks: writers.length ? ["clip_meaning", "clip_signal"] : ["clip_signal"],
   };
 }
 const checkComputeWhere = (b) => { if (b?.computeWhere != null && !["server", "pc"].includes(b.computeWhere)) throw new ApiError(400, null, "computeWhere must be \"server\" or \"pc\""); };
@@ -4614,7 +4944,11 @@ app.post("/api/niches", async (ctx) => {
   if (!b.language && b.country) b.language = COUNTRY_LANGUAGE[String(b.country).trim().toLowerCase()] || undefined;
   const id = newId(); await q(`INSERT INTO niches (id, brand_id, key, display_name, tone, topic_source_adapter) VALUES ($1,$2,$3,$4,$5,$6)`, [id, b.brandId, b.key, b.displayName, b.tone || "", b.topicSourceAdapter || "newsapi_mock"]);
   const rest = { ...b }; delete rest.brandId; delete rest.key; delete rest.displayName; delete rest.tone; delete rest.topicSourceAdapter;
-  const row = Object.keys(rest).some((k) => k in NICHE_MAP) ? await patchRow("niches", id, rest, NICHE_MAP) : await one(`SELECT * FROM niches WHERE id=$1`, [id]);
+  for (const k of Object.keys(rest)) if (rest[k] === null) delete rest[k];                 // a field left empty in the form: the default
+  // All of it or none of it: a programme whose settings were refused is not left behind half made.
+  let row;
+  try { row = Object.keys(rest).some((k) => k in NICHE_MAP) ? await patchRow("niches", id, rest, NICHE_MAP) : await one(`SELECT * FROM niches WHERE id=$1`, [id]); }
+  catch (e) { await q(`DELETE FROM niches WHERE id=$1`, [id]).catch(() => {}); throw e; }
   if (Array.isArray(b.sourceIds)) for (const s of b.sourceIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, s]);
   // A Bangladesh program with no sources picked gets the catalog's sources for its language (or the TV channels).
   if (b.autoSources !== false && !(b.sourceIds || []).length) await installCatalogSources(catalogFor(row), [id]);
@@ -4624,7 +4958,7 @@ app.post("/api/niches", async (ctx) => {
 });
 app.post("/api/programs", async (ctx) => { ctx.req.url = "/api/niches"; const r = app.routes.find((x) => x.method === "POST" && x.re.test("/api/niches")); return r.handler(ctx); });
 app.patch("/api/niches/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
-app.patch("/api/programs/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
+app.patch("/api/programs/:id", async (ctx) => { checkComputeWhere(ctx.body); if (ctx.body.maxItemsPerDay === null) ctx.body.maxItemsPerDay = 0; json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
 // Who is doing the work right now: the server's own record of its build, and whether your PC is on. The PC beats every
 // 30 seconds, so a heartbeat older than 90 means it is off — and anything routed to it is waiting, not stuck.
 // Hear a voice before choosing it. It is also the only honest way to know whether a voice works from where this
@@ -4643,55 +4977,67 @@ app.post("/api/voices/test", async (ctx) => {
 // "built" means it passes its tests but has not yet been run on real footage, "to build" means it does not exist.
 // Kept beside the code rather than in the dashboard so a variant that is built or proven is updated in one place.
 const CATALOG = [
-  { id: "1a", type: "Clip", name: "Laptop clip", what: "Your link → the moment that matters, cut to a captioned 9:16 reel", runs: "pc", needs: ["pc"], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc" } },
-  { id: "1b", type: "Clip", name: "Rented clip", what: "A clipping service does the cut while your PC is off", runs: "rented", needs: ["clip_service"], status: "to build" },
+  { id: "1a", type: "Clip", name: "Laptop clip", what: "Your link → the moment that matters, cut to a captioned 9:16 reel", runs: "pc", needs: ["pc"], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "clip_meaning", computeWhere: "pc" } },
+  { id: "1b", type: "Clip", name: "Rented clip", what: "A clipping service does the cut while your PC is off", runs: "rented", needs: ["clip_service"], status: "built", note: "Optional, and the one variant that costs money: Vizard's Creator plan (about $14.50 a month). Everything else here clips for free", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "vizard" } },
   { id: "1c", type: "Clip", name: "LLM-picked clip", what: "An LLM reads the transcript and chooses the moment", runs: "server or pc", needs: ["writer"], status: "proven", note: "On fourteen real speeches it put the line anyone would clip first in 9 (the free picker: 4)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "llm_clipper" } },
-  { id: "1d", type: "Clip", name: "Server clip", what: "As 1a, on the server at 720p, for links that are not YouTube", runs: "server", needs: [], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "server" } },
+  { id: "1d", type: "Clip", name: "Server clip", what: "As 1a, on the server at 720p, for links that are not YouTube", runs: "server", needs: [], status: "proven", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "clip_meaning", computeWhere: "server" } },
   { id: "2a", type: "News card", name: "Photo card", what: "Headline and caption over the outlet's own photo, branded", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
   { id: "2b", type: "News card", name: "Text card", what: "Typographic card for a story without a photo", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
   { id: "2c", type: "News card", name: "Stock card", what: "A Pexels photo of the story's country behind the headline", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
   { id: "3a", type: "News reel", name: "Photo reel", what: "The outlet's photo, local footage, Bangla narration, burned captions", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "NEWS_REEL" } },
-  { id: "3b", type: "News reel", name: "Telecast clip", what: "A TV report cut to its moment — nothing written, nothing narrated", runs: "pc", needs: ["pc"], status: "proven", note: "Proven on an English TV report; Bangla speech needs hosted transcription (Gemini billing)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT" } },
+  { id: "3b", type: "News reel", name: "Telecast clip", what: "A TV report cut to its moment — nothing written, nothing narrated", runs: "pc", needs: ["pc"], status: "proven", note: "Proven on an English TV report; Bangla speech needs hosted transcription (local whisper cannot do Bangla)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "3c", type: "News reel", name: "Telecast + intro", what: "3b with a narrated headline card in front", runs: "server or pc", needs: ["writer", "voice"], status: "proven", note: "Proven with a Bangla intro in front of an English report", setup: { contentType: "PODCAST_CLIP", productionMethod: "TELECAST_INTRO" } },
   { id: "4a", type: "Reaction", name: "Silent reaction", what: "The moment at 1.1× with your clip — split-screen or in the corner", runs: "server or pc", needs: ["persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY" } },
   { id: "4b", type: "Reaction", name: "Summary voiceover", what: "A few sentences of summary over the clip, its sound ducked", runs: "server or pc", needs: ["writer", "voice"], status: "proven", setup: { contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER" } },
   { id: "4c", type: "Reaction", name: "Long-form reaction", what: "Play / comment beats: the source in segments, your commentary between", runs: "server or pc", needs: ["writer", "voice", "persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG" } },
-  { id: "5a", type: "Recap", name: "Scene recap", what: "Gemini watches the video, picks scenes, the recap is cut and narrated", runs: "pc", needs: ["pc", "writer", "voice", "gemini_video"], status: "to build" },
+  { id: "5a", type: "Recap", name: "Scene recap", what: "Gemini watches the video, picks scenes, the recap is cut and narrated over the film's own sound", runs: "pc", needs: ["pc", "writer", "voice", "gemini_video"], status: "built", note: "On Gemini's free tier: about 100 tokens a second of video, forty minutes per request. When the day's allowance is spent it is told from the dialogue instead (5b)", setup: { contentType: "MOVIE_RECAP", productionMethod: "SCENE_RECAP", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "5b", type: "Recap", name: "Transcript recap", what: "A dialogue-led video retold from its transcript, cut by timestamp", runs: "server or pc", needs: ["writer", "voice"], status: "proven", setup: { contentType: "MOVIE_RECAP", productionMethod: "MOVIE_RECAP" } },
-  { id: "5c", type: "Recap", name: "Twelve Labs recap", what: "Moment retrieval by a video-search API, same assembly", runs: "pc", needs: ["pc", "writer", "voice", "twelve_labs"], status: "to build" },
-  { id: "6a", type: "Animation", name: "Explainer", what: "Script → motion graphics, type and transitions (Remotion)", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", setup: { contentType: "ANIMATED_EXPLAINER" } },
-  { id: "6b", type: "Animation", name: "Data / research", what: "Animated charts, counted-up figures and timelines from the research's own numbers", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "An explainer programme with Explainer style set to Data", setup: { contentType: "ANIMATED_EXPLAINER" } },
-  { id: "6c", type: "Animation", name: "Illustrated series", what: "AI character images composited and moved in code", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
-  { id: "7a", type: "Script → video", name: "Own footage", what: "Your footage library matched to each sentence, narrated", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
+  { id: "5c", type: "Recap", name: "Twelve Labs recap", what: "Moment retrieval by a video-search API, same assembly", runs: "pc", needs: ["pc", "writer", "voice", "twelve_labs"], status: "built", note: "Optional: 5a does the same on Gemini's free tier", setup: { contentType: "MOVIE_RECAP", productionMethod: "SCENE_RECAP", transcriptAdapter: "twelve_labs", computeWhere: "pc" }, loose: ["computeWhere"] },
+  { id: "6a", type: "Animation", name: "Explainer", what: "Script → motion graphics, type and transitions (Remotion)", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: null } }, loose: ["computeWhere"] },
+  { id: "6b", type: "Animation", name: "Data / research", what: "Animated charts, counted-up figures and timelines from the research's own numbers", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "An explainer programme with Explainer style set to Data", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "data" } }, loose: ["computeWhere"] },
+  { id: "6c", type: "Animation", name: "Illustrated series", what: "The series' characters drawn by a free image generator, put into drawn scenes and moved in code", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "Pictures from Pollinations: free, no key; a free Pollinations account's token removes its corner logo", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "illustrated" } }, loose: ["computeWhere"] },
+  { id: "7a", type: "Script → video", name: "Own footage", what: "Your footage library matched to each sentence, narrated", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "Set the footage folder on the programme; clips are found by their names, a .txt note beside them, or what Gemini sees in them", setup: { contentType: "IMAGE_SLIDESHOW", computeWhere: "pc", methodConfig: { footage_dir: true } }, loose: ["computeWhere"] },
   { id: "7b", type: "Script → video", name: "Stock footage", what: "A script narrated over stock footage of the right country", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
   { id: "7c", type: "Script → video", name: "Photo sequence", what: "Stills with motion, narrated", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
 ];
+// Which blueprint variant a programme makes: the most specific setups it fits. Several tie where the blueprint itself
+// does not tell them apart in configuration (2a-c are one programme choosing per story; 3b is 1c on a TV report).
+// A setup is also how a new programme of that variant starts; keys listed in "loose" are only that — a recap run on the
+// server is still a scene recap — and do not decide which variant an existing programme is.
+function variantsOf(n) {
+  const mc = P(n.method_config) || {};
+  const core = (v) => Object.fromEntries(Object.entries(v.setup).filter(([k]) => !(v.loose || []).includes(k)));
+  const fits = (st) => st.contentType === n.content_type && (!st.productionMethod || (n.production_method || "") === st.productionMethod)
+    && (!st.computeWhere || (n.compute_where || "server") === st.computeWhere) && (!st.clipAdapter || n.clip_adapter === st.clipAdapter) && (!st.transcriptAdapter || n.transcript_adapter === st.transcriptAdapter)
+    && Object.entries(st.methodConfig || {}).every(([k, v]) => (v === true ? !!mc[k] : (mc[k] ?? null) === v));          // true: set to anything
+  const weight = (st) => Object.keys(st).filter((k) => k !== "methodConfig").length + Object.keys(st.methodConfig || {}).length;
+  const hits = CATALOG.filter((v) => v.setup && fits(core(v))), best = Math.max(0, ...hits.map((v) => weight(core(v))));
+  return hits.filter((v) => weight(core(v)) === best);
+}
 app.get("/api/catalog", async (ctx) => {
-  const [gemini, anthropic, voice, beat, persona, programs, refusals] = await Promise.all([
-    credentialsFor("gemini"), credentialsFor("anthropic"), edgeInstalled(),
+  const [haveWriters, voice, beat, persona, programs, refusals] = await Promise.all([
+    writerKeys(), edgeInstalled(),
     one(`SELECT EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key = 'worker.pc'`),
     one(`SELECT count(*)::int AS n FROM media_assets WHERE kind = 'UPLOAD' AND deleted_at IS NULL AND meta->>'purpose' = 'reactor'`),
-    q(`SELECT content_type, production_method, compute_where, clip_adapter, display_name FROM niches`),
+    q(`SELECT content_type, production_method, compute_where, clip_adapter, transcript_adapter, method_config, display_name FROM niches`),
     // A quota resets within the day; a refusal that old says nothing about now. Out of credit stays until a success clears it.
     q(`SELECT substring(key from 18) AS provider, value, EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key LIKE 'provider.refused.%'`)]);
   const pcOnline = beat ? Number(beat.age) < 90 : false;
   const refusing = (prov) => { const r = refusals.find((x) => x.provider === prov); const why = r ? (typeof r.value === "string" ? P(r.value) : r.value)?.reason : null;
     return why && (why === "out of credit" || Number(r.age) < 12 * 3600) ? why : null; };
-  const writerKeys = [["gemini", "Gemini", gemini], ["anthropic", "Claude", anthropic]].filter(([, , c]) => c.length);
-  const writers = writerKeys.filter(([prov]) => !refusing(prov)).map(([, name]) => name);
-  const refusedWriters = writerKeys.filter(([prov]) => refusing(prov)).map(([prov, name]) => `${name}: ${refusing(prov)}`);
+  const writers = haveWriters.filter((w) => !refusing(w.prov)).map((w) => w.name);
+  const refusedWriters = haveWriters.filter((w) => refusing(w.prov)).map((w) => `${w.name}: ${refusing(w.prov)}`);
   const needs = {
     pc: { ok: pcOnline, label: "your PC on", detail: pcOnline ? "online now" : beat ? "off — work waits for it" : "never connected — run pc\\start.ps1" },
-    writer: { ok: writers.length > 0, label: "a writer that works", detail: [writers.join(" + "), ...refusedWriters].filter(Boolean).join("; ") || "add a Gemini or Claude key" },
+    writer: { ok: writers.length > 0, label: "a writer that works", detail: [writers.join(" + "), ...refusedWriters].filter(Boolean).join("; ") || "add a free Gemini or Groq key" },
     voice: { ok: voice, label: "a voice", detail: voice ? "edge-tts (free)" : "edge-tts is not installed here" },
     persona: { ok: persona.n > 0, label: "your reactor clip", detail: persona.n ? `${persona.n} uploaded` : "upload one under Brands → Media library" },
-    clip_service: { ok: false, label: "a clipping subscription", detail: "not built yet" },
-    gemini_video: { ok: false, label: "Gemini video input", detail: "not built yet" },
-    twelve_labs: { ok: false, label: "a Twelve Labs key", detail: "not built yet" },
+    clip_service: { ok: (await credentialsFor("vizard")).length > 0, label: "a clipping subscription", detail: (await credentialsFor("vizard")).length ? "Vizard key set" : "optional — a Vizard key (API keys)" },
+    gemini_video: { ok: haveWriters.some((w) => w.prov === "gemini") && !refusing("gemini"), label: "Gemini video input", detail: haveWriters.some((w) => w.prov === "gemini") ? (refusing("gemini") ? `Gemini: ${refusing("gemini")}` : "free tier, your Gemini key") : "add a free Gemini key" },
+    twelve_labs: { ok: (await credentialsFor("twelve_labs")).length > 0, label: "a Twelve Labs key", detail: (await credentialsFor("twelve_labs")).length ? "set" : "optional — a Twelve Labs key (API keys)" },
   };
   json(ctx, 200, CATALOG.map((v) => {
-    const st = v.setup, used = st ? programs.filter((p) => p.content_type === st.contentType && (!st.productionMethod || (p.production_method || "") === st.productionMethod)
-      && (!st.computeWhere || (p.compute_where || "server") === st.computeWhere) && (!st.clipAdapter || p.clip_adapter === st.clipAdapter)) : [];
+    const used = v.setup ? programs.filter((p) => variantsOf(p).includes(v)) : [];
     const missing = v.needs.filter((n) => !needs[n]?.ok);
     return { ...v, needs: v.needs.map((n) => ({ key: n, ...needs[n] })), ready: v.status !== "to build" && !missing.length, programs: used.map((p) => p.display_name) };
   }));
@@ -4819,7 +5165,7 @@ app.get("/api/schedule", async (ctx) => json(ctx, 200, {
 // ---- setup checklist: what still stands between this install and running on its own
 app.get("/api/setup-status", async (ctx) => {
   const has = async (p) => (await credentialsFor(p)).length > 0;
-  const [gem, oai, ant, pex] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("pexels")]);
+  const [gem, oai, ant, pex, writers] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("pexels"), writerKeys()]);
   const storage = (await storageBackend()).name;
   const kit = await one(`SELECT COUNT(*)::int AS n FROM brands WHERE brand_kit ? 'logo_url' OR brand_kit ? 'primary_color'`);
   const programs = await one(`SELECT COUNT(*)::int AS n FROM niches WHERE is_active::int = 1`);
@@ -4827,7 +5173,7 @@ app.get("/api/setup-status", async (ctx) => {
   let liveReady = 0; for (const c of live) { const needs = c.platform === "YOUTUBE" ? "youtube_oauth" : "meta"; if (c.credential_id || (needs === "meta" ? ENV.META_ACCESS_TOKEN : ENV.YOUTUBE_REFRESH_TOKEN)) liveReady++; }
   const freeTier = await one(`SELECT 1 AS x FROM notifications WHERE kind = 'quota' AND title ILIKE '%free tier%' AND created_at > now() - interval '48 hours' LIMIT 1`);
   const items = [
-    { key: "ai", ok: gem || oai || ant, title: "An AI key", detail: gem ? "Gemini is set" : oai ? "OpenAI is set" : ant ? "Anthropic is set" : "Add a Gemini key (API keys page, or GEMINI_API_KEY on Render)", link: "#/keys" },
+    { key: "ai", ok: writers.length > 0, title: "An AI key", detail: writers.length ? `${writers.map((w) => w.name).join(", ")} set` : "Add a free Gemini or Groq key (API keys page)", link: "#/keys" },
     { key: "password", ok: !!ENV.DASHBOARD_PASSWORD, title: "Dashboard password", detail: ENV.DASHBOARD_PASSWORD ? "Set" : "Set DASHBOARD_PASSWORD on Render — the dashboard is open to anyone", link: null },
     { key: "vault", ok: vaultReady(), title: "Key vault", detail: vaultReady() ? "On" : "Set SECRETS_KEY on Render to store keys from the dashboard", link: null },
     { key: "storage", ok: storage !== "local", title: "Media storage", detail: storage !== "local" ? `Using ${storage}` : "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on Render (local disk is wiped on deploy and isn't shared with the video worker)", link: "#/settings" },
@@ -4835,7 +5181,8 @@ app.get("/api/setup-status", async (ctx) => {
     { key: "brand", ok: kit.n > 0, title: "A brand kit", detail: kit.n ? "Set" : "Give a brand its logo and colours — every photocard and video uses them", link: "#/brands" },
     { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
     { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
-    { key: "billing", ok: !freeTier, title: "An AI key with billing", detail: freeTier ? "This key ran out of free-tier requests in the last two days — a free key allows about 20 a day per model and no pictures. Enable billing on it (Google AI Studio → Billing)" : "No free-tier limit hit recently", link: "#/keys" },
+    // No billing: when one free allowance runs out, the next free writer answers. One writer alone stops for the day.
+    { key: "writers", ok: !freeTier || writers.length > 1, title: "A second free writer", detail: writers.length > 1 ? `${writers.length} writers take turns when one runs out` : freeTier ? "Your only writer ran out of its free allowance in the last two days. Add a free Groq key (console.groq.com) or Mistral key (console.mistral.ai) and work continues when it does" : "One writer is enough until its free allowance runs out; a free Groq key is a good second", link: "#/keys" },
     { key: "photos", ok: pex, title: "Photos for posts", detail: pex ? "Stock photos are available when a picture cannot be generated" : "Without generated pictures, posts go out as text cards. A free Pexels key (pexels.com/api) gives them real photos — the writer skips one when it could mislead", link: "#/keys" },
     { key: "budget", ok: Number(await setting("budget.daily_cap_usd", 0)) > 0, title: "A daily spend cap", detail: Number(await setting("budget.daily_cap_usd", 0)) > 0 ? `$${await setting("budget.daily_cap_usd", 0)} a day` : "Set one in Settings so a busy news day cannot run up a bill", link: "#/settings" },
     { key: "alerts", ok: !!(await telegramTarget().catch(() => null)), title: "Alerts on your phone", detail: "Telegram bot token + chat id (Settings → Alerts)", link: "#/settings" },
@@ -4897,7 +5244,7 @@ app.post("/api/generate", async (ctx) => {
   const niche = await one(`SELECT * FROM niches WHERE id=$1`, [nicheId]); if (!niche) throw new ApiError(404, null, "Program not found");
   if (VIDEO_TYPES.has(niche.content_type)) throw new ApiError(400, null, "Video-clip programs generate from video candidates (POST /api/video-candidates), not from Generate now");
   const itemId = await createQueuedItem(niche, { seriesId: seriesId || null, sourceItemId: sourceItemId || null, topic: topic || "", sourceDataRef: topic ? { provider: "manual", description: ctx.body.summary || "", url: ctx.body.url || null } : null });
-  await enqueue("GENERATE_CONTENT", { itemId }, { queue: queueFor(niche.content_type), priority: 5, contentItemId: itemId });
+  await enqueue("GENERATE_CONTENT", { itemId }, { queue: genQueue(niche), priority: 5, contentItemId: itemId });
   json(ctx, 202, await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]));
 });
 // Approving twenty drafts one at a time is the bottleneck that makes an automated newsroom manual again. This approves
@@ -4915,7 +5262,7 @@ app.post("/api/review/approve-clean", async (ctx) => {
 });
 app.post("/api/content-items/:id/approve", async (ctx) => { if (rateLimited(`appr:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many approve requests"); json(ctx, 200, await itemWithMedia(await approveItem(ctx.params.id, { scheduledFor: ctx.body.scheduledFor || null }))); });
 app.post("/api/content-items/:id/reject", async (ctx) => json(ctx, 200, await rejectItem(ctx.params.id, ctx.body.note)));
-app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); if (VIDEO_TYPES.has(it.content_type) && part === "all") { const owner = await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]); await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: videoQueueFor(owner), contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : queueFor(it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
+app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); if (VIDEO_TYPES.has(it.content_type) && part === "all") { const owner = await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]); await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: videoQueueFor(owner), contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : genQueue(await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]), it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
 // Reviewer edits to an AI draft are logged as style feedback, and a changed headline redraws the photocard.
 app.patch("/api/content-items/:id", async (ctx) => {
   const b = ctx.body; const map = { script: "script", headline: "headline", summary: "summary", body: "body", captions: "captions", hashtags: "hashtags", imagePrompt: "image_prompt", scheduledFor: "scheduled_for", heroMediaId: "hero_media_id" };

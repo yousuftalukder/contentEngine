@@ -84,8 +84,8 @@ const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Tex
 let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
 let PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
 let MULTI_FIELD = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
-const PROVIDER_LABEL = { telegram: "Telegram bot (alerts)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
-const PROVIDER_HELP = { telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
+const PROVIDER_LABEL = { pollinations: "Pollinations (free pictures — optional token)", groq: "Groq (free writer)", mistral: "Mistral (free writer)", cerebras: "Cerebras (free writer)", openrouter: "OpenRouter (free models)", xai: "xAI Grok", telegram: "Telegram bot (alerts)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
+const PROVIDER_HELP = { pollinations: "Not needed: pictures are drawn without a key. A free account's token (auth.pollinations.ai) removes the small logo in the corner.", groq: "Free, no card: console.groq.com → API Keys. Takes over writing when Gemini's daily allowance runs out.", mistral: "Free Experiment plan: console.mistral.ai → API Keys (asks for a phone number, no card).", cerebras: "cloud.cerebras.ai → API Keys.", openrouter: "openrouter.ai → Keys. Uses only its free models.", xai: "console.x.ai → API Keys. Uses your xAI credits.", telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
 const password = (name, extra = {}) => h("input", { type: "password", name, autocomplete: "new-password", spellcheck: false, ...extra });
 
 // form field builders
@@ -119,23 +119,26 @@ function formDialog(title, fields, onSave, { saveLabel = "Save", wide } = {}) {
 function jsonDialog(title, obj) { modal(title, h("div", null, h("pre", null, JSON.stringify(obj, null, 2)))); }
 
 // ---------------------------------------------------------------- shell
-const PAGES = [
-  ["overview", "Overview"], ["catalog", "What it makes"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"], ["insights", "Insights"],
-  ["programs", "Programs"], ["brands", "Brands"], ["sources", "Sources"], ["candidates", "Video candidates"], ["channels", "Channels"],
-  ["adapters", "Adapters"], ["keys", "API keys"], ["settings", "Settings"],
+// Grouped by what the owner is doing: today's decisions, deciding what gets made, the one-time setup, and the engine's
+// own controls, which most days nobody opens.
+const NAV = [
+  ["Today", [["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["insights", "Insights"]]],
+  ["Make", [["catalog", "What it makes"], ["programs", "Programmes"], ["candidates", "Videos to clip"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"]]],
+  ["Set up", [["brands", "Brands"], ["sources", "Sources"], ["channels", "Channels"], ["keys", "API keys"]]],
+  ["Engine", [["adapters", "Adapters"], ["settings", "Settings"]]],
 ];
+const PAGES = NAV.flatMap(([, items]) => items);
 let health = null, stats = null;
 
 function renderRail(active) {
   const links = $("#railLinks"); links.innerHTML = "";
-  for (const [id, label, badge] of PAGES) {
+  for (const [group, items] of NAV) { links.appendChild(h("div", { class: "rail-group" }, group)); for (const [id, label, badge] of items) {
     const a = h("a", { href: "#/" + id, class: active === id ? "active" : "" }, label);
     if (badge === "review") { const n = stats?.items?.PENDING_REVIEW || 0; if (n) a.appendChild(h("span", { class: "count" }, n)); }
     if (badge === "ideas") { const n = stats?.ideas || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n)); }
     if (id === "items") { const n = stats?.items?.FAILED || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n + " failed")); }
     links.appendChild(a);
-    if (id === "overview" || id === "items" || id === "insights" || id === "channels") links.appendChild(h("div", { class: "rail-sep" }));
-  }
+  } }
   const f = $("#railFoot"); f.innerHTML = "";
   if (health) f.append(
     h("div", null, h("span", { class: "dot" + (health.ok ? "" : " off") }), h("b", null, health.ok ? "Engine running" : "Database unreachable")),
@@ -167,38 +170,54 @@ const pages = {};
 // ---------------------------------------------------------------- what it makes
 // Every variant in the blueprint, where it runs, and whether what it needs is there right now — so "why is nothing
 // coming out of this programme" has an answer on one page: the PC is off, there is no writer key, no reactor clip.
+// The blueprint's seven kinds, in its words. The variants themselves, their state and what each needs come from the
+// engine (/api/catalog), so this page is never out of step with what is actually built.
+const BLUEPRINT = {
+  "Clip": ["1", "Clip / trimmed reel", "Long video in, the moment that matters out. The main product: nothing is written or narrated — the speaker said it, the picker chooses where the cut starts."],
+  "News card": ["2", "News card", "A story from the feeds as a branded card: headline, caption, the outlet's own photo."],
+  "News reel": ["3", "News reel", "A story as a short video: the outlet's photos narrated, or a TV report clipped."],
+  "Reaction": ["4", "Reaction", "Someone else's clip with you on it: split-screen, your face in the corner, or your commentary between segments."],
+  "Recap": ["5", "Recap", "A long video becomes a shorter one that tells its story, cut from its own footage."],
+  "Animation": ["6", "Animation", "Made from nothing but a script: motion graphics, charts, illustrated characters. Rendered on your PC."],
+  "Script → video": ["7", "Script → video", "A script narrated over footage: your own library, stock of the right country, or photos with motion."],
+};
+const STATUS_TAG = { proven: ["green", "proven"], built: ["amber", "built — not yet run on real footage"], "to build": ["", "to build"] };
+const WHERE = { pc: "your PC", server: "server", rented: "rented API", "server or pc": "server or your PC" };
 pages.catalog = async () => {
   const rows = await get("/api/catalog");
-  const statusTag = { proven: ["green", "proven"], built: ["amber", "built, not yet run on real footage"], "to build": ["", "to build"] };
-  const where = { pc: "your PC", server: "server", rented: "rented API", "server or pc": "server or your PC" };
   const types = [...new Set(rows.map((r) => r.type))];
   return h("div", null,
-    pageHead("What it makes", "Every kind of video and post the engine can make, where the work happens, and whether what it needs is in place right now.",
+    pageHead("What it makes", "Every kind of video and post in the blueprint, where the work happens, and whether what it needs is in place right now. Start a programme from any variant that is built.",
       h("button", { class: "btn", onclick: () => route() }, "Refresh")),
-    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap;margin-bottom:12px" },
-      h("span", null, h("b", null, rows.filter((r) => r.ready).length), " ready to run now"),
-      h("span", null, h("b", null, rows.filter((r) => r.status === "proven").length), " proven in production"),
-      h("span", null, h("b", null, rows.filter((r) => r.status === "to build").length), " still to build")),
-    types.map((t) => h("div", null, h("h2", null, t),
-      h("div", { class: "panel" }, rows.filter((r) => r.type === t).map((r) => {
-        const [tone, label] = statusTag[r.status] || ["", r.status];
-        return h("div", { class: "row", style: "padding:10px 0;border-bottom:1px solid var(--ink-3);align-items:flex-start;gap:12px" },
-          h("b", { style: "min-width:2.2em" }, r.id),
-          h("div", { class: "grow" },
-            h("div", null, h("b", { style: "font-weight:500" }, r.name), " ", h("span", { class: `tag ${tone}` }, label), " ", h("span", { class: "tag" }, where[r.runs] || r.runs),
-              r.ready ? h("span", { class: "tag green", style: "margin-left:6px" }, "ready now") : null),
-            h("div", { class: "sub" }, r.what),
-            r.note ? h("div", { class: "small mute" }, r.note) : null,
-            r.needs.length ? h("div", { class: "row", style: "gap:6px;flex-wrap:wrap;margin-top:6px" },
-              r.needs.map((n) => h("span", { class: `tag ${n.ok ? "green" : "red"}`, title: n.detail }, `${n.ok ? "✓" : "✗"} ${n.label}: ${n.detail}`)))
-              : h("div", { class: "small mute", style: "margin-top:6px" }, "Needs nothing — free, no key."),
-            r.programs.length ? h("div", { class: "small mute", style: "margin-top:4px" }, "Your programmes: ", r.programs.join(", ")) : null));
-      })))));
+    h("div", { class: "stat-list", style: "grid-template-columns:repeat(4,1fr);margin-bottom:6px" },
+      stat(rows.filter((r) => r.ready).length, "ready to run now", "green"), stat(rows.filter((r) => r.status === "proven").length, "proven in production"),
+      stat(rows.filter((r) => r.status === "built").length, "built, not yet proven"), stat(rows.filter((r) => r.status === "to build").length, "still to build")),
+    types.map((t) => { const [num, title, blurb] = BLUEPRINT[t] || ["", t, ""]; return h("section", null,
+      h("h2", null, num ? h("span", { class: "mute" }, num, " — ") : null, title), blurb ? h("p", { class: "muted", style: "margin:-4px 0 10px;max-width:80ch" }, blurb) : null,
+      h("div", { class: "variants" }, rows.filter((r) => r.type === t).map(variantCard))); }));
 };
+function variantCard(r) {
+  const [tone, label] = STATUS_TAG[r.status] || ["", r.status];
+  return h("div", { class: "variant" + (r.ready ? " ready" : "") },
+    h("div", { class: "row", style: "align-items:baseline" }, h("span", { class: "vid" }, r.id), h("b", { class: "grow", style: "font-weight:600" }, r.name)),
+    h("div", { class: "row", style: "gap:6px;margin:6px 0" }, h("span", { class: `tag ${tone}` }, label), h("span", { class: "tag" }, WHERE[r.runs] || r.runs), r.ready ? h("span", { class: "tag green" }, "ready now") : null),
+    h("div", { class: "sub", style: "font-size:13px;color:var(--paper-dim)" }, r.what),
+    r.note ? h("div", { class: "small mute", style: "margin-top:4px" }, r.note) : null,
+    h("div", { class: "needs" }, r.needs.length ? r.needs.map((n) => h("div", { class: n.ok ? "ok" : "no", title: n.detail }, n.ok ? "✓ " : "✗ ", h("span", null, n.label), h("span", { class: "mute" }, " — ", n.detail)))
+      : h("div", { class: "ok" }, "✓ needs nothing — free, no key")),
+    h("div", { class: "row", style: "margin-top:auto;padding-top:10px" },
+      r.programs.length ? h("span", { class: "small mute grow" }, "Your programmes: ", r.programs.join(", ")) : h("span", { class: "grow" }),
+      r.setup && r.status !== "to build" ? h("button", { class: "btn sm" + (r.programs.length ? "" : " primary"), onclick: () => newProgrammeFrom(r) }, "Make a programme") : null));
+}
+async function newProgrammeFrom(variant) {
+  const [brands, sources, adapters, styles] = await Promise.all([get("/api/brands"), get("/api/sources"), get("/api/adapters"), get("/api/style-profiles")]);
+  if (!brands.length) { toast("Create a brand first (Brands)", true); location.hash = "#/brands"; return; }
+  programDialog(null, brands, sources, adapters, styles, () => { location.hash = "#/programs"; route(); }, variant);
+}
 
 // ---------------------------------------------------------------- overview
 pages.overview = async () => {
-  const [programs, sources, channels, alerts, setup] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null)]);
+  const [programs, sources, channels, alerts, setup, blueprint] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null), get("/api/catalog").catch(() => null)]);
   const it = stats?.items || {}, as = stats?.assets || {};
   const pending = it.PENDING_REVIEW || 0;
   const seeded = programs.length > 0;
@@ -223,7 +242,7 @@ pages.overview = async () => {
     (stats?.quotaPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber)" },
       h("b", { style: "font-weight:500" }, "Waiting for the AI quota to reset"),
       stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
-      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free key allows about 20 requests a day per model — enable billing on it to lift the cap.")) : null,
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free Gemini key allows about 20 requests a day per model; add a second free writer (Groq or Mistral, on API keys) and it takes over while this one waits.")) : null,
 
     h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
     h("div", { class: "panel" }, alerts.length ? [
@@ -241,11 +260,16 @@ pages.overview = async () => {
       } }, h("span", { class: "dot" }), l))),
       stats?.globalPause ? h("p", { style: "margin:12px 0 0;color:var(--amber)" }, "Publishing is globally paused (Settings). Approved items will wait.") : null),
 
+    blueprint ? h("h2", null, "What it makes ", h("a", { class: "small", href: "#/catalog", style: "font-family:var(--sans);font-weight:400" }, "all variants →")) : null,
+    blueprint ? h("div", { class: "variants compact" }, blueprint.map((r) => { const [tone] = STATUS_TAG[r.status] || [""];
+      return h("a", { class: "variant mini" + (r.ready ? " ready" : ""), href: "#/catalog", title: r.what }, h("span", { class: "vid" }, r.id), h("span", { class: "grow" }, r.name),
+        h("span", { class: `tag ${r.ready ? "green" : tone}` }, r.ready ? "ready" : r.status === "to build" ? "to build" : r.needs.filter((n) => !n.ok).map((n) => n.label).join(", ") || r.status)); })) : null,
+
     setup ? h("h2", null, "Setup ", h("span", { class: `tag ${setup.done === setup.total ? "green" : "amber"}` }, `${setup.done} of ${setup.total}`)) : null,
     setup ? h("div", { class: "panel" }, h("ol", { class: "steps" }, setup.items.map((s) => step(s.ok, h("span", null, h("b", { style: "font-weight:500" }, s.title), " — ", s.link && !s.ok ? h("a", { href: s.link }, s.detail) : s.detail))))) : null,
 
-    h("h2", null, "Try it with mock data"),
-    h("div", { class: "panel" },
+    seeded ? null : h("h2", null, "Try it with mock data"),
+    seeded ? null : h("div", { class: "panel" },
       h("ol", { class: "steps" },
         step(seeded, h("span", null, "Create the starter setup: a demo brand, a mock news feed, the “Bangladesh News” program and a mock Facebook channel. ",
           !seeded ? h("button", { class: "btn primary sm", onclick: () => run(async () => { const r = await post("/api/seed"); jsonDialog("Starter setup created", r); route(); }, "Starter setup created") }, "Create starter setup") : null)),
@@ -425,10 +449,11 @@ async function openItem(id) {
 pages.programs = async () => {
   const [programs, brands, sources, channels, adapters, styles] = await Promise.all([get("/api/programs"), get("/api/brands"), get("/api/sources"), get("/api/channels"), get("/api/adapters"), get("/api/style-profiles")]);
   const root = h("div", null,
-    pageHead("Programs", "A program is a recurring show: what it's about, where topics come from, which adapters make it, and how strictly you review it.",
+    pageHead("Programmes", "A programme is a recurring show: which variant of the blueprint it makes, where its material comes from, who writes and voices it, and how strictly you review it.",
+      h("a", { class: "btn", href: "#/catalog" }, "Start from a variant"),
       h("button", { class: "btn", onclick: () => brandDialog(brands) }, "Brands"),
       h("button", { class: "btn", onclick: () => styleDialog(styles, brands) }, "Style profiles"),
-      h("button", { class: "btn primary", disabled: !brands.length, onclick: () => programDialog(null, brands, sources, adapters, styles, route) }, "New program")));
+      h("button", { class: "btn primary", disabled: !brands.length, onclick: () => programDialog(null, brands, sources, adapters, styles, route) }, "New programme")));
   if (!brands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "Create a brand first"), "Programs and channels belong to a brand. ", h("button", { class: "btn sm", onclick: () => brandDialog(brands) }, "Add brand")));
   else if (!programs.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No programs yet"), "Create one, or use the starter setup on the Overview page."));
   // Whether your PC is on, shown only when something actually runs there — and what is waiting for it if it is off.
@@ -448,7 +473,7 @@ function programCard(p, brands, sources, channels, adapters, styles) {
   const topic = h("input", { type: "text", placeholder: "Topic or headline", style: "max-width:320px" });
   return h("div", { class: "panel" },
     h("div", { class: "row" },
-      h("div", null, h("h3", { style: "margin:0" }, p.display_name, " ", yes(p.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
+      h("div", null, h("h3", { style: "margin:0" }, (p.variants || []).length ? h("span", { class: "vid", title: p.variant_name || "" }, p.variants.join(" · ")) : null, " ", p.display_name, " ", yes(p.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
         h("div", { class: "small mute" }, nice(p.content_type), " · ", p.language, "/", p.country || "—", " · review: ", nice(p.approval_mode), p.approval_mode === "AUTO_AFTER_WINDOW" ? ` (${p.review_window_minutes || 60} min)` : "",
           isVideo ? h("span", { class: `tag ${p.compute_where === "pc" ? "blue" : ""}`, style: "margin-left:6px" }, p.compute_where === "pc" ? "runs on my PC" : "runs on server") : null, " · ", p.max_items_per_day ? `${p.max_items_per_day}/day` : "no daily cap", yes(p.publish_to_portal) ? " · portal" : "")),
       h("div", { class: "right row" },
@@ -462,11 +487,13 @@ function programCard(p, brands, sources, channels, adapters, styles) {
       h("div", null, h("div", { class: "small muted" }, "Publishes to"),
         h("div", { class: "row", style: "margin-top:4px" }, (p.channels || []).map((c) => h("span", { class: "tag green" }, c.name, " ", h("a", { href: "#", title: "Unsubscribe", onclick: (e) => { e.preventDefault(); run(() => del(`/api/channels/${c.id}/niches/${p.id}`), "Channel unsubscribed").then(route); } }, "×"))),
           linkPicker(channels.filter((c) => !(p.channels || []).some((x) => x.id === c.id)).map((c) => ({ id: c.id, name: c.display_name })), (id) => run(() => post(`/api/channels/${id}/niches/${p.id}`), "Channel subscribed").then(route), "Add channel")))),
-    h("div", { class: "small mute", style: "margin-top:8px" }, "Style: ", p.style_profile_id ? (styles.find((s) => s.id === p.style_profile_id)?.name || "linked") : h("span", null, "none yet (being generated, or pick one in Edit)"),
+    h("div", { class: "small mute", style: "margin-top:8px" }, "Writes with: ", [p.script_adapter, ...(p.script_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(default)",
+      isVideo ? ` · picks moments with: ${[p.clip_adapter, ...(p.clip_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(default)"}` : ""),
+    h("div", { class: "small mute", style: "margin-top:2px" }, "Style: ", p.style_profile_id ? (styles.find((s) => s.id === p.style_profile_id)?.name || "linked") : h("span", null, "none yet (being generated, or pick one in Edit)"),
       " · quality check: ", (p.method_config?.qa?.enabled ?? true) ? `on${(p.method_config?.qa?.auto_fix ?? true) ? " with auto-fix" : ""}` : "off",
       p.method_config?.autopilot?.topics_per_day ? ` · autopilot: ${p.method_config.autopilot.topics_per_day} idea(s)/day` : ""),
     h("div", { class: "row", style: "margin-top:12px" },
-      isVideo ? h("span", { class: "small mute" }, "Video programs generate from video candidates, not from a topic.") : [topic,
+      isVideo ? h("span", { class: "small mute" }, "Video programmes make clips from the links under Videos to clip, not from a topic.") : [topic,
         h("button", { class: "btn sm", onclick: () => run(async () => { await post("/api/generate", { nicheId: p.id, topic: topic.value || undefined }); }, "Generating — it will land in Review").then(() => { topic.value = ""; refreshMeta().then(() => renderRail("programs")); }) }, topic.value ? "Generate from topic" : "Generate now")],
       isVideo ? h("button", { class: "btn sm", onclick: () => candidateDialog(p.id) }, "Add a video URL") : null,
       h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post(`/api/programs/${p.id}/plan`); toast(`${r.created} new idea(s)`); location.hash = `#/ideas/${p.id}`; }) }, "Plan ideas now"),
@@ -511,27 +538,50 @@ const PRESETS = {
   us_semi_long: { label: "US semi-long video (16:9, ffmpeg)", key: "us_long", displayName: "US Explained", contentType: "LONG_FORM_VIDEO", language: "en", country: "United States", approvalMode: "MANUAL", maxItemsPerDay: 2, renderAdapter: "ffmpeg", tone: "considered, plain-spoken", _orientation: "16:9", _deskMinSources: 2, _deskGap: 240, _topics: ["general", "tech"], _exclude: "deal of the day,best deals,sponsored" },
   facts_series: { label: "Facts videos — daily, planner-driven", key: "facts", displayName: "Facts", contentType: "IMAGE_SLIDESHOW", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 60, maxItemsPerDay: 3, _orientation: "9:16", _apTopics: 1, autoSources: false },
 };
-async function programDialog(p, brands, sources, adapters, styles, done) {
+// A variant's setup, as the form's own fields. methodConfig keys live in the form under their "_" names.
+const SETUP_FIELDS = { explainer_style: "_explainerStyle", reaction_layout: "_reactionLayout", orientation: "_orientation", footage_dir: "_footageDir" };
+function applySetup(f, setup) {
+  const put = (name, val) => { const el = f.querySelector(`[name="${name}"]`); if (!el) return; if (el.type === "checkbox") el.checked = !!val; else el.value = val ?? ""; };
+  for (const [k, v] of Object.entries(setup || {})) if (k !== "methodConfig") put(k, v);
+  for (const [k, v] of Object.entries(setup?.methodConfig || {})) if (SETUP_FIELDS[k] && v !== true) put(SETUP_FIELDS[k], v);
+  f.querySelector("[name=contentType]")?.dispatchEvent(new Event("change"));
+}
+// Which parts of the form matter for a content type. Hidden parts keep their values; they just are not in the way.
+const NEWS_TYPES = new Set(["NEWS_STATIC", "NEWS_REEL"]);
+function showFor(f) {
+  const t = f.querySelector("[name=contentType]")?.value || "";
+  const on = { news: NEWS_TYPES.has(t), clips: VIDEO_TYPES.has(t), video: VIDEO_TYPES.has(t) || MADE_VIDEO_TYPES.has(t), explainer: t === "ANIMATED_EXPLAINER", written: !VIDEO_TYPES.has(t) };
+  f.querySelectorAll("[data-for]").forEach((el) => { el.hidden = !el.dataset.for.split(" ").some((k) => on[k]); });
+}
+// An ordered fallback chain as an editable list. Only sent when changed, so a new programme keeps the engine's own
+// choice (every writer with a key) unless someone deliberately sets one.
+function chainField(label, name, current, options, help) {
+  const val = (current || []).join(", ");
+  return field(label, text(name, val, { "data-list": "1", "data-initial": val, placeholder: "(engine's choice)" }),
+    h("span", null, help ? `${help} ` : "", options?.length ? `Available: ${options.join(", ")}` : ""));
+}
+async function programDialog(p, brands, sources, adapters, styles, done, start = null) {
   const a = adapters || {}, uploads = await get("/api/uploads").catch(() => []); let preset = null;
+  const catalog = await get("/api/catalog").catch(() => []);
   const opt = (keys, cur) => select(null, [["", "(default)"], ...(keys || []).map((k) => [k, k])], cur || "");
   const f = h("div", null,
     h("div", { class: "grid2" },
       field("Name", text("displayName", p?.display_name)),
       p ? null : field("Key", text("key", "", { placeholder: "e.g. bd_news" }), "Short unique id, letters/underscores."),
       p ? null : field("Brand", select("brandId", brands.map((b) => [b.id, b.name]))),
-      field("Content type", select("contentType", CONTENT_TYPES.map((t) => [t, nice(t)]), p?.content_type || "NEWS_STATIC")),
+      field("Content type", select("contentType", CONTENT_TYPES.map((t) => [t, nice(t)]), p?.content_type || "NEWS_STATIC", { onchange: (e) => showFor(e.target.closest(".dialog") || document) })),
       field("Language", text("language", p?.language || "en")),
       field("Country", text("country", p?.country || "Bangladesh")),
       field("Review", select("approvalMode", [["MANUAL", "Manual — waits for me"], ["AUTO_AFTER_WINDOW", "Auto-approve after a window"], ["AUTO", "Auto — publish immediately"]], p?.approval_mode || "MANUAL")),
-      field("Video work runs on", select("computeWhere", [["server", "Server — always on, slower, YouTube blocked"], ["pc", "My PC — fast, free, YouTube works; waits while it's off"]], p?.compute_where || "server"),
-        "Only video steps move. News, review and publishing stay on the server."),
+      h("div", { "data-for": "video" }, field("Video work runs on", select("computeWhere", [["server", "Server — always on, slower, YouTube blocked"], ["pc", "My PC — fast, free, YouTube works; waits while it's off"]], p?.compute_where || "server"),
+        "Only video steps move. News, review and publishing stay on the server.")),
       field("Review window (minutes)", num("reviewWindowMinutes", p?.review_window_minutes ?? 60)),
       field("Max items per day", num("maxItemsPerDay", p?.max_items_per_day), "Leave empty for no cap."),
       field("Style profile", select("styleProfileId", [["", "(none)"], ...styles.map((s) => [s.id, s.name])], p?.style_profile_id || ""))),
     field("Tone", text("tone", p?.tone || "clear, factual, click-worthy")),
     check("publishToPortal", "Also publish an article to the news portal", p ? yes(p.publish_to_portal) : true),
-    h("fieldset", null, h("legend", null, "Adapters (empty = program default)"),
-      h("div", { class: "grid3" },
+    h("details", { class: "engine-choices" }, h("summary", null, "Engine choices — which adapter does each step, and who stands in when it cannot"),
+      h("div", { class: "grid3", style: "margin-top:10px" },
         field("Topic source", Object.assign(opt(a.topicSources, p?.topic_source_adapter), { name: "topicSourceAdapter" })),
         field("Script / LLM", Object.assign(opt(a.scriptAdapters, p?.script_adapter), { name: "scriptAdapter" })),
         field("Image", Object.assign(opt(a.imageAdapters, p?.image_adapter), { name: "imageAdapter" })),
@@ -540,31 +590,49 @@ async function programDialog(p, brands, sources, adapters, styles, done) {
         field("Embeddings (dedup)", Object.assign(opt(a.embedAdapters, p?.embed_adapter), { name: "embedAdapter" })),
         field("Download (video)", Object.assign(opt(a.downloadAdapters, p?.download_adapter), { name: "downloadAdapter" })),
         field("Transcript (video)", Object.assign(opt(a.transcriptAdapters, p?.transcript_adapter), { name: "transcriptAdapter" })),
-        field("Clipper (video)", Object.assign(opt(a.clipAdapters, p?.clip_adapter), { name: "clipAdapter" })))),
-    videoFields(p, uploads),
+        field("Clipper (video)", Object.assign(opt(a.clipAdapters, p?.clip_adapter), { name: "clipAdapter" }))),
+      h("div", { class: "grid2" },
+        chainField("Writers after the first", "scriptAdapterFallbacks", p?.script_adapter_fallbacks, a.scriptAdapters, "Tried in order when the writer above has spent its allowance."),
+        chainField("Voices after the first", "voiceAdapterFallbacks", p?.voice_adapter_fallbacks, a.voiceAdapters),
+        chainField("Pictures after the first", "imageAdapterFallbacks", p?.image_adapter_fallbacks, a.imageAdapters),
+        chainField("Moment pickers after the first", "clipAdapterFallbacks", p?.clip_adapter_fallbacks, a.clipAdapters),
+        chainField("Transcribers after the first", "transcriptAdapterFallbacks", p?.transcript_adapter_fallbacks, a.transcriptAdapters))),
+    h("div", { "data-for": "video" }, videoFields(p, uploads)),
     automationFields(p?.method_config || {}),
     p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name])), "Leave empty for a Bangladesh program: it starts with the verified sources for its language (TV channels for video programs)."),
   );
+  // What it makes, as the blueprint names it: picking a variant sets the type, method and pickers it needs.
+  const buildable = catalog.filter((v) => v.setup && v.status !== "to build");
+  const variantPick = select(null, [["", p ? "(as configured)" : "Choose what it makes…"], ...buildable.map((v) => [v.id, `${v.id} — ${v.type}: ${v.name}${v.ready ? "" : " (needs: " + v.needs.filter((n) => !n.ok).map((n) => n.label).join(", ") + ")"}`])],
+    start?.id || (p?.variants || [])[0] || "", { onchange: (e) => { const v = buildable.find((x) => x.id === e.target.value); if (v) applySetup(f, v.setup); } });
+  const head = [field("What it makes", variantPick, "A variant from the blueprint (What it makes). Everything it sets stays editable below.")];
   if (!p) {
-    const pick = select(null, [["", "Start from a preset…"], ...Object.entries(PRESETS).map(([k, x]) => [k, x.label])], "", { onchange: (e) => {
+    const pick = select(null, [["", "Or start from a preset…"], ...Object.entries(PRESETS).map(([k, x]) => [k, x.label])], "", { onchange: (e) => {
       preset = PRESETS[e.target.value]; if (!preset) return;
       for (const [k, val] of Object.entries(preset)) { const el = f.querySelector(`[name="${k}"]`); if (!el) continue; if (el.type === "checkbox") el.checked = !!val; else el.value = val; }
+      showFor(f);
     } });
-    f.prepend(field("Preset", pick, "Fills the form for a common kind of program — adjust anything before creating it."));
+    head.push(field("Preset", pick, "A ready-made programme (language, country, review, pace) — adjust anything before creating it."));
   }
-  formDialog(p ? "Edit program" : "New program", f, async (v) => {
+  f.prepend(h("div", { class: "grid2" }, head));
+  if (start?.setup) applySetup(f, start.setup);
+  queueMicrotask(() => showFor(f));
+  formDialog(p ? `Edit ${p.display_name}` : start ? `New programme — ${start.id} ${start.name}` : "New programme", f, async (v) => {
     if (preset?.autoSources === false) v.autoSources = false;
     v.methodConfig = readAutomation(v, readVideo(v, p?.method_config || {}));
     if (preset?._topics) v.methodConfig.topics = preset._topics;          // which desk of its country the program takes
     if (preset?._exclude) v.topicFilters = { exclude: preset._exclude.split(",").map((x) => x.trim()).filter(Boolean) };
     for (const k of Object.keys(v)) if (v[k] === "" && k !== "tone") delete v[k];
+    if (v.maxItemsPerDay == null) v.maxItemsPerDay = 0;                   // empty means no cap, which the engine stores as 0
+    if (v.reviewWindowMinutes == null) delete v.reviewWindowMinutes;
+    f.querySelectorAll("[data-initial]").forEach((el) => { if (el.value.trim() === el.dataset.initial) delete v[el.name]; });
     if (v.sourceIds) v.sourceIds = Array.from(f.querySelector("[name=sourceIds]").selectedOptions).map((o) => o.value);
     if (p) { delete v.brandId; delete v.key; await patch(`/api/programs/${p.id}`, v); } else await post("/api/programs", v);
-    toast(p ? "Program saved" : "Program created"); done();
+    toast(p ? "Programme saved" : "Programme created"); done();
   }, { wide: true });
 }
 // Video options (production method + method_config video keys). Reactor clips and music come from the media library.
-const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["TELECAST_INTRO", "Telecast with intro — a narrated headline card, then the report"], ["REACTION_OVERLAY", "Reaction short — your clip with the source (split-screen or corner)"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap — narrated summary"]];
+const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["TELECAST_INTRO", "Telecast with intro — a narrated headline card, then the report"], ["REACTION_OVERLAY", "Reaction short — your clip with the source (split-screen or corner)"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap from the transcript — narrated summary (5b)"], ["SCENE_RECAP", "Scene recap — Gemini watches the video, the film's sound stays under the narration (5a)"]];
 function videoFields(p, uploads) {
   const mc = p?.method_config || {}, reactors = uploads.filter((u) => u.meta?.purpose === "reactor"), music = uploads.filter((u) => u.meta?.purpose === "music");
   return h("fieldset", null, h("legend", null, "Video"),
@@ -577,12 +645,24 @@ function videoFields(p, uploads) {
       field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame."),
       field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
       field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 })),
-      field("Explainer style", select("_explainerStyle", [["", "General — the six layouts mixed"], ["data", "Data — charts, figures and timelines from the research's own numbers"]], mc.explainer_style || ""))),
+      field("Explainer style", select("_explainerStyle", [["", "General — the six layouts mixed"], ["data", "Data — charts, figures and timelines from the research's own numbers"], ["illustrated", "Illustrated — drawn scenes and the series' characters, moved in code"]], mc.explainer_style || ""))),
+    h("div", { class: "grid2" },
+      field("Cast (illustrated)", area("_cast", (mc.characters || []).map((c) => `${c.name}: ${c.look}`).join("\n"), { placeholder: "One per line — Name: how they look\nRafi: a cheerful Bangladeshi rickshaw driver in a green lungi and white vest, thin moustache", style: "min-height:70px" }),
+        "The same characters come back every episode, drawn the same way. Leave empty and each story names its own."),
+      field("Art style (illustrated)", text("_artStyle", mc.art_style || "", { placeholder: "flat vector illustration, clean lines, soft warm colours, storybook style" })),
+      field("Your footage folder (on the PC)", text("_footageDir", mc.footage_dir || "", { placeholder: "D:\\Footage" }), "Script videos take each section's footage from here first: clips found by their names, a .txt note beside them, or what Gemini sees in them. Set video work to run on My PC."),
+      h("div", null, field("Clips Gemini describes per day", num("_describe", mc.describe_per_day ?? 5, { min: 0, max: 50 }), "Only clips without a name or note that says what they are; each is described once."),
+        check("_ownOnly", "Own footage only — never stock", !!mc.own_footage_only))),
     h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
 }
 function readVideo(v, mc) {
   const out = { ...mc, captions: !!v._captions, brand_finish: !!v._brandFinish, vertical_layout: v._verticalLayout || "crop", explainer_minutes: v._explainerMinutes ?? 3 };
   if (v._explainerStyle) out.explainer_style = v._explainerStyle; else delete out.explainer_style;
+  const cast = String(v._cast || "").split("\n").map((l) => l.split(":")).filter((x) => x[0].trim() && x.length > 1).map(([name, ...look]) => ({ name: name.trim(), look: look.join(":").trim() }));
+  if (cast.length) out.characters = cast; else delete out.characters;
+  if (String(v._artStyle || "").trim()) out.art_style = v._artStyle.trim(); else delete out.art_style;
+  if (String(v._footageDir || "").trim()) { out.footage_dir = v._footageDir.trim(); out.describe_per_day = v._describe ?? 5; out.own_footage_only = !!v._ownOnly; }
+  else { delete out.footage_dir; delete out.describe_per_day; delete out.own_footage_only; }
   if (v._orientation) out.orientation = v._orientation; else delete out.orientation;
   if (v._reactor) out.reactor_url = v._reactor; else delete out.reactor_url;
   out.reaction_layout = v._reactionLayout || "stack";
@@ -597,12 +677,13 @@ function automationFields(mc) {
     h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_qaEnabled", "Quality check every draft", qa.enabled ?? true), check("_qaAutoFix", "Let it fix flagged drafts once", qa.auto_fix ?? true)),
     h("div", { class: "grid3", style: "margin-top:8px" },
       field("Pass score (0-1)", num("_qaMinScore", qa.min_score ?? 0.75, { step: "0.05", min: 0, max: 1 })),
+      field("Autopilot ideas per day", num("_apTopics", ap.topics_per_day ?? 0, { min: 0 }), "The planner writes this many of its best ideas itself. 0 = off.")),
+    h("div", { class: "grid3", "data-for": "news" },
       field("Outlets required", num("_deskMinSources", d.min_sources ?? 1, { min: 1 }), "News: 2+ waits until a second outlet confirms a story."),
       field("Wait for more outlets (min)", num("_deskSettle", d.settle_minutes ?? 5, { min: 0 })),
       field("Oldest story taken (hours)", num("_deskMaxAge", d.max_age_hours ?? 12, { min: 1 })),
       field("Stories per pass", num("_deskPerSweep", d.per_sweep ?? 2, { min: 1 })),
-      field("Minutes between stories", num("_deskGap", d.min_gap_minutes ?? 10, { min: 0 })),
-      field("Autopilot ideas per day", num("_apTopics", ap.topics_per_day ?? 0, { min: 0 }), "The planner writes this many of its best ideas itself. 0 = off.")));
+      field("Minutes between stories", num("_deskGap", d.min_gap_minutes ?? 10, { min: 0 }))));
 }
 function readAutomation(v, mc) {
   const out = { ...mc, qa: { ...(mc.qa || {}), enabled: !!v._qaEnabled, auto_fix: !!v._qaAutoFix, min_score: v._qaMinScore ?? 0.75 },
@@ -851,7 +932,7 @@ pages.candidates = async () => {
   const [cands, programs] = await Promise.all([get("/api/video-candidates"), get("/api/programs")]);
   const videoPrograms = programs.filter((p) => VIDEO_TYPES.has(p.content_type));
   const root = h("div", null,
-    pageHead("Video candidates", "Source videos scored for clipping. Processing downloads, transcribes, picks clips and sends each clip into Review.",
+    pageHead("Videos to clip", "Paste a link, or let the sources bring videos in. Each is transcribed, its best moments picked and cut, and every clip goes to Review.",
       h("button", { class: "btn primary", disabled: !videoPrograms.length, title: videoPrograms.length ? "" : "Create a video-type program first", onclick: () => candidateDialog(null, videoPrograms) }, "Add a video URL")));
   if (!cands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No candidates yet"), videoPrograms.length ? "Add a video URL, or link a YouTube source to a video program." : "Create a program with a clip content type (Podcast clip, Reaction clip, …) first."));
   else root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
