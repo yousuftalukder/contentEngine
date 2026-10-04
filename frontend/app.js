@@ -120,7 +120,7 @@ function jsonDialog(title, obj) { modal(title, h("div", null, h("pre", null, JSO
 
 // ---------------------------------------------------------------- shell
 const PAGES = [
-  ["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"], ["insights", "Insights"],
+  ["overview", "Overview"], ["catalog", "What it makes"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"], ["insights", "Insights"],
   ["programs", "Programs"], ["brands", "Brands"], ["sources", "Sources"], ["candidates", "Video candidates"], ["channels", "Channels"],
   ["adapters", "Adapters"], ["keys", "API keys"], ["settings", "Settings"],
 ];
@@ -163,6 +163,38 @@ function pageHead(title, desc, ...actions) {
   return h("div", { class: "page-head" }, h("div", null, h("h1", null, title), desc ? h("p", null, desc) : null), actions.length ? h("div", { class: "actions" }, actions) : null);
 }
 const pages = {};
+
+// ---------------------------------------------------------------- what it makes
+// Every variant in the blueprint, where it runs, and whether what it needs is there right now — so "why is nothing
+// coming out of this programme" has an answer on one page: the PC is off, there is no writer key, no reactor clip.
+pages.catalog = async () => {
+  const rows = await get("/api/catalog");
+  const statusTag = { proven: ["green", "proven"], built: ["amber", "built, not yet run on real footage"], "to build": ["", "to build"] };
+  const where = { pc: "your PC", server: "server", rented: "rented API", "server or pc": "server or your PC" };
+  const types = [...new Set(rows.map((r) => r.type))];
+  return h("div", null,
+    pageHead("What it makes", "Every kind of video and post the engine can make, where the work happens, and whether what it needs is in place right now.",
+      h("button", { class: "btn", onclick: () => route() }, "Refresh")),
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap;margin-bottom:12px" },
+      h("span", null, h("b", null, rows.filter((r) => r.ready).length), " ready to run now"),
+      h("span", null, h("b", null, rows.filter((r) => r.status === "proven").length), " proven in production"),
+      h("span", null, h("b", null, rows.filter((r) => r.status === "to build").length), " still to build")),
+    types.map((t) => h("div", null, h("h2", null, t),
+      h("div", { class: "panel" }, rows.filter((r) => r.type === t).map((r) => {
+        const [tone, label] = statusTag[r.status] || ["", r.status];
+        return h("div", { class: "row", style: "padding:10px 0;border-bottom:1px solid var(--ink-3);align-items:flex-start;gap:12px" },
+          h("b", { style: "min-width:2.2em" }, r.id),
+          h("div", { class: "grow" },
+            h("div", null, h("b", { style: "font-weight:500" }, r.name), " ", h("span", { class: `tag ${tone}` }, label), " ", h("span", { class: "tag" }, where[r.runs] || r.runs),
+              r.ready ? h("span", { class: "tag green", style: "margin-left:6px" }, "ready now") : null),
+            h("div", { class: "sub" }, r.what),
+            r.note ? h("div", { class: "small mute" }, r.note) : null,
+            r.needs.length ? h("div", { class: "row", style: "gap:6px;flex-wrap:wrap;margin-top:6px" },
+              r.needs.map((n) => h("span", { class: `tag ${n.ok ? "green" : "red"}`, title: n.detail }, `${n.ok ? "✓" : "✗"} ${n.label}: ${n.detail}`)))
+              : h("div", { class: "small mute", style: "margin-top:6px" }, "Needs nothing — free, no key."),
+            r.programs.length ? h("div", { class: "small mute", style: "margin-top:4px" }, "Your programmes: ", r.programs.join(", ")) : null));
+      })))));
+};
 
 // ---------------------------------------------------------------- overview
 pages.overview = async () => {
