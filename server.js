@@ -1776,7 +1776,15 @@ impl("IMAGE", "pollinations", { label: "Pollinations (free, no key)", configSche
     const token = (await credentialsFor("pollinations"))[0]?.secret;
     const base = ENV.POLLINATIONS_API_BASE || "https://image.pollinations.ai";
     const qs = form({ width: w, height: h, model: cfg.model || "flux", seed: Number.isFinite(Number(seed)) ? Number(seed) : parseInt(sha(full).slice(0, 7), 16), nologo: "true", private: "true" });
-    const bytes = await retryTransient(() => fetchBytes(`${base}/prompt/${encodeURIComponent(full.slice(0, 1500))}?${qs}`, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(120000) }), { tries: 3, baseMs: 6000 });
+    // Without a token the service turns away about every other request with an empty 402 and serves the next one
+    // (measured 2026-10-04: strict alternation, whatever the spacing), and it is busy now and then. So a 402, a 429 or
+    // a 5xx is asked again a few times before it counts; anything else is a real failure.
+    const url = `${base}/prompt/${encodeURIComponent(full.slice(0, 1500))}?${qs}`;
+    let bytes;
+    for (let i = 1; ; i++) {
+      try { bytes = await fetchBytes(url, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(120000) }); break; }
+      catch (e) { if (i >= 6 || !(e.status === 402 || e.status === 429 || e.status >= 500 || isTransient(e))) throw e; await sleep(Number(ENV.POLLINATIONS_RETRY_MS ?? 2500) * i); }
+    }
     if (bytes.length < 2000) throw new Error("Pollinations returned no picture");
     const media = await storeImage(bytes, "image/jpeg", contentItemId, { provider: "pollinations", prompt: full, seed }, { width: w, height: h }, specs.compose === false ? null : { headline, specs });
     return { ...media, cost: 0, units: 1 };

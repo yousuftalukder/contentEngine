@@ -10,18 +10,21 @@ import { startEngine, waitFor } from "./harness.mjs";
 // 6c, an illustrated series: the planner is given the programme's cast, and every Illustrated scene is drawn by the free
 // image service — the place with nobody in it, and the character on white, with a seed taken from the character so a
 // series' character is drawn alike every time. The studio is switched off here; drawing happens before the render.
+// The stand-in refuses every other request the way the real service does without a token, so the retry is exercised.
 const hasFfmpeg = spawnSync("ffmpeg", ["-version"]).status === 0;
 test("illustrated series: the cast reaches the planner and each scene is drawn, a character always with the same seed", { skip: !hasFfmpeg && "ffmpeg not installed" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "ce-draw-")), jpg = join(dir, "p.jpg");
   spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=512x512", "-frames:v", "1", jpg]);
-  const picture = readFileSync(jpg), drawn = [];
+  const picture = readFileSync(jpg), drawn = []; let calls = 0;
   const stub = http.createServer((req, res) => {
     const url = new URL(req.url, "http://x");
+    // The real service turns away every other request without a token, with an empty 402.
+    if (++calls % 2 === 1) { res.writeHead(402, { "content-type": "application/json" }); return res.end("{}"); }
     drawn.push({ prompt: decodeURIComponent(url.pathname.replace(/^\/prompt\//, "")), seed: url.searchParams.get("seed"), w: url.searchParams.get("width") });
     res.writeHead(200, { "content-type": "image/jpeg" }); res.end(picture);
   });
   await new Promise((r) => stub.listen(0, "127.0.0.1", r));
-  const eng = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999", POLLINATIONS_API_BASE: `http://127.0.0.1:${stub.address().port}` } });
+  const eng = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999", POLLINATIONS_API_BASE: `http://127.0.0.1:${stub.address().port}`, POLLINATIONS_RETRY_MS: "10" } });
   try {
     await eng.api("POST", "/api/adapter-configs", { key: "llm_story", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "This is an ILLUSTRATED story", json: {
       title: "Rafi and the rain", description: "ILLUSTRATED PLAN", hashtags: ["story"], scenes: [
