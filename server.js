@@ -1211,16 +1211,28 @@ const FILLER = /\b(?:u[mh]+|er+|you know|i mean|sort of|kind of|basically|litera
 // because they are hard" states no fact whatsoever. Saying a phrase three times is a refrain and setting one thing
 // against another is antithesis, and both are a speaker marking their own punchline — in any register, any language.
 const ANTITHESIS = [/\bnot because\b[\s\S]{0,100}?\bbut because\b/i, /\bit'?s not\b[\s\S]{0,80}?\bit'?s\b/i, /\bnot only\b[\s\S]{0,80}?\bbut\b/i];
+// A refrain is a phrase the speaker comes back to: four words said twice, or three said three times. Three words said
+// twice was the old test, and almost any forty seconds of speech passes it ("the United States", "a lot of") — every
+// pick on six real speeches carried "one of them twice", so it told the windows apart by nothing.
 function hasRefrain(text) {
   const words = String(text).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
   if (words.length < 12) return false;
-  const seen = new Set();
-  for (let i = 0; i + 3 <= words.length; i++) {
-    const three = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
-    if (seen.has(three)) return true;
-    seen.add(three);
-  }
+  const count = new Map();
+  for (let n = 3; n <= 4; n++) for (let i = 0; i + n <= words.length; i++) { const k = words.slice(i, i + n).join(" "); count.set(k, (count.get(k) || 0) + 1); }
+  for (const [k, v] of count) if ((k.split(" ").length === 4 && v >= 2) || v >= 3) return true;
   return false;
+}
+// Anaphora: three clauses that open the same way. "There is not a liberal America… There is the United States…
+// There is not a black America…", "We shall fight on the beaches, we shall fight on the landing grounds…", "I have a
+// dream that…" — the shape of nearly every passage people quote, and a passage that states no fact at all. Hedges
+// that open clauses out of habit ("I think", "you know") are not rhetoric and do not count.
+const HABIT_OPENERS = new Set(["i think", "you know", "i mean", "and then", "so i", "and i", "and so", "i guess", "it is", "this is"]);
+function hasAnaphora(text) {
+  const clauses = String(text).toLowerCase().replace(/\b(there|it|that|what|here|he|she)'s\b/g, "$1 is").replace(/\b(we|you|they)'re\b/g, "$1 are")
+    .split(/[.!?;,:\u2014\u2013\u0964]+|\s-{1,2}\s/).map((c) => c.replace(/[^\p{L}\p{N}\s]/gu, " ").trim().split(/\s+/).filter(Boolean)).filter((w) => w.length >= 3);
+  const count = new Map();
+  for (const w of clauses) { const k = `${w[0]} ${w[1]}`; if (!HABIT_OPENERS.has(k)) count.set(k, (count.get(k) || 0) + 1); }
+  return [...count.values()].some((v) => v >= 3);
 }
 // Everything a window can earn: the neutral half, a clean opening, a clean finish, and a full house of substance.
 const MEANING_MAX = 0.5 + 0.2 + 0.1 + 0.35;
@@ -1249,9 +1261,9 @@ impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no
         if (OPENS_MID_THOUGHT.test(run[0].text)) { meaning -= 0.35; why.push("starts mid-thought"); }
         else if (STRONG_OPENER.test(run[0].text)) { meaning += 0.2; why.push("opens on its own feet"); }
         if (/[.!?।]$/.test(text)) meaning += 0.1; else { meaning -= 0.15; why.push("trails off"); }
-        const refrain = hasRefrain(text), antithesis = ANTITHESIS.some((re) => re.test(text));
-        const hits = SUBSTANCE.filter((re) => re.test(text)).length + (refrain ? 1 : 0) + (antithesis ? 1 : 0);
-        if (hits) { meaning += Math.min(0.35, hits * 0.12); why.push(`${hits} thing${hits > 1 ? "s" : ""} actually said${refrain ? ", one of them twice" : ""}${antithesis ? ", one set against another" : ""}`); }
+        const refrain = hasRefrain(text), antithesis = ANTITHESIS.some((re) => re.test(text)), anaphora = hasAnaphora(text);
+        const hits = SUBSTANCE.filter((re) => re.test(text)).length + (refrain ? 1 : 0) + (antithesis ? 1 : 0) + (anaphora ? 1 : 0);
+        if (hits) { meaning += Math.min(0.35, hits * 0.12); why.push(`${hits} thing${hits > 1 ? "s" : ""} actually said${refrain ? ", one of them again and again" : ""}${anaphora ? ", clause after clause opening the same way" : ""}${antithesis ? ", one set against another" : ""}`); }
         const filler = (text.match(FILLER) || []).length;
         if (filler) { meaning -= Math.min(0.25, (filler / Math.max(words, 1)) * 2); why.push(`${filler} filler`); }
         if (words / span < 1.2) { meaning -= 0.2; why.push("barely a word in it"); }
@@ -4451,7 +4463,7 @@ const CATALOG = [
   { id: "2b", type: "News card", name: "Text card", what: "Typographic card for a story without a photo", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
   { id: "2c", type: "News card", name: "Stock card", what: "A Pexels photo of the story's country behind the headline", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
   { id: "3a", type: "News reel", name: "Photo reel", what: "The outlet's photo, local footage, Bangla narration, burned captions", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "NEWS_REEL" } },
-  { id: "3b", type: "News reel", name: "Telecast clip", what: "A TV report cut to its moment — nothing written, nothing narrated", runs: "pc", needs: ["pc"], status: "built", note: "English telecasts work today; Bangla speech needs hosted transcription (Gemini billing)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT" } },
+  { id: "3b", type: "News reel", name: "Telecast clip", what: "A TV report cut to its moment — nothing written, nothing narrated", runs: "pc", needs: ["pc"], status: "proven", note: "Proven on an English TV report; Bangla speech needs hosted transcription (Gemini billing)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT" } },
   { id: "3c", type: "News reel", name: "Telecast + intro", what: "3b with a narrated headline card in front", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
   { id: "4a", type: "Reaction", name: "Silent reaction", what: "The moment at 1.1× with your clip — split-screen or in the corner", runs: "server or pc", needs: ["persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY" } },
   { id: "4b", type: "Reaction", name: "Summary voiceover", what: "A few sentences of summary over the clip, its sound ducked", runs: "pc", needs: ["writer", "voice"], status: "built", setup: { contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER" } },

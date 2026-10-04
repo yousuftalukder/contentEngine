@@ -1,0 +1,8 @@
+[
+  {"id": "jfk-rice", "url": "https://www.youtube.com/watch?v=QXqlziZV63k", "title": "Kennedy at Rice University, 1962", "moments": ["choose to go to the moon"]},
+  {"id": "jobs-stanford", "url": "https://www.youtube.com/watch?v=UF8uR6Z6KLc", "title": "Steve Jobs, Stanford commencement, 2005", "moments": ["connect the dots", "find what you love", "your time is limited", "stay hungry"]},
+  {"id": "reagan-berlin", "url": "https://www.youtube.com/watch?v=5MDFX-dNtsM", "title": "Reagan at the Brandenburg Gate, 1987", "moments": ["down this wall"]},
+  {"id": "obama-dnc", "url": "https://www.youtube.com/watch?v=ueMNqdB1QIE", "title": "Obama, DNC keynote, 2004", "moments": ["not a liberal america"]},
+  {"id": "mlk-dream", "url": "https://www.youtube.com/watch?v=8LWuu2Zwsfs", "title": "King, I Have a Dream, 1963", "moments": ["i have a dream"]},
+  {"id": "churchill-beaches", "url": "https://www.youtube.com/watch?v=s_LncVnecLA", "title": "Churchill, We Shall Fight on the Beaches, 1940", "moments": ["fight on the beaches"]}
+]
