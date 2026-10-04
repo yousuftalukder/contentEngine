@@ -176,4 +176,7 @@ is off. Its first test before building: one video through the API, to see whethe
 
 1a, 1d, 2a–c, 7c, 6a, edge-tts voice, and the whole of 2 live in production. 3a (Bangla news reel on edge-tts,
 the outlet's own photo, local footage) and 4a (split-screen and picture-in-picture, rendered by the server from a
-real speech, with a stock stand-in for the host until there is a real persona clip) since 2026-10-04.
+real speech, with a stock stand-in for the host until there is a real persona clip) since 2026-10-04. Also proven on
+2026-10-04, made by the server: 1c (the LLM picker — first place for the famous line in 9 of 14 speeches, against 4
+for the free heuristic), 3b (an English TV report clipped on the PC), 4b (summary voice-over), 5b (transcript recap)
+and 7b (a Bangla explainer on Bangladesh-only stock footage).
