@@ -13,7 +13,8 @@ const lines = [
   [13.8, 21.5, "Drivers who had waited three days said the queue stretched for four kilometres."],
   [21.5, 29.0, "The authority says two more dredgers will keep the channel open through the monsoon."],
   [29.0, 37.4, "Traders say vegetable prices in Dhaka rose by a third while the crossing was closed."],
-  [37.4, 45.0, "Nobody can say yet whether the channel will hold when the next flood comes."],
+  [37.4, 45.0, "Nobody can say yet whether the channel will hold when the next flood comes. (audience cheering)"],
+  [45.0, 52.0, "[BLANK_AUDIO]"],
 ];
 // What whisper does with -nt: one segment per 30-second window, the text of the window run together.
 const out = noTimestamps
