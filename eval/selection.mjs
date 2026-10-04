@@ -61,7 +61,12 @@ function momentsIn(segments, phrases) {
 // eval/cases.json is what the pickers are tuned on; eval/holdout.json is never looked at while tuning, and is the
 // check that a change helps speeches it was not shaped around (CASES=eval/holdout.json).
 const cases = JSON.parse(readFileSync(join(ROOT, process.env.CASES || join("eval", "cases.json")), "utf8")).filter((c) => !only || c.id === only);
-const eng = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999" } });
+// The LLM picker needs a writer. Keys are never read from the developer's environment by the test harness, so they are
+// handed in by name: EVAL_ANTHROPIC_API_KEY or EVAL_GEMINI_API_KEY, and the picker uses whichever is there.
+const writerEnv = { ...(process.env.EVAL_ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: process.env.EVAL_ANTHROPIC_API_KEY } : {}), ...(process.env.EVAL_GEMINI_API_KEY ? { GEMINI_API_KEY: process.env.EVAL_GEMINI_API_KEY } : {}) };
+const writer = writerEnv.ANTHROPIC_API_KEY ? "anthropic_live" : writerEnv.GEMINI_API_KEY ? "gemini_live" : null;
+if (PICKERS.includes("llm_clipper") && !writer) { console.log("llm_clipper needs EVAL_ANTHROPIC_API_KEY or EVAL_GEMINI_API_KEY"); process.exit(1); }
+const eng = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999", ...writerEnv } });
 const table = [];
 try {
   await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
@@ -78,7 +83,7 @@ try {
     for (const picker of PICKERS) {
       const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: `eval_${c.id}_${picker}`.replace(/\W/g, "_"), displayName: `${c.id} / ${picker}`,
         contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", useMocks: true, autoStyle: false, autoSources: false, language: "en",
-        downloadAdapter: "direct", transcriptAdapter: tkey, clipAdapter: picker, renderAdapter: "render_mock",
+        downloadAdapter: "direct", transcriptAdapter: tkey, clipAdapter: picker, renderAdapter: "render_mock", ...(writer ? { scriptAdapter: writer, scriptAdapterFallbacks: [] } : {}),
         methodConfig: { clips_per_video: TOP, min_clip_score: 0, captions: false, brand_finish: false } });
       const cand = await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: audio, title: c.title });
       const clips = await waitFor(async () => {
