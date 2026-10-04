@@ -58,3 +58,14 @@ bndur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/bn.mp3)
 echo "bangla narration: ${bndur}s"
 awk -v d="$bndur" 'BEGIN { exit (d > 2 ? 0 : 1) }'
 echo "ok: edge-tts produced ${bndur}s of Bangla speech"
+
+echo "== two pictures at different frame rates combine on this ffmpeg =="
+# Debian's ffmpeg 5.1 never finishes a vstack of a 30 fps source and a 24 fps phone clip — a reaction render on Render
+# sat at it until its 30-minute timeout. The engine brings both to 30 fps first; this is that filter shape, on this
+# image's ffmpeg, with a deadline. Without the two fps filters it hangs here exactly as it did in production.
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=30:duration=6" -f lavfi -i "testsrc2=size=360x640:rate=24:duration=3" -map 0 -t 6 /tmp/src.mp4 -map 1 -t 3 /tmp/host.mp4
+timeout 120 ffmpeg -hide_banner -loglevel error -y -i /tmp/src.mp4 -stream_loop -1 -i /tmp/host.mp4 \
+  -filter_complex "[0:v]setpts=PTS/1.1,fps=30,scale=360:320:force_original_aspect_ratio=decrease,pad=360:320:(ow-iw)/2:(oh-ih)/2,setsar=1[m];[1:v]fps=30,scale=360:320:force_original_aspect_ratio=decrease,pad=360:320:(ow-iw)/2:(oh-ih)/2,setsar=1[o];[m][o]vstack=inputs=2:shortest=1[v]" \
+  -map "[v]" -t 5 -c:v libx264 -preset ultrafast /tmp/stack.mp4 || { echo "FAIL: the reaction stack did not finish on this ffmpeg"; exit 1; }
+sdur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/stack.mp4)
+echo "ok: stacked ${sdur}s from a 30 fps source and a 24 fps clip"
