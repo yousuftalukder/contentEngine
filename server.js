@@ -2029,8 +2029,22 @@ const duckUnder = (mi, vi, dur) =>
   // normalize=0 matters: amix divides every input by their number by default, so mixing a bed in would quietly drop
   // the narration 6 dB. The bed's level is set by its own volume filter, and alimiter catches whatever peaks.
   `[voice][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]`;
+// Black bars baked into the picture: a 4:3 broadcast or archive film stored in a 16:9 file, a letterboxed film. Left
+// in, the vertical layouts frame the bars along with the picture and the speaker shrinks to a stamp in a black field.
+// cropdetect runs over the clip itself (two frames a second, keeping the largest picture it sees, so one dark scene
+// does not get cropped as if it were a bar), and the crop is only taken when it removes something worth removing.
+async function barsCrop(input, start = 0, dur = 0) {
+  try {
+    const { err } = await exec("ffmpeg", ["-nostats", ...(start > 0 ? ["-ss", String(start)] : []), ...(dur > 0 ? ["-t", String(Math.min(dur, 180))] : ["-t", "180"]),
+      "-i", input, "-vf", "fps=2,cropdetect=limit=24:round=2:reset=0", "-an", "-f", "null", "-"], { timeoutMs: 5 * 60000 });
+    const found = [...String(err).matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)].at(-1); if (!found) return "";
+    const [w, h, x, y] = found.slice(1).map(Number), { width, height } = await imageDims(input);
+    if (!width || !height || w < width * 0.3 || h < height * 0.3) return "";            // a mostly-black clip: nothing to trust
+    return w < width * 0.96 || h < height * 0.96 ? `crop=${w}:${h}:${x}:${y},` : "";
+  } catch (e) { warn(`bars: ${e.message.slice(0, 120)}`); return ""; }
+}
 async function cutClip(input, start, end, { vertical = true, ass = null, layout = "crop" } = {}) {
-  const vf = [vertical ? (layout === "blurpad" ? vfVerticalBlurpad() : vfVertical()) : vfLandscape()];
+  const vf = [`${await barsCrop(input, start, end - start)}${vertical ? (layout === "blurpad" ? vfVerticalBlurpad() : vfVertical()) : vfLandscape()}`];
   if (ass) vf.push(assVf(ass));
   const out = tmpPath("mp4");
   await exec("ffmpeg", ["-y", "-ss", String(start), "-t", String(Math.max(1, end - start)), "-i", input, "-vf", vf.join(","), ...X264, out]);
@@ -2098,7 +2112,7 @@ function shapeReaction(beats, cfg = {}) {
 async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
   const [W, H] = renderSize("16:9"), FMT = ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"];
   const { brand } = await studioBrand(niche); const reactor = reactorUrl ? await toTmpFile(reactorUrl, "mp4") : null;
-  const accent = (brand.accent || "#ffc400").replace("#", "0x"), srcAudio = await hasAudio(sourcePath), segs = [], temp = [];
+  const accent = (brand.accent || "#ffc400").replace("#", "0x"), srcAudio = await hasAudio(sourcePath), segs = [], temp = [], bars = await barsCrop(sourcePath);
   try {
     let lastT = 0;
     for (const [i, b] of beats.entries()) {
@@ -2106,7 +2120,7 @@ async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
       if (b.type === "play") {
         const dur = Math.max(1, b.end - b.start); lastT = b.end;
         const inputs = ["-ss", String(b.start), "-t", String(dur), "-i", sourcePath, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : []), ...(srcAudio ? [] : ["-f", "lavfi", "-t", String(dur), "-i", "anullsrc=r=48000:cl=stereo"])];
-        const fc = `[0:v]${vfLandscape()},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=${Math.round((W * 0.27) / 2) * 2}:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-${Math.round(W * 0.02)}:H-h-${Math.round(W * 0.02)}:shortest=1[v]` : ";[m]null[v]");
+        const fc = `[0:v]${bars}${vfLandscape()},fps=30,setsar=1[m]` + (reactor ? `;[1:v]scale=${Math.round((W * 0.27) / 2) * 2}:-2,fps=30,setsar=1,pad=iw+8:ih+8:4:4:color=${accent}[r];[m][r]overlay=W-w-${Math.round(W * 0.02)}:H-h-${Math.round(W * 0.02)}:shortest=1[v]` : ";[m]null[v]");
         const aIn = srcAudio ? "0:a" : `${reactor ? 2 : 1}:a`;
         await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", aIn, "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
       } else {
@@ -2188,7 +2202,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         // Both pictures are brought to one frame rate before they are combined. Debian's ffmpeg 5.1 — the one on Render —
         // never finishes a vstack of a 30 fps source and a 24 fps phone clip (6.1 does it in seconds), and the job then
         // sits until its timeout and is retried into the same wall.
-        const fast = `${speed !== 1 ? `setpts=PTS/${speed},` : ""}fps=30,`;
+        const fast = `${await barsCrop(sourcePath, clip.start, clip.end - clip.start)}${speed !== 1 ? `setpts=PTS/${speed},` : ""}fps=30,`;
         // Each half is filled, not fitted: a 16:9 picture fitted into a near-square half is a strip with black above and
         // below, and a source that already carries black side bars (most archive footage) shrinks to a stamp. Filling
         // trims the sides, which for a speaker or a face is the part nobody watches.
@@ -2231,7 +2245,7 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const said = extras.audio?.spoken || extras.script || "";
         const recapAss = c.captions === false || !said ? null
           : caps[caps.push(await writeCaptionsAss([{ start: 0, end: nd, text: said }], 0, nd, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, accent: (await studioBrand(niche)).brand.accent })) - 1];
-        const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${vertical ? vfVertical() : vfLandscape()}${recapAss ? `,${assVf(recapAss)}` : ""}[v]`;
+        const fc = `${trims};${scenes.map((_, i) => `[v${i}]`).join("")}concat=n=${scenes.length}:v=1:a=0,${await barsCrop(sourcePath)}${vertical ? vfVertical() : vfLandscape()}${recapAss ? `,${assVf(recapAss)}` : ""}[v]`;
         await exec("ffmpeg", ["-y", "-i", sourcePath, "-i", a, "-filter_complex", fc, "-map", "[v]", "-map", "1:a", "-shortest", ...X264, file]); await cleanup(a); break;
       }
       default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical)) - 1] });

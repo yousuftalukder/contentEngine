@@ -87,6 +87,27 @@ test("reaction picture-in-picture renders at the small instance's size", { skip:
   } finally { await small.stop(); }
 });
 
+// Archive and broadcast footage often carries its own black bars — a 4:3 picture inside a 16:9 file. The whole-picture
+// layout used to frame the bars too. A white 4:3 picture with black bars: after the crop, the left edge of the framed
+// picture is white, not black.
+test("baked-in black bars are cropped off before the vertical layout", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const boxed = join(dir, "pillarboxed.mp4");
+  ff("-f", "lavfi", "-i", "color=c=white:s=640x480:rate=30:duration=40", "-f", "lavfi", "-i", "sine=frequency=330:duration=40", "-vf", "pad=854:480:107:0:black",
+    "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", boxed);
+  const p = await eng.api("POST", "/api/programs", { ...base(), key: "boxed", displayName: "Boxed", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT",
+    methodConfig: { vertical_layout: "blurpad", clips_per_video: 1, captions: false, brand_finish: false } });
+  await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: boxed, title: "Boxed broadcast" });
+  const it = await waitFor(async () => { const x = (await eng.api("GET", `/api/content-items?nicheId=${p.id}`))[0]; if (x?.status === "FAILED") throw new Error(x.rejection_note); return x?.status === "PENDING_REVIEW" && x; }, { timeout: 240000, interval: 1000, what: "the boxed clip" });
+  const full = await eng.api("GET", `/api/content-items/${it.id}`);
+  const file = join(dir, "boxed-out.mp4");
+  (await import("node:fs")).writeFileSync(file, Buffer.from(await (await fetch(full.hero_media.url.replace(/^https?:\/\/[^/]+/, eng.base))).arrayBuffer()));
+  const v = probe(file).streams.find((x) => x.codec_type === "video");
+  // A strip at the left edge, halfway down: inside the framed picture whatever the frame size.
+  const r = spawnSync("ffmpeg", ["-hide_banner", "-ss", "2", "-i", file, "-frames:v", "1", "-vf", `crop=${Math.round(v.width * 0.03)}:${Math.round(v.height * 0.05)}:2:${Math.round(v.height * 0.475)},signalstats,metadata=print:key=lavfi.signalstats.YAVG`, "-f", "null", "-"], { encoding: "utf8" });
+  const yavg = Number(/YAVG=([\d.]+)/.exec(r.stderr)?.[1] ?? 0);
+  assert.ok(yavg > 150, `the left edge of the picture is the picture, not a bar (brightness ${yavg}; black is about 16)`);
+});
+
 // The studio renderer is picked for any program that makes its own videos, on whatever machine the video lane runs on.
 // An instance too small for Chromium must still produce the reel through ffmpeg rather than fail the item.
 test("a studio program on an instance too small for the studio still renders, through ffmpeg", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
