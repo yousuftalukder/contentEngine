@@ -38,6 +38,8 @@ const FRONTEND_DIR = join(__dirname, "frontend");
 const WORKER_ID = `${ENV.RENDER_INSTANCE_ID || "local"}-${process.pid}`;
 const QUEUE_POLL_MS = Number(ENV.QUEUE_POLL_INTERVAL_MS) || 3000;
 const LOCK_TIMEOUT_MIN = Number(ENV.JOB_LOCK_TIMEOUT_MINUTES) || 45;
+// Where Gemini is reached: the real API, or a stand-in in tests (the model fallback is otherwise untestable).
+const GEMINI_BASE = (ENV.GEMINI_API_BASE || "https://generativelanguage.googleapis.com").replace(/\/$/, "");
 const DEFAULTS = {
   ANTHROPIC_MODEL: ENV.ANTHROPIC_MODEL || "claude-sonnet-5",
   GEMINI_MODEL: ENV.GEMINI_MODEL || "gemini-flash-latest",
@@ -613,6 +615,9 @@ const isSpent = (m) => spentUntil(m) > Date.now();
 function noteSpent(model, e) {
   const q = quotaWait(e);
   if (q?.kind === "day") modelSpent.set(model, Date.now() + q.seconds * 1000);
+  // "limit: 0" is a model the plan does not include at all — a free key and any Pro model. No reset lifts it, so it is
+  // set aside for a day instead of being asked again by every job.
+  else if (q?.kind === "plan") modelSpent.set(model, Date.now() + 24 * 3600e3);
   else if (isOverloaded(e)) modelSpent.set(model, Date.now() + 180e3);
 }
 async function withModelFallback(models, call) {
@@ -637,7 +642,7 @@ const geminiCatalog = { at: 0, list: [] };
 const GEMINI_KINDS = { text: (n) => /^gemini-.*(flash|pro)/.test(n) && !/image|tts|audio|live|embedding|vision|thinking-exp/.test(n), image: (n) => /image/.test(n) && /^gemini/.test(n), tts: (n) => /tts/.test(n) };
 async function geminiReplacements(key, kind, tried, max = 3) {
   if (Date.now() - geminiCatalog.at > 6 * 3600e3 || !geminiCatalog.list.length) {
-    const r = await fetchJson("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": key } });
+    const r = await fetchJson(`${GEMINI_BASE}/v1beta/models?pageSize=1000`, { headers: { "x-goog-api-key": key } });
     geminiCatalog.list = (r.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => m.name.replace(/^models\//, "")); geminiCatalog.at = Date.now();
   }
   // Prefer "latest" aliases, then the highest version; flash before pro for text (cost), as configured defaults do.
@@ -654,7 +659,11 @@ async function withGeminiModels(key, kind, models, call) {
     if (e.status !== 404 && !spent) throw e;
     const alt = await geminiReplacements(key, kind, models, spent ? 8 : 3).catch(() => []); if (!alt.length) throw e;
     warn(`Gemini ${kind}: ${models.join(", ")} ${spent ? "have spent today's free allowance" : "not found"}; trying ${alt.join(", ")}`);
-    return withModelFallback(alt, call);
+    // When the stand-ins fail only because the plan excludes them, the reason worth reporting is still the first one:
+    // today's allowance is spent and comes back at midnight Pacific — not "the plan does not include gemini-pro-latest",
+    // which sent the alert after a model nobody chose.
+    try { return await withModelFallback(alt, call); }
+    catch (e2) { if (spent && quotaWait(e2)?.kind === "plan") throw e; throw e2; }
   }
 }
 impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, fallback_models: { type: "array", default: DEFAULTS.GEMINI_FALLBACK_MODELS }, grounding: { type: "boolean", default: false } }, create: (cfg, ctx = {}) => ({
@@ -668,7 +677,7 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
         generationConfig: { maxOutputTokens: maxTokens, responseMimeType: json && !useSearch ? "application/json" : undefined },
         tools: useSearch ? [{ google_search: {} }] : undefined,
       };
-      const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+      const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, {
         method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(req) }) }));
       const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
       const u = body.usageMetadata || {};
@@ -997,19 +1006,19 @@ impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped 
       const bytes = await readFile(audio);
       return await withKey("gemini", async (key) => {
         // Files API resumable upload
-        const start = await fetch("https://generativelanguage.googleapis.com/upload/v1beta/files", { method: "POST", headers: { "x-goog-api-key": key, "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start", "X-Goog-Upload-Header-Content-Length": String(bytes.length), "X-Goog-Upload-Header-Content-Type": "audio/mpeg", "Content-Type": "application/json" }, body: JSON.stringify({ file: { display_name: "clip-audio" } }) });
+        const start = await fetch(`${GEMINI_BASE}/upload/v1beta/files`, { method: "POST", headers: { "x-goog-api-key": key, "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start", "X-Goog-Upload-Header-Content-Length": String(bytes.length), "X-Goog-Upload-Header-Content-Type": "audio/mpeg", "Content-Type": "application/json" }, body: JSON.stringify({ file: { display_name: "clip-audio" } }) });
         const uploadUrl = start.headers.get("x-goog-upload-url"); if (!uploadUrl) throw new ApiError(start.status, await start.text(), "Gemini file upload start failed");
         const fin = await fetchJson(uploadUrl, { method: "POST", headers: { "Content-Length": String(bytes.length), "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize" }, body: bytes });
         let file = fin.file;
-        for (let i = 0; i < 60 && file.state === "PROCESSING"; i++) { await sleep(3000); file = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/${file.name}`, { headers: { "x-goog-api-key": key } }); }
+        for (let i = 0; i < 60 && file.state === "PROCESSING"; i++) { await sleep(3000); file = await fetchJson(`${GEMINI_BASE}/v1beta/${file.name}`, { headers: { "x-goog-api-key": key } }); }
         const model = cfg.model || DEFAULTS.GEMINI_MODEL;
-        const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
+        const body = await fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
           contents: [{ parts: [{ file_data: { file_uri: file.uri, mime_type: "audio/mpeg" } }, { text: `Transcribe this audio${language ? ` (language: ${language})` : ""} into a JSON array of segments: [{"start": seconds, "end": seconds, "text": "..."}]. Segments should be 3-10 seconds each with accurate timestamps. Output ONLY the JSON array.` }] }],
           generationConfig: { responseMimeType: "application/json", maxOutputTokens: 60000 } }) });
         const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
         const segs = extractJson(text).filter((s) => s && typeof s.text === "string").map((s) => ({ start: Number(s.start) || 0, end: Number(s.end) || 0, text: s.text }));
         const u = body.usageMetadata || {};
-        fetch(`https://generativelanguage.googleapis.com/v1beta/${file.name}`, { method: "DELETE", headers: { "x-goog-api-key": key } }).catch(() => {});
+        fetch(`${GEMINI_BASE}/v1beta/${file.name}`, { method: "DELETE", headers: { "x-goog-api-key": key } }).catch(() => {});
         return { segments: segs, text: joinSegments(segs), cost: tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), units: 1 };
       }, ctx.pin);
     } finally { await cleanup(audio); }
@@ -1617,7 +1626,7 @@ impl("IMAGE", "gemini_image", { label: "Gemini image generation", configSchema: 
     const ar = specs.aspect_ratio || (specs.height > specs.width ? "9:16" : specs.width > specs.height ? "16:9" : "1:1");
     const full = `${prompt || headline}. ${specs.style || "Photorealistic editorial news image, dramatic lighting, no watermarks."} ${specs.render_text === true ? `Render this headline as bold, legible overlay text: "${headline}".` : "Do not render any text, letters, captions or logos anywhere in the image; leave the lower third visually calm."} Aspect ratio ${ar}.`;
     return withKey("gemini", async (key) => {
-      const { model: used, body } = await withGeminiModels(key, "image", [model], async (m) => ({ model: m, body: await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+      const { model: used, body } = await withGeminiModels(key, "image", [model], async (m) => ({ model: m, body: await fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
         body: JSON.stringify({ contents: [{ parts: [{ text: full }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: ar } } }) }) }));
       const part = (body.candidates?.[0]?.content?.parts || []).find((p) => p.inlineData || p.inline_data);
       if (!part) throw new Error("Gemini returned no image (blocked by safety, or wrong model id?)");
@@ -1884,7 +1893,7 @@ impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSche
       try {
         for (const p of parts) {
           const text = cfg.style ? `${cfg.style}: ${p}` : p;
-          const body = await withGeminiModels(key, "tts", models.filter(Boolean), (m) => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+          const body = await withGeminiModels(key, "tts", models.filter(Boolean), (m) => fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
             body: JSON.stringify({ contents: [{ parts: [{ text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }) }));
           const d = (body.candidates?.[0]?.content?.parts || []).find((x) => x.inlineData || x.inline_data); if (!d) throw new Error("Gemini TTS returned no audio");
           const inl = d.inlineData || d.inline_data; const rate = Number((/rate=(\d+)/.exec(inl.mimeType || inl.mime_type || "") || [])[1]) || 24000;
@@ -1907,14 +1916,14 @@ impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { re
 impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg, ctx = {}) => ({
   async embed(text) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL;
-    const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
+    const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
     return r.v;
   },
   async embedMany(texts, { dimensions = 256, task = "CLUSTERING" } = {}) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL; const out = [];
     for (let i = 0; i < texts.length; i += 100) {
       const chunk = texts.slice(i, i + 100);
-      const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+      const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
         body: JSON.stringify({ requests: chunk.map((t) => ({ model: `models/${model}`, content: { parts: [{ text: String(t).slice(0, 2000) }] }, taskType: task, outputDimensionality: dimensions })) }) })); return { v: (b.embeddings || []).map((e) => e.values || null), units: 1, cost: 0 }; }, ctx.pin);
       out.push(...chunk.map((_, j) => r.v[j] || null));
     }
@@ -4377,7 +4386,7 @@ app.post("/api/credentials/:id/test", async (ctx) => {
   const auth = (k) => ({ Authorization: `Bearer ${k}` });
   const tests = {
     anthropic: () => fetchJson("https://api.anthropic.com/v1/models?limit=1", { headers: { "x-api-key": c.secret, "anthropic-version": "2023-06-01" } }),
-    gemini: () => fetchJson("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", { headers: { "x-goog-api-key": c.secret } }),
+    gemini: () => fetchJson(`${GEMINI_BASE}/v1beta/models?pageSize=1`, { headers: { "x-goog-api-key": c.secret } }),
     openai: () => fetchJson("https://api.openai.com/v1/models?limit=1", { headers: auth(c.secret) }),
     elevenlabs: () => fetchJson("https://api.elevenlabs.io/v1/user", { headers: { "xi-api-key": c.secret } }),
     newsapi: () => fetchJson(`https://newsapi.org/v2/top-headlines?country=us&pageSize=1&apiKey=${encodeURIComponent(c.secret)}`),
