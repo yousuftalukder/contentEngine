@@ -2142,8 +2142,9 @@ async function renderReactionLong({ beats, sourcePath, niche, reactorUrl }) {
         const panel = Math.round(H * 0.56), py = Math.round((H - panel) / 2), mx = Math.round(W * 0.05);
         const side = reactor ? `[1:v]scale=-2:${panel},fps=30,setsar=1,pad=iw+10:ih+10:5:5:color=${accent}[r]`
           : `[2:a]showwaves=s=${Math.round(W / 6) * 2}x${panel}:mode=cline:colors=${accent}:rate=30,format=yuva420p[r]`;
-        const fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:3,eq=brightness=-0.3[bg];`
-          + `[0:v]scale=-2:${panel},pad=iw+10:ih+10:5:5:color=black@0.6[fz];[bg][fz]overlay=${mx}:${py}[a];`
+        // The frozen frame is the source's own, so its baked-in bars are cropped the same way as the playing segments.
+        const fc = `[0:v]${bars}scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:3,eq=brightness=-0.3[bg];`
+          + `[0:v]${bars}scale=-2:${panel},pad=iw+10:ih+10:5:5:color=black@0.6[fz];[bg][fz]overlay=${mx}:${py}[a];`
           + `${side};[a][r]overlay=W-w-${mx}:${py}[b];[b]${assVf(ass)},fps=30,format=yuv420p[v]`;
         const inputs = ["-loop", "1", "-t", String(dur), "-i", still, ...(reactor ? ["-stream_loop", "-1", "-i", reactor] : ["-f", "lavfi", "-i", "color=c=black:s=16x16"]), "-i", vo];
         await exec("ffmpeg", ["-y", ...inputs, "-filter_complex", fc, "-map", "[v]", "-map", "2:a", "-t", String(dur), ...FMT, seg], { timeoutMs: 30 * 60000 });
