@@ -46,13 +46,18 @@ function transcriptFor(c) {
 // Where each famous line is said: a segment, or two adjacent ones, whose words contain the phrase. Every occurrence
 // counts — "I have a dream" is said eight times, and a clip of any of them is the clip.
 function momentsIn(segments, phrases) {
+  // When the phrase is said: the segment's start plus the words before it at a speaking pace (2.5 words a second),
+  // capped by its share of the segment's text. Not the segment's middle: whisper folds the applause after a line into
+  // the line's segment, and "Mr. Gorbachev, tear down this wall" then sat ten seconds into the cheering.
+  const when = (s, text, want) => { const i = text.indexOf(want), before = text.slice(0, i).split(" ").filter(Boolean).length;
+    return s.start + Math.min(before / 2.5, (s.end - s.start) * (i / Math.max(1, text.length))); };
   const found = [];
   for (const p of phrases) {
     const want = norm(p);
     segments.forEach((s, i) => {
       const one = norm(s.text), two = i + 1 < segments.length ? `${one} ${norm(segments[i + 1].text)}` : one;
-      if (one.includes(want)) found.push({ phrase: p, at: (s.start + s.end) / 2 });
-      else if (two.includes(want) && !norm(segments[i + 1].text).includes(want)) found.push({ phrase: p, at: s.end });
+      if (one.includes(want)) found.push({ phrase: p, at: when(s, one, want) });
+      else if (two.includes(want) && !norm(segments[i + 1].text).includes(want)) found.push({ phrase: p, at: when(s, two, want) });
     });
   }
   return found;
