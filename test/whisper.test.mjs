@@ -34,5 +34,11 @@ test("whisper is asked for timestamps, and the transcript keeps its sentence tim
     assert.equal(segs.length, 6, "one segment per sentence, not one per 30 seconds");
     assert.ok(segs.every((s) => s.end - s.start < 10), "and none of them is a 30-second block");
     assert.equal(segs[1].start, 6.2, "with whisper's own timing");
+    // What whisper hears that is not speech comes out of the words, so it never reaches a caption; the audience's
+    // reaction is kept beside them with its time.
+    const stored = typeof row.transcript === "string" ? JSON.parse(row.transcript) : row.transcript;
+    assert.ok(!segs.some((s) => /BLANK_AUDIO|\(audience/i.test(s.text)), "no [BLANK_AUDIO] or (audience cheering) in the words");
+    assert.equal(segs.at(-1).text, "Nobody can say yet whether the channel will hold when the next flood comes.");
+    assert.equal(stored.events?.[0]?.kind, "audience cheering", "the reaction is kept as an event");
   } finally { await eng.stop(); }
 });

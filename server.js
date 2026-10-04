@@ -968,6 +968,22 @@ impl("DOWNLOAD", "direct", { label: "Direct link / uploaded file", create: () =>
 
 // ---- 6e. Transcribe (stage TRANSCRIBE). transcribe({path, language}) -> {segments:[{start,end,text}], text}
 const joinSegments = (segs) => segs.map((s) => s.text).join(" ");
+// whisper writes what it hears that is not speech as words in brackets: "[BLANK_AUDIO]", "(dramatic music)",
+// "(audience cheering)". Left in, they were burned into captions and read by the picker as the end of a sentence that
+// trailed off. They come out of the words — and the audience's reactions are kept, with their times, because applause
+// right after a line is the clearest sign there is that the line landed.
+const NONSPEECH = /\[[^\]]{1,40}\]|\((?:[a-z]+ ){0,3}(?:music|applause|applauding|cheering|cheers|laughter|laughing|laughs|silence|noise|inaudible|crowd|chanting|booing|clapping)\)|\*[a-z ]{1,30}\*/gi;
+const REACTION = /applause|applauding|cheering|cheers|laughter|laughing|laughs|clapping|chanting/i;
+function cleanTranscript(segments) {
+  const out = [], events = [];
+  for (const seg of segments || []) {
+    const raw = String(seg.text || "");
+    for (const m of raw.match(NONSPEECH) || []) if (REACTION.test(m)) events.push({ start: Number(seg.start) || 0, end: Number(seg.end) || 0, kind: m.replace(/[^a-z ]/gi, "").trim().toLowerCase() });
+    const text = raw.replace(NONSPEECH, " ").replace(/\s+/g, " ").trim();
+    if (text && /[\p{L}\p{N}]/u.test(text)) out.push({ ...seg, text });
+  }
+  return { segments: out, events };
+}
 impl("TRANSCRIBE", "transcribe_mock", { label: "Mock", configSchema: { segments: { type: "array" } }, create: (cfg = {}) => ({
   // An instance of this impl can carry the words themselves (Adapters → new instance → config.segments), which is how
   // a test about *what was said* supplies a transcript. Without them, filler on an eight-second grid as before.
@@ -1093,20 +1109,38 @@ const methodCfg = (niche) => ({ clip_min_seconds: 25, clip_max_seconds: 75, clip
 // Both come free out of ffmpeg in one pass over audio we have already fetched, and together they answer the two
 // questions a transcript cannot — which moment had energy in it, and where a cut will not land mid-word.
 async function audioSignals(path) {
-  const loud = [], silences = [];
+  const loud = [], silences = [], frames = [];
   try {
+    // Loudness every tenth of a second, in one pass. A pause is then judged against this recording's own floor rather
+    // than a fixed -34 dB: a 1933 broadcast, a live crowd or a news report with a music bed never drops that low, and
+    // the pass found no pauses in them at all — every "where does this thought start" question went unanswered.
     const { err } = await exec("ffmpeg", ["-nostats", "-i", path,
-      "-af", "aresample=8000,asetnsamples=8000,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level,silencedetect=noise=-34dB:d=0.30",
+      "-af", "aresample=8000,asetnsamples=800,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
       "-f", "null", "-"], { timeoutMs: 15 * 60000 });
-    let at = 0, open = null;
+    let at = 0;
     for (const line of String(err).split(/\r?\n/)) {
       const t = /pts_time:([\d.]+)/.exec(line); if (t) { at = Number(t[1]); continue; }
       const rms = /RMS_level=(-?[\d.]+|-?inf)/.exec(line);
-      if (rms) { loud.push({ at, db: rms[1] === "-inf" ? -90 : Number(rms[1]) }); continue; }
-      const ss = /silence_start:\s*([\d.]+)/.exec(line); if (ss) { open = Number(ss[1]); continue; }
-      const se = /silence_end:\s*([\d.]+)/.exec(line); if (se && open !== null) { silences.push({ start: open, end: Number(se[1]) }); open = null; }
+      if (rms) frames.push({ at, db: rms[1] === "-inf" ? -90 : Math.max(-90, Number(rms[1])) });
     }
   } catch (e) { warn(`audio signals: ${e.message.slice(0, 120)}`); }
+  if (!frames.length) return { loud, silences };
+  // Per second, as the scorers have always read it: the power of ten frames averaged, back in decibels.
+  for (let i = 0; i < frames.length; i += 10) {
+    const block = frames.slice(i, i + 10), power = block.reduce((n, f) => n + 10 ** (f.db / 10), 0) / block.length;
+    loud.push({ at: block[0].at, db: power > 0 ? Math.max(-90, 10 * Math.log10(power)) : -90 });
+  }
+  // Quiet is relative: within 6 dB of the quietest tenth of this recording counts, never stricter than the old -34 dB
+  // (so clean audio is judged as before), and always well under the middle of the speech (so a loud bed is not silence).
+  const sorted = frames.map((f) => f.db).sort((a, b) => a - b), pct = (q) => sorted[Math.floor(q * (sorted.length - 1))];
+  const quiet = Math.min(Math.max(-34, pct(0.1) + 6), pct(0.5) - 6), step = frames.length > 1 ? frames[1].at - frames[0].at || 0.1 : 0.1;
+  let open = null;
+  for (const f of frames) {
+    if (f.db < quiet) { if (open === null) open = f.at; continue; }
+    if (open !== null && f.at - open >= 0.3) silences.push({ start: Number(open.toFixed(2)), end: Number(f.at.toFixed(2)) });
+    open = null;
+  }
+  if (open !== null) { const last = frames.at(-1).at + step; if (last - open >= 0.3) silences.push({ start: Number(open.toFixed(2)), end: Number(last.toFixed(2)) }); }
   return { loud, silences };
 }
 // How loud a stretch is against the rest of the video, 0..1. Relative, because one recording's shout is another's
@@ -1205,12 +1239,16 @@ const SUBSTANCE = [
   /[০-৯]/,
   /(?:সবচেয়ে|প্রথম|কখনো|আসলে|সত্যি|কেবল)/,
 ];
+const OUTRO = /\b(?:subscribe|thanks? (?:you )?(?:so much )?for (?:watching|listening)|see you (?:next time|in the next)|hit the (?:bell|like)|link in the description|that'?s (?:all|it) for (?:today|this (?:week|episode)))\b/i;
 const FILLER = /\b(?:u[mh]+|er+|you know|i mean|sort of|kind of|basically|literally)\b/gi;
 // Rhetoric, which is what people actually clip. The list above sees facts, and on a real speech that made it rank
 // the most quoted passage in the language fourth: "we choose to go to the moon… not because they are easy, but
 // because they are hard" states no fact whatsoever. Saying a phrase three times is a refrain and setting one thing
 // against another is antithesis, and both are a speaker marking their own punchline — in any register, any language.
-const ANTITHESIS = [/\bnot because\b[\s\S]{0,100}?\bbut because\b/i, /\bit'?s not\b[\s\S]{0,80}?\bit'?s\b/i, /\bnot only\b[\s\S]{0,80}?\bbut\b/i];
+// "Ask not what your country can do for you, ask what you can do for your country": the same small word on both
+// sides of the turn is the reversal, whatever words fill it.
+const ANTITHESIS = [/\bnot because\b[\s\S]{0,100}?\bbut because\b/i, /\bit'?s not\b[\s\S]{0,80}?\bit'?s\b/i, /\bnot only\b[\s\S]{0,80}?\bbut\b/i,
+  /\bnot (what|who|how|why|where|when|for|to|by|with)\b[\s\S]{0,100}?[,;:.\u2014-]\s*(?:but\s+|ask\s+|rather\s+)?\1\b/i];
 // A refrain is a phrase the speaker comes back to: four words said twice, or three said three times. Three words said
 // twice was the old test, and almost any forty seconds of speech passes it ("the United States", "a lot of") — every
 // pick on six real speeches carried "one of them twice", so it told the windows apart by nothing.
@@ -1232,7 +1270,14 @@ function hasAnaphora(text) {
     .split(/[.!?;,:\u2014\u2013\u0964]+|\s-{1,2}\s/).map((c) => c.replace(/[^\p{L}\p{N}\s]/gu, " ").trim().split(/\s+/).filter(Boolean)).filter((w) => w.length >= 3);
   const count = new Map();
   for (const w of clauses) { const k = `${w[0]} ${w[1]}`; if (!HABIT_OPENERS.has(k)) count.set(k, (count.get(k) || 0) + 1); }
-  return [...count.values()].some((v) => v >= 3);
+  if ([...count.values()].some((v) => v >= 3)) return true;
+  // Three in a row on the same word is the tricolon: "will endure as it has endured, will revive, and will prosper",
+  // "the energy, the faith, the devotion". In a row, because "I" opens half the clauses of ordinary talk.
+  const lead = String(text).toLowerCase().split(/[.!?;,:\u2014\u2013\u0964]+|\s-{1,2}\s/)
+    .map((c) => c.replace(/[^\p{L}\p{N}\s]/gu, " ").trim().split(/\s+/).filter(Boolean)).filter((w) => w.length)
+    .map((w) => (["and", "but", "or", "so"].includes(w[0]) && w.length > 1 ? w[1] : w[0]));
+  for (let i = 2; i < lead.length; i++) if (lead[i] === lead[i - 1] && lead[i] === lead[i - 2] && !["i", "and", "it", "you"].includes(lead[i])) return true;
+  return false;
 }
 // Everything a window can earn: the neutral half, a clean opening, a clean finish, and a full house of substance.
 const MEANING_MAX = 0.5 + 0.2 + 0.1 + 0.35;
@@ -1258,7 +1303,12 @@ impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no
         const words = text.split(/\s+/).filter(Boolean).length;
         const density = clamp(run.reduce((n, s) => n + (s.end - s.start), 0) / span, 0, 1);
         const why = []; let meaning = 0.5;
-        if (OPENS_MID_THOUGHT.test(run[0].text)) { meaning -= 0.35; why.push("starts mid-thought"); }
+        // "And so, my fellow Americans, ask not…", "So first of all, let me assert…": the biggest line of a speech often
+        // opens on a conjunction. What separates that from a clip that starts halfway through an argument is the
+        // pause in front of it — a speaker stops before a new thought and runs on into the middle of one.
+        const pausedBefore = silences.some((x) => x.end - x.start >= 0.45 && x.end >= run[0].start - 1.0 && x.end <= run[0].start + 1.0);
+        if (OPENS_MID_THOUGHT.test(run[0].text) && pausedBefore) { meaning -= 0.05; why.push("opens on a beat after a pause"); }
+        else if (OPENS_MID_THOUGHT.test(run[0].text)) { meaning -= 0.35; why.push("starts mid-thought"); }
         else if (STRONG_OPENER.test(run[0].text)) { meaning += 0.2; why.push("opens on its own feet"); }
         if (/[.!?।]$/.test(text)) meaning += 0.1; else { meaning -= 0.15; why.push("trails off"); }
         const refrain = hasRefrain(text), antithesis = ANTITHESIS.some((re) => re.test(text)), anaphora = hasAnaphora(text);
@@ -1268,7 +1318,9 @@ impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no
         if (filler) { meaning -= Math.min(0.25, (filler / Math.max(words, 1)) * 2); why.push(`${filler} filler`); }
         if (words / span < 1.2) { meaning -= 0.2; why.push("barely a word in it"); }
         if (start < 30) meaning -= 0.15;                              // hello-and-welcome
-        if (duration > 180 && end > duration - 20) meaning -= 0.15;   // thanks-for-watching
+        // The sign-off is judged by what is said, not by where it falls: a speech's last line is often its best ("this was
+        // their finest hour" is the final sentence), and a blanket penalty on the last twenty seconds buried it.
+        if (OUTRO.test(text)) { meaning -= 0.25; why.push("a sign-off"); }
         // As a fraction of the best a window could possibly do, rather than capped at one. Capping made two windows
         // that both scored "full marks" indistinguishable — the five-sentence thought and the four-sentence tail of
         // the same thought tied, and a hair of loudness picked the worse one, which dropped the sentence that set it
@@ -3337,8 +3389,10 @@ async function processCandidate(candidateId) {
     // allowance of a hosted model is worth spending first, and the slow one is what the day looks like after it.
     transcript = await withFallbacks("TRANSCRIBE", niche.transcript_adapter || "transcribe_mock", niche.transcript_adapter_fallbacks,
       (tr) => tr.transcribe({ path: file.path, duration: file.duration, language: niche.language }));
-    await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments })]);
-  }
+    const clean = cleanTranscript(transcript.segments);
+    transcript = { ...transcript, segments: clean.segments, events: clean.events };
+    await q(`UPDATE video_candidates SET transcript=$2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ segments: transcript.segments, events: transcript.events })]);
+  } else if (!transcript.events) transcript = { ...transcript, ...cleanTranscript(transcript.segments) };   // stored before cleaning existed
   // One pass over the soundtrack for what the words do not say: where it got loud, and where nobody was speaking.
   const signals = existsSync(file.path) ? await audioSignals(file.path) : { loud: [], silences: [] };
   // The soundtrack has done its job. What is kept is the link and what was learned from it — the transcript, and in a
@@ -3369,7 +3423,7 @@ async function renderClipItem(itemId, clipId) {
   const cand = await one(`SELECT * FROM video_candidates WHERE id=$1`, [clip.video_candidate_id]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   await setItem(itemId, { status: "RENDERING" });
-  const transcript = P(cand.transcript) || { segments: [] }; const c = { start: Number(clip.start_seconds), end: Number(clip.end_seconds), title: clip.title, hook: clip.hook };
+  const stored = P(cand.transcript) || { segments: [] }, transcript = stored.events ? stored : { ...stored, ...cleanTranscript(stored.segments) }; const c = { start: Number(clip.start_seconds), end: Number(clip.end_seconds), title: clip.title, hook: clip.hook };
   // Only the part being published is fetched. A reel is forty seconds of a video that may be two hours long, and
   // fetching the two hours to cut forty seconds of it is most of the cost of the whole pipeline. Methods that really
   // do play across the whole video (a long reaction, a recap) have a clip spanning it, so they get what they need.
