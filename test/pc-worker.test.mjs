@@ -47,5 +47,15 @@ test("work routed to your PC waits for your PC, and your PC does it", async () =
     assert.equal(after.pc.online, true, "the dashboard sees the PC is on");
     const serverBoot = await server.query(`SELECT value FROM settings WHERE key = 'boot.last'`);
     assert.ok(serverBoot.length, "the server's own boot record is still there");
+
+    // A PC whose clock runs an hour fast, switched off five minutes ago. Its own timestamp says it beat in the future;
+    // only the database's clock knows it has been quiet.
+    await pc.stop(); pc = null;
+    // Re-inserted rather than updated: a trigger stamps updated_at on every update, which is what keeps it honest.
+    await server.query(`DELETE FROM settings WHERE key = 'worker.pc'`);
+    await server.query(`INSERT INTO settings (key, value, updated_at) VALUES ('worker.pc', $1::jsonb, now() - interval '5 minutes')`, [JSON.stringify({ at: new Date(Date.now() + 3600e3).toISOString(), worker: "fast-clock" })]);
+    const off = await server.api("GET", "/api/workers");
+    assert.equal(off.pc.online, false, `a PC with a fast clock is off once it stops beating (seen ${off.pc.seen_seconds_ago}s ago)`);
+    assert.ok(off.pc.seen_seconds_ago >= 299, "and how long ago is measured on the database's clock");
   } finally { await pc?.stop(); await server.stop(); }
 });
