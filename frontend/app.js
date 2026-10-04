@@ -564,7 +564,7 @@ async function programDialog(p, brands, sources, adapters, styles, done) {
   }, { wide: true });
 }
 // Video options (production method + method_config video keys). Reactor clips and music come from the media library.
-const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["REACTION_OVERLAY", "Reaction short — your clip with the source (split-screen or corner)"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap — narrated summary"]];
+const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["TELECAST_INTRO", "Telecast with intro — a narrated headline card, then the report"], ["REACTION_OVERLAY", "Reaction short — your clip with the source (split-screen or corner)"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap — narrated summary"]];
 function videoFields(p, uploads) {
   const mc = p?.method_config || {}, reactors = uploads.filter((u) => u.meta?.purpose === "reactor"), music = uploads.filter((u) => u.meta?.purpose === "music");
   return h("fieldset", null, h("legend", null, "Video"),

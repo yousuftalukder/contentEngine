@@ -2222,6 +2222,25 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
           "-filter_complex", vfc + afc, "-map", "[v]", ...(afc ? ["-map", "[a]"] : []), "-t", String(len), ...enc, file], { timeoutMs: 30 * 60000 });
         await cleanup(ov); break;
       }
+      case "TELECAST_INTRO": {
+        if (!extras.intro?.audio?.url) throw new Error("TELECAST_INTRO render needs extras.intro (the narrated headline)");
+        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical, false)) - 1] });
+        const [W, H] = renderSize(vertical ? "9:16" : "16:9"), vo = await toTmpFile(extras.intro.audio.url, "mp3"), still = tmpPath("jpg"), card = tmpPath("mp4");
+        const dur = ((await ffprobeDuration(vo)) || extras.intro.audio.duration_seconds || 4) + 0.6;
+        // The card's picture is the report's own first frame, blurred and darkened under the headline: it reads as the
+        // same story, not as a separate advert stuck on the front.
+        await exec("ffmpeg", ["-y", "-ss", String(clip.start + 0.5), "-i", sourcePath, "-frames:v", "1", "-q:v", "2", still]);
+        const cardAss = caps[caps.push(await writeCaptionsAss([{ start: 0, end: dur - 0.3, text: extras.intro.text }], 0, dur, { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, hook: extras.intro.headline })) - 1];
+        await exec("ffmpeg", ["-y", "-loop", "1", "-t", String(dur), "-i", still, "-i", vo, "-filter_complex",
+          `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=20:2,eq=brightness=-0.25,fps=30,setsar=1,${assVf(cardAss)},format=yuv420p[v];[1:a]apad,${AFMT}[a]`,
+          "-map", "[v]", "-map", "[a]", "-t", String(dur), ...SEG_ENCODE, "-c:a", "aac", "-b:a", "160k", card], { timeoutMs: 15 * 60000 });
+        file = tmpPath("mp4");
+        const mainA = await hasAudio(main);
+        await exec("ffmpeg", ["-y", "-i", card, "-i", main, ...(mainA ? [] : ["-f", "lavfi", "-t", String(clip.end - clip.start), "-i", "anullsrc=r=44100:cl=stereo"]), "-filter_complex",
+          `[0:v]fps=30,scale=${W}:${H},setsar=1[v0];[1:v]fps=30,scale=${W}:${H},setsar=1[v1];[0:a]${AFMT}[a0];[${mainA ? 1 : 2}:a]${AFMT}[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]`,
+          "-map", "[v]", "-map", "[a]", ...X264, file], { timeoutMs: 30 * 60000 });
+        await cleanup(main, vo, still, card); break;
+      }
       case "VOICEOVER": {
         // Our narration over the clip: the cut covers the whole narration, captions follow the new words, and the original
         // sound stays underneath at a low level instead of being dropped.
@@ -3490,6 +3509,20 @@ async function renderClipItem(itemId, clipId) {
     if (recap && d.beats?.length) { const total = d.beats.reduce((s, b) => s + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)), 0) || 1; const k = (audio.duration_seconds || total) / total; extras.scenes = d.beats.map((b) => ({ start: Number(b.start) || 0, end: (Number(b.start) || 0) + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)) * k })); }
     await setItem(itemId, { headline: d.title || clip.title, script, voice_asset_url: audio.url, hashtags: d.hashtags || [] });
   }
+  // Telecast with an intro (3c): the report as it was broadcast, after a short headline card our own voice reads —
+  // what a news page puts in front of a TV clip so the viewer knows what they are about to watch. The intro says only
+  // what the report says.
+  if (niche.production_method === "TELECAST_INTRO") {
+    const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 500,
+      system: `You are the news editor of "${niche.display_name}". ${langLine(niche.language)} You never state anything the report does not.`,
+      prompt: `A TV report: "${cand.title}". What is said in the part we publish:\n${script.slice(0, 2500)}\n\nWrite the intro a presenter reads before it — one or two sentences, at most 25 words, saying what happened — and an on-screen headline of at most 8 words. JSON: {"intro": "...", "headline": "..."}`,
+      mock: { intro: `${clip.title}.`, headline: clip.title } }));
+    await addCost(itemId, r.cost); const d = r.data || {};
+    const intro = String(d.intro || clip.title || "").trim(), headline = String(d.headline || clip.title || "").trim();
+    const voice = await voiceFor(niche); const audio = await voice.synthesize({ script: intro, voiceId: niche.voice_id, contentItemId: itemId, lang: niche.language }); await addCost(itemId, audio.cost);
+    extras.intro = { audio, text: intro, headline };
+    await setItem(itemId, { headline: headline || clip.title, script: `${intro}\n\n${script}` });
+  }
   if (niche.production_method === "REACTION_LONG") {
     // Plan the reaction: which parts of the source play, and what we say between them (at least ~30% commentary, so the
     // video is our own work rather than a re-upload). Each comment is voiced separately and timed by its measured audio.
@@ -4568,7 +4601,7 @@ const CATALOG = [
   { id: "2c", type: "News card", name: "Stock card", what: "A Pexels photo of the story's country behind the headline", runs: "server", needs: ["writer"], status: "proven", setup: { contentType: "NEWS_STATIC" } },
   { id: "3a", type: "News reel", name: "Photo reel", what: "The outlet's photo, local footage, Bangla narration, burned captions", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "NEWS_REEL" } },
   { id: "3b", type: "News reel", name: "Telecast clip", what: "A TV report cut to its moment — nothing written, nothing narrated", runs: "pc", needs: ["pc"], status: "proven", note: "Proven on an English TV report; Bangla speech needs hosted transcription (Gemini billing)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT" } },
-  { id: "3c", type: "News reel", name: "Telecast + intro", what: "3b with a narrated headline card in front", runs: "pc", needs: ["pc", "writer", "voice"], status: "to build" },
+  { id: "3c", type: "News reel", name: "Telecast + intro", what: "3b with a narrated headline card in front", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", setup: { contentType: "PODCAST_CLIP", productionMethod: "TELECAST_INTRO" } },
   { id: "4a", type: "Reaction", name: "Silent reaction", what: "The moment at 1.1× with your clip — split-screen or in the corner", runs: "server or pc", needs: ["persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY" } },
   { id: "4b", type: "Reaction", name: "Summary voiceover", what: "A few sentences of summary over the clip, its sound ducked", runs: "server or pc", needs: ["writer", "voice"], status: "proven", setup: { contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER" } },
   { id: "4c", type: "Reaction", name: "Long-form reaction", what: "Play / comment beats: the source in segments, your commentary between", runs: "server or pc", needs: ["writer", "voice", "persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG" } },
