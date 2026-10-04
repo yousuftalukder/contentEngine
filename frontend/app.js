@@ -576,11 +576,13 @@ function videoFields(p, uploads) {
       field("Reaction short layout", select("_reactionLayout", [["stack", "Split-screen — source on top, you below"], ["pip", "Corner — you over the whole source"]], mc.reaction_layout || "stack")),
       field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame."),
       field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
-      field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 }))),
+      field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 })),
+      field("Explainer style", select("_explainerStyle", [["", "General — the six layouts mixed"], ["data", "Data — charts, figures and timelines from the research's own numbers"]], mc.explainer_style || ""))),
     h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
 }
 function readVideo(v, mc) {
   const out = { ...mc, captions: !!v._captions, brand_finish: !!v._brandFinish, vertical_layout: v._verticalLayout || "crop", explainer_minutes: v._explainerMinutes ?? 3 };
+  if (v._explainerStyle) out.explainer_style = v._explainerStyle; else delete out.explainer_style;
   if (v._orientation) out.orientation = v._orientation; else delete out.orientation;
   if (v._reactor) out.reactor_url = v._reactor; else delete out.reactor_url;
   out.reaction_layout = v._reactionLayout || "stack";

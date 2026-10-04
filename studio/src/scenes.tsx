@@ -229,4 +229,62 @@ export const FullQuote: React.FC<SceneProps> = ({ data, brand, vertical }) => {
   );
 };
 
-export const LAYOUTS: Record<string, React.FC<SceneProps>> = { TitleCard, BulletReveal, IconGrid, Comparison, DataChart, FullQuote };
+// One figure, counted up to as the narrator says it: the shape of a data video's strongest line ("40% of the workforce").
+// The count eases out hard, so the last digits settle slowly enough to read; the label and its context arrive after.
+export const BigNumber: React.FC<SceneProps> = ({ data, cues, brand, vertical }) => {
+  const frame = useCurrentFrame();
+  const at = cue(cues, 0, 6), value = Number(data.value) || 0;
+  const t = interpolate(frame - at, [0, 42], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp", easing: EASE.out });
+  const decimals = Number.isInteger(value) ? 0 : Math.min(2, String(value).split(".")[1]?.length || 1);
+  const shown = (value * t).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const ring = interpolate(frame - at, [0, 30], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp", easing: EASE.out });
+  return (
+    <Body vertical={vertical} center>
+      <Heading text={data.heading} brand={brand} vertical={vertical} />
+      <div style={{ display: "flex", flexDirection: "column", alignItems: vertical ? "center" : "flex-start", transform: `translateY(${drift(frame, 4, 300)}px)` }}>
+        <div style={{ position: "relative", fontSize: vertical ? 220 : 240, fontWeight: 900, color: "#fff", lineHeight: 1, letterSpacing: "-0.03em", fontVariantNumeric: "tabular-nums" }}>
+          <span style={{ color: brand.accent }}>{data.prefix || ""}</span>{shown}<span style={{ color: brand.accent, fontSize: "0.5em", marginLeft: 12 }}>{data.unit || ""}</span>
+          <div style={{ position: "absolute", left: 0, bottom: -18, height: 10, width: `${ring * 100}%`, background: brand.accent, borderRadius: 5 }} />
+        </div>
+        <Reveal at={at + 30} style={{ fontSize: vertical ? 56 : 54, fontWeight: 700, color: "#fff", marginTop: 56, maxWidth: vertical ? 900 : 1400, textAlign: vertical ? "center" : "left" }}>{data.label}</Reveal>
+        {data.context ? <Reveal at={at + 44} style={{ fontSize: vertical ? 40 : 38, color: "rgba(255,255,255,.72)", marginTop: 18, maxWidth: vertical ? 900 : 1400, textAlign: vertical ? "center" : "left" }}>{data.context}</Reveal> : null}
+      </div>
+    </Body>
+  );
+};
+
+// Dated events along a line drawn as the story moves forward: across the frame on a landscape video, down it on a
+// vertical one. Each stop lands on the sentence that names it; the one being spoken is lifted, the rest wait dimmed.
+export const Timeline: React.FC<SceneProps> = ({ data, cues, brand, vertical }) => {
+  const frame = useCurrentFrame();
+  const events: { date: string; label: string }[] = (data.events || []).slice(0, 6).map((e: any) => ({ date: String(e.date || ""), label: String(e.label || "") }));
+  const n = Math.max(1, events.length), first = cue(cues, 0, 8), last = cue(cues, n - 1, first + (n - 1) * 24);
+  const drawn = interpolate(frame, [first - 6, last + 10], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp", easing: EASE.inOut });
+  const speaking = events.reduce((k, _, i) => (frame >= cue(cues, i, first + i * 24) ? i : k), -1);
+  return (
+    <Body vertical={vertical}>
+      <Heading text={data.heading} brand={brand} vertical={vertical} />
+      <div style={{ position: "relative", flex: 1, display: "flex", flexDirection: vertical ? "column" : "row", justifyContent: "space-between", alignItems: vertical ? "flex-start" : "center", marginTop: vertical ? 10 : 40 }}>
+        <div style={{ position: "absolute", background: "rgba(255,255,255,.12)", borderRadius: 4, ...(vertical ? { left: 22, top: 0, bottom: 0, width: 8 } : { left: 0, right: 0, top: "50%", height: 8, marginTop: -4 }) }} />
+        <div style={{ position: "absolute", background: brand.accent, borderRadius: 4, ...(vertical ? { left: 22, top: 0, width: 8, height: `${drawn * 100}%` } : { left: 0, top: "50%", height: 8, marginTop: -4, width: `${drawn * 100}%` }) }} />
+        {events.map((e, i) => {
+          const at = cue(cues, i, first + i * 24), inn = useEnter(at, 18), lift = useCue(at);
+          const dim = speaking >= 0 && i !== speaking ? 0.55 : 1;
+          return (
+            <div key={i} style={{ position: "relative", display: "flex", flexDirection: vertical ? "row" : "column", alignItems: "center", gap: vertical ? 34 : 18, opacity: inn * dim,
+              transform: `${vertical ? `translateX(${(1 - inn) * 30}px)` : `translateY(${(1 - inn) * 30 - lift * 12}px)`} scale(${1 + lift * 0.06})`, flex: vertical ? "0 0 auto" : 1, marginBottom: vertical ? 30 : 0 }}>
+              {!vertical ? <div style={{ fontSize: 44, fontWeight: 800, color: brand.accent, minHeight: 56 }}>{e.date}</div> : null}
+              <div style={{ width: 52, height: 52, borderRadius: 26, background: i <= speaking ? brand.accent : shade(brand.primary, -0.4), border: "6px solid #fff", flex: "0 0 auto", zIndex: 1 }} />
+              <div style={{ textAlign: vertical ? "left" : "center", maxWidth: vertical ? 760 : 320 }}>
+                {vertical ? <div style={{ fontSize: 44, fontWeight: 800, color: brand.accent }}>{e.date}</div> : null}
+                <div style={{ fontSize: vertical ? 42 : 34, color: "#fff", fontWeight: 600, lineHeight: 1.25 }}>{e.label}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Body>
+  );
+};
+
+export const LAYOUTS: Record<string, React.FC<SceneProps>> = { TitleCard, BulletReveal, IconGrid, Comparison, DataChart, FullQuote, BigNumber, Timeline };
