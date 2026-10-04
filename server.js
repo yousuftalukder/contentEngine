@@ -1029,6 +1029,7 @@ const WHISPER_DIR = ENV.WHISPER_DIR || "/opt/whisper";
 // choice is made from what /proc/cpuinfo reports here rather than from what was true on the machine that built it.
 let whisperBin;
 function whisperCli() {
+  if (ENV.WHISPER_CLI) return ENV.WHISPER_CLI;                                    // a named binary, or a stand-in in tests
   if (whisperBin === undefined) {
     const have = new Set(cpuFeatures());
     const fast = ["avx2", "fma", "f16c"].every((f) => have.has(f)) && existsSync("/usr/local/bin/whisper-cli-avx2");
@@ -1057,9 +1058,14 @@ impl("TRANSCRIBE", "whisper_cpp", { label: "whisper.cpp (on this machine, free)"
         // Fewer threads on a small box: each one carries its own scratch, and a fraction of a CPU does not go faster
         // for being divided into four.
         const threads = cfg.threads || (memoryLimitMb() < WHISPER_BIG_MEMORY_MB ? 2 : null);
-        await exec(whisperCli(), ["-m", model, "-f", wav, "-oj", "-of", base, "-nt",
+        // Timestamps on. With -nt whisper decodes each 30-second window as one block with no timing inside it, and every
+        // transcript in production came back as 0-30, 30-60, 60-90: the picker could not place a moment within half a
+        // minute, a clip's text spilled into its neighbours, and captions were spread evenly across each block instead
+        // of following the speech. Timestamps cost about 40% more decoding and give sentence-length segments.
+        const bin = whisperCli(), args = ["-m", model, "-f", wav, "-oj", "-of", base,
           ...(threads ? ["-t", String(threads)] : []),
-          ...(lang && lang !== "auto" ? ["-l", lang] : ["-l", "auto"])], { timeoutMs: 90 * 60000 });
+          ...(lang && lang !== "auto" ? ["-l", lang] : ["-l", "auto"])];
+        await (/\.m?js$/.test(bin) ? exec(process.execPath, [bin, ...args], { timeoutMs: 90 * 60000 }) : exec(bin, args, { timeoutMs: 90 * 60000 }));
         const data = JSON.parse(await readFile(`${base}.json`, "utf8"));
         const segs = (data.transcription || []).map((x) => ({
           start: Number(x.offsets?.from ?? 0) / 1000, end: Number(x.offsets?.to ?? 0) / 1000, text: String(x.text || "").trim(),
