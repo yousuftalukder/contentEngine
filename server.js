@@ -4152,6 +4152,18 @@ async function sweepReviewDeadlines() {
   const due = await q(`SELECT id FROM content_items WHERE status='PENDING_REVIEW' AND review_deadline_at IS NOT NULL AND review_deadline_at <= now() LIMIT 20`);
   for (const it of due) { try { await approveItem(it.id, { auto: true }); log(`auto-approved ${it.id} after review window`); } catch (e) { warn("auto-approve failed", e.message); } }
 }
+// News that nobody reviewed in a day is not news any more. Production had 2,602 drafts waiting, 2,408 of them older
+// than a day, and the morning's stories were buried under last week's. A news draft (a card or a news reel; clips and
+// other videos keep) still waiting after review.news_expiry_hours is set aside with a note saying why — a status, not a
+// deletion, and 0 turns it off.
+async function sweepStaleNews() {
+  const hours = Number(await setting("review.news_expiry_hours", 24));
+  if (!(hours > 0)) return;
+  const gone = await q(`UPDATE content_items SET status = 'REJECTED', rejection_note = $2
+    WHERE status = 'PENDING_REVIEW' AND content_type IN ('NEWS_STATIC', 'NEWS_REEL') AND created_at < now() - ($1 || ' hours')::interval RETURNING id`,
+    [String(hours), `Expired unreviewed: news older than ${hours} hours is not published (Settings → review.news_expiry_hours).`]);
+  if (gone.length) log(`review: ${gone.length} news draft(s) older than ${hours} h set aside unreviewed`);
+}
 async function sweepMetrics() {
   const rows = await q(`SELECT id FROM content_assets WHERE status='PUBLISHED' AND published_at > now() - interval '14 days' AND (last_metrics IS NULL OR (last_metrics->>'at')::timestamptz < now() - interval '6 hours') LIMIT 30`);
   for (const a of rows) await enqueue("POLL_METRICS", { assetId: a.id }, { queue: "metrics", dedupeKey: `metrics:${a.id}`, maxAttempts: 1 });
@@ -4379,7 +4391,7 @@ function startWorkers() {
   }
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
-  every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(30 * 60000, sweepMetrics);
+  every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(10 * 60000, sweepStaleNews); every(30 * 60000, sweepMetrics);
   every(6 * 3600000, sweepRetention); every(60 * 60000, sweepPlanner); every(10 * 60000, sweepSeries); every(60 * 60000, sweepStyleRefinement);
   every(15 * 60000, sweepHealth);
   upgradeExistingPrograms().then(upgradeAdapters).then(syncCatalogSources).catch((e) => warn("upgrade", e.message));

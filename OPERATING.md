@@ -25,6 +25,14 @@ shows the PC as off and the work as waiting.
    - **"Caption not written — the writer refused"** — the AI was out of its free allowance; the clip's own words stand
      in. Rewrite the caption before posting.
 3. **Overview** shows alerts (a key out of credit, a feed failing) and whether the AI allowance is waiting to reset.
+4. News you have not reviewed within **24 hours** is set aside as "Expired unreviewed" — day-old news is not worth
+   publishing, and it buried the fresh stories (2,400 day-old drafts had piled up). Change the window, or turn it off
+   with 0, in **Settings → review.news_expiry_hours**. Clips and other videos never expire.
+
+**Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
+Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each
+Page's token encrypted), attach it to your programmes, and approved posts go out with the source link as the first
+comment.
 
 ## Making clips from a long video
 
@@ -47,6 +55,7 @@ Reaction videos, voice-overs, recaps and "telecast with intro" are the same flow
 
 | you add | where | unlocks |
 |---|---|---|
+| your **Facebook Page** | dashboard → **Channels → Connect Facebook** | real publishing (today the channel is a mock) |
 | your **Gemini key** in the vault | dashboard → **API keys** (paste it there, not only on Render) | the AI picker and writer on your PC; animated explainers (6a, 6b) end to end |
 | **Gemini billing** | Google AI Studio → Billing | no more daily allowance stops; scene recap (5a); illustrated series (6c, needs image generation); Bangla speech transcription for TV clips |
 | a **reactor clip** of yourself | dashboard → Brands → Media library (purpose: reactor) | reaction videos you can publish (4a, 4c — proven with a stand-in) |
