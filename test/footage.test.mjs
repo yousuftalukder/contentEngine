@@ -17,7 +17,8 @@ let eng, brand;
 before(async () => {
   if (!ffmpeg) return;
   ff("-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=40", "-f", "lavfi", "-i", "sine=frequency=330:duration=40", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", join(dir, "source.mp4"));
-  ff("-f", "lavfi", "-i", "mandelbrot=size=480x480:rate=30", "-t", "5", "-c:v", "libx264", "-pix_fmt", "yuv420p", join(dir, "reactor.mp4"));
+  // 24 fps, like a phone recording: a host clip at the same rate as the source hides a frame-rate bug in older ffmpeg.
+  ff("-f", "lavfi", "-i", "mandelbrot=size=480x480:rate=24", "-t", "5", "-c:v", "libx264", "-pix_fmt", "yuv420p", join(dir, "reactor.mp4"));
   ff("-f", "lavfi", "-i", "color=c=0xffb300:s=320x120", "-frames:v", "1", join(dir, "logo.png"));
   eng = await startEngine();
   await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });

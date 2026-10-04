@@ -5,9 +5,9 @@ name: Image
 on:
   push:
     branches: [main]
-    paths: [Dockerfile, .dockerignore, studio/**, package.json, package-lock.json, .github/workflows/image.yml]
+    paths: [Dockerfile, .dockerignore, studio/**, package.json, package-lock.json, .github/workflows/image.yml, .github/image-check.sh]
   pull_request:
-    paths: [Dockerfile, .dockerignore, studio/**, package.json, package-lock.json, .github/workflows/image.yml]
+    paths: [Dockerfile, .dockerignore, studio/**, package.json, package-lock.json, .github/workflows/image.yml, .github/image-check.sh]
   workflow_dispatch:
 
 jobs:

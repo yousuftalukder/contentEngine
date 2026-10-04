@@ -2071,7 +2071,6 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         // a fixed 1080×1920 once took a free instance past its memory and killed the job.
         const ovUrl = c.overlay_video_url || c.reactor_url; if (!ovUrl) throw new Error("REACTION_OVERLAY needs method_config.overlay_video_url (your own reaction clip)");
         const speed = Math.min(1.5, Math.max(1, Number(c.speed) || 1)), len = (clip.end - clip.start) / speed;
-        const main = await cutClip(sourcePath, clip.start, clip.end, { vertical: false });
         const ov = await toTmpFile(ovUrl, "mp4"); file = tmpPath("mp4");
         const [W, H] = renderSize("9:16"), half = Math.round(H / 4) * 2, margin = Math.round(W * 0.045);
         // The captions go on after the stack, not into the clip before it: burned in first they are sized for a wide
@@ -2080,18 +2079,26 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         const at = (t) => clip.start + (t - clip.start) / speed;
         const fastSegs = segs.map((x) => ({ ...x, start: at(x.start), end: at(x.end), words: x.words?.map((w) => ({ ...w, start: at(w.start), end: at(w.end) })) }));
         const stackAss = caps[caps.push(await assFor(true, false, fastSegs, clip.start, clip.start + len)) - 1];
-        const fast = speed !== 1 ? `setpts=PTS/${speed},` : "";
+        // Both pictures are brought to one frame rate before they are combined. Debian's ffmpeg 5.1 — the one on Render —
+        // never finishes a vstack of a 30 fps source and a 24 fps phone clip (6.1 does it in seconds), and the job then
+        // sits until its timeout and is retried into the same wall.
+        const fast = `${speed !== 1 ? `setpts=PTS/${speed},` : ""}fps=30,`;
         const box = (w, h) => `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
         const pip = c.reaction_layout === "pip", hostW = Math.round((W * 0.38) / 2) * 2;
         const vfc = pip
-          ? `[0:v]${fast}${vfVerticalBlurpad()}[m];[1:v]scale=${hostW}:-2,setsar=1,pad=iw+8:ih+8:4:4:color=white[o];[m][o]overlay=W-w-${margin}:${Math.round(H * 0.1)}:shortest=0,${assVf(stackAss)}[v]`
-          : `[0:v]${fast}${box(W, half)}[m];[1:v]${box(W, H - half)}[o];[m][o]vstack=inputs=2,${assVf(stackAss)}[v]`;
+          ? `[0:v]${fast}${vfVerticalBlurpad()}[m];[1:v]fps=30,scale=${hostW}:-2,setsar=1,pad=iw+8:ih+8:4:4:color=white[o];[m][o]overlay=W-w-${margin}:${Math.round(H * 0.1)}:shortest=1,${assVf(stackAss)}[v]`
+          : `[0:v]${fast}${box(W, half)}[m];[1:v]fps=30,${box(W, H - half)}[o];[m][o]vstack=inputs=2:shortest=1,${assVf(stackAss)}[v]`;
         // The source's sound at the new speed with the host's on top; whichever side has no audio track is left out.
-        const [mainA, hostA] = [await hasAudio(main), await hasAudio(ov)], hostVol = Number(c.reactor_volume ?? 1);
+        const [mainA, hostA] = [await hasAudio(sourcePath), await hasAudio(ov)], hostVol = Number(c.reactor_volume ?? 1);
         const afc = mainA && hostA ? `;[0:a]${speed !== 1 ? `atempo=${speed},` : ""}${AFMT}[ma];[1:a]volume=${hostVol},${AFMT}[ra];[ma][ra]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[a]`
           : mainA ? `;[0:a]${speed !== 1 ? `atempo=${speed},` : ""}anull[a]` : hostA ? `;[1:a]volume=${hostVol}[a]` : "";
-        await exec("ffmpeg", ["-y", "-i", main, "-stream_loop", "-1", "-i", ov, "-filter_complex", vfc + afc, "-map", "[v]", ...(afc ? ["-map", "[a]"] : []), "-t", String(len), ...X264, file], { timeoutMs: 30 * 60000 });
-        await cleanup(main, ov); break;
+        // One pass straight from the source: a separate full-quality landscape cut first was thrown away by this step,
+        // and was the most expensive encode of the three on a small instance. When the brand pass follows, this is an
+        // intermediate too, so it is written fast and nearly lossless rather than slowly and well.
+        const enc = c.brand_finish !== false ? ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"] : X264;
+        await exec("ffmpeg", ["-y", "-ss", String(clip.start), "-t", String(clip.end - clip.start), "-i", sourcePath, "-stream_loop", "-1", "-i", ov,
+          "-filter_complex", vfc + afc, "-map", "[v]", ...(afc ? ["-map", "[a]"] : []), "-t", String(len), ...enc, file], { timeoutMs: 30 * 60000 });
+        await cleanup(ov); break;
       }
       case "VOICEOVER": {
         // Our narration over the clip: the cut covers the whole narration, captions follow the new words, and the original
