@@ -69,3 +69,14 @@ timeout 120 ffmpeg -hide_banner -loglevel error -y -i /tmp/src.mp4 -stream_loop 
   -map "[v]" -t 5 -c:v libx264 -preset ultrafast /tmp/stack.mp4 || { echo "FAIL: the reaction stack did not finish on this ffmpeg"; exit 1; }
 sdur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/stack.mp4)
 echo "ok: stacked ${sdur}s from a 30 fps source and a 24 fps clip"
+
+echo "== the brand pass levels the sound on this ffmpeg =="
+# The last pass on every footage video: loudness to -14 LUFS at 48 kHz. On this image's ffmpeg (5.1) the chain failed
+# outright without the closing aformat ("Cannot select channel layout"), and the engine fell back to the unbranded,
+# unlevelled file on every video it rendered.
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=300:duration=4" -f lavfi -i "color=c=black:s=320x240:d=4" -ac 2 -shortest /tmp/plain.mp4
+ffmpeg -hide_banner -loglevel error -y -i /tmp/plain.mp4 -filter_complex "[0:v]null[v];[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo[a]" \
+  -map "[v]" -map "[a]" -c:v libx264 -preset ultrafast -c:a aac /tmp/finished.mp4 || { echo "FAIL: the brand pass audio chain is refused by this ffmpeg"; exit 1; }
+rate=$(ffprobe -v error -select_streams a -show_entries stream=sample_rate -of csv=p=0 /tmp/finished.mp4)
+[ "$rate" = "48000" ] || { echo "FAIL: finished audio is ${rate} Hz"; exit 1; }
+echo "ok: the brand pass ran and wrote ${rate} Hz audio"

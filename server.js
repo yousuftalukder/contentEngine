@@ -1841,7 +1841,8 @@ const assVf = (file, fontsDir = null) => { const d = fontsDirFor(fontsDir); retu
 const ASS_FORMAT = "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding";
 // Captions for [start, end] of a timed transcript, shifted to 0 and cut into short phrases (a few words, timed by character
 // count). Karaoke colours each word as it is spoken. An optional hook sits in a box at the top for the first four seconds.
-async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1920, hook = null, font = OVERLAY_FONT, karaoke = true, accent = "#ffd400" } = {}) {
+// `middle` centres the captions in the frame — on the seam of a split screen, where they cover neither picture.
+async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1920, hook = null, font = OVERLAY_FONT, karaoke = true, accent = "#ffd400", middle = false } = {}) {
   const vertical = height > width, size = Math.round(height * (vertical ? 0.04 : 0.052)), maxWords = vertical ? 4 : 8, events = [];
   const weight = (w) => w.length + 1;
   for (const s of (segments || []).filter((x) => x.end > start && x.start < end)) {
@@ -1858,7 +1859,7 @@ async function writeCaptionsAss(segments, start, end, { width = 1080, height = 1
   const white = assColor("#ffffff"), mx = Math.round(width * 0.07);
   const ass = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n${ASS_FORMAT}\n`
     // Karaoke: SecondaryColour = not yet spoken, PrimaryColour = spoken.
-    + `Style: Cap,${font},${size},${karaoke ? assColor(accent) : white},${white},&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(size * 0.09))},${Math.round(size * 0.05)},2,${mx},${mx},${Math.round(height * (vertical ? 0.22 : 0.07))},1\n`
+    + `Style: Cap,${font},${size},${karaoke ? assColor(accent) : white},${white},&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(size * 0.09))},${Math.round(size * 0.05)},${middle ? 5 : 2},${mx},${mx},${Math.round(height * (vertical ? 0.22 : 0.07))},1\n`
     + `Style: Hook,${font},${Math.round(size * 1.05)},${white},${white},&H70000000,&H70000000,-1,0,0,0,100,100,0,0,3,${Math.round(size * 0.3)},0,8,${mx},${mx},${Math.round(height * (vertical ? 0.12 : 0.06))},1\n`
     + `\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n`;
   const f = tmpPath("ass"); await writeFile(f, ass); return f;
@@ -1938,6 +1939,8 @@ async function cutClip(input, start, end, { vertical = true, ass = null, layout 
 }
 const hasAudio = async (file) => { try { const { out } = await exec("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", file]); return out.trim().length > 0; } catch { return false; } };
 // Last pass on every footage video: the brand logo in a corner and loudness normalised for social platforms (-14 LUFS).
+// It reports whether it ran: a pass that fails leaves the video unbranded and unlevelled rather than failing the job,
+// and that was invisible — on Render's ffmpeg 5.1 it failed on every video for weeks while the PC's 6.1 hid it.
 async function brandFinish(file, niche, { vertical = true } = {}) {
   const { brand } = await studioBrand(niche); const out = tmpPath("mp4"), audio = await hasAudio(file);
   const fw = renderSize(vertical ? "9:16" : "16:9")[0];
@@ -1945,9 +1948,11 @@ async function brandFinish(file, niche, { vertical = true } = {}) {
   try {
     const args = ["-y", "-i", file, ...(brand.logo ? ["-i", brand.logo] : [])];
     const fc = brand.logo ? `[1:v]scale=${logoW}:-1,format=rgba,colorchannelmixer=aa=0.88[lg];[0:v][lg]overlay=${margin}:${margin}[v]` : "[0:v]null[v]";
-    await exec("ffmpeg", [...args, "-filter_complex", fc + (audio ? ";[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a]" : ""), "-map", "[v]", ...(audio ? ["-map", "[a]"] : []), ...X264, out]);
-    await cleanup(file); return out;
-  } catch (e) { warn(`brand finish skipped: ${e.message.slice(0, 160)}`); await cleanup(out); return file; }
+    // The layout is named after the resample: ffmpeg 5.1 cannot choose one for the encoder on its own there and
+    // refuses the whole pass ("Cannot select channel layout"), whatever the source's audio was.
+    await exec("ffmpeg", [...args, "-filter_complex", fc + (audio ? ";[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo[a]" : ""), "-map", "[v]", ...(audio ? ["-map", "[a]"] : []), ...X264, out]);
+    await cleanup(file); return { file: out, finish: "done" };
+  } catch (e) { warn(`brand finish skipped: ${e.message.slice(0, 160)}`); await cleanup(out); return { file, finish: `skipped: ${e.message.slice(-200)}` }; }
   finally { await cleanup(brand.logo, brand.fontUrl); }
 }
 // Long-form reaction: the source plays in segments with the reactor picture-in-picture; between them the video pauses on a
@@ -2078,13 +2083,17 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         // the faster playback.
         const at = (t) => clip.start + (t - clip.start) / speed;
         const fastSegs = segs.map((x) => ({ ...x, start: at(x.start), end: at(x.end), words: x.words?.map((w) => ({ ...w, start: at(w.start), end: at(w.end) })) }));
-        const stackAss = caps[caps.push(await assFor(true, false, fastSegs, clip.start, clip.start + len)) - 1];
+        const pip = c.reaction_layout === "pip", hostW = Math.round((W * 0.38) / 2) * 2;
+        const stackAss = caps[caps.push(pip ? await assFor(true, false, fastSegs, clip.start, clip.start + len)
+          : await writeCaptionsAss(fastSegs, clip.start, clip.start + len, { width: 1080, height: 1920, middle: true })) - 1];
         // Both pictures are brought to one frame rate before they are combined. Debian's ffmpeg 5.1 — the one on Render —
         // never finishes a vstack of a 30 fps source and a 24 fps phone clip (6.1 does it in seconds), and the job then
         // sits until its timeout and is retried into the same wall.
         const fast = `${speed !== 1 ? `setpts=PTS/${speed},` : ""}fps=30,`;
-        const box = (w, h) => `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
-        const pip = c.reaction_layout === "pip", hostW = Math.round((W * 0.38) / 2) * 2;
+        // Each half is filled, not fitted: a 16:9 picture fitted into a near-square half is a strip with black above and
+        // below, and a source that already carries black side bars (most archive footage) shrinks to a stamp. Filling
+        // trims the sides, which for a speaker or a face is the part nobody watches.
+        const box = (w, h) => `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1`;
         const vfc = pip
           ? `[0:v]${fast}${vfVerticalBlurpad()}[m];[1:v]fps=30,scale=${hostW}:-2,setsar=1,pad=iw+8:ih+8:4:4:color=white[o];[m][o]overlay=W-w-${margin}:${Math.round(H * 0.1)}:shortest=1,${assVf(stackAss)}[v]`
           : `[0:v]${fast}${box(W, half)}[m];[1:v]fps=30,${box(W, H - half)}[o];[m][o]vstack=inputs=2:shortest=1,${assVf(stackAss)}[v]`;
@@ -2129,8 +2138,9 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
       default: file = await cutClip(sourcePath, clip.start, clip.end, { vertical, layout, ass: caps[caps.push(await assFor(vertical)) - 1] });
     }
     await cleanup(...caps);
-    if (c.brand_finish !== false) file = await brandFinish(file, niche, { vertical });
-    return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip });
+    let finish = "off";
+    if (c.brand_finish !== false) ({ file, finish } = await brandFinish(file, niche, { vertical }));
+    return publishRender(file, contentItemId, { method: niche.production_method, orientation: vertical ? "9:16" : "16:9", clip, brand_finish: finish });
   },
   // durations (seconds per picture) follow the narration section by section; without them the pictures share it equally.
   async renderSlideshow({ images, audio, durations = null, contentItemId, orientation = "9:16", captions = [], niche = null, headline = null, kicker = null, credit = null, hook = null }) {
