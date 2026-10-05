@@ -1530,10 +1530,14 @@ impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSch
       i = k;
     }
     const picks = []; let cost = 0;
+    // The caption is written in the same request: the model has just read the whole transcript and knows what each
+    // moment says and why it matters. It used to be a request of its own per clip — on a free key, with 20 requests a
+    // day per model, three captions cost as much as three more videos.
+    const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
     for (const [n, piece] of pieces.entries()) {
-      const r = await withFallbacks("SCRIPT", primary, fallbacks, (llm) => llm.complete({ json: true, maxTokens: 3000,
-        system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}. Tone: ${niche.tone || "engaging"}.`,
-        prompt: `Video: "${candidate.title}"\nTimestamped transcript${pieces.length > 1 ? ` (part ${n + 1} of ${pieces.length})` : ""}:\n${piece}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why"}]`,
+      const r = await withFallbacks("SCRIPT", primary, fallbacks, (llm) => llm.complete({ json: true, maxTokens: 4000,
+        system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}, and write the post that goes with each. Tone: ${niche.tone || "engaging"}. Captions: ${langLine(niche.language)}${styleBlock(style, niche)}`,
+        prompt: `Video: "${candidate.title}"\nTimestamped transcript${pieces.length > 1 ? ` (part ${n + 1} of ${pieces.length})` : ""}:\n${piece}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. For each clip also write the post: a caption of 1-3 sentences saying what the clip shows and why it is worth watching — only what is actually said in it, no hashtags in the caption — and 3-6 hashtags. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why", "caption": "...", "hashtags": ["..."]}]`,
         mock: [{ start: 0, end: c.clip_min_seconds + 10, title: "Mock clip", hook: "Mock hook", score: 0.7, reason: "mock" }] }));
       cost += r.cost || 0;
       picks.push(...(Array.isArray(r.data) ? r.data : r.data?.clips || []));
@@ -1557,7 +1561,7 @@ impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSch
       const energy = energyOf(loud, start, end);
       const score = Number(((Number.isFinite(said) ? clamp(said, 0, 1) : 0.6) * 0.75 + energy * 0.25).toFixed(3));
       const moved = Math.abs(start - rawStart) + Math.abs(end - rawEnd);
-      return { start, end, title: x.title || candidate.title, hook: x.hook || "", score,
+      return { start, end, title: x.title || candidate.title, hook: x.hook || "", score, caption: typeof x.caption === "string" ? x.caption.trim() : "", hashtags: Array.isArray(x.hashtags) ? x.hashtags : [],
         reason: [x.reason, moved > 0.05 ? `cut moved ${moved.toFixed(1)}s to the nearest pause or sentence start` : null].filter(Boolean).join("; ") };
     })
       .filter((x) => x.end - x.start >= Math.min(10, c.clip_min_seconds * 0.5)).sort((a, b) => b.score - a.score)
@@ -4174,7 +4178,12 @@ JSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "cha
   // its existence: it goes to review with the clip's own words as its caption and a note saying so.
   const plain = { headline: c.title, captions: { facebook: c.hook || c.title, instagram: c.hook || c.title, youtube: `Clip from ${cand.title}` }, hashtags: [] };
   let cap, captionNote = null;
-  try { cap = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 600,
+  // The picker wrote the caption when it chose the moment; a clip whose words are still the speaker's own uses it and
+  // spends no request here. Methods that rewrite what is said (a voice-over, a recap, a long reaction) still write theirs.
+  const picked = (P(item.source_data_ref) || {}).clip || {};
+  if (picked.caption && !["VOICEOVER", "MOVIE_RECAP", "SCENE_RECAP", "REACTION_LONG"].includes(niche.production_method || "")) {
+    cap = { cost: 0, data: { headline: c.title, captions: { facebook: picked.caption, instagram: picked.caption, youtube: `${picked.caption}\n\nClip from ${cand.title}` }, hashtags: currentYearTags(picked.hashtags) } };
+  } else try { cap = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 600,
     system: `You write social captions for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
     prompt: `Clip title: ${c.title}\nHook: ${c.hook}\nWhat is said: ${script.slice(0, 1500)}\nSource: ${cand.title}\nReturn JSON: {"headline": "video title max 90 chars", "captions": {"facebook": "...", "instagram": "...", "youtube": "description with credit to the source"}, "hashtags": ["..."]}`,
     mock: { ...plain, hashtags: ["shorts"] } })); }
@@ -4389,6 +4398,13 @@ async function reviseFromQa(itemId, niche, report) {
 }
 async function qualityGate(itemId, niche) {
   const cfg = await qaCfg(niche); if (!cfg.enabled) return { status: "SKIPPED" };
+  // A trimmed clip under hand review: its only text is a caption written from the speaker's own words, the person
+  // reviewing it is the check, and the automated one cost one to three requests per clip of a free allowance of twenty
+  // a day per model. It still runs for programmes that publish by themselves, where it is the only gate.
+  if ((niche.approval_mode || "MANUAL") === "MANUAL" && !(P(niche.method_config) || {}).qa?.check_clips) {
+    const it = await one(`SELECT clip_id FROM content_items WHERE id = $1`, [itemId]);
+    if (it?.clip_id && ["PODCAST_HIGHLIGHT", "REACTION_OVERLAY", "TELECAST_INTRO", ""].includes(niche.production_method || "")) return { status: "SKIPPED" };
+  }
   try {
     let qa = await runQa(itemId, niche);
     if (qa.status === "REVIEW" && cfg.auto_fix && (await reviseFromQa(itemId, niche, qa.report))) {
