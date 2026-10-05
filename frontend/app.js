@@ -677,7 +677,8 @@ function automationFields(mc) {
     h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_qaEnabled", "Quality check every draft", qa.enabled ?? true), check("_qaAutoFix", "Let it fix flagged drafts once", qa.auto_fix ?? true)),
     h("div", { class: "grid3", style: "margin-top:8px" },
       field("Pass score (0-1)", num("_qaMinScore", qa.min_score ?? 0.75, { step: "0.05", min: 0, max: 1 })),
-      field("Autopilot ideas per day", num("_apTopics", ap.topics_per_day ?? 0, { min: 0 }), "The planner writes this many of its best ideas itself. 0 = off.")),
+      field("Autopilot ideas per day", num("_apTopics", ap.topics_per_day ?? 0, { min: 0 }), "The planner writes this many of its best ideas itself. 0 = off."),
+      field("Stop drafting when this many wait for review", num("_backlog", mc.review_backlog ?? "", { min: 0, placeholder: "30 (Settings)" }), "Manual review only. Empty: the setting review.max_waiting (30); 0: never stop. Keeps the free AI allowance for work you will see.")),
     h("div", { class: "grid3", "data-for": "news" },
       field("Outlets required", num("_deskMinSources", d.min_sources ?? 1, { min: 1 }), "News: 2+ waits until a second outlet confirms a story."),
       field("Wait for more outlets (min)", num("_deskSettle", d.settle_minutes ?? 5, { min: 0 })),
@@ -689,6 +690,7 @@ function readAutomation(v, mc) {
   const out = { ...mc, qa: { ...(mc.qa || {}), enabled: !!v._qaEnabled, auto_fix: !!v._qaAutoFix, min_score: v._qaMinScore ?? 0.75 },
     desk: { ...(mc.desk || {}), min_sources: v._deskMinSources ?? 1, settle_minutes: v._deskSettle ?? 5, max_age_hours: v._deskMaxAge ?? 12, per_sweep: v._deskPerSweep ?? 2, min_gap_minutes: v._deskGap ?? 10 },
     autopilot: { ...(mc.autopilot || {}), topics_per_day: v._apTopics ?? 0 } };
+  if (v._backlog == null) delete out.review_backlog; else out.review_backlog = v._backlog;
   for (const k of Object.keys(v)) if (k.startsWith("_")) delete v[k];
   return out;
 }

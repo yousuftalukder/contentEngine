@@ -28,6 +28,10 @@ shows the PC as off and the work as waiting.
 4. News you have not reviewed within **24 hours** is set aside as "Expired unreviewed" — day-old news is not worth
    publishing, and it buried the fresh stories (2,400 day-old drafts had piled up). Change the window, or turn it off
    with 0, in **Settings → review.news_expiry_hours**. Clips and other videos never expire.
+5. A programme you review by hand stops drafting while **30** of its drafts are already waiting for you, and starts
+   again as you review them (or they expire). Drafting faster than anyone reads spent the whole free Gemini allowance
+   on news nobody saw — 222 drafts in one day — and left the clips without the AI that picks their best moments.
+   Change it in **Settings → review.max_waiting** (0 = never stop), or per programme under Automation.
 
 **Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
 Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each

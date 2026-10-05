@@ -272,3 +272,25 @@ test("the desk prefers a story that came with a photo and a summary", async () =
   }, { timeout: 40000, what: "the desk to pick one" });
   assert.match(order[0].topic, /Ferry capsizes/, `it reached first for the story it can actually make something of — took "${order[0].topic}"`);
 });
+
+// A programme reviewed by hand never drafts faster than it is read: with two drafts waiting, the desk takes no more
+// stories, however many there are; once one is reviewed, it takes the next.
+test("a hand-reviewed programme stops drafting while its review backlog is full, and resumes as it is read", async () => {
+  const s = await eng.api("POST", "/api/sources", { name: "Busy outlet", adapterKey: "ingest_mock", config: { items: [
+    { title: "Metro rail adds a new station at Kamalapur", url: "https://busy.example/1" },
+    { title: "Rice prices fall for a third week in Dhaka markets", url: "https://busy.example/2" },
+    { title: "New bridge opens over the Padma tributary", url: "https://busy.example/3" },
+    { title: "Schools reopen after the monsoon floods recede", url: "https://busy.example/4" }] } });
+  const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "backlog_news", displayName: "Backlog News", contentType: "NEWS_STATIC", country: "Bangladesh", useMocks: true,
+    approvalMode: "MANUAL", sourceIds: [s.id], methodConfig: { review_backlog: 2, qa: { enabled: false }, desk: { settle_minutes: 0, min_gap_minutes: 0, per_sweep: 5, max_pending: 10 } } });
+  await eng.api("POST", `/api/sources/${s.id}/poll`);
+  await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id = $1 AND cluster_id IS NOT NULL`, [s.id])).length === 4, { what: "four stories clustered" });
+  const drafts = async () => eng.api("GET", `/api/content-items?nicheId=${p.id}`);
+  for (let i = 0; i < 4; i++) { await eng.api("POST", "/api/desk/run"); await waitFor(async () => (await drafts()).every((x) => x.status === "PENDING_REVIEW"), { what: "drafts settled" }); }
+  assert.equal((await drafts()).length, 2, "two drafts waiting, so no third");
+
+  const [first] = await drafts();
+  await eng.query(`UPDATE content_items SET status = 'REJECTED' WHERE id = $1`, [first.id]);
+  await eng.api("POST", "/api/desk/run");
+  await waitFor(async () => { const d = await drafts(); return d.length === 3 && d.every((x) => ["PENDING_REVIEW", "REJECTED"].includes(x.status)); }, { what: "the next story taken" });
+});
