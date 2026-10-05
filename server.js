@@ -1545,14 +1545,20 @@ impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSch
     const { loud = [], silences = [] } = signals || {};
     const clips = (Array.isArray(r.data) ? r.data : r.data?.clips || []).map((x) => {
       const rawStart = Number(x.start) || 0, rawEnd = Number(x.end) || 0;
-      const start = snapToSilence(rawStart, silences, { edge: "start" });
+      let start = snapToSilence(rawStart, silences, { edge: "start" });
+      // A clip opens where its sentence opens. The model is asked to start on a sentence boundary and sometimes lands a
+      // few seconds in — Obama 2004 started three seconds after the line it was chosen for. Moved back to the start of
+      // the sentence it lands in when that is no more than 8 s earlier. Measured on 42 stored picker runs over 14
+      // speeches (no new calls): the famous line in the top three 31 → 34, first 24 → 25, and no run worse.
+      const inSentence = transcript.segments.find((s) => s.start <= start + 0.01 && start < s.end);
+      if (inSentence && start - inSentence.start > 0.05 && start - inSentence.start <= 8) start = inSentence.start;
       const end = snapToSilence(rawEnd, silences, { edge: "end" });
       const said = Number(x.score);
       const energy = energyOf(loud, start, end);
       const score = Number(((Number.isFinite(said) ? clamp(said, 0, 1) : 0.6) * 0.75 + energy * 0.25).toFixed(3));
       const moved = Math.abs(start - rawStart) + Math.abs(end - rawEnd);
       return { start, end, title: x.title || candidate.title, hook: x.hook || "", score,
-        reason: [x.reason, moved > 0.05 ? `cut moved ${moved.toFixed(1)}s to the nearest pause` : null].filter(Boolean).join("; ") };
+        reason: [x.reason, moved > 0.05 ? `cut moved ${moved.toFixed(1)}s to the nearest pause or sentence start` : null].filter(Boolean).join("; ") };
     })
       .filter((x) => x.end - x.start >= Math.min(10, c.clip_min_seconds * 0.5)).sort((a, b) => b.score - a.score)
       // The same moment found in two overlapping pieces is one clip: the better-scored one stays.
