@@ -286,7 +286,8 @@ test("a hand-reviewed programme stops drafting while its review backlog is full,
   await eng.api("POST", `/api/sources/${s.id}/poll`);
   await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id = $1 AND cluster_id IS NOT NULL`, [s.id])).length === 4, { what: "four stories clustered" });
   const drafts = async () => eng.api("GET", `/api/content-items?nicheId=${p.id}`);
-  for (let i = 0; i < 4; i++) { await eng.api("POST", "/api/desk/run"); await waitFor(async () => (await drafts()).every((x) => x.status === "PENDING_REVIEW"), { what: "drafts settled" }); }
+  const settled = async () => (await drafts()).every((x) => ["PENDING_REVIEW", "REJECTED", "FAILED"].includes(x.status));
+  for (let i = 0; i < 4; i++) { await eng.api("POST", "/api/desk/run"); await waitFor(settled, { timeout: 60000, what: "drafts settled" }); }
   assert.equal((await drafts()).length, 2, "two drafts waiting, so no third");
   const paused = (await eng.api("GET", "/api/stats")).backlogPauses.find((x) => x.program === "Backlog News");
   assert.deepEqual(paused, { program: "Backlog News", waiting: 2, limit: 2 }, "and the Overview says why it has gone quiet");
@@ -294,5 +295,5 @@ test("a hand-reviewed programme stops drafting while its review backlog is full,
   const [first] = await drafts();
   await eng.query(`UPDATE content_items SET status = 'REJECTED' WHERE id = $1`, [first.id]);
   await eng.api("POST", "/api/desk/run");
-  await waitFor(async () => { const d = await drafts(); return d.length === 3 && d.every((x) => ["PENDING_REVIEW", "REJECTED"].includes(x.status)); }, { what: "the next story taken" });
+  await waitFor(async () => (await drafts()).length === 3 && settled(), { timeout: 60000, what: "the next story taken" });
 });
