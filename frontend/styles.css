@@ -198,7 +198,7 @@ tr:hover td { background: rgba(255,255,255,.02); }
 .qa-red { border-left-color: var(--red); }
 .qa-list { margin: 2px 0 0; padding-left: 18px; font-size: 13px; }
 .bar-cell { display: flex; align-items: center; gap: 8px; }
-.bar { height: 8px; min-width: 2px; background: var(--blue); border-radius: 4px; }
+.meter { height: 8px; min-width: 2px; background: var(--blue); border-radius: 4px; }   /* insights bars; ".bar" is the review action bar */
 .kit-preview img { width: 100%; max-width: 440px; border-radius: var(--r); border: 1px solid var(--line); }
 
 /* ---- navigation groups, blueprint variants ---- */
