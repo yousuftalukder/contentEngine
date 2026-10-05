@@ -8,7 +8,7 @@ see BLUEPRINT.md and the dashboard's **What it makes** page.
 | | what it does | always on? |
 |---|---|---|
 | **The server** (Render) | reads the news, writes cards and reels, makes light videos, publishes | yes |
-| **Your PC** (the worker) | anything from YouTube (Render is blocked there), heavy video, animated explainers | only while it runs |
+| **Your PC** (the worker) | anything from YouTube (Render is blocked there), heavy video, rendering animations (the server writes them) | only while it runs |
 | **The dashboard** | where you review, approve and set things up | — |
 
 A programme set to **"Video work runs on: My PC"** waits for your PC. Nothing is lost while it is off; the dashboard
@@ -22,8 +22,9 @@ shows the PC as off and the work as waiting.
    - **"Written from headlines only"** — none of the outlets' articles could be read (Ittefaq, Desh Rupantor, Bangla
      Tribune and Dhaka Tribune block servers). Check every fact against the source before approving. These drafts are
      never published automatically.
-   - **"Caption not written — the writer refused"** — the AI was out of its free allowance; the clip's own words stand
-     in. Rewrite the caption before posting.
+   - **"Caption not written — the writer refused"** — the AI was out of its free allowance when this video was
+     finished; the clip's own words stand in. Rewrite the caption before posting. (Rare now: a clip's caption is
+     written when its moment is chosen, and your PC borrows the server's writer.)
 3. **Overview** shows alerts (a key out of credit, a feed failing) and whether the AI allowance is waiting to reset.
 4. News you have not reviewed within **24 hours** is set aside as "Expired unreviewed" — day-old news is not worth
    publishing, and it buried the fresh stories (2,400 day-old drafts had piled up). Change the window, or turn it off
@@ -78,6 +79,8 @@ dashboard's API keys page lets the PC write directly, which is a little faster.)
 - **Stop:** close that window. Running jobs go back to the queue.
 - **Start it at every sign-in:** `powershell -ExecutionPolicy Bypass -File pc\autostart.ps1` (undo with `-Remove`).
 - First time on a new PC: `pc\setup.ps1`, then fill in `.env.pc` from Render's Environment tab.
+- **Run `pc\setup.ps1` once more** (added 2026-10-05): it now installs deno, which yt-dlp needs to keep reading YouTube
+  (it warns that YouTube without it is deprecated). Everything already installed is left alone.
 
 ## What adding each thing unlocks
 
@@ -87,7 +90,7 @@ extras, never requirements.
 | you add | where | unlocks |
 |---|---|---|
 | your **Facebook Page** | dashboard → **Channels → Connect Facebook** | real publishing (today the channel is a mock) |
-| a free **Gemini key** in the vault | dashboard → **API keys** (paste it there, not only on Render, so your PC can use it too) | the best free writer for Bangla; scene recaps (5a: Gemini watches the video); what Gemini sees in your own footage (7a) |
+| a free **Gemini key** | on Render (it is there now), or dashboard → **API keys** | the best free writer for Bangla; scene recaps (5a: Gemini watches the video); Bangla transcription; what Gemini sees in your own footage (7a). Your PC borrows the server's, so it needs none of its own |
 | a free **Groq** or **Mistral** key (or OpenRouter, Cerebras, xAI Grok) | API keys | more writers in the chain: when Gemini's ~20 requests a day per model run out, the next one writes. Groq: console.groq.com, no card |
 | a **Pollinations** token (optional) | API keys | removes the small corner logo from free generated pictures (illustrated series, 6c). Pictures work without it |
 | a **reactor clip** of yourself | dashboard → Brands → Media library (purpose: reactor) | reaction videos you can publish (4a, 4c — proven with a stand-in) |
@@ -97,10 +100,11 @@ extras, never requirements.
 
 ## Test programmes left from the proofs
 
-Made on 2026-10-04 to prove variants on the real server, all under the demo brand, none publishing anywhere:
-`reaction_test`, `voiceover_test`, `recap_test`, `reaction_long_test`, `telecast_intro_test`, `stockvideo_test`
-(inactive), `eval_llm_picker` (inactive, the selection evaluation). Deactivate or delete them from **Programs** when
-you no longer want them; keep `eval_llm_picker` if the selection evaluation should be re-run.
+Made on 2026-10-04 and 10-05 to prove variants on the real server, all under the demo brand, none publishing anywhere:
+`reaction_test`, `voiceover_test`, `recap_test`, `reaction_long_test`, `telecast_intro_test`, `scene_recap_test`,
+`bn_clip_test`, `data_explainer_test`, `illustrated_test`, `stockvideo_test` (inactive), `eval_llm_picker` (inactive,
+the selection evaluation). Deactivate or delete them from **Programmes** when you no longer want them; keep
+`eval_llm_picker` if the selection evaluation should be re-run (`eval/boundaries.mjs` re-scores its stored runs for free).
 
 ## Security housekeeping
 
