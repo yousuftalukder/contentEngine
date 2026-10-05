@@ -50,7 +50,8 @@ test("made videos go where the programme's video work runs; text stays on the se
       const [j] = await eng.query(`SELECT queue FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [id]); return j.queue;
     };
     assert.equal(await queueOf({ key: "pc_video", displayName: "PC video", contentType: "IMAGE_SLIDESHOW", computeWhere: "pc" }), "video_local");
-    assert.equal(await queueOf({ key: "pc_explainer", displayName: "PC explainer", contentType: "ANIMATED_EXPLAINER", computeWhere: "pc" }), "video_local");
+    // An explainer is written on the server, where the AI key is; only its render goes to the PC (pc-worker test).
+    assert.equal(await queueOf({ key: "pc_explainer", displayName: "PC explainer", contentType: "ANIMATED_EXPLAINER", computeWhere: "pc" }), "video");
     assert.equal(await queueOf({ key: "srv_video", displayName: "Server video", contentType: "IMAGE_SLIDESHOW" }), "video");
     assert.equal(await queueOf({ key: "pc_news", displayName: "PC news", contentType: "NEWS_STATIC", computeWhere: "pc" }), "text");
   } finally { await eng.stop(); }
