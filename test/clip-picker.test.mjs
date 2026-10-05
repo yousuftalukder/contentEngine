@@ -93,3 +93,31 @@ test("when the AI picker is only out of allowance, the video waits for it; a pro
     assert.match(clip.reason, /whole thought/, "by the free picker, at once");
   } finally { await eng.stop(); }
 });
+
+// A long video is read in pieces, not cut off: the line worth clipping is near the end, far past what one piece holds
+// (the transcript used to be truncated at 120,000 characters — about two hours of speech). The picker still finds it.
+test("the LLM picker reads a long transcript in pieces, so a moment near the end can be chosen", { skip: spawnSync("ffmpeg", ["-version"]).status !== 0 && "ffmpeg not installed" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ce-long-")), src = join(dir, "talk.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=5:duration=1210", "-f", "lavfi", "-i", "sine=frequency=220:duration=1210", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src]);
+  const eng = await startEngine();
+  try {
+    await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    // Two hundred sentences; only the last stretch contains the line, and the picker is told where it is only there.
+    const segments = Array.from({ length: 200 }, (_, i) => ({ start: i * 6, end: i * 6 + 6, text: i >= 190 ? `ONLY-NEAR-THE-END sentence ${i} is the one everyone will quote tomorrow morning.` : `Sentence ${i} is ordinary talk about the weather and the traffic on the way in.` }));
+    await eng.api("POST", "/api/adapter-configs", { key: "tr_long", stage: "TRANSCRIBE", impl: "transcribe_mock", config: { segments } });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_reads", stage: "SCRIPT", impl: "llm_mock", config: { respond: [
+      // A request that holds the opening answers with filler, so the line can only come from a piece without it —
+      // read whole (as before), the picker would return the filler and nothing else.
+      { match: "Sentence 0 is ordinary", json: [{ start: 60, end: 90, title: "Weather", hook: "", score: 0.2, reason: "filler" }] },
+      { match: "ONLY-NEAR-THE-END", json: [{ start: 1150, end: 1180, title: "The line", hook: "", score: 0.95, reason: "the quoted line" }] }] } });
+    const b = await eng.api("POST", "/api/brands", { name: "Long" });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "long_talk", displayName: "Long talk", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", useMocks: true, autoStyle: false, autoSources: false,
+      downloadAdapter: "direct", transcriptAdapter: "tr_long", renderAdapter: "render_mock", scriptAdapter: "llm_reads", scriptAdapterFallbacks: [],
+      clipAdapter: "llm_clipper", clipAdapterFallbacks: ["clip_meaning"], methodConfig: { clips_per_video: 1, clip_min_seconds: 20, clip_max_seconds: 40, min_clip_score: 0, transcript_chars: 4000 } });
+    const cand = await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "A long talk" });
+    const clip = await waitFor(async () => { const [v] = await eng.query(`SELECT status, error_message FROM video_candidates WHERE id = $1`, [cand.id]);
+      if (v?.status === "FAILED") throw new Error(v.error_message); return v?.status === "PROCESSED" && (await eng.query(`SELECT start_seconds, reason FROM clips WHERE video_candidate_id = $1`, [cand.id]))[0]; }, { timeout: 90000, what: "the clip" });
+    assert.match(clip.reason, /quoted line/, `the line near the end was chosen: ${clip.reason}`);
+    assert.ok(Number(clip.start_seconds) > 1100, `at ${clip.start_seconds}s, not at the start`);
+  } finally { await eng.stop(); }
+});
