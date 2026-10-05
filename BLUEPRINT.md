@@ -203,11 +203,15 @@ is off. Its first test before building: one video through the API, to see whethe
 
 ## Built, not yet proven on real material (2026-10-04)
 
-5a (scene recap), 5c (Twelve Labs, optional), 6b (data explainer), 6c (illustrated series), 7a (own footage) and 1b
+5c (Twelve Labs, optional), 6b (data explainer), 6c (illustrated series), 7a (own footage) and 1b
 (Vizard, optional) — each passes its tests against stand-ins for the services, and none has yet been made from real
 material in production. 6d (Blender) stays unbuilt, for the reason given under 6.
 
 ## Proven working
+
+**5a, 2026-10-05:** a scene recap made by the server from *Duck and Cover* (1951, archive.org): Gemini's free tier
+watched a 360p, one-frame-a-second proxy, the recap script narrates what is on screen (the turtle, the dynamite, the
+classroom drill) and each cut matches its line, over the film's own sound. 55 s, 720×1280.
 
 1a, 1d, 2a–c, 7c, 6a, edge-tts voice, and the whole of 2 live in production. 3a (Bangla news reel on edge-tts,
 the outlet's own photo, local footage) and 4a (split-screen and picture-in-picture, rendered by the server from a
