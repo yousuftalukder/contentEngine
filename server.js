@@ -3786,7 +3786,9 @@ async function generateExplainer(item, niche, style) {
   if (!scenes.length) throw new Error("The explainer plan came back without usable scenes");
   const texts = scenes.map((s) => [s.intro, ...s.parts].filter(Boolean).join(" "));
   const title = p.title || m.title;
-  if (scenes.some((s) => s.layout === "Illustrated")) await drawIllustrated(scenes, niche, item.id, vertical);
+  // Pictures are drawn where the video is rendered: when that is your PC, the PC draws them — the free picture service
+  // is known to answer it, and nothing is drawn that a failed hand-off would waste.
+  if (scenes.some((s) => s.layout === "Illustrated") && (studioReady() || niche.compute_where !== "pc")) await drawIllustrated(scenes, niche, item.id, vertical);
   await setItem(item.id, { headline: title, script: texts.join("\n\n"), summary: p.description || "", hashtags: p.hashtags || [] });
   const narr = await narrateParts(niche, texts, item.id); await addCost(item.id, narr.cost);
   await setItem(item.id, { voice_asset_url: narr.audio.url, status: "RENDERING" });
@@ -3839,6 +3841,11 @@ async function studioRenderJob(itemId) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); if (!item) return;
   const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]); const plan = P(item.script_meta)?.studio;
   if (!plan) throw new Error("this explainer has no render plan");
+  // An illustrated story handed over undrawn: its pictures are drawn here, and the plan keeps them for a retry.
+  if (plan.scenes.some((s) => s.layout === "Illustrated" && !s.data?.background && !s.data?.figure)) {
+    await drawIllustrated(plan.scenes, niche, itemId, plan.height > plan.width);
+    await setItem(itemId, { script_meta: { ...(P(item.script_meta) || {}), studio: plan } });
+  }
   await renderExplainer(itemId, niche, plan);
   return finishGeneration(itemId, niche);
 }
