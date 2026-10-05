@@ -121,3 +121,24 @@ test("the LLM picker reads a long transcript in pieces, so a moment near the end
     assert.ok(Number(clip.start_seconds) > 1100, `at ${clip.start_seconds}s, not at the start`);
   } finally { await eng.stop(); }
 });
+
+// A clip opens where its sentence opens: a pick that lands a few seconds into a sentence starts at that sentence.
+test("an LLM pick that starts a few seconds into a sentence is moved back to where the sentence starts", { skip: spawnSync("ffmpeg", ["-version"]).status !== 0 && "ffmpeg not installed" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ce-sent-")), src = join(dir, "talk.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=5:duration=80", "-f", "lavfi", "-i", "sine=frequency=220:duration=80", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src]);
+  const eng = await startEngine();
+  try {
+    await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const segments = Array.from({ length: 10 }, (_, i) => ({ start: i * 8, end: i * 8 + 8, text: `Sentence ${i} carries a whole thought that a viewer could follow without anything before it.` }));
+    await eng.api("POST", "/api/adapter-configs", { key: "tr_sent", stage: "TRANSCRIBE", impl: "transcribe_mock", config: { segments } });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_mid", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Timestamped transcript", json: [{ start: 19, end: 48, title: "Mid", hook: "", score: 0.9, reason: "lands mid-sentence" }] }] } });
+    const b = await eng.api("POST", "/api/brands", { name: "Sentences" });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "sentences", displayName: "Sentences", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", useMocks: true, autoStyle: false, autoSources: false,
+      downloadAdapter: "direct", transcriptAdapter: "tr_sent", renderAdapter: "render_mock", scriptAdapter: "llm_mid", scriptAdapterFallbacks: [],
+      clipAdapter: "llm_clipper", clipAdapterFallbacks: ["clip_meaning"], methodConfig: { clips_per_video: 1, clip_min_seconds: 20, clip_max_seconds: 40, min_clip_score: 0 } });
+    const cand = await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "A talk" });
+    const clip = await waitFor(async () => { const [v] = await eng.query(`SELECT status, error_message FROM video_candidates WHERE id = $1`, [cand.id]);
+      if (v?.status === "FAILED") throw new Error(v.error_message); return v?.status === "PROCESSED" && (await eng.query(`SELECT start_seconds FROM clips WHERE video_candidate_id = $1`, [cand.id]))[0]; }, { timeout: 60000, what: "the clip" });
+    assert.equal(Number(clip.start_seconds), 16, "the pick at 19 s starts where its sentence starts, 16 s");
+  } finally { await eng.stop(); }
+});
