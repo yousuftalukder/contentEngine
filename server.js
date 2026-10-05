@@ -3838,7 +3838,18 @@ async function processCandidate(candidateId) {
   let clips;
   // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
   if (niche.content_type === "MOVIE_RECAP" || sceneRecap || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
-  else { clips = await withFallbacks("CLIP", niche.clip_adapter || "llm_clipper", niche.clip_adapter_fallbacks, (c) => c.selectClips({ transcript, niche, candidate: cand, signals }));
+  else {
+    // Which moment is the product, and the LLM picker finds it far more often than the free ones (the famous line in
+    // the top three on 10 of 14 speeches, against 6 and 5). So when it is only out of today's allowance, the video
+    // waits for the reset rather than being cut by a weaker picker; any other failure (a bad answer, no key) goes to
+    // the next picker at once. A programme that would rather have its clips now says so: picker_fallback "now".
+    const keys = [...new Set([niche.clip_adapter || "llm_clipper", ...(P(niche.clip_adapter_fallbacks) || [])])];
+    const pick = (list) => withFallbacks("CLIP", list[0], list.slice(1), (c) => c.selectClips({ transcript, niche, candidate: cand, signals }));
+    if (methodCfg(niche).picker_fallback === "now" || keys.length < 2) clips = await pick(keys);
+    else {
+      try { clips = await pick(keys.slice(0, 1)); }
+      catch (e) { if (quotaWait(e)?.seconds) throw e; clips = await pick(keys.slice(1)); }
+    }
     // Take every moment worth taking, not a fixed three. A count is the wrong control: on one video it throws away
     // something good, and on the next it scrapes the barrel to fill the quota. min_clip_score is the bar, and
     // clips_per_video is only the ceiling that stops a long rambling video producing twenty mediocre reels.
