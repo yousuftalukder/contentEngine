@@ -3339,7 +3339,36 @@ async function cardSpecs(niche, m = {}, { width = 1080, height = 1080 } = {}) {
 }
 // The little label on a text card: news says "latest" in the program's language, anything else says which program it is.
 const cardLabel = (niche) => (/^NEWS/.test(niche.content_type || "") ? undefined : niche.display_name);
-const llmFor = async (niche, fn) => withFallbacks("SCRIPT", niche.script_adapter, await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks"), fn);
+// The writer for a programme. On your PC, which often has no AI key while the server does, a request that nothing here
+// could answer is relayed: it goes to the server as a job, the server's writer answers, and the answer comes back.
+// Without this every caption written on the PC was "the writer refused", and nothing that writes could run there.
+const onPcOnly = () => LANES.includes(PC_LANE) && !LANES.includes("text");
+const llmFor = async (niche, fn) => {
+  const fallbacks = await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks");
+  if (onPcOnly() && !(await someUsable([niche.script_adapter, ...fallbacks]))) return fn({ complete: (request) => relayComplete(niche, request) });
+  return withFallbacks("SCRIPT", niche.script_adapter, fallbacks, fn);
+};
+async function someUsable(keys) { for (const k of keys.filter(Boolean)) if (await adapterUsable(k)) return true; return false; }
+async function relayComplete(niche, request) {
+  const id = await enqueue("LLM_RELAY", { nicheId: niche.id, request }, { queue: "text", priority: 9, maxAttempts: 2 });
+  const until = Date.now() + Number(ENV.RELAY_TIMEOUT_MS || 15 * 60000);
+  for (;;) {
+    const j = await one(`SELECT status, error_message FROM jobs WHERE id = $1`, [id]);
+    if (j?.status === "SUCCEEDED") {
+      // Read from the table itself: settings are cached per process, and this one was written by another process.
+      const key = `relay.${id}`, row = await one(`SELECT value FROM settings WHERE key = $1`, [key]), out = P(row?.value);
+      await q(`DELETE FROM settings WHERE key = $1`, [key]).catch(() => {});
+      if (!out) throw new Error("the server answered, but its answer was not found");
+      return out;
+    }
+    if (j?.status === "FAILED" || Date.now() > until) {
+      // The server's own reason, with its HTTP status where it gave one, so a spent allowance is still read as a quota.
+      const msg = j?.error_message || "the server did not answer the writing request in time";
+      throw Object.assign(new Error(`via the server: ${msg}`), { status: Number((/-> (\d{3})/.exec(msg) || [])[1]) || undefined, transient: j?.status === "FAILED" ? undefined : true });   // a failure is judged by its own status; no answer in time is worth retrying
+    }
+    await sleep(Number(ENV.RELAY_POLL_MS || 2000));
+  }
+}
 // `lead` puts an adapter in front of the program's own, without disturbing what the program is configured to use: the
 // story's own photo is tried first when it has one, and what the program would have drawn is the fallback.
 const imageFor = async (niche, fn, lead = null, tail = null) => {
@@ -4529,6 +4558,14 @@ const HANDLERS = {
   async REGENERATE({ itemId, part }) { return regenerate(itemId, part); },
   async PROCESS_CANDIDATE({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return processCandidate(candidateId); },
   async RENDER_CLIP({ itemId, clipId }) { return renderClipItem(itemId, clipId); },
+  // The server's half of a relayed writing request from the PC: answered with this programme's writers, kept for the
+  // PC to collect (a job's own result is cut short, and an answer is often longer than that).
+  async LLM_RELAY({ nicheId, request }, job) {
+    const niche = await one(`SELECT * FROM niches WHERE id = $1`, [nicheId]); if (!niche) throw new Error("relay for an unknown programme");
+    const r = await llmFor(niche, (llm) => llm.complete(request));
+    await putSetting(`relay.${job.id}`, { text: r.text, data: r.data ?? null, cost: r.cost || 0, model: r.model || null });
+    return { answered: true };
+  },
   async PICK_CLIPS({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return pickOnServer(candidateId); },
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
   async POLL_METRICS({ assetId }) { return pollMetrics(assetId); },

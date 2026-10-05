@@ -134,3 +134,40 @@ test("Bangla speech is never given to local whisper: a PC without a key sends th
     assert.deepEqual(jobs, ["PROCESS_CANDIDATE@video_local", "PICK_CLIPS@text", "RENDER_CLIP@video_local"]);
   } finally { await pc?.stop(); await server.stop(); await new Promise((r) => gemini.close(r)); }
 });
+
+// Writing on a PC without a key: every request it cannot answer is relayed to the server's writer. Here the caption of
+// a clip cut on the PC — which used to read "Caption not written — the writer refused" — is written by the server.
+test("a PC without a key relays its writing to the server: the clip's caption is written, not refused", async () => {
+  const http = await import("node:http");
+  const gemini = http.createServer((req, res) => { let raw = ""; req.on("data", (d) => (raw += d)); req.on("end", () => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (!/:generateContent/.test(req.url)) return res.end(JSON.stringify({ models: [] }));
+    const caption = /social captions/.test(raw);
+    const answer = caption ? { headline: "The lesson nobody tells you", captions: { facebook: "Written by the server's writer", instagram: "Written by the server's writer", youtube: "Clip from A talk" }, hashtags: ["lesson"] }
+      : [{ start: 8, end: 30, title: "The thing nobody tells you", hook: "", score: 0.9, reason: "chosen on the server" }];
+    res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10 } }));
+  }); });
+  await new Promise((r) => gemini.listen(0, "127.0.0.1", r));
+  const server = await startEngine({ env: { GEMINI_API_KEY: "server-only-key", GEMINI_API_BASE: `http://127.0.0.1:${gemini.address().port}` } });
+  let pc;
+  try {
+    await server.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const brand = await server.api("POST", "/api/brands", { name: "Relay" });
+    await server.api("POST", "/api/adapter-configs", { key: "talk_words3", stage: "TRANSCRIBE", impl: "transcribe_mock", label: "Talk",
+      config: { segments: [0, 8, 16, 24, 32, 40].map((t) => ({ start: t, end: t + 8, text: `We spent ${t + 3} years learning the one thing nobody tells you about this.` })) } });
+    const p = await server.api("POST", "/api/programs", { brandId: brand.id, key: "relay_clips", displayName: "Relay", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT",
+      useMocks: true, autoStyle: false, autoSources: false, computeWhere: "pc", downloadAdapter: "download_mock", transcriptAdapter: "talk_words3", renderAdapter: "render_mock",
+      scriptAdapter: "gemini_live", scriptAdapterFallbacks: [], clipAdapter: "llm_clipper", clipAdapterFallbacks: ["clip_meaning"],
+      methodConfig: { clips_per_video: 1, clip_min_seconds: 10, clip_max_seconds: 30, min_clip_score: 0, qa: { enabled: false } } });
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false", RELAY_POLL_MS: "200" } });
+    await server.api("POST", "/api/video-candidates", { nicheId: p.id, url: "https://example.invalid/talk.mp4", title: "A talk" });
+    const item = await waitFor(async () => { const [x] = await server.query(`SELECT ci.status, ci.captions, ci.headline, ci.rejection_note FROM content_items ci WHERE ci.niche_id = $1`, [p.id]);
+      if (x?.status === "FAILED") throw new Error(x.rejection_note); return x?.status === "PENDING_REVIEW" && x; }, { timeout: 120000, interval: 500, what: "the clip in review" });
+    const captions = typeof item.captions === "string" ? JSON.parse(item.captions) : item.captions;
+    assert.equal(captions.facebook, "Written by the server's writer", `the caption came from the server's writer (${item.rejection_note}; ${JSON.stringify(await server.query(`SELECT type, queue, status, left(coalesce(error_message,''), 300) AS e FROM jobs WHERE type IN ('LLM_RELAY','RENDER_CLIP')`))})`);
+    assert.doesNotMatch(item.rejection_note || "", /writer refused/, "and is not the refused-writer stand-in");
+    const relayed = await server.query(`SELECT queue, status FROM jobs WHERE type = 'LLM_RELAY'`);
+    assert.ok(relayed.length && relayed.every((j) => j.queue === "text" && j.status === "SUCCEEDED"), `relayed through the server's text lane: ${JSON.stringify(relayed)}`);
+    assert.equal((await server.query(`SELECT 1 FROM settings WHERE key LIKE 'relay.%'`)).length, 0, "and the answers were collected and cleared");
+  } finally { await pc?.stop(); await server.stop(); await new Promise((r) => gemini.close(r)); }
+});
