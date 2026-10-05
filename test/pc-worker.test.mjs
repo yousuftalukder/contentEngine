@@ -92,3 +92,45 @@ test("a PC without a writer hands the choosing to the server, and the clip comes
       ["PROCESS_CANDIDATE@video_local", "PICK_CLIPS@text", "RENDER_CLIP@video_local"], "transcribed on the PC, picked on the server, cut on the PC");
   } finally { await pc?.stop(); await server.stop(); await new Promise((r) => gemini.close(r)); }
 });
+
+// Bangla speech on a PC with no key: local whisper cannot hear Bangla (it writes Urdu script), so it is never used for
+// it. The PC sends the soundtrack up; the server transcribes it with its hosted transcriber, picks, and the PC cuts.
+test("Bangla speech is never given to local whisper: a PC without a key sends the audio to the server to transcribe", { skip: (await import("node:child_process")).spawnSync("ffmpeg", ["-version"]).status !== 0 && "ffmpeg not installed" }, async () => {
+  const http = await import("node:http"), { spawnSync } = await import("node:child_process"), { mkdtempSync } = await import("node:fs"), { tmpdir } = await import("node:os"), { join } = await import("node:path");
+  const src = join(mkdtempSync(join(tmpdir(), "ce-bn-")), "report.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=40", "-f", "lavfi", "-i", "sine=frequency=220:duration=40", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src]);
+  let uploads = 0;
+  const gemini = http.createServer((req, res) => { const chunks = []; req.on("data", (d) => chunks.push(d)); req.on("end", () => {
+    const base = `http://127.0.0.1:${gemini.address().port}`, send = (b, h = {}) => { res.writeHead(200, { "content-type": "application/json", ...h }); res.end(JSON.stringify(b)); };
+    if (req.url.startsWith("/upload/v1beta/files")) { uploads++; return send({}, { "x-goog-upload-url": `${base}/up` }); }
+    if (req.url === "/up") return send({ file: { name: "files/a", uri: `${base}/files/a`, state: "ACTIVE" } });
+    if (req.method === "DELETE") return send({});
+    if (!/:generateContent/.test(req.url)) return send({ models: [] });
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    const text = /file_data/.test(JSON.stringify(body.contents))
+      ? [0, 8, 16, 24, 32].map((t) => ({ start: t, end: t + 8, text: `পাটুরিয়ায় ফেরি চলাচল আবার শুরু হয়েছে, যাত্রীরা স্বস্তি পেয়েছেন ${t}` }))
+      : [{ start: 8, end: 30, title: "ফেরি চলাচল শুরু", hook: "", score: 0.9, reason: "the server read the Bangla transcript" }];
+    send({ candidates: [{ content: { parts: [{ text: JSON.stringify(text) }] } }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10 } });
+  }); });
+  await new Promise((r) => gemini.listen(0, "127.0.0.1", r));
+  const server = await startEngine({ env: { GEMINI_API_KEY: "server-only-key", GEMINI_API_BASE: `http://127.0.0.1:${gemini.address().port}` } });
+  let pc;
+  try {
+    await server.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const brand = await server.api("POST", "/api/brands", { name: "বাংলা" });
+    const p = await server.api("POST", "/api/programs", { brandId: brand.id, key: "bn_tv", displayName: "TV clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT",
+      language: "bn", country: "Bangladesh", useMocks: true, autoStyle: false, autoSources: false, computeWhere: "pc", downloadAdapter: "direct", renderAdapter: "render_mock",
+      transcriptAdapter: "whisper_cpp", transcriptAdapterFallbacks: ["gemini_transcribe"], scriptAdapter: "gemini_live", scriptAdapterFallbacks: [],
+      clipAdapter: "llm_clipper", clipAdapterFallbacks: ["clip_meaning"], methodConfig: { clips_per_video: 1, clip_min_seconds: 10, clip_max_seconds: 30, min_clip_score: 0, qa: { enabled: false } } });
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false" } });
+    const cand = await server.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "পাটুরিয়া" });
+    const clip = await waitFor(async () => { const [c] = await server.query(`SELECT cl.reason, cl.transcript_text, ci.status FROM clips cl JOIN content_items ci ON ci.id = cl.content_item_id WHERE cl.niche_id = $1`, [p.id]);
+      const [v] = await server.query(`SELECT status, error_message FROM video_candidates WHERE id = $1`, [cand.id]); if (v?.status === "FAILED") throw new Error(v.error_message);
+      return c?.status === "PENDING_REVIEW" && c; }, { timeout: 120000, interval: 500, what: "the Bangla clip in review" });
+    assert.match(clip.transcript_text, /ফেরি চলাচল/, "the words are the hosted transcriber's Bangla, not whisper's");
+    assert.match(clip.reason, /server read the Bangla transcript/);
+    assert.equal(uploads, 1, "the soundtrack went to the hosted transcriber once");
+    const jobs = (await server.query(`SELECT type, queue FROM jobs ORDER BY created_at`)).filter((j) => ["PROCESS_CANDIDATE", "PICK_CLIPS", "RENDER_CLIP"].includes(j.type)).map((j) => `${j.type}@${j.queue}`);
+    assert.deepEqual(jobs, ["PROCESS_CANDIDATE@video_local", "PICK_CLIPS@text", "RENDER_CLIP@video_local"]);
+  } finally { await pc?.stop(); await server.stop(); await new Promise((r) => gemini.close(r)); }
+});
