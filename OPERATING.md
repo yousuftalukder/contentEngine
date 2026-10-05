@@ -68,6 +68,10 @@ and who stands in when that writer's allowance runs out (*Engine choices* in the
 
 ## The PC worker
 
+Your PC does not need an AI key of its own. Anything it has to write — a clip's caption, a recap script, the script
+for a video on your own footage — it asks the server's writer for, and the server answers. (Adding a key to the
+dashboard's API keys page lets the PC write directly, which is a little faster.)
+
 - **Start:** `powershell -ExecutionPolicy Bypass -File pc\start.ps1` (a window opens; minimise it).
 - **Stop:** close that window. Running jobs go back to the queue.
 - **Start it at every sign-in:** `powershell -ExecutionPolicy Bypass -File pc\autostart.ps1` (undo with `-Remove`).
