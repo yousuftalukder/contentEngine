@@ -244,6 +244,8 @@ pages.overview = async () => {
       stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
       h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free Gemini key allows about 20 requests a day per model; add a second free writer (Groq or Mistral, on API keys) and it takes over while this one waits.")) : null,
 
+    stats?.newsPrograms?.length ? newsControls(stats) : null,
+
     (stats?.backlogPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber);margin-top:12px" },
       h("b", { style: "font-weight:500" }, "Waiting for you to review"),
       stats.backlogPauses.map((p) => h("div", { class: "sub" }, `${p.program}: ${p.waiting} drafts are waiting, so it has stopped drafting until fewer than ${p.limit} are`)),
@@ -287,6 +289,21 @@ pages.overview = async () => {
   );
   return root;
 };
+// Pause or resume news drafting in one click, and each news programme on its own. "Pause news" keeps reading the
+// feeds (so resuming starts on today's stories); a paused programme takes nothing until it is resumed.
+function newsControls(st, { compact = false } = {}) {
+  const paused = !!st?.newsPaused, progs = st?.newsPrograms || [];
+  const toggleAll = () => run(() => put("/api/settings/news.paused", { value: !paused }), paused ? "News resumed — drafting from today's stories" : "News paused — nothing more is drafted until you resume").then(route);
+  const toggleOne = (p) => run(() => patch(`/api/programs/${p.id}`, { isActive: !p.active }), p.active ? `${p.name} paused` : `${p.name} resumed`).then(route);
+  return h("div", { class: `panel${paused ? " warn" : ""}`, style: `margin-top:12px;${paused ? "border-color:var(--amber)" : ""}` },
+    h("div", { class: "row" },
+      h("div", { class: "grow" }, h("b", { style: "font-weight:500" }, paused ? "News is paused" : "News is running"),
+        h("span", { class: "sub" }, paused ? "Feeds are still read; nothing is drafted until you resume." : "New stories are drafted as the feeds bring them in.")),
+      h("button", { class: `btn ${paused ? "primary" : ""}`, onclick: toggleAll }, paused ? "Resume news" : "Pause news")),
+    compact || !progs.length ? null : h("div", { class: "row", style: "gap:6px;flex-wrap:wrap;margin-top:10px" },
+      progs.map((p) => h("span", { class: `tag ${p.active && !paused ? "green" : ""}`, style: "display:inline-flex;align-items:center;gap:6px;padding:4px 8px" },
+        p.name, h("a", { href: "#", title: p.active ? "Pause this programme" : "Resume this programme", onclick: (e) => { e.preventDefault(); toggleOne(p); } }, p.active ? "pause" : "resume")))));
+}
 function stat(n, l, color) { return h("div", { class: "stat" }, h("div", { class: "n", style: color ? `color:var(--${color})` : "" }, n), h("div", { class: "l" }, l)); }
 function step(done, content) { return h("li", { class: done ? "done" : "" }, content); }
 
@@ -831,7 +848,7 @@ pages.ideas = async (sub) => {
 pages.desk = async () => {
   const clusters = await get("/api/desk?hours=24");
   const root = h("div", null, pageHead("News desk", "Every story seen in the last 24 hours, grouped across outlets and languages. Stories carried by more (and weightier) outlets rank higher; each program takes its best uncovered ones.",
-    h("button", { class: "btn", onclick: () => run(() => post("/api/desk/run"), "Desk pass queued").then(route) }, "Run a desk pass now")));
+    h("button", { class: "btn", onclick: () => run(() => post("/api/desk/run"), "Desk pass queued").then(route) }, "Run a desk pass now")), newsControls(stats));
   if (!clusters.length) { root.appendChild(h("div", { class: "empty" }, h("b", null, "No stories yet"), "Link sources to a news program; stories appear as feeds are polled.")); return root; }
   root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
     h("thead", null, h("tr", null, h("th", null, "Story"), h("th", null, "Outlets"), h("th", null, "Rank"), h("th", null, "Covered by"))),

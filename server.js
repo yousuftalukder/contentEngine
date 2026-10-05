@@ -2932,6 +2932,7 @@ function scoreCandidate(item, niche) {
 }
 // Route one source_item to every program subscribed to its source.
 async function routeSourceItem(item) {
+  if (item.kind !== "VIDEO" && (await newsPaused())) return 0;          // news paused: articles are kept, not drafted
   const niches = await q(`SELECT n.*, s.license_policy FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id JOIN sources s ON s.id = ns.source_id WHERE ns.source_id = $1 AND n.is_active::int = 1 ORDER BY n.priority DESC`, [item.source_id]);
   let routed = 0;
   for (const niche of niches) {
@@ -3123,8 +3124,11 @@ async function clusterItems(items, source) {
 }
 let deskTimer = null;
 const deskSoon = () => { if (!deskTimer) deskTimer = setTimeout(() => { deskTimer = null; sweepNewsDesk().catch((e) => warn("news desk", e.message)); }, 1000); };
+// One switch for all of it: "Pause news" on the dashboard. The feeds are still read and stories still grouped, so
+// that "Resume" starts on today's stories rather than on a backlog; nothing is drafted from them meanwhile.
+const newsPaused = async () => flag(await setting("news.paused", false));
 async function sweepNewsDesk() {
-  if (!(await setting("desk.enabled", true))) return;
+  if (!(await setting("desk.enabled", true)) || (await newsPaused())) return;
   const programs = (await q(`SELECT * FROM niches WHERE is_active::int = 1 ORDER BY priority DESC`)).filter((n) => DESK_TYPES.has(n.content_type));
   for (const niche of programs) {
     const cfg = deskCfg(niche);
@@ -4865,7 +4869,9 @@ function authOk(req) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 async function readBody(req) { return new Promise((resolve, reject) => { let d = ""; req.on("data", (c) => { d += c; if (d.length > 1e6) { reject(new ApiError(413, null, "Body too large")); req.destroy(); } }); req.on("end", () => { if (!d) return resolve({}); try { resolve(JSON.parse(d)); } catch { reject(new ApiError(400, null, "Invalid JSON body")); } }); req.on("error", reject); }); }
-async function serveFile(res, path) { try { const data = await readFile(path); res.writeHead(200, { "Content-Type": MIME[extname(path)] || "application/octet-stream", "Cache-Control": "public, max-age=300" }); res.end(data); return true; } catch { return false; } }
+// The dashboard's own files are checked every time (a deploy must reach the open dashboard at once, not five minutes
+// later against a newer API); media files have unique names and can be kept.
+async function serveFile(res, path, cache = "public, max-age=300") { try { const data = await readFile(path); res.writeHead(200, { "Content-Type": MIME[extname(path)] || "application/octet-stream", "Cache-Control": cache }); res.end(data); return true; } catch { return false; } }
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost"); const pathname = decodeURIComponent(url.pathname);
   res.setHeader("Access-Control-Allow-Origin", ENV.CORS_ORIGIN || "*"); res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS"); res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -4876,7 +4882,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname.startsWith("/media/") && req.method === "GET") { const p = join(LOCAL_MEDIA_DIR, pathname.slice(7)); if (!p.startsWith(LOCAL_MEDIA_DIR) || !(await serveFile(res, p))) send(res, 404, { error: "Not found" }); return; }
     const match = app.routes.find((r) => r.method === req.method && r.re.test(pathname));
     if (!match) {
-      if (req.method === "GET" && !pathname.startsWith("/api/")) { const p = join(FRONTEND_DIR, pathname === "/" ? "index.html" : pathname); if (p.startsWith(FRONTEND_DIR) && (await serveFile(res, p))) return; if (await serveFile(res, join(FRONTEND_DIR, "index.html"))) return; }
+      if (req.method === "GET" && !pathname.startsWith("/api/")) { const p = join(FRONTEND_DIR, pathname === "/" ? "index.html" : pathname); if (p.startsWith(FRONTEND_DIR) && (await serveFile(res, p, "no-cache"))) return; if (await serveFile(res, join(FRONTEND_DIR, "index.html"), "no-cache")) return; }
       return send(res, 404, { error: "Not found", path: pathname });
     }
     const groups = match.re.exec(pathname).slice(1); const params = {}; match.names.forEach((n, i) => (params[n] = groups[i]));
@@ -4893,7 +4899,8 @@ app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await ins
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses() });
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses(), newsPaused: await newsPaused(),
+    newsPrograms: (await q(`SELECT id, display_name, content_type, is_active FROM niches WHERE content_type = ANY($1) ORDER BY display_name`, [[...DESK_TYPES]])).map((n) => ({ id: n.id, name: n.display_name, type: n.content_type, active: flag(n.is_active) })) });
 });
 // ---- storage
 app.get("/api/storage", async (ctx) => {

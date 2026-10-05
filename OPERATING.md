@@ -33,6 +33,10 @@ shows the PC as off and the work as waiting.
    on news nobody saw — 222 drafts in one day — and left the clips without the AI that picks their best moments.
    Change it in **Settings → review.max_waiting** (0 = never stop), or per programme under Automation.
 
+**Pausing news.** *Pause news* on the Overview (or the News desk page) stops all drafting from the news feeds in one
+click; the feeds are still read, so *Resume news* starts on today's stories. Each news programme also has its own
+pause / resume beside it.
+
 **Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
 Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each
 Page's token encrypted), attach it to your programmes, and approved posts go out with the source link as the first

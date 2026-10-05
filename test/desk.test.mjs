@@ -297,3 +297,23 @@ test("a hand-reviewed programme stops drafting while its review backlog is full,
   await eng.api("POST", "/api/desk/run");
   await waitFor(async () => (await drafts()).length === 3 && settled(), { timeout: 60000, what: "the next story taken" });
 });
+
+// "Pause news" on the dashboard: stories keep arriving and grouping, but nothing is drafted until "Resume news".
+test("pausing news stops drafting while the feeds are still read; resuming drafts again", async () => {
+  const s = await eng.api("POST", "/api/sources", { name: "Paused outlet", adapterKey: "ingest_mock", config: { items: [{ title: "Ferries resume at Paturia after fog", url: "https://paused.example/1" }] } });
+  const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "paused_news", displayName: "Paused News", contentType: "NEWS_STATIC", country: "Bangladesh", useMocks: true,
+    sourceIds: [s.id], methodConfig: { qa: { enabled: false }, desk: { settle_minutes: 0, min_gap_minutes: 0, per_sweep: 5 } } });
+  await eng.api("PUT", "/api/settings/news.paused", { value: true });
+  try {
+    await eng.api("POST", `/api/sources/${s.id}/poll`);
+    await waitFor(async () => (await eng.query(`SELECT 1 FROM source_items WHERE source_id = $1 AND cluster_id IS NOT NULL`, [s.id])).length === 1, { what: "the story read and grouped while paused" });
+    await eng.api("POST", "/api/desk/run");
+    await new Promise((r) => setTimeout(r, 2500));
+    assert.equal((await eng.api("GET", `/api/content-items?nicheId=${p.id}`)).length, 0, "nothing drafted while news is paused");
+    const st = await eng.api("GET", "/api/stats");
+    assert.equal(st.newsPaused, true, "and the dashboard knows it is paused");
+    assert.ok(st.newsPrograms.some((x) => x.name === "Paused News" && x.active), "with each news programme listed for its own pause button");
+  } finally { await eng.api("PUT", "/api/settings/news.paused", { value: false }); }
+  await eng.api("POST", "/api/desk/run");
+  await waitFor(async () => (await eng.api("GET", `/api/content-items?nicheId=${p.id}`)).length === 1, { timeout: 60000, what: "the story drafted after resuming" });
+});
