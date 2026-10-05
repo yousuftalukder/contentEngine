@@ -59,3 +59,36 @@ test("work routed to your PC waits for your PC, and your PC does it", async () =
     assert.ok(off.pc.seen_seconds_ago >= 299, "and how long ago is measured on the database's clock");
   } finally { await pc?.stop(); await server.stop(); }
 });
+
+// Your PC transcribes (YouTube serves it) but may have no AI key, while the server has one. The moment is chosen on
+// the server from the PC's transcript — the LLM picker, not the free one — and the clip goes back to the PC to cut.
+test("a PC without a writer hands the choosing to the server, and the clip comes back to the PC", async () => {
+  const http = await import("node:http");
+  const gemini = http.createServer((req, res) => { let raw = ""; req.on("data", (d) => (raw += d)); req.on("end", () => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (!/:generateContent/.test(req.url)) return res.end(JSON.stringify({ models: [] }));
+    const picks = [{ start: 8, end: 30, title: "The thing nobody tells you", hook: "", score: 0.9, reason: "chosen by the LLM on the server" }];
+    res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(picks) }] } }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10 } }));
+  }); });
+  await new Promise((r) => gemini.listen(0, "127.0.0.1", r));
+  const server = await startEngine({ env: { GEMINI_API_KEY: "server-only-key", GEMINI_API_BASE: `http://127.0.0.1:${gemini.address().port}` } });
+  let pc;
+  try {
+    await server.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const brand = await server.api("POST", "/api/brands", { name: "Handoff" });
+    await server.api("POST", "/api/adapter-configs", { key: "talk_words2", stage: "TRANSCRIBE", impl: "transcribe_mock", label: "Talk",
+      config: { segments: [0, 8, 16, 24, 32, 40].map((t) => ({ start: t, end: t + 8, text: `We spent ${t + 3} years learning the one thing nobody tells you about this.` })) } });
+    const p = await server.api("POST", "/api/programs", { brandId: brand.id, key: "handoff", displayName: "Handoff", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT",
+      useMocks: true, autoStyle: false, autoSources: false, computeWhere: "pc", downloadAdapter: "download_mock", transcriptAdapter: "talk_words2", renderAdapter: "render_mock",
+      scriptAdapter: "gemini_live", scriptAdapterFallbacks: [], clipAdapter: "llm_clipper", clipAdapterFallbacks: ["clip_meaning", "clip_signal"],
+      methodConfig: { clips_per_video: 1, clip_min_seconds: 10, clip_max_seconds: 30, min_clip_score: 0, qa: { enabled: false } } });
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false" } });
+    await server.api("POST", "/api/video-candidates", { nicheId: p.id, url: "https://example.invalid/talk.mp4", title: "A talk" });
+    const clip = await waitFor(async () => { const [c] = await server.query(`SELECT cl.reason, ci.status FROM clips cl JOIN content_items ci ON ci.id = cl.content_item_id WHERE cl.niche_id = $1`, [p.id]);
+      if (c?.status === "FAILED") throw new Error("item failed"); return c?.status === "PENDING_REVIEW" && c; }, { timeout: 120000, interval: 500, what: "the clip in review" });
+    assert.equal(clip.reason.includes("chosen by the LLM on the server"), true, `the server's LLM chose it, not the free picker: ${clip.reason}`);
+    const jobs = await server.query(`SELECT type, queue FROM jobs ORDER BY created_at`);
+    assert.deepEqual(jobs.filter((j) => ["PROCESS_CANDIDATE", "PICK_CLIPS", "RENDER_CLIP"].includes(j.type)).map((j) => `${j.type}@${j.queue}`),
+      ["PROCESS_CANDIDATE@video_local", "PICK_CLIPS@text", "RENDER_CLIP@video_local"], "transcribed on the PC, picked on the server, cut on the PC");
+  } finally { await pc?.stop(); await server.stop(); await new Promise((r) => gemini.close(r)); }
+});

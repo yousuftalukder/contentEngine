@@ -3854,23 +3854,56 @@ async function processCandidate(candidateId) {
   // Recaps and long reactions work on the whole video (a long reaction then plans its own segments); others pick clips.
   if (niche.content_type === "MOVIE_RECAP" || sceneRecap || niche.production_method === "REACTION_LONG") clips = [{ start: 0, end: file.duration || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }];
   else {
-    // Which moment is the product, and the LLM picker finds it far more often than the free ones (the famous line in
-    // the top three on 10 of 14 speeches, against 6 and 5). So when it is only out of today's allowance, the video
-    // waits for the reset rather than being cut by a weaker picker; any other failure (a bad answer, no key) goes to
-    // the next picker at once. A programme that would rather have its clips now says so: picker_fallback "now".
-    const keys = [...new Set([niche.clip_adapter || "llm_clipper", ...(P(niche.clip_adapter_fallbacks) || [])])];
-    const pick = (list) => withFallbacks("CLIP", list[0], list.slice(1), (c) => c.selectClips({ transcript, niche, candidate: cand, signals }));
-    if (methodCfg(niche).picker_fallback === "now" || keys.length < 2) clips = await pick(keys);
-    else {
-      try { clips = await pick(keys.slice(0, 1)); }
-      catch (e) { if (quotaWait(e)?.seconds) throw e; clips = await pick(keys.slice(1)); }
+    // Your PC fetches and transcribes (YouTube serves it, not the server), but it may have no AI key of its own while
+    // the server does. Choosing the moment needs only the transcript, so the PC hands that one step to the server
+    // rather than settle for the free picker; the clips come back to the PC to be cut.
+    if (LANES.includes(PC_LANE) && !LANES.includes("text") && !(await canPickHere(niche))) {
+      await q(`UPDATE video_candidates SET transcript = COALESCE(transcript, '{}'::jsonb) || $2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ signals })]);
+      await enqueue("PICK_CLIPS", { candidateId }, { queue: "text", priority: niche.priority, dedupeKey: `pick:${candidateId}` });
+      log(`candidate ${candidateId}: transcribed here; the moments are picked on the server, which has a writer`);
+      return { picking: "server" };
     }
-    // Take every moment worth taking, not a fixed three. A count is the wrong control: on one video it throws away
-    // something good, and on the next it scrapes the barrel to fill the quota. min_clip_score is the bar, and
-    // clips_per_video is only the ceiling that stops a long rambling video producing twenty mediocre reels.
-    const mc = methodCfg(niche), bar = Number(mc.min_clip_score ?? 0);
-    clips = clips.filter((c) => Number(c.score ?? 1) >= bar).slice(0, mc.clips_per_video || 1);
+    clips = await pickClips(cand, niche, transcript, signals);
   }
+  await queueClips(cand, niche, transcript, clips);
+}
+// Whether the programme's picker can run in this process: an LLM picker needs a writer whose key is here.
+async function canPickHere(niche) {
+  const row = await one(`SELECT impl, config FROM adapter_configs WHERE key = $1 AND enabled::int = 1`, [niche.clip_adapter || "llm_clipper"]);
+  if (row?.impl !== "llm_clipper") return true;
+  const cfg = P(row.config) || {}, writers = cfg.llm ? [cfg.llm, ...(cfg.llm_fallbacks || [])] : [niche.script_adapter, ...(P(niche.script_adapter_fallbacks) || [])];
+  for (const k of writers.filter(Boolean)) if (await adapterUsable(k)) return true;
+  return false;
+}
+async function pickClips(cand, niche, transcript, signals) {
+  // Which moment is the product, and the LLM picker finds it far more often than the free ones (the famous line in
+  // the top three on 10 of 14 speeches, against 6 and 5). So when it is only out of today's allowance, the video
+  // waits for the reset rather than being cut by a weaker picker; any other failure (a bad answer, no key) goes to
+  // the next picker at once. A programme that would rather have its clips now says so: picker_fallback "now".
+  const keys = [...new Set([niche.clip_adapter || "llm_clipper", ...(P(niche.clip_adapter_fallbacks) || [])])];
+  const pick = (list) => withFallbacks("CLIP", list[0], list.slice(1), (c) => c.selectClips({ transcript, niche, candidate: cand, signals }));
+  let clips;
+  if (methodCfg(niche).picker_fallback === "now" || keys.length < 2) clips = await pick(keys);
+  else {
+    try { clips = await pick(keys.slice(0, 1)); }
+    catch (e) { if (quotaWait(e)?.seconds) throw e; clips = await pick(keys.slice(1)); }
+  }
+  // Take every moment worth taking, not a fixed three. A count is the wrong control: on one video it throws away
+  // something good, and on the next it scrapes the barrel to fill the quota. min_clip_score is the bar, and
+  // clips_per_video is only the ceiling that stops a long rambling video producing twenty mediocre reels.
+  const mc = methodCfg(niche), bar = Number(mc.min_clip_score ?? 0);
+  return clips.filter((c) => Number(c.score ?? 1) >= bar).slice(0, mc.clips_per_video || 1);
+}
+// The server's half of a PC candidate: the stored transcript and soundtrack signals in, the chosen moments out.
+async function pickOnServer(candidateId) {
+  const cand = await one(`SELECT * FROM video_candidates WHERE id = $1`, [candidateId]); if (!cand) return;
+  const niche = await one(`SELECT * FROM niches WHERE id = $1`, [cand.niche_id]); if (!niche) throw new Error("candidate has no program");
+  const stored = P(cand.transcript) || {}, transcript = stored.events ? stored : { ...stored, ...cleanTranscript(stored.segments) };
+  if (!transcript.segments?.length) throw new Error("the transcript handed over by the PC is empty");
+  await queueClips(cand, niche, transcript, await pickClips(cand, niche, transcript, stored.signals || { loud: [], silences: [] }));
+}
+async function queueClips(cand, niche, transcript, clips) {
+  const candidateId = cand.id;
   if (!clips.length) throw new Error("no clip-worthy moments found");
   for (const cl of clips) {
     const clipId = newId(); const text = transcript.segments.filter((s) => s.end > cl.start && s.start < cl.end).map((s) => s.text).join(" ");
@@ -4424,6 +4457,7 @@ const HANDLERS = {
   async REGENERATE({ itemId, part }) { return regenerate(itemId, part); },
   async PROCESS_CANDIDATE({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return processCandidate(candidateId); },
   async RENDER_CLIP({ itemId, clipId }) { return renderClipItem(itemId, clipId); },
+  async PICK_CLIPS({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return pickOnServer(candidateId); },
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
   async POLL_METRICS({ assetId }) { return pollMetrics(assetId); },
   async STYLE_GENERATE({ brandId, nicheId, samples }) { const s = await generateStyle({ brandId, nicheId, samples }); return { styleProfileId: s.id }; },
@@ -4435,7 +4469,7 @@ const HANDLERS = {
 // off exponentially — 1, 2, 4 … 32 min, about an hour in all — for jobs that are safe to repeat. Publishing keeps its
 // own small attempt count so a slow platform cannot cause double posts. Permanent failures stop at once.
 const TRANSIENT_MAX_ATTEMPTS = Number(ENV.TRANSIENT_MAX_ATTEMPTS) || 7;
-const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "RENDER_CLIP", "POLL_METRICS", "STYLE_GENERATE", "STYLE_REFINE", "PLAN_PROGRAM", "SERIES_NEXT"]);
+const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "PICK_CLIPS", "RENDER_CLIP", "POLL_METRICS", "STYLE_GENERATE", "STYLE_REFINE", "PLAN_PROGRAM", "SERIES_NEXT"]);
 function retryDelay(job, e) {
   if (isPermanent(e)) return null;
   const transient = isTransient(e);
