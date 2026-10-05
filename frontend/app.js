@@ -887,7 +887,7 @@ pages.insights = async (sub) => {
     const max = Math.max(1, ...rows.map((r) => r.avg_views));
     return rows.length ? h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, rows.map((r) => h("tr", null,
       h("td", { class: "small", style: "width:32%" }, label(r)),
-      h("td", null, h("div", { class: "bar-cell" }, h("div", { class: "bar", style: `width:${Math.max(2, (r.avg_views / max) * 100)}%` }), h("span", { class: "small mute" }, r.avg_views, " avg views"))),
+      h("td", null, h("div", { class: "bar-cell" }, h("div", { class: "meter", style: `width:${Math.max(2, (r.avg_views / max) * 100)}%` }), h("span", { class: "small mute" }, r.avg_views, " avg views"))),
       h("td", { class: "small mute" }, r.posts, " posts · ", r.avg_likes, " likes")))))) : h("p", { class: "mute small" }, "No published posts with metrics yet.");
   };
   const root = h("div", null, pageHead("Insights", "What worked, per program: formats, platforms, posting hours and the posts that led. The planner reads the same numbers.",
