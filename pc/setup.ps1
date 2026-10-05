@@ -32,6 +32,17 @@ if (-not (Test-Path (Join-Path $bin "yt-dlp.exe"))) {
   Fetch "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" (Join-Path $bin "yt-dlp.exe")
 } else { Write-Host "yt-dlp: already present" }
 
+# deno: the JavaScript runtime yt-dlp now uses to read YouTube's pages. Without one, yt-dlp warns that YouTube
+# extraction "has been deprecated, and some formats may be missing" -- and YouTube is the one site this PC is the
+# worker for. yt-dlp looks for deno on PATH by itself; start.ps1 puts the tools folder's bin there. Official GitHub release.
+if (-not (Test-Path (Join-Path $bin "deno.exe"))) {
+  Write-Host "deno"
+  $zip = Join-Path $env:TEMP "deno-windows.zip"
+  Fetch "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" $zip
+  Expand-Archive -Force $zip $bin
+  Remove-Item -Force $zip
+} else { Write-Host "deno: already present" }
+
 # whisper.cpp: the official x64 build (it picks the fastest CPU code path at run time), and the multilingual base
 # model. Base is the right size here: a PC has the memory a 512 MB server does not, and it is ~8x faster than real time.
 if (-not (Test-Path (Join-Path $wbin "whisper-cli.exe"))) {
@@ -64,7 +75,7 @@ Write-Host "Checking the tools run:"
 # error under "Stop" — which would report a working tool as broken.
 $ErrorActionPreference = "Continue"
 $bad = @()
-foreach ($t in @(@((Join-Path $bin "ffmpeg.exe"), "-version"), @((Join-Path $bin "yt-dlp.exe"), "--version"), @((Join-Path $wbin "whisper-cli.exe"), "--help"), @((Join-Path $edge "Scripts\edge-tts.exe"), "--version"))) {
+foreach ($t in @(@((Join-Path $bin "ffmpeg.exe"), "-version"), @((Join-Path $bin "yt-dlp.exe"), "--version"), @((Join-Path $bin "deno.exe"), "--version"), @((Join-Path $wbin "whisper-cli.exe"), "--help"), @((Join-Path $edge "Scripts\edge-tts.exe"), "--version"))) {
   $null = & $t[0] $t[1] 2>$null
   if ($LASTEXITCODE -eq 0) { Write-Host "  ok   $(Split-Path $t[0] -Leaf)" } else { Write-Host "  FAIL $(Split-Path $t[0] -Leaf) (exit $LASTEXITCODE)"; $bad += $t[0] }
 }
