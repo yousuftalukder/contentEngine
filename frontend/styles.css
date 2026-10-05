@@ -132,7 +132,7 @@ tr:hover td { background: rgba(255,255,255,.02); }
 .stat .n { font-family: var(--serif); font-size: 24px; font-weight: 600; }
 .stat .l { color: var(--paper-dim); font-size: 12px; }
 .lanes { display: flex; gap: 6px; flex-wrap: wrap; }
-.lane { display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 20px; padding: 3px 10px 3px 6px; font-size: 12px; cursor: pointer; }
+.lane { display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 20px; padding: 3px 10px 3px 6px; font-size: 12px; cursor: pointer; background: var(--ink); color: var(--paper-dim); }
 .lane .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
 .lane.off { color: var(--paper-mute); }
 .lane.off .dot { background: var(--line); }
