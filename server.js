@@ -3837,9 +3837,23 @@ async function processCandidate(candidateId) {
     // allowance of a hosted model is worth spending first, and the slow one is what the day looks like after it.
     // A scene recap asks Gemini to watch first; on a day its allowance is spent the programme's own transcriber takes
     // over and the recap is told from the dialogue, as 5b does, rather than not at all.
-    const own = niche.transcript_adapter || "transcribe_mock", ownFb = P(niche.transcript_adapter_fallbacks) || [];
-    const [trKey, trFb] = sceneRecap && !/gemini_video|twelve_labs/.test(own) ? ["gemini_video", [own, ...ownFb]] : [own, niche.transcript_adapter_fallbacks];
-    transcript = await withFallbacks("TRANSCRIBE", trKey, trFb, (tr) => tr.transcribe({ path: file.path, duration: file.duration, language: niche.language }));
+    const chain = await transcribers(niche, sceneRecap);
+    if (!chain.length) {
+      // Bangla speech and nothing here that can hear it (local whisper cannot; a hosted transcriber needs a key this
+      // PC lacks): the soundtrack goes up to storage and the server, which has a key, transcribes and picks.
+      if (LANES.includes(PC_LANE) && !LANES.includes("text")) {
+        const signals = await audioSignals(file.path), small = await extractAudio(file.path);
+        try {
+          const url = await storeFile(`audio/${candidateId}.mp3`, await readFile(small), "audio/mpeg");
+          await q(`UPDATE video_candidates SET transcript = $2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ audio_url: url, signals })]);
+        } finally { await cleanup(small); if (audioOnly) await cleanup(file.path); }
+        await enqueue("PICK_CLIPS", { candidateId }, { queue: "text", priority: niche.priority, dedupeKey: `pick:${candidateId}` });
+        log(`candidate ${candidateId}: ${niche.language} speech; the server transcribes it`);
+        return { transcribing: "server" };
+      }
+      throw new Error(`${niche.language === "bn" ? "Bangla" : niche.language} speech needs a hosted transcriber (local whisper cannot do it): add a Gemini key on API keys`);
+    }
+    transcript = await withFallbacks("TRANSCRIBE", chain[0], chain.slice(1), (tr) => tr.transcribe({ path: file.path, duration: file.duration, language: niche.language }));
     // Scenes are kept whole — a scene where nobody speaks is often the one the recap needs.
     const clean = transcript.scenes ? { segments: transcript.segments, events: [] } : cleanTranscript(transcript.segments);
     transcript = { ...transcript, segments: clean.segments, events: clean.events };
@@ -3866,6 +3880,23 @@ async function processCandidate(candidateId) {
     clips = await pickClips(cand, niche, transcript, signals);
   }
   await queueClips(cand, niche, transcript, clips);
+}
+// The transcribers to try, in order, that can actually work in this process. Local whisper is left out for a language
+// it cannot do: on Bangla it writes Urdu script, or nothing — a transcript like that picks the wrong moments and puts
+// the wrong words on screen, which is worse than waiting for one that can hear it.
+const LOCAL_ASR_CANNOT = /^bn/i;
+async function transcribers(niche, sceneRecap) {
+  const own = niche.transcript_adapter || "transcribe_mock", ownFb = P(niche.transcript_adapter_fallbacks) || [];
+  const keys = [...new Set(sceneRecap && !/gemini_video|twelve_labs/.test(own) ? ["gemini_video", own, ...ownFb] : [own, ...ownFb])];
+  const rows = keys.length ? await q(`SELECT key, impl FROM adapter_configs WHERE key = ANY($1)`, [keys]) : [];
+  const implOf = (k) => rows.find((r) => r.key === k)?.impl || k;
+  const out = [];
+  for (const k of keys) {
+    if (LOCAL_ASR_CANNOT.test(niche.language || "") && /^whisper_(cpp|local)$/.test(implOf(k))) continue;
+    if (await adapterUsable(k)) out.push(k);
+  }
+  // For any other language an empty list is left to the adapters to explain ("No API key for …").
+  return out.length || LOCAL_ASR_CANNOT.test(niche.language || "") ? out : keys;
 }
 // Whether the programme's picker can run in this process: an LLM picker needs a writer whose key is here.
 async function canPickHere(niche) {
@@ -3898,9 +3929,26 @@ async function pickClips(cand, niche, transcript, signals) {
 async function pickOnServer(candidateId) {
   const cand = await one(`SELECT * FROM video_candidates WHERE id = $1`, [candidateId]); if (!cand) return;
   const niche = await one(`SELECT * FROM niches WHERE id = $1`, [cand.niche_id]); if (!niche) throw new Error("candidate has no program");
-  const stored = P(cand.transcript) || {}, transcript = stored.events ? stored : { ...stored, ...cleanTranscript(stored.segments) };
+  const stored = P(cand.transcript) || {};
+  // Speech the PC could not transcribe (Bangla, no key there) arrives as its soundtrack; it is transcribed here.
+  if (!stored.segments?.length && stored.audio_url) {
+    const chain = await transcribers(niche, false);
+    if (!chain.length) throw new Error(`${niche.language === "bn" ? "Bangla" : niche.language} speech needs a hosted transcriber (local whisper cannot do it): add a Gemini key on API keys`);
+    const audio = await toTmpFile(stored.audio_url, "mp3");
+    try {
+      const t = await withFallbacks("TRANSCRIBE", chain[0], chain.slice(1), (tr) => tr.transcribe({ path: audio, duration: null, language: niche.language }));
+      const clean = cleanTranscript(t.segments);
+      Object.assign(stored, { segments: clean.segments, events: clean.events });
+      await q(`UPDATE video_candidates SET transcript = $2::jsonb WHERE id=$1`, [candidateId, JSON.stringify(stored)]);
+    } finally { await cleanup(audio); }
+  }
+  const transcript = stored.events ? stored : { ...stored, ...cleanTranscript(stored.segments) };
   if (!transcript.segments?.length) throw new Error("the transcript handed over by the PC is empty");
-  await queueClips(cand, niche, transcript, await pickClips(cand, niche, transcript, stored.signals || { loud: [], silences: [] }));
+  // Recaps and long reactions work on the whole video, as on the PC; everything else picks its moments.
+  const whole = niche.content_type === "MOVIE_RECAP" || niche.production_method === "SCENE_RECAP" || niche.production_method === "REACTION_LONG";
+  const clips = whole ? [{ start: 0, end: cand.duration_seconds || transcript.segments.at(-1)?.end || 600, title: cand.title, hook: "", score: 1, reason: "whole video" }]
+    : await pickClips(cand, niche, transcript, stored.signals || { loud: [], silences: [] });
+  await queueClips(cand, niche, transcript, clips);
 }
 async function queueClips(cand, niche, transcript, clips) {
   const candidateId = cand.id;

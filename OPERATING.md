@@ -45,6 +45,8 @@ comment.
    fourteen famous speeches it put the line anyone would clip first in nine), cuts each to a captioned vertical reel,
    adds the logo and levels the sound. If your PC has no AI key of its own, the server does the picking from your
    PC's transcript and hands the clips back to the PC to cut.
+   Bangla speech is never given to the PC's local transcriber (it cannot hear Bangla): it goes to Gemini — on the
+   server, from the PC's soundtrack, when the PC has no key.
 3. The clips land in **Review**.
 4. When the AI that picks the moments has used up today's free allowance, the video **waits** for the reset (midnight
    Pacific) rather than being cut by the weaker free picker. If you would rather have clips sooner, set the programme's
