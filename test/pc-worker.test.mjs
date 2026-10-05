@@ -171,3 +171,37 @@ test("a PC without a key relays its writing to the server: the clip's caption is
     assert.equal((await server.query(`SELECT 1 FROM settings WHERE key LIKE 'relay.%'`)).length, 0, "and the answers were collected and cleared");
   } finally { await pc?.stop(); await server.stop(); await new Promise((r) => gemini.close(r)); }
 });
+
+// An explainer written on the server and rendered on the PC. The server has the writer and the voice but too little
+// memory for the studio; it writes, narrates, stores the plan and hands only the render to the PC. (The studio itself
+// is switched off on both here; the PC's attempt to render shows the work arrived there with its plan.)
+test("an explainer is written on the server and only its render is handed to the PC", async () => {
+  const tone = "-hide_banner -loglevel error -y -f lavfi -i sine=frequency=220:duration=2".split(" ");
+  const server = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999" } });
+  let pc;
+  try {
+    await server.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    await server.api("POST", "/api/adapter-configs", { key: "tts_tone", stage: "VOICE", impl: "tts_command", config: { command: "ffmpeg", args: [...tone, "{out}"], voice: "", format: "wav" } });
+    await server.api("POST", "/api/adapter-configs", { key: "llm_plan", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "script animated explainer", json: {
+      title: "Metro in a minute", description: "A plan written on the server", hashtags: ["metro"], scenes: [
+        { layout: "TitleCard", chapter: "Start", data: { title: "Metro in a minute" }, parts: ["Here is the metro."] },
+        { layout: "BulletReveal", chapter: "Facts", data: { heading: "Facts", bullets: ["Fast", "Cheap"] }, parts: ["It is fast.", "It is cheap."] },
+        { layout: "FullQuote", chapter: "End", data: { quote: "On time", attribution: "Riders" }, parts: ["That is it."] }] } }] } });
+    const brand = await server.api("POST", "/api/brands", { name: "Explainers" });
+    const p = await server.api("POST", "/api/programs", { brandId: brand.id, key: "pc_explainer2", displayName: "PC explainer", contentType: "ANIMATED_EXPLAINER", computeWhere: "pc",
+      useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "llm_plan", scriptAdapterFallbacks: [], voiceAdapter: "tts_tone", methodConfig: { explainer_minutes: 1, qa: { enabled: false } } });
+    const { id } = await server.api("POST", "/api/generate", { nicheId: p.id, topic: "Dhaka metro" });
+    const handed = await waitFor(async () => { const [j] = await server.query(`SELECT queue, status FROM jobs WHERE type = 'STUDIO_RENDER' AND content_item_id = $1`, [id]); return j; }, { timeout: 60000, what: "the render handed to the PC" });
+    assert.equal(handed.queue, "video_local", "the render is the PC's job");
+    const [gen] = await server.query(`SELECT queue, status FROM jobs WHERE type = 'GENERATE_CONTENT' AND content_item_id = $1`, [id]);
+    assert.deepEqual([gen.queue, gen.status], ["video", "SUCCEEDED"], "the writing was done on the server");
+    const it = await server.api("GET", `/api/content-items/${id}`);
+    assert.equal(it.status, "RENDERING", "the item waits for the PC, not failed");
+    const plan = it.script_meta.studio;
+    assert.ok(plan.audio && plan.scenes.length === 3 && plan.scenes[0].durationInFrames > 0, "with the whole plan stored: narration, scenes, timing");
+
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false", STUDIO_MIN_MEMORY_MB: "999999" } });
+    const tried = await waitFor(async () => { const [j] = await server.query(`SELECT status, attempts, error_message FROM jobs WHERE type = 'STUDIO_RENDER' AND content_item_id = $1`, [id]); return j?.attempts > 0 && j; }, { timeout: 60000, what: "the PC to take the render" });
+    assert.match(tried.error_message || "", /studio/i, "the PC took the render (and, with its studio off here, said so)");
+  } finally { await pc?.stop(); await server.stop(); }
+});
