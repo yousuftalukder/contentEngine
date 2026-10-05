@@ -4476,6 +4476,16 @@ async function deferForQuota(job, payload, quota, msg) {
 }
 const dhakaTime = (d) => { try { return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" }).format(d); } catch { return d.toISOString().slice(0, 16).replace("T", " ") + " UTC"; } };
 // Programs whose writer is waiting for a quota to reset, for the dashboard: [{program, until}].
+// Programmes that have stopped drafting because their review backlog is full, so the dashboard can say why a
+// programme has gone quiet instead of leaving it to look broken.
+async function backlogPauses() {
+  const limit = Number(await setting("review.max_waiting", 30));
+  const rows = await q(`SELECT n.display_name, n.method_config, count(ci.id)::int AS waiting FROM niches n
+    JOIN content_items ci ON ci.niche_id = n.id AND ci.status IN ('PENDING_REVIEW','QUEUED','FETCHING_DATA','DRAFTING','RENDERING')
+    WHERE n.is_active::int = 1 AND COALESCE(n.approval_mode, 'MANUAL') = 'MANUAL' GROUP BY n.id`);
+  return rows.map((r) => ({ program: r.display_name, waiting: r.waiting, limit: Number((P(r.method_config) || {}).review_backlog ?? limit) }))
+    .filter((r) => r.limit > 0 && r.waiting >= r.limit);
+}
 async function quotaPauses() {
   const m = await settings(); const now = Date.now(), out = [];
   for (const [k, v] of Object.entries(m)) {
@@ -4849,7 +4859,7 @@ app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await ins
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), quotaPauses: await quotaPauses() });
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses() });
 });
 // ---- storage
 app.get("/api/storage", async (ctx) => {

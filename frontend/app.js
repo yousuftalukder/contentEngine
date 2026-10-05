@@ -244,6 +244,11 @@ pages.overview = async () => {
       stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
       h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free Gemini key allows about 20 requests a day per model; add a second free writer (Groq or Mistral, on API keys) and it takes over while this one waits.")) : null,
 
+    (stats?.backlogPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber);margin-top:12px" },
+      h("b", { style: "font-weight:500" }, "Waiting for you to review"),
+      stats.backlogPauses.map((p) => h("div", { class: "sub" }, `${p.program}: ${p.waiting} drafts are waiting, so it has stopped drafting until fewer than ${p.limit} are`)),
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Review them (or let them expire) and it starts again by itself. This keeps the free AI allowance for work you will see — change the limit in Settings → review.max_waiting.")) : null,
+
     h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
     h("div", { class: "panel" }, alerts.length ? [
       alerts.map((a) => h("div", { class: "row", style: `padding:8px 0;border-bottom:1px solid var(--ink-3);align-items:flex-start;opacity:${a.read_at ? 0.6 : 1}` },
