@@ -27,6 +27,22 @@ Three places the work can happen, and the difference matters:
 - **Rented** — an API that does the expensive middle. Costs money, always available. **Optional everywhere:** every
   variant has a free route, and a rented one only switches on when its key is added (agreed 2026-10-04: no billing).
 
+**Each step runs where it can (2026-10-05).** The server holds the AI keys and the free voice; the PC has YouTube, the
+studio and your footage, but usually no key. So a job is split at the step that needs the other machine, never failed:
+
+| step | where | how it crosses |
+|---|---|---|
+| fetch a YouTube video, transcribe English, cut and render clips | PC | — |
+| choose the moments (LLM picker) | server, if the PC has no writer | `PICK_CLIPS` with the PC's transcript and soundtrack signals |
+| transcribe Bangla (local whisper cannot) | server (Gemini) | the PC uploads a 16 kHz copy of the audio |
+| any other writing on the PC (captions, recap and reaction scripts, 7a scripts) | server | `LLM_RELAY`: the request goes as a job, the answer comes back |
+| write an explainer (research, plan, pictures, narration) | server | the plan is stored on the item |
+| render an explainer (Remotion) | PC | `STUDIO_RENDER` with the stored plan |
+
+The free allowance is protected for the work that matters: a hand-reviewed programme stops drafting at 30 waiting
+(news wrote 222 unread drafts a day and spent it all), and a clip waits for the LLM picker's reset rather than being cut
+by the weaker heuristic.
+
 ---
 
 ## 1 — Clip / trimmed reel
