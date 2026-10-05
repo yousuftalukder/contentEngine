@@ -288,6 +288,8 @@ test("a hand-reviewed programme stops drafting while its review backlog is full,
   const drafts = async () => eng.api("GET", `/api/content-items?nicheId=${p.id}`);
   for (let i = 0; i < 4; i++) { await eng.api("POST", "/api/desk/run"); await waitFor(async () => (await drafts()).every((x) => x.status === "PENDING_REVIEW"), { what: "drafts settled" }); }
   assert.equal((await drafts()).length, 2, "two drafts waiting, so no third");
+  const paused = (await eng.api("GET", "/api/stats")).backlogPauses.find((x) => x.program === "Backlog News");
+  assert.deepEqual(paused, { program: "Backlog News", waiting: 2, limit: 2 }, "and the Overview says why it has gone quiet");
 
   const [first] = await drafts();
   await eng.query(`UPDATE content_items SET status = 'REJECTED' WHERE id = $1`, [first.id]);
