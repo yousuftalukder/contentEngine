@@ -41,8 +41,10 @@ comment.
 ## Making clips from a long video
 
 1. **Videos to clip → paste the link**, pick the clips programme (`yt_clips` runs on your PC; YouTube links need it).
-2. The engine transcribes it, an AI reads the transcript and picks the moments (on fourteen famous speeches it put the
-   line anyone would clip first in nine), cuts each to a captioned vertical reel, adds the logo and levels the sound.
+2. The engine transcribes it (on your PC for YouTube links), an AI reads the transcript and picks the moments (on
+   fourteen famous speeches it put the line anyone would clip first in nine), cuts each to a captioned vertical reel,
+   adds the logo and levels the sound. If your PC has no AI key of its own, the server does the picking from your
+   PC's transcript and hands the clips back to the PC to cut.
 3. The clips land in **Review**.
 4. When the AI that picks the moments has used up today's free allowance, the video **waits** for the reset (midnight
    Pacific) rather than being cut by the weaker free picker. If you would rather have clips sooner, set the programme's
