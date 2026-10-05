@@ -2893,9 +2893,24 @@ function passesFilters(item, niche) {
   return true;
 }
 async function underDailyCap(niche) {
+  if (!(await underReviewBacklog(niche))) return false;
   if (!niche.max_items_per_day) return true;
   const r = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE niche_id = $1 AND created_at >= CURRENT_DATE AND status <> 'FAILED'`, [niche.id]);
   return r.n < niche.max_items_per_day;
+}
+// Never draft faster than drafts are read. A programme you review by hand stops taking new work while this many of its
+// drafts are already waiting for you, and starts again as you review them or they expire. On 2026-10-04 the Bangla
+// news programme wrote 222 drafts in a day, none of them ever approved, and spent the whole free Gemini allowance
+// doing it — so the clips, which pick their moments with that writer, fell back to the weaker free picker. Programmes
+// that approve on their own never pile up and are not held back. Settings → review.max_waiting (0 turns it off); a
+// programme's own method_config.review_backlog overrides it. Drafts asked for by hand ("Generate now") are not held.
+async function underReviewBacklog(niche) {
+  if ((niche.approval_mode || "MANUAL") !== "MANUAL") return true;
+  const own = methodCfg(niche).review_backlog, limit = Number(own ?? (await setting("review.max_waiting", 30)));
+  if (!(limit > 0)) return true;
+  // Drafts still being written count too: they are about to wait as well.
+  const r = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE niche_id = $1 AND status IN ('PENDING_REVIEW','QUEUED','FETCHING_DATA','DRAFTING','RENDERING')`, [niche.id]);
+  return r.n < limit;
 }
 const VIDEO_TYPES = new Set(["PODCAST_CLIP", "REACTION_CLIP", "VOICEOVER_CLIP", "MOVIE_RECAP"]);
 // Made videos (narrated reels, explainers) are written from articles like text posts but rendered on the video lane.
