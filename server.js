@@ -2940,7 +2940,8 @@ const queueFor = (contentType) => VIDEO_TYPES.has(contentType) || MADE_VIDEO_TYP
 // Where a programme's drafts are made. A made video (an explainer, a script narrated over footage) is video work, and it
 // goes where the programme says its video work runs: an explainer needs the studio, and a script over your own footage
 // needs the folder it lives in — neither is on the server. Text drafts stay on the server either way.
-const genQueue = (niche, type = niche?.content_type) => (MADE_VIDEO_TYPES.has(type) && niche?.compute_where === "pc" ? PC_LANE : queueFor(type));
+// An explainer is the exception: it is written on the server, where the AI key is, and only its render goes to the PC.
+const genQueue = (niche, type = niche?.content_type) => (MADE_VIDEO_TYPES.has(type) && type !== "ANIMATED_EXPLAINER" && niche?.compute_where === "pc" ? PC_LANE : queueFor(type));
 function scoreCandidate(item, niche) {
   const c = methodCfg(niche); let s = 0.35; const reasons = [];
   if (item.views) { const v = Math.min(1, Math.log10(item.views + 1) / 6.5); s += 0.3 * v; reasons.push(`views ${item.views}`); }
@@ -3773,18 +3774,44 @@ async function generateExplainer(item, niche, style) {
   if (chapters.length && !chapters[0].startsWith("0:00 ")) chapters.unshift(`0:00 ${lang.startsWith("bn") ? "শুরু" : "Intro"}`);
   const description = [p.description || "", chapters.length >= 3 ? `\n${chapters.join("\n")}` : ""].join("\n").trim();
   await setItem(item.id, { captions: { youtube: description, default: p.description || title, facebook: p.description || title } });
-  if (narr.audio.mock || !studioReady()) throw new Error("ANIMATED_EXPLAINER needs the video studio and a real voice adapter (the studio renders the animation)");
-  const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(narr.audio.url, "mp3"), drawn = [];
-  for (const b of built) for (const k of ["background", "figure"]) if (b.data?.[k]) { b.data[k] = await toTmpFile(b.data[k], /\.png(\?|$)/i.test(b.data[k]) ? "png" : "jpg"); drawn.push(b.data[k]); }
-  const props = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), brand, title, audio: audioFile, music, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built };
+  if (narr.audio.mock) throw new Error("ANIMATED_EXPLAINER needs a real voice adapter (the narration times the animation)");
+  // Everything the render needs, by address: the narration and every picture are already in storage.
+  const studio = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), title, audio: narr.audio.url, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built, orientation };
+  // The writing happens where there is a writer, the rendering where there is a studio. The server has the AI key and
+  // the free voice but 512 MB, too little for the studio's browser; your PC has the studio but, often, no key. So the
+  // server writes, draws and narrates, and hands the finished plan to the PC, which only renders it.
+  if (!studioReady()) {
+    if (niche.compute_where !== "pc") throw new Error("ANIMATED_EXPLAINER needs the video studio, which runs on your PC: set the programme's video work to run on My PC");
+    await setItem(item.id, { status: "RENDERING", script_meta: { ...(P(item.script_meta) || {}), studio } });
+    await enqueue("STUDIO_RENDER", { itemId: item.id }, { queue: PC_LANE, contentItemId: item.id, priority: niche.priority, dedupeKey: `studio:${item.id}` });
+    log(`explainer ${item.id}: written here; the render waits for your PC`);
+    return { handedOff: true };
+  }
+  await renderExplainer(item.id, niche, studio);
+}
+// The studio half of an explainer: the plan in, the video (and a thumbnail) out. Runs where the studio is.
+async function renderExplainer(itemId, niche, plan) {
+  const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(plan.audio, "mp3"), drawn = [];
+  const scenes = JSON.parse(JSON.stringify(plan.scenes));
+  for (const b of scenes) for (const k of ["background", "figure"]) if (b.data?.[k]) { b.data[k] = await toTmpFile(b.data[k], /\.png(\?|$)/i.test(b.data[k]) ? "png" : "jpg"); drawn.push(b.data[k]); }
+  const { orientation, audio, ...rest } = plan;
+  const props = { ...rest, brand, audio: audioFile, music, scenes };
   try {
     const out = await studioRender("Explainer", props);
-    const video = await publishRender(out, item.id, { method: "EXPLAINER", orientation, scenes: built.length });
-    try { const png = await studioRender("Explainer", { ...props, stillFrame: Math.min(45, built[0].durationInFrames - 1) }, { kind: "still", ext: "png" }); const bytes = await readFile(png); await cleanup(png);
-      const j = await toJpeg(bytes, "image/png"); await recordMedia({ contentItemId: item.id, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: props.width, height: props.height, meta: { purpose: "youtube thumbnail" } }); }
+    const video = await publishRender(out, itemId, { method: "EXPLAINER", orientation, scenes: scenes.length });
+    try { const png = await studioRender("Explainer", { ...props, stillFrame: Math.min(45, scenes[0].durationInFrames - 1) }, { kind: "still", ext: "png" }); const bytes = await readFile(png); await cleanup(png);
+      const j = await toJpeg(bytes, "image/png"); await recordMedia({ contentItemId: itemId, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: props.width, height: props.height, meta: { purpose: "youtube thumbnail" } }); }
     catch (e) { warn(`explainer thumbnail: ${e.message.slice(0, 160)}`); }
-    await setItem(item.id, { hero_media_id: video.id });
+    await setItem(itemId, { hero_media_id: video.id });
   } finally { await cleanup(audioFile, brand.logo, brand.fontUrl, music, ...drawn); }
+}
+// The PC's job for a handed-off explainer: render the stored plan, then finish the item as generation would have.
+async function studioRenderJob(itemId) {
+  const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); if (!item) return;
+  const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]); const plan = P(item.script_meta)?.studio;
+  if (!plan) throw new Error("this explainer has no render plan");
+  await renderExplainer(itemId, niche, plan);
+  return finishGeneration(itemId, niche);
 }
 // ---- 1b. A rented clipper: the service fetches the link itself, finds the moments and cuts them, so this works while
 // your PC is off and YouTube refuses the server. Optional — it switches on with a key (Vizard: Creator plan and up).
@@ -4116,7 +4143,7 @@ async function runGeneration(itemId) {
   if (item.series_id && item.episode_number == null) { const s = await one(`SELECT episode_counter FROM series WHERE id=$1`, [item.series_id]); if (s) { await setItem(itemId, { episode_number: s.episode_counter + 1 }); item.episode_number = s.episode_counter + 1; } }
   item._series = await seriesBlock(item);
   if (type === "LONG_POST") await generateLongPost(item, niche, style);
-  else if (type === "ANIMATED_EXPLAINER") await generateExplainer(item, niche, style);
+  else if (type === "ANIMATED_EXPLAINER") { if ((await generateExplainer(item, niche, style))?.handedOff) return { renderingOn: "pc" }; }
   else if (MADE_VIDEO_TYPES.has(type)) await generateReel(item, niche, style);
   else await generateStatic(item, niche, style);
   return finishGeneration(itemId, niche);
@@ -4529,6 +4556,7 @@ const HANDLERS = {
   async REGENERATE({ itemId, part }) { return regenerate(itemId, part); },
   async PROCESS_CANDIDATE({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return processCandidate(candidateId); },
   async RENDER_CLIP({ itemId, clipId }) { return renderClipItem(itemId, clipId); },
+  async STUDIO_RENDER({ itemId }) { return studioRenderJob(itemId); },
   async PICK_CLIPS({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return pickOnServer(candidateId); },
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
   async POLL_METRICS({ assetId }) { return pollMetrics(assetId); },
@@ -4541,7 +4569,7 @@ const HANDLERS = {
 // off exponentially — 1, 2, 4 … 32 min, about an hour in all — for jobs that are safe to repeat. Publishing keeps its
 // own small attempt count so a slow platform cannot cause double posts. Permanent failures stop at once.
 const TRANSIENT_MAX_ATTEMPTS = Number(ENV.TRANSIENT_MAX_ATTEMPTS) || 7;
-const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "PICK_CLIPS", "RENDER_CLIP", "POLL_METRICS", "STYLE_GENERATE", "STYLE_REFINE", "PLAN_PROGRAM", "SERIES_NEXT"]);
+const PATIENT_JOBS = new Set(["INGEST_SOURCE", "GENERATE_CONTENT", "REGENERATE", "PROCESS_CANDIDATE", "PICK_CLIPS", "STUDIO_RENDER", "RENDER_CLIP", "POLL_METRICS", "STYLE_GENERATE", "STYLE_REFINE", "PLAN_PROGRAM", "SERIES_NEXT"]);
 function retryDelay(job, e) {
   if (isPermanent(e)) return null;
   const transient = isTransient(e);
