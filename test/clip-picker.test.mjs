@@ -142,3 +142,32 @@ test("an LLM pick that starts a few seconds into a sentence is moved back to whe
     assert.equal(Number(clip.start_seconds), 16, "the pick at 19 s starts where its sentence starts, 16 s");
   } finally { await eng.stop(); }
 });
+
+// One request per video, not one per clip and more: the picker writes each clip's caption as it chooses it, and a
+// trimmed clip that a person reviews is not sent through the automated check (one to three more requests per clip).
+test("the picker writes the caption with the moment, and a hand-reviewed trimmed clip spends no further requests", { skip: spawnSync("ffmpeg", ["-version"]).status !== 0 && "ffmpeg not installed" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ce-frugal-")), src = join(dir, "talk.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=5:duration=60", "-f", "lavfi", "-i", "sine=frequency=220:duration=60", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src]);
+  const eng = await startEngine();
+  try {
+    await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const segments = Array.from({ length: 7 }, (_, i) => ({ start: i * 8, end: i * 8 + 8, text: `Sentence ${i} says something worth hearing about the river and the people who live by it.` }));
+    await eng.api("POST", "/api/adapter-configs", { key: "tr_frugal", stage: "TRANSCRIBE", impl: "transcribe_mock", config: { segments } });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_frugal", stage: "SCRIPT", impl: "llm_mock", config: { respond: [
+      { match: "social captions", json: { headline: "x", captions: { facebook: "FROM A SEPARATE CAPTION REQUEST" }, hashtags: [] } },
+      { match: "standards editor", json: { verdict: "REVIEW", score: 0.1, summary: "THE CHECK RAN" } },
+      { match: "Timestamped transcript", json: [{ start: 8, end: 32, title: "The river", hook: "", score: 0.9, reason: "the best moment", caption: "Why the river matters to the people who live by it.", hashtags: ["river", "Bangladesh"] }] }] } });
+    const b = await eng.api("POST", "/api/brands", { name: "Frugal" });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "frugal", displayName: "Frugal", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", useMocks: true, autoStyle: false, autoSources: false,
+      approvalMode: "MANUAL", downloadAdapter: "direct", transcriptAdapter: "tr_frugal", renderAdapter: "render_mock", scriptAdapter: "llm_frugal", scriptAdapterFallbacks: [],
+      clipAdapter: "llm_clipper", clipAdapterFallbacks: ["clip_meaning"], methodConfig: { clips_per_video: 1, clip_min_seconds: 20, clip_max_seconds: 40, min_clip_score: 0 } });
+    await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "A talk" });
+    const it = await waitFor(async () => { const [x] = await eng.query(`SELECT status, captions, hashtags, qa_status, rejection_note FROM content_items WHERE niche_id = $1`, [p.id]);
+      if (x?.status === "FAILED") throw new Error(x.rejection_note); return x?.status === "PENDING_REVIEW" && x; }, { timeout: 60000, what: "the clip in review" });
+    const caps = typeof it.captions === "string" ? JSON.parse(it.captions) : it.captions;
+    assert.equal(caps.facebook, "Why the river matters to the people who live by it.", "the caption the picker wrote, not a second request's");
+    assert.match(caps.youtube, /Clip from A talk/, "with the source credited on YouTube");
+    assert.ok(JSON.stringify(it.hashtags).includes("#river"), "and its hashtags");
+    assert.equal(it.qa_status, null, "the automated check did not run for a trimmed clip a person reviews");
+  } finally { await eng.stop(); }
+});

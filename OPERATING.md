@@ -51,7 +51,9 @@ comment.
    PC's transcript and hands the clips back to the PC to cut.
    Bangla speech is never given to the PC's local transcriber (it cannot hear Bangla): it goes to Gemini — on the
    server, from the PC's soundtrack, when the PC has no key.
-3. The clips land in **Review**.
+3. The clips land in **Review**, each with the caption the AI wrote when it chose the moment. A trimmed clip under
+   hand review skips the automated quality check (you are the check); a clips programme that publishes by itself
+   keeps it. A video costs about one AI request, not seven to thirteen as it did.
 4. When the AI that picks the moments has used up today's free allowance, the video **waits** for the reset (midnight
    Pacific) rather than being cut by the weaker free picker. If you would rather have clips sooner, set the programme's
    *When the AI picker is out of allowance* to *Use the free picker now* (Programmes → Edit → Video).
