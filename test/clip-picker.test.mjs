@@ -62,3 +62,34 @@ test("when the writer refuses, the video is still clipped — by the free picker
     assert.match(clip.reason, /whole thought/, `the free picker chose it — got: ${clip.reason}`);
   } finally { await eng.stop(); }
 });
+
+// The LLM picker out of today's allowance is not a reason to cut the video with a weaker picker: the video waits for
+// the reset, without spending an attempt. A programme that wants its clips now ("now") gets the free picker at once.
+test("when the AI picker is only out of allowance, the video waits for it; a programme that wants clips now gets the free picker", { skip: spawnSync("ffmpeg", ["-version"]).status !== 0 && "ffmpeg not installed" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ce-wait-")), src = join(dir, "talk.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=60", "-f", "lavfi", "-i", "sine=frequency=220:duration=60", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src]);
+  const eng = await startEngine();
+  try {
+    await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_spent", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 99, fail_status: 429,
+      fail_message: "You exceeded your current quota. Quota exceeded for metric: generate_content_free_tier_requests, limit: 20 (GenerateRequestsPerDayPerProjectPerModel-FreeTier)" } });
+    const segments = Array.from({ length: 8 }, (_, i) => ({ start: i * 7, end: i * 7 + 7, text: `Sentence ${i + 1} is where the speaker says something that matters to the people in the hall today.` }));
+    await eng.api("POST", "/api/adapter-configs", { key: "tr_fixed2", stage: "TRANSCRIBE", impl: "transcribe_mock", config: { segments } });
+    const b = await eng.api("POST", "/api/brands", { name: "Spent writer" });
+    const programme = (key, extra = {}) => eng.api("POST", "/api/programs", { brandId: b.id, key, displayName: key, contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", useMocks: true, autoStyle: false, autoSources: false,
+      downloadAdapter: "direct", transcriptAdapter: "tr_fixed2", renderAdapter: "render_mock", scriptAdapter: "llm_spent", scriptAdapterFallbacks: [],
+      clipAdapter: "llm_clipper", clipAdapterFallbacks: ["clip_meaning", "clip_signal"], methodConfig: { clips_per_video: 1, clip_min_seconds: 20, clip_max_seconds: 40, min_clip_score: 0, ...extra } });
+    const waits = await programme("waits"), now = await programme("now", { picker_fallback: "now" });
+
+    const c1 = await eng.api("POST", "/api/video-candidates", { nicheId: waits.id, url: src, title: "A talk" });
+    const job = await waitFor(async () => { const [j] = await eng.query(`SELECT status, attempts, run_after > now() AS later FROM jobs WHERE type = 'PROCESS_CANDIDATE' AND payload::jsonb->>'candidateId' = $1`, [c1.id]);
+      return j?.status === "PENDING" && j.later && j; }, { timeout: 60000, what: "the video put off until the reset" });
+    assert.equal(job.attempts, 0, "waiting for the allowance is not an attempt");
+    assert.equal((await eng.query(`SELECT 1 FROM clips WHERE video_candidate_id = $1`, [c1.id])).length, 0, "and no clip was cut by the free picker meanwhile");
+
+    const c2 = await eng.api("POST", "/api/video-candidates", { nicheId: now.id, url: src, title: "A talk" });
+    const clip = await waitFor(async () => { const [v] = await eng.query(`SELECT status, error_message FROM video_candidates WHERE id = $1`, [c2.id]);
+      if (v?.status === "FAILED") throw new Error(v.error_message); return v?.status === "PROCESSED" && (await eng.query(`SELECT reason FROM clips WHERE video_candidate_id = $1`, [c2.id]))[0]; }, { timeout: 60000, what: "the clip cut now" });
+    assert.match(clip.reason, /whole thought/, "by the free picker, at once");
+  } finally { await eng.stop(); }
+});

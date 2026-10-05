@@ -642,6 +642,7 @@ function videoFields(p, uploads) {
       field("Vertical layout for landscape footage", select("_verticalLayout", [["crop", "Crop to fill"], ["blurpad", "Whole picture on a blurred fill"]], mc.vertical_layout || "crop")),
       field("Reactor clip", select("_reactor", [["", reactors.length ? "(none — waveform instead)" : "(upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || mc.overlay_video_url || "")),
       field("Reaction short layout", select("_reactionLayout", [["stack", "Split-screen — source on top, you below"], ["pip", "Corner — you over the whole source"]], mc.reaction_layout || "stack")),
+      field("When the AI picker is out of allowance", select("_pickerFallback", [["", "Wait for it — the best moment, a few hours later"], ["now", "Use the free picker now — sooner, weaker picks"]], mc.picker_fallback || "")),
       field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame."),
       field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
       field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 })),
@@ -666,6 +667,7 @@ function readVideo(v, mc) {
   if (v._orientation) out.orientation = v._orientation; else delete out.orientation;
   if (v._reactor) out.reactor_url = v._reactor; else delete out.reactor_url;
   out.reaction_layout = v._reactionLayout || "stack";
+  if (v._pickerFallback) out.picker_fallback = v._pickerFallback; else delete out.picker_fallback;
   const speed = Number(v._speed); if (speed > 1) out.speed = Math.min(1.5, speed); else delete out.speed;
   if (v._music === "none") out.music = false; else if (v._music) out.music = v._music; else delete out.music;
   return out;
