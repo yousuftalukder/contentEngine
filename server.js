@@ -1503,13 +1503,31 @@ impl("CLIP", "clip_meaning", { label: "The moment that means something (free, no
 impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSchema: { llm: { type: "string", default: "(program's script adapter)" }, llm_fallbacks: { type: "array" } }, create: (cfg) => ({
   async selectClips({ transcript, niche, candidate, signals }) {
     const c = methodCfg(niche);
-    const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`).join("\n").slice(0, 120000);
+    const lines = transcript.segments.map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`);
     // config.llm lets clipping run on a different SCRIPT instance (e.g. "openai_live") than the program's writer.
     const primary = cfg.llm || niche.script_adapter, fallbacks = cfg.llm ? (cfg.llm_fallbacks || []) : await fallbacksFor(niche.script_adapter_fallbacks, "llm.default_fallbacks");
-    const r = await withFallbacks("SCRIPT", primary, fallbacks, (llm) => llm.complete({ json: true, maxTokens: 3000,
-      system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}. Tone: ${niche.tone || "engaging"}.`,
-      prompt: `Video: "${candidate.title}"\nTimestamped transcript:\n${lines}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why"}]`,
-      mock: [{ start: 0, end: c.clip_min_seconds + 10, title: "Mock clip", hook: "Mock hook", score: 0.7, reason: "mock" }] }));
+    // A long video is read in pieces rather than cut off. The transcript used to be truncated at 120,000 characters —
+    // about two hours of speech — so on a three-hour podcast the last hour could never be chosen. Each piece fits a
+    // free model's window comfortably, the pieces overlap by a few minutes so a moment on a boundary is whole in one
+    // of them, and the picks from every piece are merged and ranked together.
+    const limit = Number(c.transcript_chars) || 100000, pieces = [];
+    for (let i = 0; i < lines.length;) {
+      let j = i, size = 0; while (j < lines.length && (size + lines[j].length < limit || j === i)) size += lines[j++].length + 1;
+      pieces.push(lines.slice(i, j).join("\n"));
+      if (j >= lines.length) break;
+      const back = transcript.segments[j - 1].end - 180; let k = j; while (k > i + 1 && transcript.segments[k - 1].start > back) k--;
+      i = k;
+    }
+    const picks = []; let cost = 0;
+    for (const [n, piece] of pieces.entries()) {
+      const r = await withFallbacks("SCRIPT", primary, fallbacks, (llm) => llm.complete({ json: true, maxTokens: 3000,
+        system: `You are a senior short-form video editor. You find the most re-watchable, self-contained moments in long videos for ${niche.display_name}. Tone: ${niche.tone || "engaging"}.`,
+        prompt: `Video: "${candidate.title}"\nTimestamped transcript${pieces.length > 1 ? ` (part ${n + 1} of ${pieces.length})` : ""}:\n${piece}\n\nPick up to ${c.clips_per_video} clips, each ${c.clip_min_seconds}-${c.clip_max_seconds} seconds, that start and end on sentence boundaries and work with zero context. Score 0-1 for virality. JSON: [{"start": seconds, "end": seconds, "title": "short punchy title", "hook": "first-line on-screen hook", "score": 0.0, "reason": "why"}]`,
+        mock: [{ start: 0, end: c.clip_min_seconds + 10, title: "Mock clip", hook: "Mock hook", score: 0.7, reason: "mock" }] }));
+      cost += r.cost || 0;
+      picks.push(...(Array.isArray(r.data) ? r.data : r.data?.clips || []));
+    }
+    const r = { data: picks, cost };
     // The model reads the words and says which moment means something. Where the cut lands is not its decision: it
     // proposes a time, the pauses either side of that time decide the frame it actually starts and ends on, and the
     // soundtrack's energy breaks ties between moments the model liked equally.
@@ -1525,7 +1543,9 @@ impl("CLIP", "llm_clipper", { label: "LLM clipper (reads transcript)", configSch
       return { start, end, title: x.title || candidate.title, hook: x.hook || "", score,
         reason: [x.reason, moved > 0.05 ? `cut moved ${moved.toFixed(1)}s to the nearest pause` : null].filter(Boolean).join("; ") };
     })
-      .filter((x) => x.end - x.start >= Math.min(10, c.clip_min_seconds * 0.5)).sort((a, b) => b.score - a.score);
+      .filter((x) => x.end - x.start >= Math.min(10, c.clip_min_seconds * 0.5)).sort((a, b) => b.score - a.score)
+      // The same moment found in two overlapping pieces is one clip: the better-scored one stays.
+      .filter((x, i, all) => !all.slice(0, i).some((y) => Math.min(x.end, y.end) - Math.max(x.start, y.start) > 0.5 * Math.min(x.end - x.start, y.end - y.start)));
     clips.cost = r.cost || 0; return clips;
   } }) });
 
