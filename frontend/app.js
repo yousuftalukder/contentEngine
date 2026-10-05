@@ -84,8 +84,8 @@ const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Tex
 let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
 let PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
 let MULTI_FIELD = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
-const PROVIDER_LABEL = { pollinations: "Pollinations (free pictures — optional token)", groq: "Groq (free writer)", mistral: "Mistral (free writer)", cerebras: "Cerebras (free writer)", openrouter: "OpenRouter (free models)", xai: "xAI Grok", telegram: "Telegram bot (alerts)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
-const PROVIDER_HELP = { pollinations: "Not needed: pictures are drawn without a key. A free account's token (auth.pollinations.ai) removes the small logo in the corner.", groq: "Free, no card: console.groq.com → API Keys. Takes over writing when Gemini's daily allowance runs out.", mistral: "Free Experiment plan: console.mistral.ai → API Keys (asks for a phone number, no card).", cerebras: "cloud.cerebras.ai → API Keys.", openrouter: "openrouter.ai → Keys. Uses only its free models.", xai: "console.x.ai → API Keys. Uses your xAI credits.", telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
+const PROVIDER_LABEL = { vizard: "Vizard (optional rented clipping)", twelve_labs: "Twelve Labs (optional video understanding)", pollinations: "Pollinations (free pictures — optional token)", groq: "Groq (free writer)", mistral: "Mistral (free writer)", cerebras: "Cerebras (free writer)", openrouter: "OpenRouter (free models)", xai: "xAI Grok", telegram: "Telegram bot (alerts)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
+const PROVIDER_HELP = { vizard: "Optional and paid (Creator plan, about $14.50 a month): clips YouTube links while your PC is off. Then set a clips programme's clipper to vizard.", twelve_labs: "Optional: Twelve Labs reads a video's chapters for recaps (5c). Gemini does the same for free (5a). Then set a recap programme's transcriber to twelve_labs.", pollinations: "Not needed: pictures are drawn without a key. A free account's token (auth.pollinations.ai) removes the small logo in the corner.", groq: "Free, no card: console.groq.com → API Keys. Takes over writing when Gemini's daily allowance runs out.", mistral: "Free Experiment plan: console.mistral.ai → API Keys (asks for a phone number, no card).", cerebras: "cloud.cerebras.ai → API Keys.", openrouter: "openrouter.ai → Keys. Uses only its free models.", xai: "console.x.ai → API Keys. Uses your xAI credits.", telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
 const password = (name, extra = {}) => h("input", { type: "password", name, autocomplete: "new-password", spellcheck: false, ...extra });
 
 // form field builders
@@ -245,6 +245,11 @@ pages.overview = async () => {
       h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free Gemini key allows about 20 requests a day per model; add a second free writer (Groq or Mistral, on API keys) and it takes over while this one waits.")) : null,
 
     stats?.newsPrograms?.length ? newsControls(stats) : null,
+
+    (stats?.aiToday || []).length ? h("div", { class: "panel", style: "margin-top:12px" },
+      h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "AI requests today"),
+        (stats.aiToday || []).map((r) => h("span", { class: "tag" }, `${r.provider}: ${r.requests}`))),
+      h("div", { class: "sub" }, "A free Gemini key allows about 20 requests a day per model, so this is what limits how much gets made. A clipped video uses about one; a news draft two or three. A second free writer (Groq, on API keys) adds its own allowance.")) : null,
 
     (stats?.backlogPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber);margin-top:12px" },
       h("b", { style: "font-weight:500" }, "Waiting for you to review"),
@@ -711,7 +716,8 @@ function readVideo(v, mc) {
 function automationFields(mc) {
   const qa = mc.qa || {}, d = mc.desk || {}, ap = mc.autopilot || {};
   return h("fieldset", null, h("legend", null, "Automation"),
-    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_qaEnabled", "Quality check every draft", qa.enabled ?? true), check("_qaAutoFix", "Let it fix flagged drafts once", qa.auto_fix ?? true)),
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_qaEnabled", "Quality check every draft", qa.enabled ?? true), check("_qaAutoFix", "Let it fix flagged drafts once", qa.auto_fix ?? true),
+      check("_qaClips", "Check trimmed clips too (off: under hand review, you are the check — saves AI requests)", !!qa.check_clips)),
     h("div", { class: "grid3", style: "margin-top:8px" },
       field("Pass score (0-1)", num("_qaMinScore", qa.min_score ?? 0.75, { step: "0.05", min: 0, max: 1 })),
       field("Autopilot ideas per day", num("_apTopics", ap.topics_per_day ?? 0, { min: 0 }), "The planner writes this many of its best ideas itself. 0 = off."),
@@ -724,7 +730,7 @@ function automationFields(mc) {
       field("Minutes between stories", num("_deskGap", d.min_gap_minutes ?? 10, { min: 0 }))));
 }
 function readAutomation(v, mc) {
-  const out = { ...mc, qa: { ...(mc.qa || {}), enabled: !!v._qaEnabled, auto_fix: !!v._qaAutoFix, min_score: v._qaMinScore ?? 0.75 },
+  const out = { ...mc, qa: { ...(mc.qa || {}), enabled: !!v._qaEnabled, auto_fix: !!v._qaAutoFix, min_score: v._qaMinScore ?? 0.75, check_clips: !!v._qaClips },
     desk: { ...(mc.desk || {}), min_sources: v._deskMinSources ?? 1, settle_minutes: v._deskSettle ?? 5, max_age_hours: v._deskMaxAge ?? 12, per_sweep: v._deskPerSweep ?? 2, min_gap_minutes: v._deskGap ?? 10 },
     autopilot: { ...(mc.autopilot || {}), topics_per_day: v._apTopics ?? 0 } };
   if (v._backlog == null) delete out.review_backlog; else out.review_backlog = v._backlog;
@@ -1207,11 +1213,15 @@ pages.settings = async () => {
   const known = ["queues.enabled", "publishing.global_pause", "budget.daily_cap_usd", "ingest.enabled", "repurpose.view_threshold", "storage.cleanup_enabled", "storage.cleanup_after_publish_hours",
     "qa.enabled", "qa.auto_fix", "qa.min_score", "desk.enabled", "planner.enabled", "style.auto_refine", "llm.default_fallbacks", "image.default_fallbacks"];
   const minScore = num(null, val("qa.min_score", 0.75), { step: "0.05", min: 0, max: 1, style: "max-width:120px" });
+  const expiry = num(null, val("review.news_expiry_hours", 24), { min: 0, style: "max-width:100px" });
+  const waiting = num(null, val("review.max_waiting", 30), { min: 0, style: "max-width:100px" });
   const tgChat = text(null, val("alerts.telegram_chat_id", "") || "", { placeholder: "chat id, e.g. 123456789", style: "max-width:220px" });
-  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1");
+  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1", "news.paused", "review.news_expiry_hours", "review.max_waiting");
   const fb = text(null, (val("llm.default_fallbacks", []) || []).join(", "), { placeholder: "e.g. openai_live, anthropic_live", style: "max-width:360px" });
   const toggle = (key, def, on, off) => h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val(key, def) ? on : off), h("button", { class: "btn sm", onclick: () => save(key, !val(key, def)) }, val(key, def) ? "Turn off" : "Turn on"));
-  const other = Object.entries(s).filter(([k]) => !known.includes(k));
+  // The engine's own bookkeeping (boot records, quota pauses, relayed answers, cached descriptions) is not a setting.
+  const internal = /^(boot\.|worker\.|quota\.|provider\.refused\.|relay\.|upgrade\.|vizard\.project\.|twelve_labs\.|footage\.seen\.|catalog)/;
+  const other = Object.entries(s).filter(([k]) => !known.includes(k) && !internal.test(k));
   return h("div", null, pageHead("Settings", "Global switches. Program-level behaviour lives on each program."),
     h("div", { class: "panel" }, h("h3", null, "Publishing"),
       h("div", { class: "row" }, h("span", { class: "grow" }, val("publishing.global_pause", false) ? "Publishing is paused. Approved items wait and retry every 10 minutes." : "Publishing is running."),
@@ -1219,6 +1229,11 @@ pages.settings = async () => {
     h("div", { class: "panel" }, h("h3", null, "Ingestion"),
       h("div", { class: "row" }, h("span", { class: "grow" }, val("ingest.enabled", true) ? "Sources are polled on their schedules." : "Automatic polling is off. You can still poll manually."),
         h("button", { class: "btn", onclick: () => save("ingest.enabled", !val("ingest.enabled", true)) }, val("ingest.enabled", true) ? "Stop automatic polling" : "Start automatic polling"))),
+    h("div", { class: "panel" }, h("h3", null, "Review and news"),
+      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val("news.paused", false) ? "News is paused: feeds are read, nothing is drafted." : "News is running."),
+        h("button", { class: `btn sm${val("news.paused", false) ? " primary" : ""}`, onclick: () => save("news.paused", !val("news.paused", false), val("news.paused", false) ? "News resumed" : "News paused") }, val("news.paused", false) ? "Resume news" : "Pause news")),
+      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Set aside news nobody has reviewed after this many hours (0 = never)"), expiry, h("button", { class: "btn sm", onclick: () => save("review.news_expiry_hours", Number(expiry.value) || 0) }, "Save")),
+      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "A hand-reviewed programme stops drafting while this many drafts wait for review (0 = never stop)"), waiting, h("button", { class: "btn sm", onclick: () => save("review.max_waiting", Number(waiting.value) || 0) }, "Save"))),
     h("div", { class: "panel" }, h("h3", null, "Automation"),
       toggle("desk.enabled", true, "News desk: articles are grouped into stories across outlets before writing.", "News desk is off: every new article is written on its own."),
       toggle("qa.enabled", true, "Quality check runs on every draft (programs can override).", "Quality check is off — automatic programs publish unchecked."),
