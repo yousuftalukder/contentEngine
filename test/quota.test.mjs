@@ -83,7 +83,8 @@ test("a daily quota parks the job until the reset, keeps its attempts and says w
 
   const alert = await waitFor(async () => (await eng.api("GET", "/api/notifications")).find((n) => n.kind === "quota"), { what: "the alert that explains the quota" });
   assert.match(alert.title, /free tier/i);
-  assert.match(alert.body, /billing/i);
+  assert.match(alert.body, /free writer/i, "and says what to do without paying: add a second free writer");
+  assert.doesNotMatch(alert.body, /billing/i);
 
   // The desk is only paused when the wait is long enough to be worth pausing for: run this a minute before midnight
   // in California and the reset is a minute away, and stopping the program for that would be pointless.
@@ -93,6 +94,23 @@ test("a daily quota parks the job until the reset, keeps its attempts and says w
     const stats = await eng.api("GET", "/api/stats");
     assert.ok(stats.quotaPauses.some((x) => x.program === "out_of_quota"), "the dashboard can say why it is quiet");
   }
+});
+
+// The cap on waiting counts from the first time the job met a quota. A job queued hours earlier — scheduled for later, or
+// waiting for the PC — used to have spent its "two hours of waiting" before it ever met one, fell back to plain
+// retries and burned the day's allowance doing it (two explainers, seven attempts each, on production).
+test("a job queued long before it meets a per-minute limit still waits for it, without spending an attempt", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_per_minute", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 99, fail_status: 429,
+    fail_message: 'POST https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent -> 429: {"error":{"code":429,"message":"Quota exceeded for metric: generate_content_free_tier_requests, limit: 10","details":[{"violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]},{"retryDelay":"20s"}]}}' } });
+  const p = await program("queued_long", { scriptAdapter: "llm_per_minute" });
+  await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: false } });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story queued three hours ago" });
+  await eng.query(`UPDATE jobs SET created_at = now() - interval '3 hours' WHERE content_item_id = $1`, [id]);
+  await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: true } });
+  const job = await waitFor(async () => { const [j] = await eng.query(`SELECT status, attempts, quota_since, run_after FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [id]);
+    return j?.status === "PENDING" && j.quota_since && j; }, { timeout: 30000, what: "the job to wait for the limit" });
+  assert.equal(job.attempts, 0, "waiting for a per-minute limit is not an attempt, however long the job sat in the queue");
+  assert.ok(new Date(job.run_after) > Date.now(), "and it comes back after the limit's delay");
 });
 
 test("a news story that would be stale by the time the quota returns is dropped, not left half-written", async () => {
