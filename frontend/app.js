@@ -372,8 +372,21 @@ function proofView(it, onDone) {
   const headlineOnly = src.article_chars === 0 && !it.clip_id && (src.outlets?.length || src.url) ? h("div", { class: "panel", style: "border-color:var(--amber)" },
     h("b", { style: "font-weight:500" }, "Written from headlines only"),
     h("div", { class: "sub" }, "None of the outlets' articles could be read (several block the server), so the writer had the headline and a one-line summary. Check every fact against the source before approving.")) : null;
+  // A clip: why this moment, and where it is in the source — with a link that opens the source right there, so a pick
+  // can be judged against what comes before and after it without hunting through an hour of video.
+  const cl = it.clip_id && src.clip ? src.clip : null;
+  const mmss = (t) => { const x = Math.max(0, Math.round(Number(t) || 0)); return `${Math.floor(x / 60)}:${String(x % 60).padStart(2, "0")}`; };
+  const atMoment = (url, t) => { if (!url) return null; const s = Math.floor(Number(t) || 0);
+    return /youtu\.?be/.test(url) ? `${url}${url.includes("?") ? "&" : "?"}t=${s}s` : /^https?:/.test(url) ? `${url}#t=${s}` : null; };
+  const why = cl ? h("div", { class: "panel", style: "margin-bottom:12px" },
+    h("b", { style: "font-weight:500" }, "Why this moment"),
+    h("div", { class: "sub" }, `${mmss(cl.start)}–${mmss(cl.end)} (${Math.round((cl.end || 0) - (cl.start || 0))}s) of `,
+      atMoment(src.url, cl.start) ? h("a", { href: atMoment(src.url, cl.start), target: "_blank", rel: "noopener" }, src.title || "the source") : (src.title || "the source")),
+    cl.reason ? h("div", { style: "margin-top:4px" }, cl.reason) : null,
+    cl.score != null ? h("div", { class: "small mute" }, `score ${Number(cl.score).toFixed(2)}`) : null) : null;
   return h("div", { class: "proof" },
     headlineOnly,
+    why,
     qaPanel(it),
     h("div", { class: "row small mute" }, tag(it.status), h("span", null, it.program_name), h("span", null, nice(it.content_type)), h("span", null, "created ", ago(it.created_at)), h("span", null, "cost ", usd(it.generation_cost_usd)),
       it.review_deadline_at ? h("span", { class: "deadline" }, untilText(it.review_deadline_at)) : null,
