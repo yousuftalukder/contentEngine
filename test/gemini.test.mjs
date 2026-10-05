@@ -39,6 +39,7 @@ test("Gemini: when the free allowance is spent, the job waits for the reset and 
     assert.ok(job.run_after, "it waits for a time, not forever");
     assert.match(job.error_message, /PerDay|limit: 20/, `the reason given is the spent daily allowance — got: ${job.error_message.slice(0, 300)}`);
     assert.doesNotMatch(job.error_message, /limit: 0/, "not the Pro model nobody chose");
+    assert.match(job.error_message, /\[metric [^\]]*quota GenerateRequestsPerDayPerProjectPerModel-FreeTier/, "and the stored error names the limit up front");
     assert.equal(asked.filter((m) => /pro/.test(m)).length, 1, "the Pro model was tried once, as a stand-in");
 
     const { id: second } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Metro rail extends its hours" });

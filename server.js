@@ -124,8 +124,19 @@ async function fetchJson(url, opts = {}) {
   const res = await fetch(url, opts);
   const text = await res.text();
   let body; try { body = JSON.parse(text); } catch { body = text; }
-  if (!res.ok) throw new ApiError(res.status, body, `${opts.method || "GET"} ${url.split("?")[0]} -> ${res.status}: ${(typeof body === "string" ? body : JSON.stringify(body)).slice(0, 400)}`);
+  if (!res.ok) throw new ApiError(res.status, body, `${opts.method || "GET"} ${url.split("?")[0]} -> ${res.status}: ${quotaSummary(body)}${(typeof body === "string" ? body : JSON.stringify(body)).slice(0, 400)}`);
   return body;
+}
+// Which limit a quota error hit, first in the message. Google puts it at the end of a long body ("Quota exceeded for
+// metric … limit: 20, model: …" and the quota id, e.g. GenerateRequestsPerDayPerProjectPerModel-FreeTier) — past where
+// a stored error is cut off, so a job's error said "you exceeded your current quota" and nothing about which one.
+function quotaSummary(body) {
+  const e = body && typeof body === "object" ? body.error : null; if (!e) return "";
+  const ids = (e.details || []).flatMap((d) => (d.violations || []).map((v) => v.quotaId).filter(Boolean));
+  const metric = (/Quota exceeded for metric: ([^\n]*?)(?:\n|$)/.exec(e.message || "") || [])[1];
+  const retry = (e.details || []).map((d) => d.retryDelay).find(Boolean);
+  const parts = [metric && `metric ${metric}`, ids.length && `quota ${[...new Set(ids)].join(", ")}`, retry && `retry in ${retry}`].filter(Boolean);
+  return parts.length ? `[${parts.join("; ")}] ` : "";
 }
 async function fetchBytes(url, opts = {}) {
   const res = await fetch(url, opts);
@@ -3407,8 +3418,8 @@ async function imageOrCard(niche, itemId, { prompt, headline, specs, label = und
 }
 async function notifyNoPictures(e) {
   const qw = quotaWait(e), provider = PROVIDER_HOSTS.find(([h]) => e.message.includes(h))?.[1] || "The image model";
-  const hint = qw && qw.kind !== "minute" && qw.freeTier ? `${provider}'s free tier does not generate pictures. Enable billing on the key (Google AI Studio → Billing — about $0.04 a picture) and pictures come back on their own.`
-    : qw ? `${provider} is over its image quota. It resumes when the quota resets; enabling billing or adding a second key lifts it.`
+  const hint = qw && qw.kind !== "minute" && qw.freeTier ? `${provider}'s free tier does not generate pictures. Add the free Pollinations picture service to the programme's pictures (Programmes → Edit → Engine choices) — it needs no key.`
+    : qw ? `${provider} is over its image quota. It resumes when the quota resets; a free picture service behind it (Pollinations, no key) keeps posts illustrated meanwhile.`
     : /No API key/i.test(e.message) ? `Add an image key on the API keys page (or set it on Render) to get pictures back.`
     : `${provider} could not make a picture.`;
   await notify("provider", "Posts are going out as text cards (no pictures)", `${hint}\n\nLast error: ${String(e.message).slice(0, 400)}`, { key: "image-fallback", cooldownHours: 12 });
@@ -4629,8 +4640,12 @@ const QUOTA_MAX_WAIT_DAYS = Number(ENV.QUOTA_MAX_WAIT_DAYS) || 3;
 async function deferForQuota(job, payload, quota, msg) {
   // Waiting has a limit: a job that has been bouncing off a per-minute limit for hours, or off a daily one for days, is
   // not really waiting for a quota — it goes back to the ordinary backoff, and fails and alerts like anything else.
+  // Counted from the first time this job waited for a quota — not from when it was created: a job queued for later, or
+  // left waiting while your PC was off, had used up its "two hours of waiting" before it ever met a limit, fell back to
+  // ordinary retries and spent the day's allowance retrying (two explainers, 7 attempts each, 2026-10-05).
   const cap = quota.kind === "minute" ? 2 * 3600e3 : quota.kind === "busy" ? 8 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3;
-  if (Date.now() - new Date(job.created_at).getTime() > cap) return false;
+  const [{ since }] = await q(`UPDATE jobs SET quota_since = COALESCE(quota_since, now()) WHERE id = $1 RETURNING quota_since AS since`, [job.id]);
+  if (Date.now() - new Date(since).getTime() > cap) return false;
   const itemId = job.content_item_id || payload.itemId || null;
   const item = itemId ? await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]) : null;
   const niche = item || payload.nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [item?.niche_id || payload.nicheId]) : null;
@@ -4683,7 +4698,7 @@ async function notifyQuota(quota, msg) {
   const back = dhakaTime(new Date(Date.now() + quota.seconds * 1000));
   await notify("quota", quota.freeTier ? `${provider} free tier: today's requests are used up` : `${provider} daily quota reached`,
     (quota.freeTier
-      ? `A free key allows only about 20 requests a day per model${quota.model ? ` — this one ran out on ${quota.model}` : ""}, which is a handful of posts. Enable billing on the key (Google AI Studio → Billing) and the cap goes away; Flash costs a fraction of a cent per post.`
+      ? `A free key allows only about 20 requests a day per model${quota.model ? ` — this one ran out on ${quota.model}` : ""}, which is a handful of posts. Work waits for the reset; add a second free writer (a Groq or Mistral key, on API keys) and it carries on meanwhile.`
       : `Raise the project's quota with the provider, or add a second key on the API keys page.`)
     + `\n\nWork resumes on its own around ${back} (Dhaka). Until then new stories are not started, and ones that would be stale by then are skipped.`,
     { level: "error", key: `quota:${provider}:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 20 });
@@ -4790,9 +4805,9 @@ const PROVIDER_HOSTS = [["api.anthropic.com", "Anthropic"], ["generativelanguage
 async function alertOnFailure(job, msg) {
   const provider = PROVIDER_HOSTS.find(([h]) => msg.includes(h))?.[1] || (msg.match(/No API key for "(\w+)"/) || [])[1] || "an API";
   const rule = [
-    [/free_tier|FreeTier/i, `${provider} is on a free key and has hit its limit`, "A free key allows about 20 requests a day per model and no pictures. Enable billing on it (Google AI Studio → Billing) — the cost per post is a fraction of a cent."],
+    [/free_tier|FreeTier/i, `${provider} is on a free key and has hit its limit`, "A free key allows about 20 requests a day per model and no pictures. Work waits for the reset; a second free writer (a Groq or Mistral key, on API keys) carries on meanwhile, and Pollinations draws pictures without a key."],
     [/credit balance|insufficient_quota|payment|\b402\b/i, `${provider} account is out of credit`, "Top it up, or let the program fall back: it uses the next writer or voice on its list automatically once one is set (Programs → Edit)."],
-    [/limit: 0\b/i, `${provider} plan does not include this model`, "Enable billing on the key, or point the program at a model the plan includes (Programs → Edit)."],
+    [/limit: 0\b/i, `${provider} plan does not include this model`, "Point the programme at a model the plan includes (Programmes → Edit → Engine choices), or add a free writer such as Groq on API keys."],
     [/exceeded your current quota|RESOURCE_EXHAUSTED/i, `${provider} quota is exhausted`, "Raise the quota with the provider, or add a second key on the API keys page."],
     [/No API key/i, `No key for ${provider}`, "Add it on the API keys page or set the env var on Render."],
     [/API key not valid|invalid[_ ]api[_ ]key|Incorrect API key|\b401\b|PERMISSION_DENIED|Unauthorized/i, `${provider} rejected the key`, "Check the key on the API keys page (Test button)."],
