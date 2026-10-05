@@ -205,3 +205,39 @@ test("an explainer is written on the server and only its render is handed to the
     assert.match(tried.error_message || "", /studio/i, "the PC took the render (and, with its studio off here, said so)");
   } finally { await pc?.stop(); await server.stop(); }
 });
+
+// An illustrated story that renders on the PC is drawn on the PC too: the server hands the plan over undrawn, and the
+// PC draws the pictures (the free picture service is known to answer it) just before it renders.
+test("an illustrated story handed to the PC is drawn there, not on the server", { skip: (await import("node:child_process")).spawnSync("ffmpeg", ["-version"]).status !== 0 && "ffmpeg not installed" }, async () => {
+  const http = await import("node:http"), { spawnSync } = await import("node:child_process"), { mkdtempSync, readFileSync } = await import("node:fs"), { tmpdir } = await import("node:os"), { join } = await import("node:path");
+  const jpg = join(mkdtempSync(join(tmpdir(), "ce-pcdraw-")), "p.jpg");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=256x256", "-frames:v", "1", jpg]);
+  const picture = readFileSync(jpg); let drawn = 0;
+  const pics = http.createServer((req, res) => { drawn++; res.writeHead(200, { "content-type": "image/jpeg" }); res.end(picture); });
+  await new Promise((r) => pics.listen(0, "127.0.0.1", r));
+  const env = { STUDIO_MIN_MEMORY_MB: "999999", POLLINATIONS_API_BASE: `http://127.0.0.1:${pics.address().port}`, POLLINATIONS_RETRY_MS: "10" };
+  const tone = "-hide_banner -loglevel error -y -f lavfi -i sine=frequency=220:duration=2".split(" ");
+  const server = await startEngine({ env });
+  let pc;
+  try {
+    await server.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    await server.api("POST", "/api/adapter-configs", { key: "tts_tone2", stage: "VOICE", impl: "tts_command", config: { command: "ffmpeg", args: [...tone, "{out}"], voice: "", format: "wav" } });
+    await server.api("POST", "/api/adapter-configs", { key: "llm_story2", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "This is an ILLUSTRATED story", json: {
+      title: "Rafi", description: "story", hashtags: ["story"], scenes: [
+        { layout: "TitleCard", chapter: "Start", data: { title: "Rafi" }, parts: ["This is Rafi."] },
+        { layout: "Illustrated", chapter: "Street", data: { setting: "a Dhaka street", character: "Rafi", action: "waving", caption: "Rafi" }, parts: ["Rafi waves."] },
+        { layout: "Illustrated", chapter: "Rain", data: { setting: "the street in rain", character: null, caption: "Rain" }, parts: ["Then it rains."] }] } }] } });
+    const brand = await server.api("POST", "/api/brands", { name: "Drawn on the PC" });
+    const p = await server.api("POST", "/api/programs", { brandId: brand.id, key: "pc_drawn", displayName: "PC drawn", contentType: "ANIMATED_EXPLAINER", computeWhere: "pc",
+      useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "llm_story2", scriptAdapterFallbacks: [], voiceAdapter: "tts_tone2",
+      methodConfig: { explainer_minutes: 1, explainer_style: "illustrated", qa: { enabled: false }, characters: [{ name: "Rafi", look: "a rickshaw driver in a green lungi" }] } });
+    const { id } = await server.api("POST", "/api/generate", { nicheId: p.id, topic: "A rainy day" });
+    await waitFor(async () => (await server.query(`SELECT 1 FROM jobs WHERE type = 'STUDIO_RENDER' AND content_item_id = $1`, [id])).length, { timeout: 60000, what: "the hand-off" });
+    assert.equal(drawn, 0, "the server drew nothing");
+    pc = await startEngine({ env: { ...env, DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false" } });
+    await waitFor(async () => { const [j] = await server.query(`SELECT attempts, status FROM jobs WHERE type = 'STUDIO_RENDER' AND content_item_id = $1`, [id]); return j?.attempts > 0 && j.status !== "RUNNING"; }, { timeout: 60000, what: "the PC to draw and try to render" });
+    assert.ok(drawn >= 3, `the PC drew the two places and the character (${drawn} pictures)`);
+    const plan = (await server.api("GET", `/api/content-items/${id}`)).script_meta.studio;
+    assert.ok(plan.scenes[1].data.background && plan.scenes[1].data.figure, "and the plan keeps them for a retry");
+  } finally { await pc?.stop(); await server.stop(); await new Promise((r) => pics.close(r)); }
+});
