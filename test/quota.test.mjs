@@ -168,6 +168,20 @@ test("a news story that would be stale by the time the quota returns is dropped,
   assert.equal(job.status, "CANCELLED", "cancelled, so it does not count as a failure");
 });
 
+// A 429 that names no limit and gives no delay is not a per-minute limit: it is asked again in a quarter of an hour,
+// not every minute across every fallback model.
+test("a quota error that names no limit and no delay waits a quarter of an hour, not a minute", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_bare_now", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 99, fail_status: 429,
+    fail_message: 'POST https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent -> 429: {"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.Help"}]}}' } });
+  const p = await program("bare_now", { scriptAdapter: "llm_bare_now" });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story that met a bare 429" });
+  const job = await waitFor(async () => { const [j] = await eng.query(`SELECT status, attempts, quota_since, run_after, now() AS now FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [id]);
+    return j?.status === "PENDING" && j.quota_since && j; }, { timeout: 30000, what: "the job to wait" });
+  const wait = (new Date(job.run_after) - new Date(job.now)) / 60000;
+  assert.ok(wait > 10 && wait < 20, `it waits about fifteen minutes (${wait.toFixed(1)})`);
+  assert.equal(job.attempts, 0, "without spending an attempt");
+});
+
 test("no picture, still a reel: sections fall back to branded backdrops and the video renders", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
   const p = await program("reel_cards", { contentType: "NEWS_REEL", imageAdapter: "image_no_key", voiceAdapter: "tts_mock", renderAdapter: "ffmpeg", language: "bn", methodConfig: { slides: 2 } });
   const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "পদ্মা সেতুতে টোল আদায়ের রেকর্ড" });
