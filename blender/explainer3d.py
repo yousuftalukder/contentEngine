@@ -84,7 +84,7 @@ elif layout == "Words3D":
         pop(text(w, 1.2 if vertical else 1.15, (1, 1, 1) if i % 2 else (*accent,), (0, 0, (1.7 if vertical else 1.5) - i * (1.55 if vertical else 1.4))), cue(i, 10 + i * 18))
     look_z = 0
 else:  # Title3D
-    t = text(data.get("title", ""), 1.3 if vertical else 1.6, (1, 1, 1), (0, 0, 0.6), 0.14); pop(t, cue(0, 4), 18)
+    t = text(data.get("title", ""), 1.1 if vertical else 1.6, (1, 1, 1), (0, 0, 0.6), 0.14); pop(t, cue(0, 4), 18)
     if data.get("subtitle"): pop(text(data["subtitle"], 0.65, accent, (0, 0, -0.9), 0.05), cue(0, 4) + 14)
     floor = bar(0, 0.02, span * 2, light); floor.location.z = -1.6
     look_z = 0
@@ -92,7 +92,7 @@ else:  # Title3D
 # A camera that keeps moving: a slow push in and a slight drift sideways over the whole scene.
 cam_data = bpy.data.cameras.new("cam"); cam_data.lens = 35 if vertical else 40
 cam = bpy.data.objects.new("cam", cam_data); scn.collection.objects.link(cam); scn.camera = cam
-dist = 19 if vertical else 17.5
+dist = 13.5 if vertical else 17.5   # a tall frame is narrow: closer, so the content fills it
 def place(frame, y, x):
     cam.location = (x, y, look_z + 1.2)
     d = (0 - x, 0 - y, look_z - (look_z + 1.2)); cam.rotation_euler = (math.atan2(math.hypot(d[0], d[1]), -d[2]), 0, math.atan2(d[1], d[0]) - math.pi / 2)
