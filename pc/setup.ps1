@@ -1,6 +1,8 @@
 # Prepares this PC to be a video worker: ffmpeg, yt-dlp and whisper.cpp in the project's own .tools folder, nothing
 # installed system-wide. Safe to run again — anything already present is left alone. Every download is printed with
 # where it comes from before it starts.
+# -Blender also installs Blender (about 350 MB), for 3D explainers (blueprint 6d). Optional: nothing else needs it.
+param([switch]$Blender)
 $ErrorActionPreference = "Stop"
 $root  = Split-Path $PSScriptRoot -Parent
 $tools = Join-Path $root ".tools"
@@ -42,6 +44,23 @@ if (-not (Test-Path (Join-Path $bin "deno.exe"))) {
   Expand-Archive -Force $zip $bin
   Remove-Item -Force $zip
 } else { Write-Host "deno: already present" }
+
+# Blender (only with -Blender): the portable Windows build of the 4.2 LTS release from blender.org, into
+# .tools\blender, where the worker finds it. Renders 3D explainers on the CPU; nothing else uses it.
+if ($Blender) {
+  $bdir = Join-Path $tools "blender"
+  if (-not (Test-Path (Join-Path $bdir "blender.exe"))) {
+    Write-Host "blender"
+    $zip = Join-Path $env:TEMP "blender-windows.zip"
+    Fetch "https://download.blender.org/release/Blender4.2/blender-4.2.3-windows-x64.zip" $zip
+    $x = Join-Path $env:TEMP "blender-x"; Remove-Item -Recurse -Force $x -ErrorAction SilentlyContinue
+    Expand-Archive -Force $zip $x
+    $exe = Get-ChildItem $x -Recurse -Filter blender.exe | Select-Object -First 1
+    New-Item -ItemType Directory -Force $bdir | Out-Null
+    Copy-Item (Join-Path $exe.DirectoryName "*") -Destination $bdir -Recurse
+    Remove-Item -Recurse -Force $x, $zip
+  } else { Write-Host "blender: already present" }
+}
 
 # whisper.cpp: the official x64 build (it picks the fastest CPU code path at run time), and the multilingual base
 # model. Base is the right size here: a PC has the memory a 512 MB server does not, and it is ~8x faster than real time.

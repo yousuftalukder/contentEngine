@@ -30,3 +30,40 @@ test("a data explainer asks the planner for data scenes, and a plan of figures a
     assert.doesNotMatch(general.captions.youtube, /^DATA PLAN/, "a general explainer is not asked for one");
   } finally { await eng.stop(); }
 });
+
+// 6d, a 3D explainer: the planner is told to use the 3D layouts, and each scene goes to Blender (a stand-in here) with
+// its data, its cue frames and the brand's colours; the scenes are joined and narrated into one video.
+test("a 3D explainer plans in 3D layouts and renders every scene through Blender", { skip: (await import("node:child_process")).spawnSync("ffmpeg", ["-version"]).status !== 0 && "ffmpeg not installed" }, async () => {
+  const { mkdtempSync, readFileSync } = await import("node:fs"), { tmpdir } = await import("node:os"), { join, dirname } = await import("node:path"), { fileURLToPath } = await import("node:url");
+  const log = join(mkdtempSync(join(tmpdir(), "ce-3d-")), "blender.log");
+  const fake = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-blender.mjs");
+  const tone = "-hide_banner -loglevel error -y -f lavfi -i sine=frequency=220:duration=2".split(" ");
+  const eng = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999", BLENDER_BIN: fake, FAKE_BLENDER_LOG: log } });
+  try {
+    await eng.api("POST", "/api/adapter-configs", { key: "tts_tone3d", stage: "VOICE", impl: "tts_command", config: { command: "ffmpeg", args: [...tone, "{out}"], voice: "", format: "wav" } });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_3d", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "3D explainer rendered in Blender", json: {
+      title: "Metro in 3D", description: "3D PLAN", hashtags: ["metro"], scenes: [
+        { layout: "Title3D", chapter: "Start", data: { title: "Dhaka Metro", subtitle: "in numbers" }, parts: ["This is the Dhaka metro, in numbers."] },
+        { layout: "Bars3D", chapter: "Riders", data: { heading: "Daily riders", unit: "k", data: [{ label: "2023", value: 180 }, { label: "2025", value: 410 }] }, parts: ["In 2023, a hundred and eighty thousand a day.", "By 2025, four hundred and ten thousand."] },
+        { layout: "Words3D", chapter: "Why", data: { heading: "Why it works", words: ["Fast", "Cheap", "On time"] }, parts: ["It is fast.", "It is cheap.", "It runs on time."] },
+        { layout: "TitleCard", data: { title: "not a 3D layout" }, parts: ["Dropped."] }] } }] } });
+    const b = await eng.api("POST", "/api/brands", { name: "3D brand", brandKit: { primary_color: "#0b3d91", accent_color: "#ffc400" } });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "three_d", displayName: "3D", contentType: "ANIMATED_EXPLAINER", useMocks: true, autoStyle: false, autoSources: false,
+      scriptAdapter: "llm_3d", scriptAdapterFallbacks: [], voiceAdapter: "tts_tone3d", methodConfig: { explainer_minutes: 1, explainer_style: "3d", orientation: "16:9", qa: { enabled: false } } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Dhaka metro ridership" });
+    const it = await waitFor(async () => { const x = await eng.api("GET", `/api/content-items/${id}`); if (x.status === "FAILED") throw new Error(x.rejection_note); return x.status === "PENDING_REVIEW" && x; }, { timeout: 120000, what: "the 3D explainer" });
+    const calls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(calls.map((c) => c.spec.layout), ["Title3D", "Bars3D", "Words3D"], "each 3D scene went to Blender, and the non-3D one was dropped");
+    assert.ok(calls.every((c) => /explainer3d\.py$/.test(c.script)), "through the scene template");
+    const bars = calls[1].spec;
+    assert.deepEqual(bars.data.data.map((d) => d.value), [180, 410], "with the research's own numbers");
+    assert.equal(bars.cues.length, 2, "and a cue frame for each bar, from the narration");
+    assert.deepEqual([bars.width, bars.height, bars.primary, bars.accent], [1280, 720, "#0b3d91", "#ffc400"], "at 720p in the brand's colours");
+    const [video] = await eng.query(`SELECT meta, duration_seconds FROM media_assets WHERE content_item_id = $1 AND kind = 'VIDEO'`, [id]);
+    const meta = typeof video.meta === "string" ? JSON.parse(video.meta) : video.meta;
+    assert.equal(meta.method, "EXPLAINER_3D");
+    const expected = calls.reduce((n, c) => n + c.spec.frames / c.spec.fps, 0);
+    assert.ok(Math.abs(Number(video.duration_seconds) - expected) < 1.5, `the scenes joined into one video (${video.duration_seconds}s of ${expected.toFixed(1)}s)`);
+    assert.match(it.captions.youtube, /^3D PLAN/);
+  } finally { await eng.stop(); }
+});

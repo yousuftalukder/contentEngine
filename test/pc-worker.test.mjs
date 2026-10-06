@@ -201,7 +201,7 @@ test("an explainer is written on the server and only its render is handed to the
     assert.ok(plan.audio && plan.scenes.length === 3 && plan.scenes[0].durationInFrames > 0, "with the whole plan stored: narration, scenes, timing");
 
     pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false", STUDIO_MIN_MEMORY_MB: "999999" } });
-    const tried = await waitFor(async () => { const [j] = await server.query(`SELECT status, attempts, error_message FROM jobs WHERE type = 'STUDIO_RENDER' AND content_item_id = $1`, [id]); return j?.attempts > 0 && j; }, { timeout: 60000, what: "the PC to take the render" });
+    const tried = await waitFor(async () => { const [j] = await server.query(`SELECT status, attempts, error_message FROM jobs WHERE type = 'STUDIO_RENDER' AND content_item_id = $1`, [id]); return j?.attempts > 0 && j.status !== "RUNNING" && j.error_message && j; }, { timeout: 60000, what: "the PC to take the render and finish its attempt" });
     assert.match(tried.error_message || "", /studio/i, "the PC took the render (and, with its studio off here, said so)");
   } finally { await pc?.stop(); await server.stop(); }
 });
