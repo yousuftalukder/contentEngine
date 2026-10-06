@@ -377,6 +377,10 @@ function proofView(it, onDone) {
   const headlineOnly = src.article_chars === 0 && !it.clip_id && (src.outlets?.length || src.url) ? h("div", { class: "panel", style: "border-color:var(--amber)" },
     h("b", { style: "font-weight:500" }, "Written from headlines only"),
     h("div", { class: "sub" }, "None of the outlets' articles could be read (several block the server), so the writer had the headline and a one-line summary. Check every fact against the source before approving.")) : null;
+  // Research the web search was refused for comes from the model's memory alone: figures and dates in it are unchecked.
+  const noSearch = src.research_searched === false ? h("div", { class: "panel", style: "border-color:var(--amber)" },
+    h("b", { style: "font-weight:500" }, "Researched without web search"),
+    h("div", { class: "sub" }, "Web search was refused for this draft (plan or search allowance), so its facts come from the writer's memory and the source article. Check figures, dates and names before approving.")) : null;
   // A clip: why this moment, and where it is in the source — with a link that opens the source right there, so a pick
   // can be judged against what comes before and after it without hunting through an hour of video.
   const cl = it.clip_id && src.clip ? src.clip : null;
@@ -391,6 +395,7 @@ function proofView(it, onDone) {
     cl.score != null ? h("div", { class: "small mute" }, `score ${Number(cl.score).toFixed(2)}`) : null) : null;
   return h("div", { class: "proof" },
     headlineOnly,
+    noSearch,
     why,
     qaPanel(it),
     h("div", { class: "row small mute" }, tag(it.status), h("span", null, it.program_name), h("span", null, nice(it.content_type)), h("span", null, "created ", ago(it.created_at)), h("span", null, "cost ", usd(it.generation_cost_usd)),
