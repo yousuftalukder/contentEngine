@@ -180,7 +180,7 @@ function nextMidnightPacific() {
   for (let i = 0; i < 26 && hour(t) !== 0; i++) t = new Date(t.getTime() + 3600e3);
   return t;
 }
-// kind: "minute" (wait `seconds`), "day" (wait for the reset), "plan" (limit 0 — the plan doesn't include this model; no
+// kind: "minute" (wait `seconds`), "unstated" (a 429 naming no limit and no delay: 15 min), "day" (wait for the reset), "plan" (limit 0 — the plan doesn't include this model; no
 // reset will help) or "billing" (out of prepaid credit). An error aggregated over fallbacks (e.causes) waits for the
 // soonest reset among its quota causes, or backs off normally if one of them is an ordinary outage.
 function quotaWait(e) {
@@ -197,6 +197,10 @@ function quotaWait(e) {
   if (/limit: 0\b/.test(s)) return { kind: "plan", seconds: null, freeTier, model };
   if (/PerDay|per day|\bRPD\b|\bTPD\b/i.test(s)) return { kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)), freeTier, model };
   const d = Number((/(?:retry(?:Delay"?:\s*"| in )|try again in )(\d+(?:\.\d+)?)s/i.exec(s) || [])[1]);
+  // A per-minute limit names itself and says when to try again. A 429 that does neither (Gemini's free tier answers a
+  // spent day this way on some models: a help link, no limit, no delay) is not asked again every minute — across every
+  // fallback model and every waiting job that was hundreds of refused requests an hour — but every fifteen.
+  if (!d && !/PerMinute|per minute|\bRPM\b|\bTPM\b/i.test(s)) return { kind: "unstated", seconds: 900, freeTier, model };
   return { kind: "minute", seconds: Math.max(30, Math.round(d || 60) + 5), freeTier, model };
 }
 // A request refused because it asked for web search (Gemini's google_search tool): a 400 or a quota error that names
@@ -4739,14 +4743,14 @@ async function deferForQuota(job, payload, quota, msg) {
   // Counted from the first time this job waited for a quota — not from when it was created: a job queued for later, or
   // left waiting while your PC was off, had used up its "two hours of waiting" before it ever met a limit, fell back to
   // ordinary retries and spent the day's allowance retrying (two explainers, 7 attempts each, 2026-10-05).
-  const cap = quota.kind === "minute" ? 2 * 3600e3 : quota.kind === "busy" ? 8 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3;
+  const cap = quota.kind === "minute" || quota.kind === "unstated" ? 2 * 3600e3 : quota.kind === "busy" ? 8 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3;
   const [{ since }] = await q(`UPDATE jobs SET quota_since = COALESCE(quota_since, now()) WHERE id = $1 RETURNING quota_since AS since`, [job.id]);
   const waited = Date.now() - new Date(since).getTime();
   // A "per-minute" limit that is still refusing two hours later is the day's allowance under another name: Gemini's
   // free tier does not always say which limit it hit (gemini-flash-lite-latest answers a bare 429). Treated as a
   // minute limit, the job went back to ordinary retries and failed — every explainer, 2026-10-06. It waits for the
   // daily reset instead, within the same few days' limit as any daily quota.
-  if (quota.kind === "minute" && waited > cap && waited <= QUOTA_MAX_WAIT_DAYS * 86400e3)
+  if ((quota.kind === "minute" || quota.kind === "unstated") && waited > cap && waited <= QUOTA_MAX_WAIT_DAYS * 86400e3)
     quota = { ...quota, kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)) };
   else if (waited > cap) return false;
   const itemId = job.content_item_id || payload.itemId || null;
