@@ -5675,7 +5675,17 @@ app.post("/api/assets/:id/check-repurpose", async (ctx) => { const r = await che
 app.post("/api/assets/:id/poll-metrics", async (ctx) => { await pollMetrics(ctx.params.id); json(ctx, 200, await one(`SELECT last_metrics FROM content_assets WHERE id=$1`, [ctx.params.id])); });
 // ---- jobs
 app.get("/api/jobs", async (ctx) => { const it = ctx.query.get("contentItemId"), st = ctx.query.get("status"); json(ctx, 200, await q(`SELECT * FROM jobs WHERE ($1::text IS NULL OR content_item_id=$1) AND ($2::text IS NULL OR status=$2) ORDER BY created_at DESC LIMIT 200`, [it, st])); });
-app.post("/api/jobs/:id/retry", async (ctx) => { await q(`UPDATE jobs SET status='PENDING', attempts=0, run_after=NULL, error_message=NULL WHERE id=$1 AND status='FAILED'`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
+// A retry starts the job afresh: its attempts, its quota wait (counted from quota_since) and the failure it left on the
+// item and the video all go, so the dashboard shows it queued rather than failed while it runs again.
+app.post("/api/jobs/:id/retry", async (ctx) => {
+  const [job] = await q(`UPDATE jobs SET status='PENDING', attempts=0, run_after=NULL, error_message=NULL, quota_since=NULL, finished_at=NULL, locked_by=NULL WHERE id=$1 AND status='FAILED' RETURNING content_item_id, payload`, [ctx.params.id]);
+  if (job) {
+    const payload = P(job.payload) || {}, itemId = job.content_item_id || payload.itemId;
+    if (itemId) await q(`UPDATE content_items SET status='QUEUED', rejection_note=NULL WHERE id=$1 AND status='FAILED'`, [itemId]);
+    if (payload.candidateId) await q(`UPDATE video_candidates SET status='QUEUED', error_message=NULL WHERE id=$1 AND status='FAILED'`, [payload.candidateId]);
+  }
+  json(ctx, 200, { ok: true, retried: !!job });
+});
 // ---- seed (safe to call repeatedly)
 app.post("/api/seed", async (ctx) => {
   let brand = await one(`SELECT * FROM brands WHERE name=$1`, ["Demo Media Co"]); if (!brand) { const id = newId(); await q(`INSERT INTO brands (id, name, description) VALUES ($1,$2,$3)`, [id, "Demo Media Co", "Starter brand"]); brand = await one(`SELECT * FROM brands WHERE id=$1`, [id]); }
