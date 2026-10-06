@@ -610,8 +610,11 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'gemini_video',     'TRANSCRIBE', 'gemini_video',     'Gemini watches the video (scenes)', '{}'),
   (gen_random_uuid()::text, 'twelve_labs',      'TRANSCRIBE', 'twelve_labs',      'Twelve Labs (video chapters)',   '{}'),
   (gen_random_uuid()::text, 'whisper_local',    'TRANSCRIBE', 'whisper_local',    'Whisper CLI (local, heavy)',     '{}'),
+  (gen_random_uuid()::text, 'whisper_cpp',      'TRANSCRIBE', 'whisper_cpp',      'whisper.cpp (on this machine, free)', '{}'),
   (gen_random_uuid()::text, 'clip_mock',        'CLIP',       'clip_mock',        'Mock clipper',                   '{}'),
   (gen_random_uuid()::text, 'llm_clipper',      'CLIP',       'llm_clipper',      'LLM reads transcript, picks clips', '{}'),
+  (gen_random_uuid()::text, 'clip_meaning',     'CLIP',       'clip_meaning',     'The moment that means something (free, no key)', '{}'),
+  (gen_random_uuid()::text, 'clip_signal',      'CLIP',       'clip_signal',      'Loudest moment (free, no key)',  '{}'),
   (gen_random_uuid()::text, 'vizard',           'CLIP',       'vizard',           'Vizard (rented clipping)',       '{}'),
   (gen_random_uuid()::text, 'llm_mock',         'SCRIPT',     'llm_mock',         'Mock LLM',                       '{}'),
   (gen_random_uuid()::text, 'anthropic_live',   'SCRIPT',     'anthropic',        'Anthropic Claude',               '{}'),
@@ -629,7 +632,10 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'gemini_image',     'IMAGE',      'gemini_image',     'Gemini image generation',        '{}'),
   (gen_random_uuid()::text, 'pexels_stock',     'IMAGE',      'pexels_stock',     'Stock photo (Pexels)',           '{}'),
   (gen_random_uuid()::text, 'pollinations',     'IMAGE',      'pollinations',     'Pollinations (free, no key)',    '{}'),
+  (gen_random_uuid()::text, 'source_photo',     'IMAGE',      'source_photo',     'The story''s own photo',         '{}'),
   (gen_random_uuid()::text, 'tts_mock',         'VOICE',      'tts_mock',         'Mock TTS (silent audio)',        '{}'),
+  (gen_random_uuid()::text, 'tts_edge',         'VOICE',      'tts_edge',         'Edge neural voices (free, no key, Bangla + English)', '{}'),
+  (gen_random_uuid()::text, 'tts_piper',        'VOICE',      'tts_piper',        'Piper (on this machine, free)',  '{}'),
   (gen_random_uuid()::text, 'elevenlabs',       'VOICE',      'elevenlabs',       'ElevenLabs TTS',                 '{}'),
   (gen_random_uuid()::text, 'gemini_tts',       'VOICE',      'gemini_tts',       'Gemini TTS (Bangla + English)',  '{}'),
   (gen_random_uuid()::text, 'render_mock',      'RENDER',     'render_mock',      'Mock renderer',                  '{}'),
@@ -640,4 +646,9 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'youtube_upload',   'PUBLISH',    'youtube_upload',   'YouTube Data API upload',        '{}'),
   (gen_random_uuid()::text, 'embed_mock',       'EMBED',      'embed_mock',       'No embeddings (Jaccard fallback)', '{}'),
   (gen_random_uuid()::text, 'gemini_embed',     'EMBED',      'gemini_embed',     'Gemini embeddings',              '{}')
+ON CONFLICT (key) DO NOTHING;
+-- A command voice does nothing until it is told which command to run (Adapters → tts_command → config.command), so it
+-- starts disabled and stays out of the programme dropdowns until someone sets it up and enables it.
+INSERT INTO adapter_configs (id, key, stage, impl, label, config, enabled) VALUES
+  (gen_random_uuid()::text, 'tts_command',      'VOICE',      'tts_command',      'Local speech engine (piper, espeak, any command)', '{}', 0)
 ON CONFLICT (key) DO NOTHING;

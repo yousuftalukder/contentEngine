@@ -182,7 +182,7 @@ const BLUEPRINT = {
   "Script → video": ["7", "Script → video", "A script narrated over footage: your own library, stock of the right country, or photos with motion."],
 };
 const STATUS_TAG = { proven: ["green", "proven"], built: ["amber", "built — not yet run on real footage"], "to build": ["", "to build"] };
-const WHERE = { pc: "your PC", server: "server", rented: "rented API", "server or pc": "server or your PC" };
+const WHERE = { pc: "your PC", server: "server", rented: "rented API", "server or pc": "server or your PC", "pc or server": "your PC (the server for non-YouTube links)" };
 pages.catalog = async () => {
   const rows = await get("/api/catalog");
   const types = [...new Set(rows.map((r) => r.type))];
@@ -584,10 +584,17 @@ const PRESETS = {
   facts_series: { label: "Facts videos — daily, planner-driven", key: "facts", displayName: "Facts", contentType: "IMAGE_SLIDESHOW", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 60, maxItemsPerDay: 3, _orientation: "9:16", _apTopics: 1, autoSources: false },
 };
 // A variant's setup, as the form's own fields. methodConfig keys live in the form under their "_" names.
-const SETUP_FIELDS = { explainer_style: "_explainerStyle", reaction_layout: "_reactionLayout", orientation: "_orientation", footage_dir: "_footageDir" };
+const SETUP_FIELDS = { explainer_style: "_explainerStyle", reaction_layout: "_reactionLayout", orientation: "_orientation", footage_dir: "_footageDir", speed: "_speed" };
+// What each field a variant can set goes back to when the next variant chosen does not set it. Switching 5c to 5a kept
+// Twelve Labs as the transcriber and 7a to 7b kept the PC and the footage folder, so the programme was still the old
+// variant under the new name. An adapter's "" is the engine's own choice.
+const SETUP_DEFAULTS = { productionMethod: "", clipAdapter: "", transcriptAdapter: "", computeWhere: "server", _explainerStyle: "", _reactionLayout: "stack", _orientation: "", _footageDir: "", _speed: 1 };
 function applySetup(f, setup) {
   const put = (name, val) => { const el = f.querySelector(`[name="${name}"]`); if (!el) return; if (el.type === "checkbox") el.checked = !!val; else el.value = val ?? ""; };
+  const named = new Set([...Object.keys(setup || {}).filter((k) => k !== "methodConfig"), ...Object.keys(setup?.methodConfig || {}).map((k) => SETUP_FIELDS[k]).filter(Boolean)]);
+  for (const [name, def] of Object.entries(SETUP_DEFAULTS)) if (!named.has(name)) put(name, def);
   for (const [k, v] of Object.entries(setup || {})) if (k !== "methodConfig") put(k, v);
+  // true means "this variant needs one" (7a's footage folder): what is already typed stays, and saving asks for it.
   for (const [k, v] of Object.entries(setup?.methodConfig || {})) if (SETUP_FIELDS[k] && v !== true) put(SETUP_FIELDS[k], v);
   f.querySelector("[name=contentType]")?.dispatchEvent(new Event("change"));
 }

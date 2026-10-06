@@ -128,14 +128,19 @@ stock pool, and a library of your own footage is the difference.
 | need | variants |
 |---|---|
 | nothing — free, no key | 1a, 1d, 3b, 4a |
-| a writer key — any free one: Gemini, Groq, Mistral, Cerebras, OpenRouter's free models, or Grok | 1c, 2a–c, 3a, 3c, 4b, 4c, 5a–c, 6a–c, 7a–c |
+| a writer key — any free one: Gemini, Groq, Mistral, Cerebras, OpenRouter's free models, or Grok | 1c, 2a–c, 3a, 3c, 4b, 4c, 5a–c, 6a–d, 7a–c |
 | a voice (edge-tts, free) | 3a, 3c, 4b, 4c, 5a–c, 6a–d, 7a–c |
+| a Pexels key *(free)* | 2c, 7b |
 | a clipping subscription *(optional, the only paid item)* | 1b only |
-| your PC switched on | 1a, 1c, 4a–c, 5a–c, 6a–d, 7a |
-| a persona from you | 4a–c |
+| your PC switched on | 1a, 1c, 3b, 3c, 4a–c, 5a–c, 6a–d, 7a |
+| a persona from you | 4a, 4c *(4b as built narrates over the clip without one)* |
 | Gemini video input (free tier) | 5a |
 | a Twelve Labs key *(optional)* | 5c |
 | your footage folder | 7a |
+
+1c, 3c, 4a–c and 5b start on your PC, because YouTube refuses the server; for a link that is not YouTube they can be
+moved to the server on the programme. 3a can use Pexels footage too, but makes its reel from the outlets' photos
+without it.
 
 ## Adapters
 
