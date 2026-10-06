@@ -686,7 +686,7 @@ function videoFields(p, uploads) {
       field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame."),
       field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
       field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 })),
-      field("Explainer style", select("_explainerStyle", [["", "General — the six layouts mixed"], ["data", "Data — charts, figures and timelines from the research's own numbers"], ["illustrated", "Illustrated — drawn scenes and the series' characters, moved in code"]], mc.explainer_style || ""))),
+      field("Explainer style", select("_explainerStyle", [["", "General — the six layouts mixed"], ["data", "Data — charts, figures and timelines from the research's own numbers"], ["illustrated", "Illustrated — drawn scenes and the series' characters, moved in code"], ["3d", "3D (Blender) — 3D titles, growing bars and words; renders on your PC with Blender"]], mc.explainer_style || ""))),
     h("div", { class: "grid2" },
       field("Cast (illustrated)", area("_cast", (mc.characters || []).map((c) => `${c.name}: ${c.look}`).join("\n"), { placeholder: "One per line — Name: how they look\nRafi: a cheerful Bangladeshi rickshaw driver in a green lungi and white vest, thin moustache", style: "min-height:70px" }),
         "The same characters come back every episode, drawn the same way. Leave empty and each story names its own."),

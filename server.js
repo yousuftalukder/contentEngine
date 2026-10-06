@@ -524,7 +524,17 @@ async function hasVideoStream(file) { try { const { out } = await exec("ffprobe"
 // probe, and on a tenth of a CPU — with the instance already busy the moment it starts — that is enough to miss the
 // deploy's health check and have the whole release killed, which is what happened. Neither tool appears or vanishes
 // while the process is alive, so asking more than once was never worth anything.
-const TOOLS = { ffmpeg: null, ytdlp: null };
+const TOOLS = { ffmpeg: null, ytdlp: null, blender: null };
+// Blender (6d): named by BLENDER_BIN (a .js/.mjs file is run with node — the test stand-in), else the copy the PC setup
+// puts in .tools\blender, else whatever is on PATH.
+function blenderCmd() {
+  const bin = ENV.BLENDER_BIN || (existsSync(join(__dirname, ".tools", "blender", "blender.exe")) ? join(__dirname, ".tools", "blender", "blender.exe") : "blender");
+  return /\.m?js$/i.test(bin) ? [process.execPath, [bin]] : [bin, []];
+}
+async function blenderAvailable() {
+  if (TOOLS.blender === null) { const [cmd, pre] = blenderCmd(); TOOLS.blender = await exec(cmd, [...pre, "--version"], { timeoutMs: 60000 }).then(() => true).catch(() => false); }
+  return TOOLS.blender;
+}
 async function checkTools() {
   TOOLS.ffmpeg = await exec("ffmpeg", ["-version"]).then(() => true).catch(() => false);
   TOOLS.ytdlp = await exec("yt-dlp", ["--version"]).then(() => true).catch(() => false);
@@ -3704,6 +3714,15 @@ const EXPLAINER_LAYOUTS = {
   Timeline: '{"heading": "...", "events": [{"date": "...", "label": "2-5 words"}]} — 3-6 dated events from the research, in order; parts: one line per event',
   Illustrated: '{"setting": "the place, drawn without people, in English, e.g. a busy Dhaka street market at dusk", "character": "a name from the cast, or null", "action": "what the character is doing, in English", "enter": "left|right", "caption": "a short on-screen line"} — an illustrated scene; parts: [1-2 lines]',
 };
+// A 3D explainer (6d): the same narrated plan, rendered by Blender instead of the studio — extruded titles, bars that
+// grow as each figure is spoken, key words arriving in 3D. Blender's text cannot shape Bangla or other complex
+// scripts, so on-screen words for those programmes are written in English while the narration stays in the language.
+const THREE_D_LAYOUTS = {
+  Title3D: '{"title": "2-6 words", "subtitle": "optional, a few words"} — an opener or a chapter title in 3D; parts: [one line]',
+  Bars3D: '{"heading": "...", "unit": "% / k / ...", "data": [{"label": "1-2 words", "value": 0}]} — 2-6 bars, ONLY numbers stated in the research; parts: one line per bar, in order',
+  Words3D: '{"heading": "optional", "words": ["2-5 short words or phrases"]} — the key ideas, one by one; parts: one line per word',
+};
+const THREE_D_STYLE = (lang) => `This is a 3D explainer rendered in Blender: use only Title3D, Bars3D and Words3D scenes, about a third of them Bars3D where the research has numbers.${/^(bn|hi|ar|ur|ta|te|ml|kn|si|my|th)/.test(lang || "") ? " The 3D renderer cannot draw this language's script: write every on-screen word (titles, words, labels) in short English, and keep the narration (parts) in the programme's language." : ""}`;
 // An illustrated story (6c): the scenes are drawn — a background with nobody in it and the series' characters drawn
 // separately on white — and the studio puts the character into the scene and moves them, so one drawing of a place
 // carries a whole scene. The cast is the programme's, so the same characters come back episode after episode.
@@ -3793,17 +3812,19 @@ async function generateExplainer(item, niche, style) {
   const notes = research.data?.notes || [];
   await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), research.model || "mock"]);
   const sceneCount = Math.max(4, Math.round(minutes * 3.5));
+  const three = mc.explainer_style === "3d", layouts = three ? THREE_D_LAYOUTS : EXPLAINER_LAYOUTS;
   const plan = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
     system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
-    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(EXPLAINER_LAYOUTS).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
+    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(layouts).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
 ` : ""}${mc.explainer_style === "illustrated" ? `${ILLUSTRATED_STYLE(castOf(mc))}
-` : ""}Start with a TitleCard; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
+` : ""}${three ? `${THREE_D_STYLE(lang)}
+` : ""}Start with a ${three ? "Title3D" : "TitleCard"}; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
     mock: { title: m.title, description: `About ${m.title}`, hashtags: ["explained"], scenes: [
       { layout: "TitleCard", chapter: "Intro", data: { title: m.title, subtitle: "Explained" }, parts: [`Here is ${m.title}, explained.`] },
       { layout: "BulletReveal", chapter: "Key points", data: { heading: "Key points", bullets: ["First", "Second"] }, parts: ["The first point.", "The second point."] },
       { layout: "FullQuote", chapter: "Wrap-up", data: { quote: "Mock quote", attribution: "Mock" }, parts: ["That is the story."] }] } }));
   await addCost(item.id, plan.cost);
-  const p = plan.data || {}; const scenes = (p.scenes || []).filter((s) => s && EXPLAINER_LAYOUTS[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
+  const p = plan.data || {}; const scenes = (p.scenes || []).filter((s) => s && layouts[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
   if (!scenes.length) throw new Error("The explainer plan came back without usable scenes");
   const texts = scenes.map((s) => [s.intro, ...s.parts].filter(Boolean).join(" "));
   const title = p.title || m.title;
@@ -3828,12 +3849,12 @@ async function generateExplainer(item, niche, style) {
   await setItem(item.id, { captions: { youtube: description, default: p.description || title, facebook: p.description || title } });
   if (narr.audio.mock) throw new Error("ANIMATED_EXPLAINER needs a real voice adapter (the narration times the animation)");
   // Everything the render needs, by address: the narration and every picture are already in storage.
-  const studio = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), title, audio: narr.audio.url, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built, orientation };
+  const studio = { width: vertical ? 1080 : 1920, height: vertical ? 1920 : 1080, fps: STUDIO_FPS, lang: lang.slice(0, 2), title, audio: narr.audio.url, subtitles: mc.subtitles !== false, outroFrames: Math.round(2.5 * STUDIO_FPS), scenes: built, orientation, engine: three ? "blender" : "studio" };
   // The writing happens where there is a writer, the rendering where there is a studio. The server has the AI key and
   // the free voice but 512 MB, too little for the studio's browser; your PC has the studio but, often, no key. So the
   // server writes, draws and narrates, and hands the finished plan to the PC, which only renders it.
-  if (!studioReady()) {
-    if (niche.compute_where !== "pc") throw new Error("ANIMATED_EXPLAINER needs the video studio, which runs on your PC: set the programme's video work to run on My PC");
+  if (!(three ? await blenderAvailable() : studioReady())) {
+    if (niche.compute_where !== "pc") throw new Error(`ANIMATED_EXPLAINER needs ${three ? "Blender" : "the video studio"}, which runs on your PC: set the programme's video work to run on My PC`);
     await setItem(item.id, { status: "RENDERING", script_meta: { ...(P(item.script_meta) || {}), studio } });
     await enqueue("STUDIO_RENDER", { itemId: item.id }, { queue: PC_LANE, contentItemId: item.id, priority: niche.priority, dedupeKey: `studio:${item.id}` });
     log(`explainer ${item.id}: written here; the render waits for your PC`);
@@ -3841,8 +3862,37 @@ async function generateExplainer(item, niche, style) {
   }
   await renderExplainer(item.id, niche, studio);
 }
+// The Blender half of a 3D explainer: each scene rendered by blender/explainer3d.py at 720p (Workbench, CPU), the
+// scenes joined, the narration laid under them, then the brand pass and a thumbnail from the first scene.
+async function renderBlender(itemId, niche, plan) {
+  if (!(await blenderAvailable())) throw new Error("Blender is not installed on this machine: run pc\\setup.ps1 -Blender on your PC");
+  const { brand, music } = await studioBrand(niche), landscape = plan.width > plan.height, w = landscape ? 1280 : 720, h = landscape ? 720 : 1280;
+  const parts = [], audio = await toTmpFile(plan.audio, "mp3"), list = tmpPath("txt"); let file = null;
+  try {
+    for (const s of plan.scenes) {
+      const spec = tmpPath("json"), out = tmpPath("mp4");
+      await writeFile(spec, JSON.stringify({ layout: s.layout, data: s.data, frames: s.durationInFrames, fps: plan.fps, width: w, height: h, primary: brand.primary, accent: brand.accent, cues: s.cues }));
+      const [cmd, pre] = blenderCmd();
+      try { await exec(cmd, [...pre, "-b", "--factory-startup", "-P", join(__dirname, "blender", "explainer3d.py"), "--", spec, out], { timeoutMs: 90 * 60000 }); }
+      finally { await cleanup(spec); }
+      parts.push(out);
+    }
+    await writeFile(list, parts.map((f) => `file '${f.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"));
+    file = tmpPath("mp4");
+    await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", audio, "-map", "0:v", "-map", "1:a",
+      "-vf", `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,fps=${plan.fps},format=yuv420p`, ...X264, "-shortest", file], { timeoutMs: 30 * 60000 });
+    let finish = "off"; ({ file, finish } = await brandFinish(file, niche, { vertical: !landscape }));
+    const video = await publishRender(file, itemId, { method: "EXPLAINER_3D", orientation: plan.orientation, scenes: plan.scenes.length, brand_finish: finish });
+    try { const still = tmpPath("jpg"); await exec("ffmpeg", ["-y", "-ss", "1", "-i", parts[0], "-frames:v", "1", "-q:v", "2", still]);
+      const j = await toJpeg(await readFile(still), "image/jpeg"); await cleanup(still);
+      await recordMedia({ contentItemId: itemId, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: w, height: h, meta: { purpose: "youtube thumbnail" } }); }
+    catch (e) { warn(`3d thumbnail: ${e.message.slice(0, 160)}`); }
+    await setItem(itemId, { hero_media_id: video.id });
+  } finally { await cleanup(audio, list, ...parts, brand.logo, brand.fontUrl, music); }
+}
 // The studio half of an explainer: the plan in, the video (and a thumbnail) out. Runs where the studio is.
 async function renderExplainer(itemId, niche, plan) {
+  if (plan.engine === "blender") return renderBlender(itemId, niche, plan);
   const { brand, music } = await studioBrand(niche); const audioFile = await toTmpFile(plan.audio, "mp3"), drawn = [];
   const scenes = JSON.parse(JSON.stringify(plan.scenes));
   for (const b of scenes) for (const k of ["background", "figure"]) if (b.data?.[k]) { b.data[k] = await toTmpFile(b.data[k], /\.png(\?|$)/i.test(b.data[k]) ? "png" : "jpg"); drawn.push(b.data[k]); }
@@ -5304,6 +5354,7 @@ const CATALOG = [
   { id: "6a", type: "Animation", name: "Explainer", what: "Script → motion graphics, type and transitions (Remotion)", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: null } }, loose: ["computeWhere"] },
   { id: "6b", type: "Animation", name: "Data / research", what: "Animated charts, counted-up figures and timelines from the research's own numbers", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "An explainer programme with Explainer style set to Data", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "data" } }, loose: ["computeWhere"] },
   { id: "6c", type: "Animation", name: "Illustrated series", what: "The series' characters drawn by a free image generator, put into drawn scenes and moved in code", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "Pictures from Pollinations: free, no key; a free Pollinations account's token removes its corner logo", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "illustrated" } }, loose: ["computeWhere"] },
+  { id: "6d", type: "Animation", name: "Blender 3D", what: "The narrated plan rendered in 3D by Blender: extruded titles, bars that grow as each figure is spoken, key words in 3D", runs: "pc", needs: ["pc", "writer", "voice", "blender"], status: "built", note: "Rendered on your PC's CPU (Workbench, 720p). On-screen 3D words are in English for Bangla programmes; the narration stays in Bangla", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "3d" } }, loose: ["computeWhere"] },
   { id: "7a", type: "Script → video", name: "Own footage", what: "Your footage library matched to each sentence, narrated", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "Set the footage folder on the programme; clips are found by their names, a .txt note beside them, or what Gemini sees in them", setup: { contentType: "IMAGE_SLIDESHOW", computeWhere: "pc", methodConfig: { footage_dir: true } }, loose: ["computeWhere"] },
   { id: "7b", type: "Script → video", name: "Stock footage", what: "A script narrated over stock footage of the right country", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
   { id: "7c", type: "Script → video", name: "Photo sequence", what: "Stills with motion, narrated", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
@@ -5325,7 +5376,7 @@ function variantsOf(n) {
 app.get("/api/catalog", async (ctx) => {
   const [haveWriters, voice, beat, persona, programs, refusals] = await Promise.all([
     writerKeys(), edgeInstalled(),
-    one(`SELECT EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key = 'worker.pc'`),
+    one(`SELECT EXTRACT(EPOCH FROM (now() - updated_at))::float AS age, (SELECT value->>'blender' FROM settings WHERE key = 'boot.pc') AS blender FROM settings WHERE key = 'worker.pc'`),
     one(`SELECT count(*)::int AS n FROM media_assets WHERE kind = 'UPLOAD' AND deleted_at IS NULL AND meta->>'purpose' = 'reactor'`),
     q(`SELECT content_type, production_method, compute_where, clip_adapter, transcript_adapter, method_config, display_name FROM niches`),
     // A quota resets within the day; a refusal that old says nothing about now. Out of credit stays until a success clears it.
@@ -5341,6 +5392,7 @@ app.get("/api/catalog", async (ctx) => {
     voice: { ok: voice, label: "a voice", detail: voice ? "edge-tts (free)" : "edge-tts is not installed here" },
     persona: { ok: persona.n > 0, label: "your reactor clip", detail: persona.n ? `${persona.n} uploaded` : "upload one under Brands → Media library" },
     clip_service: { ok: (await credentialsFor("vizard")).length > 0, label: "a clipping subscription", detail: (await credentialsFor("vizard")).length ? "Vizard key set" : "optional — a Vizard key (API keys)" },
+    blender: { ok: beat?.blender === "true", label: "Blender on your PC", detail: beat?.blender === "true" ? "installed" : "run pc\\setup.ps1 -Blender (free, about 350 MB)" },
     gemini_video: { ok: haveWriters.some((w) => w.prov === "gemini") && !refusing("gemini"), label: "Gemini video input", detail: haveWriters.some((w) => w.prov === "gemini") ? (refusing("gemini") ? `Gemini: ${refusing("gemini")}` : "free tier, your Gemini key") : "add a free Gemini key" },
     twelve_labs: { ok: (await credentialsFor("twelve_labs")).length > 0, label: "a Twelve Labs key", detail: (await credentialsFor("twelve_labs")).length ? "set" : "optional — a Twelve Labs key (API keys)" },
   };
@@ -5634,7 +5686,7 @@ app.post("/api/seed", async (ctx) => {
     // record is how anyone tells which build the server is running. The PC writes its own.
     putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: new Date().toISOString(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
       url: ENV.RENDER_EXTERNAL_URL || null, lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
-      memory_mb: memoryLimitMb(), cpu: cpuFeatures() }).catch((e) => warn("boot.last", e.message));
+      blender: await blenderAvailable(), memory_mb: memoryLimitMb(), cpu: cpuFeatures() }).catch((e) => warn("boot.last", e.message));
     // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
     if (storage.name === "supabase") ensureSupabaseBucket().catch((e) => warn("supabase storage:", e.message.slice(0, 200)));
     startWorkers();

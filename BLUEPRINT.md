@@ -105,7 +105,7 @@ this document.
 | 6a | Explainer | topic | script → motion graphics, type, transitions | **PC** | yes | yes |
 | 6b | Data / research | data + topic | animated charts and diagrams | PC | yes | yes |
 | 6c | Illustrated series | script + characters | AI character images composited and moved in code | PC | yes | yes |
-| 6d | Blender 3D | scene files | CPU render, hours, hand-authored | PC | — | yes |
+| 6d | Blender 3D | topic | script → 3D titles, growing bars, key words, rendered by Blender (Workbench, CPU) | PC | yes | yes |
 
 On an i3 with Intel UHD graphics, 6a–6c render a minute of 1080p in roughly two to eight minutes. 6d is honest
 but impractical: the render is slow and, more to the point, nothing automates *authoring* a 3D scene well.
@@ -205,7 +205,7 @@ is off. Its first test before building: one video through the API, to see whethe
 
 5c (Twelve Labs, optional), 6b (data explainer), 6c (illustrated series), 7a (own footage) and 1b
 (Vizard, optional) — each passes its tests against stand-ins for the services, and none has yet been made from real
-material in production. 6d (Blender) stays unbuilt, for the reason given under 6.
+material in production. 6d (Blender 3D) is built too (2026-10-06): the narrated plan in 3D layouts — extruded titles, growing bars, key words — rendered scene by scene by Blender's Workbench engine on the PC CPU (`blender/explainer3d.py`); install it with `pc\setup.ps1 -Blender`. It renders procedural scenes, not hand-authored ones, which is what makes it automatable.
 
 ## Proven working
 
