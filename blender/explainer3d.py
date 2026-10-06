@@ -28,6 +28,7 @@ def rgb(hexstr, fallback=(0.7, 0.1, 0.12)):
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
 primary, accent = rgb(spec.get("primary")), rgb(spec.get("accent"), (1.0, 0.77, 0.0))
 dark = tuple(c * 0.18 for c in primary)
+light = tuple(c + (1 - c) * 0.45 for c in primary)   # the brand colour lifted, so it stands out on the dark ground
 
 scn.render.engine = "BLENDER_WORKBENCH"
 sh = scn.display.shading
@@ -69,34 +70,34 @@ if layout == "Bars3D":
     step = span / n
     for i, d in enumerate(items):
         x = -span / 2 + step * (i + 0.5); h = max(0.05, float(d.get("value") or 0) / top * maxh); at = cue(i, 10 + i * 14)
-        b = bar(x, h, step * 0.55, accent if i % 2 == 0 else primary)
+        b = bar(x, h, step * 0.55, accent if i % 2 == 0 else light)
         b.scale.z = 0.001; b.keyframe_insert("scale", frame=at)
         b.scale.z = h / 2; b.keyframe_insert("scale", frame=at + 16)
-        lab = text(d.get("label", ""), 0.32, (1, 1, 1), (x, -0.4, -0.45), 0.02); pop(lab, at)
-        val = text(f'{d.get("value", "")}{data.get("unit", "")}', 0.36, (1, 1, 1), (x, -0.4, h + 0.35), 0.03); pop(val, at + 10)
-    if data.get("heading"): pop(text(data["heading"], 0.55, (1, 1, 1), (0, -0.2, maxh + 1.2)), 1)
-    look_z = maxh / 2
+        lab = text(d.get("label", ""), 0.42, (1, 1, 1), (x, -0.4, -0.45), 0.02); pop(lab, at)
+        val = text(f'{d.get("value", "")}{data.get("unit", "")}', 0.48, (1, 1, 1), (x, -0.4, h + 0.35), 0.03); pop(val, at + 10)
+    if data.get("heading"): pop(text(data["heading"], 0.72, (1, 1, 1), (0, -0.2, maxh + 1.1)), 1)
+    look_z = (maxh + 1.1 - 0.5) / 2                     # the middle of everything from the labels up to the heading
 elif layout == "Words3D":
     words = [str(w) for w in data.get("words", [])][:5] or [str(data.get("heading", ""))]
-    if data.get("heading"): pop(text(data["heading"], 0.5, accent, (0, 0, 2.6 if vertical else 2.2)), 1)
+    if data.get("heading"): pop(text(data["heading"], 0.7, accent, (0, 0, 3.4 if vertical else 2.9)), 1)
     for i, w in enumerate(words):
-        pop(text(w, 0.85 if vertical else 0.75, (1, 1, 1) if i % 2 else (*accent,), (0, 0, (1.2 if vertical else 1.0) - i * (1.15 if vertical else 1.0))), cue(i, 10 + i * 18))
+        pop(text(w, 1.2 if vertical else 1.15, (1, 1, 1) if i % 2 else (*accent,), (0, 0, (1.7 if vertical else 1.5) - i * (1.55 if vertical else 1.4))), cue(i, 10 + i * 18))
     look_z = 0
 else:  # Title3D
-    t = text(data.get("title", ""), 1.0 if vertical else 1.1, (1, 1, 1), (0, 0, 0.5), 0.12); pop(t, cue(0, 4), 18)
-    if data.get("subtitle"): pop(text(data["subtitle"], 0.45, accent, (0, 0, -0.7), 0.04), cue(0, 4) + 14)
-    floor = bar(0, 0.02, span * 2, primary); floor.location.z = -1.6
+    t = text(data.get("title", ""), 1.3 if vertical else 1.6, (1, 1, 1), (0, 0, 0.6), 0.14); pop(t, cue(0, 4), 18)
+    if data.get("subtitle"): pop(text(data["subtitle"], 0.65, accent, (0, 0, -0.9), 0.05), cue(0, 4) + 14)
+    floor = bar(0, 0.02, span * 2, light); floor.location.z = -1.6
     look_z = 0
 
 # A camera that keeps moving: a slow push in and a slight drift sideways over the whole scene.
 cam_data = bpy.data.cameras.new("cam"); cam_data.lens = 35 if vertical else 40
 cam = bpy.data.objects.new("cam", cam_data); scn.collection.objects.link(cam); scn.camera = cam
-dist = 14 if vertical else 13
+dist = 19 if vertical else 17.5
 def place(frame, y, x):
     cam.location = (x, y, look_z + 1.2)
     d = (0 - x, 0 - y, look_z - (look_z + 1.2)); cam.rotation_euler = (math.atan2(math.hypot(d[0], d[1]), -d[2]), 0, math.atan2(d[1], d[0]) - math.pi / 2)
     cam.keyframe_insert("location", frame=frame); cam.keyframe_insert("rotation_euler", frame=frame)
-place(1, -dist, -0.6); place(frames, -dist * 0.88, 0.6)
+place(1, -dist, -0.4); place(frames, -dist * 0.94, 0.4)
 
 scn.render.image_settings.file_format = "FFMPEG"
 scn.render.ffmpeg.format, scn.render.ffmpeg.codec, scn.render.ffmpeg.constant_rate_factor = "MPEG4", "H264", "MEDIUM"
