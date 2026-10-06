@@ -131,6 +131,26 @@ test("a 'per-minute' limit still refusing after two hours waits for the daily re
   assert.ok(new Date(job.run_after) > Date.now() + 3600e3, `it waits for the daily reset, not another minute (${job.run_after})`);
 });
 
+// Retry on the dashboard starts the job afresh — attempts, the quota wait and the failure on the item all go —
+// rather than leaving a story marked failed while it runs again, or a quota wait already "used up".
+test("retrying a failed job starts it afresh and puts its story back in the queue", async () => {
+  await eng.api("POST", "/api/adapter-configs", { key: "llm_refuses", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 99, fail_status: 400, fail_message: "bad request: the model refused" } });
+  const p = await program("retry_me", { scriptAdapter: "llm_refuses" });
+  const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story that failed once" });
+  const failed = await waitFor(async () => { const [j] = await eng.query(`SELECT id, status FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [id]); return j?.status === "FAILED" && j; }, { timeout: 30000, what: "the job to fail" });
+  await eng.query(`UPDATE jobs SET quota_since = now() - interval '3 days' WHERE id = $1`, [failed.id]);
+  await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: false } });
+  try {
+    const r = await eng.api("POST", `/api/jobs/${failed.id}/retry`);
+    assert.equal(r.retried, true);
+    const [j] = await eng.query(`SELECT status, attempts, quota_since, finished_at, error_message FROM jobs WHERE id = $1`, [failed.id]);
+    assert.deepEqual([j.status, j.attempts, j.quota_since, j.finished_at, j.error_message], ["PENDING", 0, null, null, null], "the job is as good as new");
+    const it = await eng.api("GET", `/api/content-items/${id}`);
+    assert.equal(it.status, "QUEUED", "and its story is queued, not failed");
+    assert.equal(it.rejection_note, null);
+  } finally { await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: true } }); }
+});
+
 test("a news story that would be stale by the time the quota returns is dropped, not left half-written", async () => {
   const p = await program("stale_quota", { scriptAdapter: "llm_out_of_quota", methodConfig: { desk: { max_age_hours: 6 } } });
   // A desk story: it belongs to a cluster, so it ages out while the writer waits for tomorrow's allowance.
