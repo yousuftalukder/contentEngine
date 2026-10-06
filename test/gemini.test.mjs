@@ -78,3 +78,47 @@ test("Gemini: an answer cut off at the length limit is asked for again with more
     assert.ok(budgets[1] > budgets[0], `the second time with more room (${budgets.join(" → ")})`);
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
+
+// Research asks Gemini to search the web, and search is its own allowance: a plan or model can refuse it while the model
+// itself still answers. Then the research is asked once more without search and the draft says so — instead of every
+// researched format (long posts, explainers) failing at its first step. A spent daily allowance for the model is a
+// different thing and is not retried without search: the job waits for the reset as before.
+test("Gemini: research the web search is refused for is done without it, and the draft says so", async () => {
+  let mode = "refuse"; const seen = [];
+  const stub = http.createServer((req, res) => {
+    let raw = ""; req.on("data", (d) => (raw += d)); req.on("end", () => {
+      const url = new URL(req.url, "http://x");
+      if (!/:generateContent$/.test(url.pathname)) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ models: [] })); }
+      const body = JSON.parse(raw), text = JSON.stringify(body.contents), research = /meticulous researcher/.test(JSON.stringify(body.system_instruction));
+      seen.push({ research, search: !!body.tools });
+      if (body.tools && mode === "refuse") { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT", message: "Search Grounding is not supported for this model." } })); }
+      if (mode === "daily") { res.writeHead(429, { "content-type": "application/json" }); return res.end(daily("gemini-flash-latest")); }
+      const answer = research ? { notes: [{ fact: "The ferry carried 4,000 people a day before the closure.", source_url: "https://example.com/ferry", source_name: "Example" }], angle: "what the closure cost" }
+        : { headline: "Paturia ferries are back", post: `Ferries are running again at Paturia.\n\n${/4,000/.test(text) ? "They carried 4,000 people a day." : ""}`, hashtags: ["ferry"], image_prompt: "a ferry" };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50 } }));
+    });
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  const eng = await startEngine({ env: { GEMINI_API_KEY: "not-a-real-key", GEMINI_API_BASE: `http://127.0.0.1:${stub.address().port}` } });
+  try {
+    const brand = await eng.api("POST", "/api/brands", { name: "No search" });
+    const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "no_search", displayName: "No search", contentType: "LONG_POST",
+      useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "gemini_live", scriptAdapterFallbacks: [], methodConfig: { qa: { enabled: false }, cover_image: false } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Paturia ferry service resumes" });
+    const it = await waitFor(async () => { const x = await eng.api("GET", `/api/content-items/${id}`); if (x.status === "FAILED") throw new Error(x.rejection_note); return x.status === "PENDING_REVIEW" && x; }, { timeout: 60000, what: "the draft" });
+    assert.match(it.body, /4,000/, "the post was written from the research done without search");
+    const r = seen.filter((s) => s.research);
+    assert.ok(r[0].search, "research asked for web search first");
+    assert.equal(r.at(-1).search, false, "and was asked once more without it");
+    const src = typeof it.source_data_ref === "string" ? JSON.parse(it.source_data_ref) : it.source_data_ref;
+    assert.equal(src.research_searched, false, "the draft carries that its research had no web search");
+    const [n] = await eng.query(`SELECT created_by FROM research_notes WHERE content_item_id = $1`, [id]);
+    assert.match(n.created_by, /no web search/, "and so do its research notes, which the fact check reads");
+
+    mode = "daily"; seen.length = 0;
+    const { id: second } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Metro rail extends its hours" });
+    await waitFor(async () => { const [j] = await eng.query(`SELECT status, error_message FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [second]); return j?.status === "PENDING" && j.error_message && j; }, { timeout: 60000, what: "the job to wait for the reset" });
+    assert.ok(seen.length && seen.every((s) => s.search), "a spent daily allowance is not retried without search");
+  } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
+});

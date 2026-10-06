@@ -199,6 +199,13 @@ function quotaWait(e) {
   const d = Number((/(?:retry(?:Delay"?:\s*"| in )|try again in )(\d+(?:\.\d+)?)s/i.exec(s) || [])[1]);
   return { kind: "minute", seconds: Math.max(30, Math.round(d || 60) + 5), freeTier, model };
 }
+// A request refused because it asked for web search (Gemini's google_search tool): a 400 or a quota error that names
+// search or grounding — not a spent allowance for the model itself. Aggregated errors count when every cause is one.
+function searchRefused(e) {
+  if (e?.causes?.length) return e.causes.every(searchRefused);
+  const s = `${e?.message || ""} ${typeof e?.body === "string" ? e.body : JSON.stringify(e?.body || "")}`;
+  return (Number(e?.status) === 400 || Number(e?.status) === 429 || /RESOURCE_EXHAUSTED/.test(s)) && /search|grounding/i.test(s);
+}
 // Short in-call retry for transient failures. 429 is left to withKey, which rotates to the next key instead.
 async function retryTransient(fn, { tries = 3, baseMs = 1500 } = {}) {
   for (let i = 1; ; i++) {
@@ -694,14 +701,25 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
     const models = [cfg.model || DEFAULTS.GEMINI_MODEL, ...(Array.isArray(cfg.fallback_models) ? cfg.fallback_models : DEFAULTS.GEMINI_FALLBACK_MODELS)];
     const useSearch = grounding || cfg.grounding;
     return withKey("gemini", async (key) => {
-      const req = {
+      let req = {
         system_instruction: system ? { parts: [{ text: system }] } : undefined,
         contents: [{ role: "user", parts: [{ text: prompt + (json && useSearch ? "\n\nRespond with ONLY valid JSON." : "") }] }],
         generationConfig: { maxOutputTokens: maxTokens, responseMimeType: json && !useSearch ? "application/json" : undefined },
         tools: useSearch ? [{ google_search: {} }] : undefined,
       };
       const call = (m, r) => fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify(r) });
-      let { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }));
+      // Web search is a separate allowance from the model's: when search itself is refused (not offered on this plan or
+      // model, or its own quota spent) the research is asked once more without it, and says so (searched: false), so
+      // the draft can carry "check the facts" rather than the whole item failing at its first step. A spent daily
+      // allowance for the model is not a search refusal and is not retried.
+      let model, body, searched = useSearch;
+      try { ({ model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }))); }
+      catch (e) {
+        if (!useSearch || !searchRefused(e)) throw e;
+        warn(`Gemini: web search refused (${String(e.message).slice(0, 160)}); researching without it`);
+        req = { ...req, tools: undefined, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { ...req.generationConfig, responseMimeType: json ? "application/json" : undefined } };
+        ({ model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }))); searched = false;
+      }
       // Stopped at the length limit, mid-answer: Bangla takes several times the tokens of English, and the newer Flash
       // models spend part of the budget thinking before they write. A JSON answer cut off there is unreadable — about
       // one Bangla news draft in fifty was lost to it — so it is asked once more, on the same model, with twice the room.
@@ -713,7 +731,7 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
       const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
       const u = body.usageMetadata || {};
       const cites = (body.candidates?.[0]?.groundingMetadata?.groundingChunks || []).map((c) => c.web?.uri).filter(Boolean);
-      return { text, data: json ? extractJson(text) : null, cost: extra + tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), model, citations: cites, units: 1 };
+      return { text, data: json ? extractJson(text) : null, cost: extra + tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), model, citations: cites, searched, units: 1 };
     }, ctx.pin);
   } }) });
 impl("SCRIPT", "openai", { label: "OpenAI (GPT)", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_MODEL }, temperature: { type: "number", default: 0.7 } }, create: (cfg, ctx = {}) => ({
@@ -3577,6 +3595,10 @@ async function generateStatic(item, niche, style) {
   const img = await imageOrCard(niche, item.id, { prompt: d.image_prompt, headline: d.headline || m.title, specs, label: cardLabel(niche) });
   await addCost(item.id, img.cost); await setItem(item.id, { hero_media_id: img.id });
 }
+// Who wrote the research notes, and whether the web was searched for them: research done without search (the search
+// was refused) is the model's memory, so the fact check and the reviewer are told to check it against the source.
+const researchBy = (r) => `${r.model || "mock"}${r.searched === false ? " · no web search" : ""}`;
+const noteNoSearch = (id) => q(`UPDATE content_items SET source_data_ref = (COALESCE(NULLIF(source_data_ref, ''), '{}')::jsonb || '{"research_searched": false}'::jsonb)::text WHERE id=$1`, [id]);
 // ---- 8b. LONG_POST: research first (notes with citations), then write in the style profile
 async function generateLongPost(item, niche, style) {
   const m = await materialFor(item, niche);
@@ -3588,7 +3610,8 @@ async function generateLongPost(item, niche, style) {
     mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
   await addCost(item.id, research.cost);
   const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
-  await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify(cites), research.model || "mock"]);
+  await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify(cites), researchBy(research)]);
+  if (research.searched === false) await noteNoSearch(item.id);
   const post = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
     system: `You write long-form Facebook posts for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)} Use ONLY the research notes as facts.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nReturn JSON: {"headline": "first line hook", "post": "the full 250-600 word post with paragraph breaks", "hashtags": ["..."], "image_prompt": "visual for a cover image"}`,
@@ -3810,7 +3833,8 @@ async function generateExplainer(item, niche, style) {
     mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
   await addCost(item.id, research.cost);
   const notes = research.data?.notes || [];
-  await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), research.model || "mock"]);
+  await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), researchBy(research)]);
+  if (research.searched === false) await noteNoSearch(item.id);
   const sceneCount = Math.max(4, Math.round(minutes * 3.5));
   const three = mc.explainer_style === "3d", layouts = three ? THREE_D_LAYOUTS : EXPLAINER_LAYOUTS;
   const plan = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
