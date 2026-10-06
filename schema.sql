@@ -69,6 +69,9 @@ ALTER TABLE niches ADD COLUMN IF NOT EXISTS embed_adapter           TEXT NOT NUL
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS voice_adapter_fallbacks JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS transcript_adapter_fallbacks JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS compute_where TEXT NOT NULL DEFAULT 'server';   -- server | pc
+-- Which videos a programme takes, whatever its sources allow: ANY, or CC_ONLY (Creative Commons licensed only).
+-- A source's own policy still applies on top; the stricter of the two wins.
+ALTER TABLE niches ADD COLUMN IF NOT EXISTS license_policy TEXT NOT NULL DEFAULT 'ANY';
 
 CREATE TABLE IF NOT EXISTS channels (
   id             TEXT PRIMARY KEY,
@@ -94,6 +97,9 @@ ALTER TABLE channels ADD COLUMN IF NOT EXISTS posting_windows     JSONB NOT NULL
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS caption_template    TEXT;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_published_at   TIMESTAMPTZ;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS credential_id       TEXT;  -- api_credentials.id (meta / youtube_oauth) used to publish on this channel
+-- Instagram channels made by "Connect Facebook" were given the format "REEL_VIDEO", which nothing else knew: the
+-- renderer only turns videos vertical for SHORT_FORM_VOICEOVER, which is what an Instagram Reel is.
+UPDATE channels SET format = 'SHORT_FORM_VOICEOVER' WHERE format = 'REEL_VIDEO';
 
 CREATE TABLE IF NOT EXISTS channel_niches (
   id         TEXT PRIMARY KEY,

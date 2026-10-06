@@ -234,11 +234,14 @@ async function migrate() {
   log("schema applied (idempotent)");
 }
 // Generic patch: whitelist map {bodyKey: column}
-async function patchRow(table, id, body, map) {
+// nullIsDefault: a null puts the column back to its schema default (NULL where it has none) instead of writing NULL
+// into a NOT NULL column and failing the whole update.
+async function patchRow(table, id, body, map, { nullIsDefault = false } = {}) {
   const sets = [], params = [id]; let i = 2;
   for (const [k, col] of Object.entries(map)) {
     if (!(k in body)) continue;
     let v = body[k];
+    if (v === null && nullIsDefault) { sets.push(`${col} = DEFAULT`); continue; }
     if (typeof v === "boolean") v = v ? 1 : 0;
     if (v !== null && typeof v === "object") v = JSON.stringify(v);
     sets.push(`${col} = $${i++}`); params.push(v);
@@ -972,10 +975,11 @@ impl("INGEST", "sitemap", { label: "News sitemap", configSchema: { url: { type: 
   } }) });
 impl("INGEST", "newsapi", { label: "NewsAPI", configSchema: { country: { type: "string" }, category: { type: "string" }, query: { type: "string" }, language: { type: "string" } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
-    const c = { ...cfg, ...(P(source.config) || {}) };
+    // "q" is NewsAPI's own name for the search and what the dashboard's example once said, so either spelling works.
+    const c = { ...cfg, ...(P(source.config) || {}) }, query = c.query || c.q;
     return withKey("newsapi", async (key) => {
-      const endpoint = c.query && !c.country ? "everything" : "top-headlines";
-      const p = form({ country: c.country, category: c.category, q: c.query, language: c.language, pageSize: c.limit || 30, sortBy: endpoint === "everything" ? "publishedAt" : undefined, apiKey: key });
+      const endpoint = query && !c.country ? "everything" : "top-headlines";
+      const p = form({ country: c.country, category: c.category, q: query, language: c.language, pageSize: c.limit || 30, sortBy: endpoint === "everything" ? "publishedAt" : undefined, apiKey: key });
       const body = await fetchJson(`https://newsapi.org/v2/${endpoint}?${p}`);
       return (body.articles || []).filter((a) => a.title && a.url).map((a) => ({ external_id: a.url, url: a.url, title: a.title, summary: a.description || a.content || "", published_at: a.publishedAt, thumbnail: a.urlToImage, kind: "ARTICLE", raw: { outlet: a.source?.name } }));
     }, ctx.pin);
@@ -983,9 +987,10 @@ impl("INGEST", "newsapi", { label: "NewsAPI", configSchema: { country: { type: "
 const iso8601ToSec = (d) => { const m = /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/.exec(d || ""); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : null; };
 impl("INGEST", "youtube_api", { label: "YouTube Data API", configSchema: { channel_id: { type: "string" }, query: { type: "string" }, limit: { type: "number", default: 20 }, hours: { type: "number", default: 72 } }, create: (cfg, ctx = {}) => ({
   async fetchItems(source) {
+    // The API's own spellings (channelId, q) are accepted too: the dashboard's example used them, and they were ignored.
     const c = { ...cfg, ...(P(source.config) || {}) };
     return withKey("youtube", async (key) => {
-      const p = form({ part: "snippet", type: "video", order: "date", maxResults: c.limit || 20, channelId: c.channel_id, q: c.query, publishedAfter: new Date(Date.now() - (c.hours || 72) * 3600e3).toISOString(), key });
+      const p = form({ part: "snippet", type: "video", order: "date", maxResults: c.limit || 20, channelId: c.channel_id || c.channelId, q: c.query || c.q, publishedAfter: new Date(Date.now() - (c.hours || 72) * 3600e3).toISOString(), key });
       const s = await fetchJson(`https://www.googleapis.com/youtube/v3/search?${p}`);
       const ids = (s.items || []).map((i) => i.id?.videoId).filter(Boolean); if (!ids.length) return { items: [], units: 100 };
       const v = await fetchJson(`https://www.googleapis.com/youtube/v3/videos?${form({ part: "snippet,contentDetails,statistics,status", id: ids.join(","), key })}`);
@@ -3007,13 +3012,15 @@ function scoreCandidate(item, niche) {
 // Route one source_item to every program subscribed to its source.
 async function routeSourceItem(item) {
   if (item.kind !== "VIDEO" && (await newsPaused())) return 0;          // news paused: articles are kept, not drafted
-  const niches = await q(`SELECT n.*, s.license_policy FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id JOIN sources s ON s.id = ns.source_id WHERE ns.source_id = $1 AND n.is_active::int = 1 ORDER BY n.priority DESC`, [item.source_id]);
+  // The source's policy and the programme's own, kept apart: selected as one name, the source's silently replaced the
+  // programme's, so "Creative Commons only" on a programme did nothing.
+  const niches = await q(`SELECT n.*, s.license_policy AS source_license_policy FROM niches n JOIN niche_sources ns ON ns.niche_id = n.id JOIN sources s ON s.id = ns.source_id WHERE ns.source_id = $1 AND n.is_active::int = 1 ORDER BY n.priority DESC`, [item.source_id]);
   let routed = 0;
   for (const niche of niches) {
     if (!passesFilters(item, niche)) continue;
     if (item.kind === "VIDEO") {
       if (!VIDEO_TYPES.has(niche.content_type)) continue;
-      if (niche.license_policy === "CC_ONLY" && !/^CC/.test(item.license || "")) continue;
+      if ((niche.license_policy === "CC_ONLY" || niche.source_license_policy === "CC_ONLY") && !/^CC/.test(item.license || "")) continue;
       const { score, reason } = scoreCandidate(item, niche);
       const cid = newId();
       await q(`INSERT INTO video_candidates (id, source_id, source_item_id, niche_id, platform, external_id, source_url, title, duration_seconds, view_count, published_at, thumbnail_url, license, score, score_reason, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
@@ -3651,6 +3658,10 @@ const REEL_SPEC = {
   LONG_FORM_VIDEO: { sections: 12, words: "4-6 spoken sentences", system: "You write researched long-form YouTube video scripts. The first 15 seconds say what the viewer will know by the end and why it is worth their time — state the payoff, do not tease it. Then earn it: each section raises the question the next one answers, and the last one closes the loop the first one opened. No filler, no recap of what was just said, no 'in this video we will'." },
 };
 async function generateReel(item, niche, style) {
+  // "Own footage only" with no folder to take it from used to make a stock-footage video (7b) under a 7a programme's
+  // name, after spending the writer on it. That is a setup mistake, said before anything is spent.
+  const own = P(niche.method_config) || {};
+  if (own.own_footage_only && !String(own.footage_dir || "").trim()) throw new ApiError(400, null, `"${niche.display_name}" uses only your own footage (7a) but needs a footage folder: set one on the programme (Video → Your footage folder).`);
   const m = await materialFor(item, niche); const type = item.content_type || niche.content_type, spec = REEL_SPEC[type] || REEL_SPEC.IMAGE_SLIDESHOW, mc = methodCfg(niche);
   const long = type === "LONG_FORM_VIDEO", orientation = long ? "16:9" : mc.orientation || "9:16", vertical = orientation !== "16:9", lang = niche.language || "en";
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
@@ -4002,6 +4013,11 @@ async function rentedClips(cand, niche, clipper) {
 async function processCandidate(candidateId) {
   const cand = await one(`SELECT * FROM video_candidates WHERE id = $1`, [candidateId]); if (!cand) return;
   const niche = await one(`SELECT * FROM niches WHERE id = $1`, [cand.niche_id]); if (!niche) throw new Error("candidate has no program");
+  // A silent reaction is the source with your clip beside it, and the render refuses without one — but only after the
+  // video was fetched, transcribed and a writer asked for the moment. Said here instead, before anything is spent.
+  const rmc = methodCfg(niche);
+  if (niche.production_method === "REACTION_OVERLAY" && !rmc.reactor_url && !rmc.overlay_video_url)
+    throw new ApiError(400, null, `"${niche.display_name}" is a reaction short (4a), which needs your reactor clip: upload one under Brands → Media library and pick it on the programme (Video → Reactor clip). Nothing was downloaded.`);
   await q(`UPDATE video_candidates SET status='PROCESSING', error_message=NULL WHERE id=$1`, [candidateId]);
   // A rented clipper fetches and cuts the video itself: nothing is downloaded or transcribed here.
   if (niche.clip_adapter) { const clipper = await resolve("CLIP", niche.clip_adapter).catch(() => null); if (clipper?.rented) return rentedClips(cand, niche, clipper); }
@@ -5161,7 +5177,7 @@ app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await ins
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses(), newsPaused: await newsPaused(),
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), telegramChatEnv: !!ENV.TELEGRAM_CHAT_ID, quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses(), newsPaused: await newsPaused(),
     aiToday: (await q(`SELECT provider, SUM(units)::int AS requests FROM api_usage_daily WHERE day = CURRENT_DATE GROUP BY provider ORDER BY 2 DESC`)).filter((r) => r.requests > 0),
     newsPrograms: (await q(`SELECT id, display_name, content_type, is_active FROM niches WHERE content_type = ANY($1) ORDER BY display_name`, [[...DESK_TYPES]])).map((n) => ({ id: n.id, name: n.display_name, type: n.content_type, active: flag(n.is_active) })) });
 });
@@ -5227,7 +5243,21 @@ app.post("/api/credentials/:id/test", async (ctx) => {
     youtube_oauth: () => fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: c.secret.client_id, client_secret: c.secret.client_secret, refresh_token: c.secret.refresh_token, grant_type: "refresh_token" }) }).then((t) => ({ token_type: t.token_type, expires_in: t.expires_in })),
     telegram: () => fetchJson(`https://api.telegram.org/bot${c.secret}/getMe`).then((r) => ({ bot: r.result?.username })),
     r2: async () => { const cfg = await r2Config(); if (!cfg) throw new Error("R2 fields incomplete"); await r2Request("PUT", "healthcheck.txt", Buffer.from("ok"), "text/plain"); await r2Request("DELETE", "healthcheck.txt"); return { bucket: cfg.bucket, public_url: cfg.public_url || "(none — set public_url so platforms can fetch files)" }; },
+    // The free writers all speak OpenAI's dialect, so listing the models is the same free, authenticated call for each.
+    ...Object.fromEntries(Object.keys(OPENAI_COMPAT).map((p) => [p, () => fetchJson(`${compatBase(p, {})}/models`, { headers: auth(c.secret) }).then((r) => ({ models: (r.data || []).length }))])),
+    // Pictures are drawn without a key; this says the service answers, and a token that is sent is not refused.
+    pollinations: () => fetchJson(`${ENV.POLLINATIONS_API_BASE || "https://image.pollinations.ai"}/models`, { headers: c.secret ? auth(c.secret) : {} }).then((r) => ({ models: Array.isArray(r) ? r.length : "answered" })),
+    twelve_labs: () => fetchJson(`${ENV.TWELVE_LABS_API_BASE || "https://api.twelvelabs.io/v1.3"}/indexes?page_limit=1`, { headers: { "x-api-key": c.secret } }).then((r) => ({ indexes: r.page_info?.total_results ?? (r.data || []).length })),
+    // Vizard has no free "who am I" call. Asking after a project that does not exist is free: a refused key says so, a
+    // good one is told there is no such project.
+    vizard: async () => {
+      const r = await fetchJson(`${ENV.VIZARD_API_BASE || "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1"}/project/query/0`, { headers: { VIZARDAI_API_KEY: c.secret } });
+      if (/key|auth|token|permission|unauthori[sz]ed/i.test(String(r.errMsg || ""))) throw new Error(`Vizard refused the key: ${r.errMsg}`);
+      return { answered: r.code ?? "ok" };
+    },
   };
+  // A provider added to the list before its check was written must say so, not fail with "tests[...] is not a function".
+  if (!tests[c.provider]) return json(ctx, 200, { ok: false, provider: c.provider, error: `There is no connection test for ${c.provider} yet — the key is used as it is` });
   try { const r = await tests[c.provider](); json(ctx, 200, { ok: true, provider: c.provider, result: typeof r === "object" && r ? Object.fromEntries(Object.entries(r).slice(0, 4).map(([k, v]) => [k, typeof v === "string" ? v.slice(0, 80) : Array.isArray(v) ? `${v.length} item(s)` : v])) : r }); }
   catch (e) { json(ctx, 200, { ok: false, provider: c.provider, error: String(e.message).slice(0, 400) }); }
 });
@@ -5283,7 +5313,7 @@ app.delete("/api/brands/:id", async (ctx) => { const dep = await one(`SELECT (SE
 const NICHE_JSON = ["method_config", "image_specs", "topic_filters", "clip_adapter_fallbacks", "script_adapter_fallbacks", "image_adapter_fallbacks", "voice_adapter_fallbacks", "transcript_adapter_fallbacks"];
 const NICHE_MAP = { displayName: "display_name", tone: "tone", visualMode: "visual_mode", topicSourceAdapter: "topic_source_adapter", scriptAdapter: "script_adapter", voiceAdapter: "voice_adapter", renderAdapter: "render_adapter", voiceId: "voice_id", factCheckStrict: "fact_check_strict", dedupThreshold: "dedup_threshold", isActive: "is_active",
   contentType: "content_type", productionMethod: "production_method", methodConfig: "method_config", language: "language", country: "country", approvalMode: "approval_mode", reviewWindowMinutes: "review_window_minutes", styleProfileId: "style_profile_id", publishToPortal: "publish_to_portal", imageAdapter: "image_adapter", imageSpecs: "image_specs", topicFilters: "topic_filters", maxItemsPerDay: "max_items_per_day", priority: "priority",
-  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", transcriptAdapterFallbacks: "transcript_adapter_fallbacks", computeWhere: "compute_where", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter" };
+  downloadAdapter: "download_adapter", transcriptAdapter: "transcript_adapter", transcriptAdapterFallbacks: "transcript_adapter_fallbacks", computeWhere: "compute_where", clipAdapter: "clip_adapter", clipAdapterFallbacks: "clip_adapter_fallbacks", scriptAdapterFallbacks: "script_adapter_fallbacks", imageAdapterFallbacks: "image_adapter_fallbacks", voiceAdapterFallbacks: "voice_adapter_fallbacks", embedAdapter: "embed_adapter", licensePolicy: "license_policy" };
 app.get("/api/niches", async (ctx) => { const b = ctx.query.get("brandId"); const rows = b ? await q(`SELECT * FROM niches WHERE brand_id=$1 ORDER BY created_at DESC`, [b]) : await q(`SELECT * FROM niches ORDER BY created_at DESC`); json(ctx, 200, rows.map((r) => rowJson(r, NICHE_JSON))); });
 app.get("/api/programs", async (ctx) => { const rows = await q(`SELECT n.*, (SELECT json_agg(json_build_object('id', s.id, 'name', s.name)) FROM sources s JOIN niche_sources ns ON ns.source_id=s.id WHERE ns.niche_id=n.id) AS sources, (SELECT json_agg(json_build_object('id', c.id, 'name', c.display_name, 'platform', c.platform)) FROM channels c JOIN channel_niches cn ON cn.channel_id=c.id WHERE cn.niche_id=n.id) AS channels FROM niches n ORDER BY created_at DESC`);
   json(ctx, 200, rows.map((r) => { const v = variantsOf(r); return { ...rowJson(r, NICHE_JSON), variants: v.map((x) => x.id), variant_name: v.map((x) => x.name).join(" / ") || null }; })); });
@@ -5328,7 +5358,18 @@ async function smartAdapterDefaults() {
     clipAdapterFallbacks: writers.length ? ["clip_meaning", "clip_signal"] : ["clip_signal"],
   };
 }
-const checkComputeWhere = (b) => { if (b?.computeWhere != null && !["server", "pc"].includes(b.computeWhere)) throw new ApiError(400, null, "computeWhere must be \"server\" or \"pc\""); };
+const checkComputeWhere = (b) => { if (b?.computeWhere != null && !["server", "pc"].includes(b.computeWhere)) throw new ApiError(400, null, "computeWhere must be \"server\" or \"pc\"");
+  if (b?.licensePolicy != null && !["ANY", "CC_ONLY"].includes(b.licensePolicy)) throw new ApiError(400, null, "licensePolicy must be \"ANY\" or \"CC_ONLY\""); };
+// An edit that empties a field asks for the engine's own choice back, not for an empty column: a cleared adapter gets
+// what a new programme would get, a cleared review window its default, and a cleared country or voice nothing. Without
+// this an emptied field was dropped before saving, so a value once set could never be taken away again.
+async function resetCleared(b) {
+  const cleared = Object.keys(b).filter((k) => b[k] === null && k in NICHE_MAP);
+  if (!cleared.length) return b;
+  if (b.maxItemsPerDay === null) b.maxItemsPerDay = 0;                                     // 0 is "no cap"
+  if (cleared.some((k) => /Adapter(Fallbacks)?$/.test(k))) { const d = await smartAdapterDefaults(); for (const k of cleared) if (k in d) b[k] = d[k]; }
+  return b;
+}
 app.post("/api/niches", async (ctx) => {
   const b = { ...(ctx.body.useMocks ? {} : await smartAdapterDefaults()), ...ctx.body }; for (const r of ["brandId", "key", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
   checkComputeWhere(b);
@@ -5350,8 +5391,8 @@ app.post("/api/niches", async (ctx) => {
   json(ctx, 201, rowJson(row, NICHE_JSON));
 });
 app.post("/api/programs", async (ctx) => { ctx.req.url = "/api/niches"; const r = app.routes.find((x) => x.method === "POST" && x.re.test("/api/niches")); return r.handler(ctx); });
-app.patch("/api/niches/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
-app.patch("/api/programs/:id", async (ctx) => { checkComputeWhere(ctx.body); if (ctx.body.maxItemsPerDay === null) ctx.body.maxItemsPerDay = 0; json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, ctx.body, NICHE_MAP), NICHE_JSON)); });
+app.patch("/api/niches/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, await resetCleared(ctx.body), NICHE_MAP, { nullIsDefault: true }), NICHE_JSON)); });
+app.patch("/api/programs/:id", async (ctx) => { checkComputeWhere(ctx.body); json(ctx, 200, rowJson(await patchRow("niches", ctx.params.id, await resetCleared(ctx.body), NICHE_MAP, { nullIsDefault: true }), NICHE_JSON)); });
 // Who is doing the work right now: the server's own record of its build, and whether your PC is on. The PC beats every
 // 30 seconds, so a heartbeat older than 90 means it is off — and anything routed to it is waiting, not stuck.
 // Hear a voice before choosing it. It is also the only honest way to know whether a voice works from where this
@@ -5499,9 +5540,12 @@ app.post("/api/meta/pages", async (ctx) => {
 // Turn a connected Page into a channel, so the whole path is: log in, pick a page, done.
 app.post("/api/meta/channels", async (ctx) => {
   const b = ctx.body; for (const r of ["brandId", "pageId", "credentialId", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
+  // Instagram publishes videos as Reels, so its channels are the short vertical format: that is the one the renderer
+  // turns 9:16 for (pictures go out as they are). This said "REEL_VIDEO", a format nothing else knew — the channel
+  // dialog could not show it and landscape videos went to Instagram unconverted.
   const id = newId(), platform = b.platform === "INSTAGRAM" ? "INSTAGRAM" : "FACEBOOK";
   await q(`INSERT INTO channels (id, brand_id, key, display_name, platform, format, timezone, credential_id, platform_account_id, publisher_adapter) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'meta_graph')`,
-    [id, b.brandId, b.key || `fb_${String(b.pageId).slice(-6)}`, b.displayName, platform, b.format || (platform === "INSTAGRAM" ? "REEL_VIDEO" : "STATIC_IMAGE_CAPTION"), b.timezone || "Asia/Dhaka", b.credentialId, String(b.pageId)]);
+    [id, b.brandId, b.key || `fb_${String(b.pageId).slice(-6)}`, b.displayName, platform, b.format || (platform === "INSTAGRAM" ? "SHORT_FORM_VOICEOVER" : "STATIC_IMAGE_CAPTION"), b.timezone || "Asia/Dhaka", b.credentialId, String(b.pageId)]);
   for (const n of b.nicheIds || []) await q(`INSERT INTO channel_niches (id, channel_id, niche_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, n]);
   json(ctx, 201, rowJson(await one(`SELECT * FROM channels WHERE id=$1`, [id]), ["platform_config", "posting_windows"]));
 });
@@ -5634,7 +5678,8 @@ app.patch("/api/portal-articles/:id", async (ctx) => json(ctx, 200, await patchR
 app.get("/api/public/articles", async (ctx) => json(ctx, 200, await q(`SELECT id, slug, title, summary, hero_image_url, language, country, published_at FROM portal_articles WHERE status='PUBLISHED' ORDER BY published_at DESC LIMIT $1 OFFSET $2`, [Math.min(100, Number(ctx.query.get("limit")) || 30), Number(ctx.query.get("offset")) || 0])));
 app.get("/api/public/articles/:slug", async (ctx) => { const a = await one(`SELECT * FROM portal_articles WHERE slug=$1 AND status='PUBLISHED'`, [ctx.params.slug]); if (!a) throw new ApiError(404, null, "Not found"); json(ctx, 200, a); });
 app.get("/a/:slug", async (ctx) => { const a = await one(`SELECT * FROM portal_articles WHERE slug=$1 AND status='PUBLISHED'`, [ctx.params.slug]); if (!a) return send(ctx.res, 404, { error: "Not found" }); const esc = (s) => String(s || "").replace(/</g, "&lt;"); ctx.res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); ctx.res.end(`<!doctype html><html lang="${a.language}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(a.title)}</title><meta property="og:title" content="${esc(a.title)}"><meta property="og:description" content="${esc(a.summary)}">${a.hero_image_url ? `<meta property="og:image" content="${a.hero_image_url}">` : ""}<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.7;color:#111}img{max-width:100%;border-radius:8px}h1{line-height:1.25}.meta{color:#666;font-size:14px}</style></head><body><h1>${esc(a.title)}</h1><div class="meta">${new Date(a.published_at).toLocaleString()}</div>${a.hero_image_url ? `<img src="${a.hero_image_url}" alt="">` : ""}<p><b>${esc(a.summary)}</b></p>${a.body_html}${a.source_url ? `<p class="meta">Source: <a href="${a.source_url}" rel="nofollow">${esc(a.source_url)}</a></p>` : ""}</body></html>`); });
-app.get("/api/research-notes", async (ctx) => json(ctx, 200, (await q(`SELECT * FROM research_notes ORDER BY created_at DESC LIMIT 200`)).map((r) => rowJson(r, ["notes", "citations"]))));
+// ?contentItemId= gives one item's research, which is what Review shows beside an explainer or a long post.
+app.get("/api/research-notes", async (ctx) => { const it = ctx.query.get("contentItemId"); json(ctx, 200, (await q(`SELECT * FROM research_notes WHERE ($1::text IS NULL OR content_item_id = $1) ORDER BY created_at DESC LIMIT 200`, [it])).map((r) => rowJson(r, ["notes", "citations"]))); });
 // ---- content items (ledger + review)
 const ITEM_JSON = ["source_data_ref", "script_meta", "niche_profile_version", "captions", "hashtags"];
 async function itemWithMedia(row) { const r = rowJson(row, ITEM_JSON); r.hero_media = r.hero_media_id ? await one(`SELECT * FROM media_assets WHERE id=$1`, [r.hero_media_id]) : null; r.assets = await q(`SELECT a.*, c.display_name AS channel_name, c.platform FROM content_assets a JOIN channels c ON c.id=a.channel_id WHERE a.content_item_id=$1`, [r.id]); r.portal_url = r.portal_article_id ? portalUrlFor(await one(`SELECT slug FROM portal_articles WHERE id=$1`, [r.portal_article_id])) : null; return r; }
@@ -5665,7 +5710,18 @@ app.post("/api/review/approve-clean", async (ctx) => {
 });
 app.post("/api/content-items/:id/approve", async (ctx) => { if (rateLimited(`appr:${ctx.ip}`, 30)) throw new ApiError(429, null, "Too many approve requests"); json(ctx, 200, await itemWithMedia(await approveItem(ctx.params.id, { scheduledFor: ctx.body.scheduledFor || null }))); });
 app.post("/api/content-items/:id/reject", async (ctx) => json(ctx, 200, await rejectItem(ctx.params.id, ctx.body.note)));
-app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); if (VIDEO_TYPES.has(it.content_type) && part === "all") { const owner = await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]); await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: videoQueueFor(owner), contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : genQueue(await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]), it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
+app.post("/api/content-items/:id/regenerate", async (ctx) => { const part = ctx.body.part || "all"; if (!["all", "headline", "image", "captions", "body", "render"].includes(part)) throw new ApiError(400, null, "part must be all|headline|image|captions|body|render"); const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found");
+  // Re-render without rewriting: an explainer handed to the PC keeps its finished plan (script, narration, pictures) on
+  // the item, so the studio can draw it again — a failed or ugly render costs no research, writing or voice. Anything
+  // else has no stored plan, and "render" is refused rather than quietly meaning "write it all again".
+  if (part === "render") {
+    const plan = P(it.script_meta)?.studio;
+    if (it.content_type !== "ANIMATED_EXPLAINER" || !plan) throw new ApiError(400, null, "Only an explainer rendered on your PC keeps a plan to render again; use Regenerate everything for this item");
+    await setItem(it.id, { status: "RENDERING" });
+    await enqueue("STUDIO_RENDER", { itemId: it.id }, { queue: PC_LANE, contentItemId: it.id, priority: 5, dedupeKey: `studio:${it.id}` });
+    return json(ctx, 202, { ok: true, rendering: true });
+  }
+  if (VIDEO_TYPES.has(it.content_type) && part === "all") { const owner = await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]); await enqueue("RENDER_CLIP", { itemId: it.id, clipId: it.clip_id }, { queue: videoQueueFor(owner), contentItemId: it.id }); } else { await setItem(it.id, { status: part === "all" ? "QUEUED" : "DRAFTING" }); await enqueue(part === "all" ? "GENERATE_CONTENT" : "REGENERATE", { itemId: it.id, part }, { queue: part === "image" ? "image" : genQueue(await one(`SELECT * FROM niches WHERE id = $1`, [it.niche_id]), it.content_type), priority: 5, contentItemId: it.id }); } json(ctx, 202, { ok: true }); });
 // Reviewer edits to an AI draft are logged as style feedback, and a changed headline redraws the photocard.
 app.patch("/api/content-items/:id", async (ctx) => {
   const b = ctx.body; const map = { script: "script", headline: "headline", summary: "summary", body: "body", captions: "captions", hashtags: "hashtags", imagePrompt: "image_prompt", scheduledFor: "scheduled_for", heroMediaId: "hero_media_id" };
