@@ -18,10 +18,13 @@ shows the PC as off and the work as waiting.
 
 1. Open **Review**. Everything waits there for you: approve, fix the caption, or reject with a reason (the reason
    teaches the next draft).
-2. Two notes you may see on a draft:
+2. Notes you may see on a draft:
    - **"Written from headlines only"** — none of the outlets' articles could be read (Ittefaq, Desh Rupantor, Bangla
      Tribune and Dhaka Tribune block servers). Check every fact against the source before approving. These drafts are
      never published automatically.
+   - **"Researched without web search"** — explainers and long posts research their topic with Google's web search
+     first; when search itself was refused (not part of the free plan for that model, or its own allowance spent),
+     the research was done from the writer's memory and the source article. Check figures, dates and names.
    - **"Caption not written — the writer refused"** — the AI was out of its free allowance when this video was
      finished; the clip's own words stand in. Rewrite the caption before posting. (Rare now: a clip's caption is
      written when its moment is chosen, and your PC borrows the server's writer.)
