@@ -4741,7 +4741,14 @@ async function deferForQuota(job, payload, quota, msg) {
   // ordinary retries and spent the day's allowance retrying (two explainers, 7 attempts each, 2026-10-05).
   const cap = quota.kind === "minute" ? 2 * 3600e3 : quota.kind === "busy" ? 8 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3;
   const [{ since }] = await q(`UPDATE jobs SET quota_since = COALESCE(quota_since, now()) WHERE id = $1 RETURNING quota_since AS since`, [job.id]);
-  if (Date.now() - new Date(since).getTime() > cap) return false;
+  const waited = Date.now() - new Date(since).getTime();
+  // A "per-minute" limit that is still refusing two hours later is the day's allowance under another name: Gemini's
+  // free tier does not always say which limit it hit (gemini-flash-lite-latest answers a bare 429). Treated as a
+  // minute limit, the job went back to ordinary retries and failed — every explainer, 2026-10-06. It waits for the
+  // daily reset instead, within the same few days' limit as any daily quota.
+  if (quota.kind === "minute" && waited > cap && waited <= QUOTA_MAX_WAIT_DAYS * 86400e3)
+    quota = { ...quota, kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)) };
+  else if (waited > cap) return false;
   const itemId = job.content_item_id || payload.itemId || null;
   const item = itemId ? await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]) : null;
   const niche = item || payload.nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [item?.niche_id || payload.nicheId]) : null;
@@ -5379,7 +5386,7 @@ const CATALOG = [
   { id: "6b", type: "Animation", name: "Data / research", what: "Animated charts, counted-up figures and timelines from the research's own numbers", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "An explainer programme with Explainer style set to Data", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "data" } }, loose: ["computeWhere"] },
   { id: "6c", type: "Animation", name: "Illustrated series", what: "The series' characters drawn by a free image generator, put into drawn scenes and moved in code", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "Pictures from Pollinations: free, no key; a free Pollinations account's token removes its corner logo", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "illustrated" } }, loose: ["computeWhere"] },
   { id: "6d", type: "Animation", name: "Blender 3D", what: "The narrated plan rendered in 3D by Blender: extruded titles, bars that grow as each figure is spoken, key words in 3D", runs: "pc", needs: ["pc", "writer", "voice", "blender"], status: "built", note: "Rendered on your PC's CPU (Workbench, 720p). On-screen 3D words are in English for Bangla programmes; the narration stays in Bangla", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "3d" } }, loose: ["computeWhere"] },
-  { id: "7a", type: "Script → video", name: "Own footage", what: "Your footage library matched to each sentence, narrated", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "Set the footage folder on the programme; clips are found by their names, a .txt note beside them, or what Gemini sees in them", setup: { contentType: "IMAGE_SLIDESHOW", computeWhere: "pc", methodConfig: { footage_dir: true } }, loose: ["computeWhere"] },
+  { id: "7a", type: "Script → video", name: "Own footage", what: "Your footage library matched to each sentence, narrated", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", note: "Proven 2026-10-06 on the PC from a real footage folder. Set the folder on the programme; clips are found by their names, a .txt note beside them, or what Gemini sees in them", setup: { contentType: "IMAGE_SLIDESHOW", computeWhere: "pc", methodConfig: { footage_dir: true } }, loose: ["computeWhere"] },
   { id: "7b", type: "Script → video", name: "Stock footage", what: "A script narrated over stock footage of the right country", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
   { id: "7c", type: "Script → video", name: "Photo sequence", what: "Stills with motion, narrated", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
 ];

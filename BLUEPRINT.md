@@ -203,11 +203,23 @@ is off. Its first test before building: one video through the API, to see whethe
 
 ## Built, not yet proven on real material (2026-10-04)
 
-5c (Twelve Labs, optional), 6b (data explainer), 6c (illustrated series), 7a (own footage) and 1b
+5c (Twelve Labs, optional), 6b (data explainer), 6c (illustrated series) and 1b
 (Vizard, optional) — each passes its tests against stand-ins for the services, and none has yet been made from real
 material in production. 6d (Blender 3D) is built too (2026-10-06): the narrated plan in 3D layouts — extruded titles, growing bars, key words — rendered scene by scene by Blender's Workbench engine on the PC CPU (`blender/explainer3d.py`); install it with `pc\setup.ps1 -Blender`. It renders procedural scenes, not hand-authored ones, which is what makes it automatable.
 
 ## Proven working
+
+**7a, 2026-10-06:** an own-footage explainer made by the PC in production, its script written by the server's writer
+(the PC holds no AI key; `LLM_RELAY`): five sections on Bangladesh's fertiliser shortage, each narrated over the clip in
+the footage folder that matched its sentence (paddy, harvest, rice sacks, a farmer), a section with no match on the
+brand backdrop. 61 s, 1080×1920. **1c end to end, same day:** Chaplin's *Great Dictator* speech fetched and transcribed
+on the PC, the moments picked on the server, cut on the PC: "You are not machines", "Dictators die" and "We have lost
+the way" — the three passages anyone would clip — each in Review with its caption, 21–37 s.
+
+The explainer proofs (6b, 6c, 6d) did not run that day: Gemini answered "high demand" for an hour after the reset, then
+gemini-flash-lite-latest refused with a bare 429 that names no limit. Read as a per-minute limit, the jobs went back to
+ordinary retries after two hours and failed; a "per-minute" limit still refusing after two hours now waits for the
+daily reset instead.
 
 **5a, 2026-10-05:** a scene recap made by the server from *Duck and Cover* (1951, archive.org): Gemini's free tier
 watched a 360p, one-frame-a-second proxy, the recap script narrates what is on screen (the turtle, the dynamite, the
