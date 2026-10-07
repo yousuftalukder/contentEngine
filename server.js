@@ -1381,17 +1381,20 @@ impl("TRANSCRIBE", "twelve_labs", { label: "Twelve Labs (video chapters: what ha
       }, ctx.pin);
     } finally { await cleanup(proxy); }
   } }) });
-impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped transcript)", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL } }, create: (cfg, ctx = {}) => ({
+impl("TRANSCRIBE", "gemini_transcribe", { label: "Gemini (audio → timestamped transcript)", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_MODEL }, fallback_models: { type: "array", default: DEFAULTS.GEMINI_FALLBACK_MODELS } }, create: (cfg, ctx = {}) => ({
   async transcribe({ path, language }) {
     const audio = await extractAudio(path);
     try {
       const bytes = await readFile(audio);
       return await withKey("gemini", async (key) => {
         const file = await geminiUpload(key, bytes, "audio/mpeg", "clip-audio");
-        const model = cfg.model || DEFAULTS.GEMINI_MODEL;
-        const body = await fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
+        // Every Gemini model has its own day's allowance. Bangla speech can only be heard here (local whisper writes it
+        // in Urdu script), and with one model it waited a whole day for that model's reset while the others had room —
+        // so it goes down the same list of models the writer does.
+        const models = [cfg.model || DEFAULTS.GEMINI_MODEL, ...(Array.isArray(cfg.fallback_models) ? cfg.fallback_models : DEFAULTS.GEMINI_FALLBACK_MODELS)];
+        const { model, body } = await withGeminiModels(key, "text", models, async (model) => ({ model, body: await fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
           contents: [{ parts: [{ file_data: { file_uri: file.uri, mime_type: "audio/mpeg" } }, { text: `Transcribe this audio${language ? ` (language: ${language})` : ""} into a JSON array of segments: [{"start": seconds, "end": seconds, "text": "..."}]. Segments should be 3-10 seconds each with accurate timestamps. Output ONLY the JSON array.` }] }],
-          generationConfig: { responseMimeType: "application/json", maxOutputTokens: 60000 } }) });
+          generationConfig: { responseMimeType: "application/json", maxOutputTokens: 60000 } }) }) }));
         const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
         const segs = extractJson(text).filter((s) => s && typeof s.text === "string").map((s) => ({ start: Number(s.start) || 0, end: Number(s.end) || 0, text: s.text }));
         const u = body.usageMetadata || {};
