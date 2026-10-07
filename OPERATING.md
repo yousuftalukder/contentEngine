@@ -41,6 +41,10 @@ shows the PC as off and the work as waiting.
    on news nobody saw — 222 drafts in one day — and left the clips without the AI that picks their best moments.
    Change it in **Settings → review.max_waiting** (0 = never stop), or per programme under Automation.
 
+**Automatic production is off unless you turn it on** (Overview). Off, nothing is made by itself: the feeds are not
+read, no news is drafted, no ideas are planned, series wait. *Generate* and pasting a video link always work. Turn it
+on to let the engine run on its own; *Pause news* below then pauses only the news within it.
+
 **Pausing news.** *Pause news* on the Overview (or the News desk page) stops all drafting from the news feeds in one
 click; the feeds are still read, so *Resume news* starts on today's stories. Each news programme also has its own
 pause / resume beside it.
