@@ -42,9 +42,11 @@ test("Gemini: when the free allowance is spent, the job waits for the reset and 
     assert.match(job.error_message, /\[metric [^\]]*quota GenerateRequestsPerDayPerProjectPerModel-FreeTier/, "and the stored error names the limit up front");
     assert.equal(asked.filter((m) => /pro/.test(m)).length, 1, "the Pro model was tried once, as a stand-in");
 
+    const before = asked.length;
     const { id: second } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Metro rail extends its hours" });
     await parked(second);
     assert.equal(asked.filter((m) => /pro/.test(m)).length, 1, "and not asked again by the next job");
+    assert.equal(asked.length, before, `nor is any model already refused today: the next job waits without asking (${asked.slice(before).join(", ")})`);
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
 
@@ -121,6 +123,7 @@ test("Gemini: research the web search is refused for is done without it, and the
     await waitFor(async () => { const [j] = await eng.query(`SELECT status, error_message FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [second]); return j?.status === "PENDING" && j.error_message && j; }, { timeout: 60000, what: "the job to wait for the reset" });
     // Only the research is judged: a one-off boot upgrade may also ask for a house style for the new programme meanwhile.
     const research = seen.filter((x) => x.research);
-    assert.ok(research.length && research.every((x) => x.search), `a spent daily allowance is not retried without search: ${JSON.stringify(research.filter((x) => !x.search))}`);
+    // (None at all is fine: once every model has refused for the day, a job waits without asking.)
+    assert.ok(research.every((x) => x.search), `a spent daily allowance is not retried without search: ${JSON.stringify(research.filter((x) => !x.search))}`);
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
