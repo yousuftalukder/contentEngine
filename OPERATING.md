@@ -25,9 +25,13 @@ shows the PC as off and the work as waiting.
    - **"Researched without web search"** — explainers and long posts research their topic with Google's web search
      first; when search itself was refused (not part of the free plan for that model, or its own allowance spent),
      the research was done from the writer's memory and the source article. Check figures, dates and names.
-   - **"Caption not written — the writer refused"** — the AI was out of its free allowance when this video was
-     finished; the clip's own words stand in. Rewrite the caption before posting. (Rare now: a clip's caption is
-     written when its moment is chosen, and your PC borrows the server's writer.)
+   - **"Check before approving"** — anything the engine wants you to know about this draft, for example *Caption not
+     written — the writer refused*: the AI was out of its free allowance when the video was finished, and the clip's
+     own words stand in. Rewrite the caption before posting.
+   - **Research notes** (explainers and long posts) — the facts the draft was written from, each with its source
+     link, so a figure can be checked against where it came from.
+   - On a video, editing the headline or caption changes the post's text, not the video. **Re-render** draws the same
+     video again (a clip, or an explainer from its stored plan); **Regenerate everything** writes it afresh.
 3. **Overview** shows alerts (a key out of credit, a feed failing) and whether the AI allowance is waiting to reset.
 4. News you have not reviewed within **24 hours** is set aside as "Expired unreviewed" — day-old news is not worth
    publishing, and it buried the fresh stories (2,400 day-old drafts had piled up). Change the window, or turn it off
@@ -40,6 +44,11 @@ shows the PC as off and the work as waiting.
 **Pausing news.** *Pause news* on the Overview (or the News desk page) stops all drafting from the news feeds in one
 click; the feeds are still read, so *Resume news* starts on today's stories. Each news programme also has its own
 pause / resume beside it.
+
+**When something keeps failing.** A job whose worker stops in the middle of it (the server running out of memory, your
+PC switched off mid-render) goes back to the queue on its own — but the third time it happens to the same job it stops
+and says so, rather than looping. **Retry** on the job starts it completely afresh. A post that was interrupted while
+it was being sent is never sent again on its own: it is marked *check the channel first*, because it may already be up.
 
 **Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
 Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each
@@ -63,7 +72,11 @@ comment.
    *When the AI picker is out of allowance* to *Use the free picker now* (Programmes → Edit → Video).
 
 Reaction videos, voice-overs, recaps and "telecast with intro" are the same flow with a different
-**Production method** on the programme (Programmes → Edit → Video).
+**Production method** on the programme (Programmes → Edit → Video). How many clips a video gives, and how long each
+may be, are on the same tab. A **summary voice-over** (4b) says two or three sentences over the opening of the clip, the
+clip's own sound dipping under the voice and coming back after it, with your reactor clip in the corner if you set one.
+A **scene recap** (5a) needs Gemini to watch the film: when your PC has no key, it sends the server a small copy (360p,
+a frame a second) and the server watches it.
 
 ## Starting a new kind of programme
 
@@ -82,6 +95,7 @@ dashboard's API keys page lets the PC write directly, which is a little faster.)
 - **Stop:** close that window. Running jobs go back to the queue.
 - **Start it at every sign-in:** `powershell -ExecutionPolicy Bypass -File pc\autostart.ps1` (undo with `-Remove`).
 - First time on a new PC: `pc\setup.ps1`, then fill in `.env.pc` from Render's Environment tab.
+- **Pause just your PC:** Overview → Worker lanes → *Your PC*. Its work waits; nothing else stops.
 - **Run `pc\setup.ps1` once more** (added 2026-10-05): it now installs deno, which yt-dlp needs to keep reading YouTube
   (it warns that YouTube without it is deprecated). Everything already installed is left alone.
 
@@ -95,17 +109,18 @@ extras, never requirements.
 | your **Facebook Page** | dashboard → **Channels → Connect Facebook** | real publishing (today the channel is a mock) |
 | a free **Gemini key** | on Render (it is there now), or dashboard → **API keys** | the best free writer for Bangla; scene recaps (5a: Gemini watches the video); Bangla transcription; what Gemini sees in your own footage (7a). Your PC borrows the server's, so it needs none of its own |
 | a free **Groq** or **Mistral** key (or OpenRouter, Cerebras, xAI Grok) | API keys | more writers in the chain: when Gemini's ~20 requests a day per model run out, the next one writes. Groq: console.groq.com, no card |
+| a free **Pexels** key | on Render (it is there now), or API keys | stock photos on news cards (2c) and stock footage in script videos (7b); without it those become text cards and photo sequences |
 | a **Pollinations** token (optional) | API keys | removes the small corner logo from free generated pictures (illustrated series, 6c). Pictures work without it |
 | a **reactor clip** of yourself | dashboard → Brands → Media library (purpose: reactor) | reaction videos you can publish (4a, 4c — proven with a stand-in) |
-| a **footage folder** on your PC | the programme → Video → *Your footage folder* | script videos on your own footage (7a), with stock behind it unless you tick *own footage only* |
+| a **footage folder** on your PC | the programme → Video → *Your footage folder* | script videos on your own footage (7a), with stock behind it unless you tick *own footage only* (a 7a programme cannot be saved without a folder) |
 | a **Vizard** key *(optional, paid ~$14.50/month)* | API keys, then a clips programme with clipper `vizard` | clipping while your PC is off (1b). Everything else clips for free on your PC or the server |
 | a **Twelve Labs** key *(optional)* | API keys, then a recap programme with transcriber `twelve_labs` | the Twelve Labs recap (5c); 5a does the same free on Gemini |
 
 ## Test programmes left from the proofs
 
-Made on 2026-10-04 and 10-05 to prove variants on the real server, all under the demo brand, none publishing anywhere:
+Made between 2026-10-04 and 10-06 to prove variants on the real server, all under the demo brand, none publishing anywhere:
 `reaction_test`, `voiceover_test`, `recap_test`, `reaction_long_test`, `telecast_intro_test`, `scene_recap_test`,
-`bn_clip_test`, `data_explainer_test`, `illustrated_test`, `stockvideo_test` (inactive), `eval_llm_picker` (inactive,
+`bn_clip_test`, `data_explainer_test`, `illustrated_test`, `blender_test`, `own_footage_test`, `stockvideo_test` (inactive), `eval_llm_picker` (inactive,
 the selection evaluation). Deactivate or delete them from **Programmes** when you no longer want them; keep
 `eval_llm_picker` if the selection evaluation should be re-run (`eval/boundaries.mjs` re-scores its stored runs for free).
 
