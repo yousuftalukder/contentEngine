@@ -4090,7 +4090,7 @@ async function generateExplainer(item, niche, style) {
 async function renderBlender(itemId, niche, plan) {
   if (!(await blenderAvailable())) throw new Error("Blender is not installed on this machine: run pc\\setup.ps1 -Blender on your PC");
   const { brand, music } = await studioBrand(niche), landscape = plan.width > plan.height, w = landscape ? 1280 : 720, h = landscape ? 720 : 1280;
-  const parts = [], audio = await toTmpFile(plan.audio, "mp3"), list = tmpPath("txt"); let file = null;
+  const parts = [], audio = await toTmpFile(plan.audio, "mp3"), list = tmpPath("txt"); let file = null, caps = null;
   try {
     for (const s of plan.scenes) {
       const spec = tmpPath("json"), out = tmpPath("mp4");
@@ -4101,9 +4101,14 @@ async function renderBlender(itemId, niche, plan) {
       parts.push(out);
     }
     await writeFile(list, parts.map((f) => `file '${f.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"));
+    // The narration burned in, as the studio does for the other explainers: a 3D video went out with only its key words
+    // on screen, which says nothing to someone scrolling with the sound off. Each scene's words, timed from its start.
+    let at = 0; const segs = [];
+    for (const sc of plan.scenes) { const wd = sc.words || []; if (wd.length) segs.push({ start: at + wd[0].from / plan.fps, end: at + wd.at(-1).to / plan.fps, text: wd.map((x) => x.text).join(" ") }); at += sc.durationInFrames / plan.fps; }
+    caps = plan.subtitles !== false && segs.length ? await writeCaptionsAss(segs, 0, at, { width: w, height: h, accent: brand.accent || "#ffd400" }) : null;
     file = tmpPath("mp4");
     await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", audio, "-map", "0:v", "-map", "1:a",
-      "-vf", `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,fps=${plan.fps},format=yuv420p`, ...X264, "-shortest", file], { timeoutMs: 30 * 60000 });
+      "-vf", `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,fps=${plan.fps}${caps ? `,${assVf(caps)}` : ""},format=yuv420p`, ...X264, "-shortest", file], { timeoutMs: 30 * 60000 });
     let finish = "off"; ({ file, finish } = await brandFinish(file, niche, { vertical: !landscape }));
     const video = await publishRender(file, itemId, { method: "EXPLAINER_3D", orientation: plan.orientation, scenes: plan.scenes.length, brand_finish: finish });
     try { const still = tmpPath("jpg"); await exec("ffmpeg", ["-y", "-ss", "1", "-i", parts[0], "-frames:v", "1", "-q:v", "2", still]);
@@ -4111,7 +4116,7 @@ async function renderBlender(itemId, niche, plan) {
       await recordMedia({ contentItemId: itemId, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: w, height: h, meta: { purpose: "youtube thumbnail" } }); }
     catch (e) { warn(`3d thumbnail: ${e.message.slice(0, 160)}`); }
     await setItem(itemId, { hero_media_id: video.id });
-  } finally { await cleanup(audio, list, ...parts, brand.logo, brand.fontUrl, music); }
+  } finally { await cleanup(audio, list, ...parts, brand.logo, brand.fontUrl, music, caps); }
 }
 // The studio half of an explainer: the plan in, the video (and a thumbnail) out. Runs where the studio is.
 async function renderExplainer(itemId, niche, plan) {
