@@ -9,8 +9,8 @@ after(async () => { await eng?.stop(); });
 test("boot: schema applies cleanly, every table has RLS, functions have a pinned search_path", async () => {
   const [{ n }] = await eng.query(`SELECT count(*)::int AS n FROM pg_tables WHERE schemaname = 'public' AND NOT rowsecurity`);
   assert.equal(n, 0, "tables without RLS");
-  const fns = await eng.query(`SELECT proname, proconfig FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('claim_job', 'set_updated_at')`);
-  assert.equal(fns.length, 2);
+  const fns = await eng.query(`SELECT proname, proconfig FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('claim_job', 'set_updated_at', 'job_is_heavy')`);
+  assert.equal(fns.length, 4, "claim_job twice (the plain claim and the PC's), set_updated_at and job_is_heavy");
   for (const f of fns) assert.deepEqual(f.proconfig, ["search_path=public"], `${f.proname} search_path`);
   const health = await eng.api("GET", "/health");
   assert.equal(health.ok, true);

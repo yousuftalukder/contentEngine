@@ -488,6 +488,40 @@ RETURNS SETOF jobs AS $$
   RETURNING *;
 $$ LANGUAGE sql SET search_path = public;
 
+-- Your PC runs several jobs at once, but never two heavy ones (a Blender or studio render, cutting a clip, transcribing
+-- a long video): each takes every core and a lot of memory, and two together starve the laptop. Which jobs are heavy
+-- is the engine's call, handed in as keys — a job type ("STUDIO_RENDER"), a type for one kind of content
+-- ("GENERATE_CONTENT:NEWS_REEL"), or that and the part asked for ("REGENERATE:NEWS_REEL:all") — so the list lives in
+-- one place in server.js and a job queued by an older server, which knows nothing of this, is still judged correctly.
+CREATE OR REPLACE FUNCTION job_is_heavy(p_type TEXT, p_item TEXT, p_payload TEXT, p_heavy TEXT[])
+RETURNS BOOLEAN AS $$
+  SELECT p_type = ANY(p_heavy) OR EXISTS (
+    SELECT 1 FROM content_items ci LEFT JOIN niches n ON n.id = ci.niche_id
+     WHERE ci.id = COALESCE(p_item, substring(p_payload from '"itemId":"([^"]+)"'))
+       AND (p_type || ':' || COALESCE(ci.content_type, n.content_type, '') = ANY(p_heavy)
+         OR p_type || ':' || COALESCE(ci.content_type, n.content_type, '') || ':' || COALESCE(substring(p_payload from '"part":"([^"]+)"'), '') = ANY(p_heavy)));
+$$ LANGUAGE sql STABLE SET search_path = public;
+
+-- The PC's claim. 'light' takes only light work (the extra loops, while the first may be rendering); 'heavy_first'
+-- takes a heavy job before anything else (the first loop, so renders are not starved by a stream of news cards the
+-- other loops can take); anything else is the plain claim above. A separate signature, so claim_job(queue, worker) —
+-- what the server and any older build call — is untouched.
+CREATE OR REPLACE FUNCTION claim_job(p_queue TEXT, p_worker TEXT, p_mode TEXT, p_heavy TEXT[])
+RETURNS SETOF jobs AS $$
+  UPDATE jobs
+     SET status = 'RUNNING', locked_by = p_worker, locked_at = now(),
+         started_at = COALESCE(started_at, now()), attempts = attempts + 1, updated_at = now()
+   WHERE id = (
+     SELECT id FROM jobs
+      WHERE status = 'PENDING' AND queue = p_queue
+        AND (run_after IS NULL OR run_after <= now())
+        AND (p_mode IS DISTINCT FROM 'light' OR NOT job_is_heavy(type, content_item_id, payload, p_heavy))
+      ORDER BY CASE WHEN p_mode = 'heavy_first' AND job_is_heavy(type, content_item_id, payload, p_heavy) THEN 0 ELSE 1 END, priority DESC, created_at ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED)
+  RETURNING *;
+$$ LANGUAGE sql SET search_path = public;
+
 -- ---------------------------------------------------------------------
 -- CREDENTIALS / USAGE / SETTINGS / ADAPTER INSTANCES
 -- ---------------------------------------------------------------------
