@@ -98,7 +98,7 @@ A long video becomes a shorter video that tells its story, cut from its own foot
 5b is much cheaper; 5a is better where the story is visual. Copyright exposure is highest here of anything in
 this document.
 
-## 6 — Animation *(Remotion, on your PC)*
+## 6 — Animation *(on your PC: Remotion for 6a–6c, Blender for 6d)*
 
 | # | variant | input | production | runs | writer | voice |
 |---|---|---|---|---|---|---|
@@ -107,8 +107,10 @@ this document.
 | 6c | Illustrated series | script + characters | AI character images composited and moved in code | PC | yes | yes |
 | 6d | Blender 3D | topic | script → 3D titles, growing bars, key words, rendered by Blender (Workbench, CPU) | PC | yes | yes |
 
-On an i3 with Intel UHD graphics, 6a–6c render a minute of 1080p in roughly two to eight minutes. 6d is honest
-but impractical: the render is slow and, more to the point, nothing automates *authoring* a 3D scene well.
+On an i3 with Intel UHD graphics, 6a–6c render a minute of 1080p in roughly two to eight minutes. 6d was first set
+aside because nothing automates *authoring* a 3D scene well; it was built (2026-10-06) by not authoring one: three
+procedural layouts (an extruded title, growing bars, key words) filled from the plan and rendered by Blender's
+Workbench engine on the CPU, about 22 s of narrated 720p from three scenes.
 
 ## 7 — Script → video
 
@@ -189,10 +191,10 @@ From the providers' own documentation; nothing bought or called yet.
 Vizard is the fit for 1b: a flat monthly price, and it fetches YouTube itself, which is exactly the gap when the PC
 is off. Its first test before building: one video through the API, to see whether the clip times come back.
 
-## Still to verify before its own build
+## Measured on the free services
 
-- Gemini video input on a long file *(5a)*: built as 360p, one-frame-a-second proxies read at low media resolution
-  (about 100 tokens a second), forty minutes per request; a longer video goes in pieces. Not yet run on a real film.
+- Gemini video input *(5a)*: 360p, one-frame-a-second proxies read at low media resolution (about 100 tokens a
+  second), forty minutes per request; a longer video goes in pieces. Proven on a real film 2026-10-05.
 - Pollinations, the free picture service *(6c)*, measured 2026-10-04: about 4 s a picture; without a token it turns
   away many requests with an empty 402 (every other one when quiet, six in a row when busy) and serves a later one, so
   the engine asks again for up to two minutes; it caps pictures at about 768 px and puts a small logo in a corner.

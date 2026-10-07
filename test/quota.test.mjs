@@ -122,7 +122,7 @@ test("a 'per-minute' limit still refusing after two hours waits for the daily re
   const p = await program("bare_429", { scriptAdapter: "llm_bare_429" });
   await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: false } });
   const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "An explainer that met a bare 429" });
-  await eng.query(`UPDATE jobs SET quota_since = now() - interval '3 hours', attempts = 6 WHERE content_item_id = $1`, [id]);
+  await eng.query(`UPDATE jobs SET quota_since = now() - interval '3 hours', quota_kind = 'short', attempts = 6 WHERE content_item_id = $1`, [id]);
   await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: true } });
   const job = await waitFor(async () => { const [j] = await eng.query(`SELECT status, attempts, run_after FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [id]);
     return (j?.status === "FAILED" || (j?.status === "PENDING" && new Date(j.run_after) > Date.now() + 3600e3)) && j; }, { timeout: 30000, what: "the job to settle" });
