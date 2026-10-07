@@ -5111,7 +5111,7 @@ async function notifyQuota(quota, msg) {
 async function runJob(job) {
   const h = HANDLERS[job.type]; const payload = P(job.payload) || {};
   // A Blender or studio render can run for over an hour; without a fresh lock it looked abandoned at 45 minutes and was
-  // handed to another worker while still running here.
+  // handed to another worker while still running here. One timer per job, stopped with it: the PC runs several at once.
   const beat = setInterval(() => q(`UPDATE jobs SET locked_at = now() WHERE id = $1 AND locked_by = $2 AND status = 'RUNNING'`, [job.id, WORKER_ID]).catch(() => {}), 60000);
   try { await runJobInner(job, h, payload); } finally { clearInterval(beat); }
 }
@@ -5149,16 +5149,51 @@ async function runJobInner(job, h, payload) {
     }
   }
 }
-async function workerLoop(queue) {
-  log(`worker lane "${queue}" started`);
+// Your PC runs several jobs at once. Since files are kept on the PC every job that writes one runs there, and with one
+// loop a 20-minute Blender render held up a 20-second news card and a one-second upload hand-off behind it. So the PC
+// lane has several loops (PC_CONCURRENCY, or Settings → worker.pc_concurrency, re-read every minute) — but only the
+// first may take heavy work, so two renders never run together and starve the laptop. The others take light work only.
+// Heavy: anything that renders or transcribes — a studio or Blender render, a clip cut, a long video transcribed and
+// picked over, and a made video (a reel, a slideshow, an explainer, long form) drafted and rendered in one job, or
+// redrawn whole. A news card, a long post, an upload hand-off, a redrawn card or a post going out is light: mostly
+// waiting on a writer or a platform. A clip type is listed too, should one ever be drafted rather than cut.
+const HEAVY_JOB_KEYS = ["STUDIO_RENDER", "RENDER_CLIP", "PROCESS_CANDIDATE", ...[...MADE_VIDEO_TYPES, ...VIDEO_TYPES].flatMap((t) => [`GENERATE_CONTENT:${t}`, `REGENERATE:${t}:all`])];
+const PC_CONCURRENCY_MAX = 6;
+const pcSlots = { want: 0, loops: new Set() };
+async function pcConcurrency() {
+  const n = Math.round(Number((await setting("worker.pc_concurrency", null)) ?? ENV.PC_CONCURRENCY ?? 2));
+  return n >= 1 ? Math.min(PC_CONCURRENCY_MAX, n) : 2;
+}
+// Starts the loops the PC is asked for. A loop above the number stops by itself once its job is done (workerLoop), so
+// lowering it never cuts a job short.
+async function syncPcSlots() {
+  let want; try { want = await pcConcurrency(); } catch (e) { warn("pc concurrency:", e.message); want = pcSlots.want || 1; }
+  if (want !== pcSlots.want) {
+    log(`your PC runs up to ${want} job${want > 1 ? "s" : ""} at once${want > 1 ? ", one heavy render at a time" : ""}`);
+    putSetting("worker.pc_slots", { concurrency: want, at: nowIso(), worker: WORKER_ID }).catch((e) => warn("pc slots", e.message));
+  }
+  pcSlots.want = want;
+  for (let i = 0; i < want; i++) if (!pcSlots.loops.has(i)) { pcSlots.loops.add(i); workerLoop(PC_LANE, i); }
+}
+async function workerLoop(queue, slot = 0) {
+  const pc = queue === PC_LANE;
+  log(`worker lane "${queue}" started${pc && slot ? ` (loop ${slot + 1}, light work only)` : ""}`);
   for (;;) {
+    if (pc && slot >= pcSlots.want) break;
     let ran = false;
     try {
       const enabled = await setting("queues.enabled", {});
-      if (enabled[queue] !== false) { const [job] = await q(`SELECT * FROM claim_job($1, $2)`, [queue, WORKER_ID]); if (job) { ran = true; await runJob(job); } }
+      // One loop on its own takes anything, as before; with several, only the first takes heavy work (and takes it first).
+      const mode = pc && pcSlots.want > 1 ? (slot === 0 ? "heavy_first" : "light") : null;
+      if (enabled[queue] !== false) {
+        const [job] = mode ? await q(`SELECT * FROM claim_job($1, $2, $3, $4)`, [queue, WORKER_ID, mode, HEAVY_JOB_KEYS]) : await q(`SELECT * FROM claim_job($1, $2)`, [queue, WORKER_ID]);
+        if (job) { ran = true; await runJob(job); }
+      }
     } catch (e) { warn(`lane ${queue}:`, e.message); }
     await sleep(ran ? 100 : QUEUE_POLL_MS);
   }
+  pcSlots.loops.delete(slot);
+  log(`worker lane "${queue}" loop ${slot + 1} stopped (the PC was asked to run fewer jobs at once)`);
 }
 async function sweepDueSources() {
   if (!(await setting("ingest.enabled", true)) || !(await autoOn())) return;
@@ -5428,7 +5463,8 @@ async function sweepRetention() {
 }
 function startWorkers() {
   if (!LANES.length) { warn("LANES is set but names no known lane — this process serves HTTP only"); return; }
-  for (const qn of LANES) workerLoop(qn);
+  for (const qn of LANES) if (qn !== PC_LANE) workerLoop(qn);
+  if (LANES.includes(PC_LANE)) { syncPcSlots(); setInterval(() => syncPcSlots().catch(() => {}), Number(ENV.PC_SLOTS_POLL_MS) || 60000); }
   // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
   // leaving routed work to look stuck.
   if (LANES.includes(PC_LANE)) {
@@ -6134,7 +6170,8 @@ process.on("exit", () => { try { tunnelProc?.kill(); } catch {} });
   await recoverAbandonedWork();
   // Render sends SIGTERM before it replaces an instance or spins one down. A job this worker was in the middle of would
   // otherwise sit RUNNING until recovery gives up on it — LOCK_TIMEOUT_MIN later — and with several deploys a day that
-  // froze the ingest lane for most of an hour each time. Hand the work back first, then go.
+  // froze the ingest lane for most of an hour each time. Hand the work back first, then go: every job it holds, since
+  // the PC runs several at once (a run's final write checks it still owns its job, so a finish does not undo this).
   const handBack = async (sig) => {
     try {
       const r = await q(`UPDATE jobs SET status='PENDING', locked_by=NULL, locked_at=NULL, attempts=GREATEST(attempts-1,0) WHERE status='RUNNING' AND locked_by=$1 RETURNING id`, [WORKER_ID]);
