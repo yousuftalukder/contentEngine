@@ -2049,11 +2049,12 @@ const pexelsClipUsed = new Map();
 async function pexelsFootage(query, { vertical = true, seconds = 6, country = null, ctx = {} } = {}) {
   const place = stockPlace(country), searches = stockSearches(query, place, 5);
   if (!searches.length) return null;
-  const base = await setting("footage.api_base", "https://api.pexels.com/videos");
-  return withKey("pexels", async (key) => {
+  // Only the search needs the key: on the PC without one it is the server's (KEY_RELAY), and the clip is still
+  // downloaded from Pexels' CDN by whoever renders.
+  const pick = async (search) => {
     const want = vertical ? { w: 720, h: 1080 } : { w: 1280, h: 720 };
     for (const q of searches) {
-      const r = await fetchJson(`${base}/search?${form({ query: q, per_page: 15, orientation: vertical ? "portrait" : "landscape", size: "medium" })}`, { headers: { Authorization: key } });
+      const r = await search({ query: q, per_page: 15, orientation: vertical ? "portrait" : "landscape", size: "medium" });
       const pool = (r.videos || []).filter((v) => v.duration >= Math.min(seconds, 4) && Date.now() - (pexelsClipUsed.get(v.id) || 0) > 14 * 86400e3 && stockIsLocal(v.url, place) && !STOCK_LOADED.test(v.url || ""));
       for (const v of pool.slice(0, 6)) {
         const file = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.width >= want.w && f.height >= want.h).sort((a, b) => a.width * a.height - b.width * b.height)[0];
@@ -2063,7 +2064,10 @@ async function pexelsFootage(query, { vertical = true, seconds = 6, country = nu
       }
     }
     return null;
-  }, ctx.pin).catch((e) => { warn(`stock footage "${searches[0]}": ${e.message.slice(0, 120)}`); return null; });
+  };
+  const found = (async () => ((await relayKeyed("pexels")) ? pick((p) => keyRelay("pexels_videos", p))
+    : withKey("pexels", async (key) => { const base = await setting("footage.api_base", "https://api.pexels.com/videos"); return pick((p) => fetchJson(`${base}/search?${form(p)}`, { headers: { Authorization: key } })); }, ctx.pin)))();
+  return found.catch((e) => { warn(`stock footage "${searches[0]}": ${e.message.slice(0, 120)}`); return null; });
 }
 // ---- 7a. Your own footage. Commercial script-to-video tools all draw on the same stock pool; a library of your own
 // clips is what makes a video look like nobody else's. The library is a folder on the machine that does the video work
@@ -2095,16 +2099,50 @@ async function footageIndex(dir, { describe = 0 } = {}) {
   // What Gemini saw in a clip, remembered by its name and size.
   const known = list.length ? await q(`SELECT key, value FROM settings WHERE key = ANY($1)`, [list.map((c) => c.key)]) : [];
   for (const r of known) { const c = list.find((x) => x.key === r.key); if (c) c.seen = String((typeof r.value === "string" ? P(r.value) ?? r.value : r.value)?.seen || ""); }
-  if (describe > 0 && (await credentialsFor("gemini")).length) {
-    const eyes = await resolve("TRANSCRIBE", "gemini_video").catch(() => null);
+  // The library lives on your PC, which has no Gemini key: there the clip is looked at by the server's (KEY_RELAY) from
+  // a few still frames, since the clip itself is too big to pass through the database. With a key here, as before.
+  const relayEyes = await relayKeyed("gemini");
+  if (describe > 0 && (relayEyes ? await canUseKey("gemini") : (await credentialsFor("gemini")).length)) {
+    const eyes = relayEyes ? null : await resolve("TRANSCRIBE", "gemini_video").catch(() => null);
     for (const c of list.filter((x) => !x.note && !x.seen).slice(0, describe)) {
-      try { const r = await eyes.transcribe({ path: c.path, duration: await ffprobeDuration(c.path) });
-        c.seen = r.segments.map((x) => x.visual).filter(Boolean).join(" ").slice(0, 800); await putSetting(c.key, { seen: c.seen, rel: c.rel }); }
+      try {
+        if (relayEyes) c.seen = String((await describeViaServer(c.path)).seen || "").slice(0, 800);
+        else { const r = await eyes.transcribe({ path: c.path, duration: await ffprobeDuration(c.path) }); c.seen = r.segments.map((x) => x.visual).filter(Boolean).join(" ").slice(0, 800); }
+        await putSetting(c.key, { seen: c.seen, rel: c.rel }); }
       catch (e) { warn(`describing ${c.rel}: ${e.message.slice(0, 120)}`); break; }
     }
   }
   for (const c of list) c.words = footWords(`${c.rel.replace(FOOTAGE_EXT, "")} ${c.note} ${c.seen}`);
   return list;
+}
+// The PC's half of a relayed look at a clip: four small stills spread across it, sent to the server, which asks Gemini.
+// Four frames at 480 pixels are a few tens of kilobytes each — enough to say "a rickshaw in the rain on a city street",
+// which is all the library match needs, and far under what a relay carries.
+async function describeViaServer(path) {
+  const seconds = await ffprobeDuration(path), frames = []; let total = 0;
+  for (const at of [0.15, 0.4, 0.65, 0.9]) {
+    const out = tmpPath("jpg");
+    try {
+      await exec("ffmpeg", ["-y", "-ss", (seconds * at).toFixed(2), "-i", path, "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "6", out], { timeoutMs: 60000 });
+      const bytes = await readFile(out);
+      if (bytes.length > MAX_RELAY_FRAME_BYTES || total + bytes.length > MAX_RELAY_FRAMES_BYTES) continue;
+      total += bytes.length; frames.push({ mime: "image/jpeg", data: bytes.toString("base64") });
+    } catch { /* a frame past the end of a short clip; the others still describe it */ } finally { await cleanup(out); }
+  }
+  if (!frames.length) throw new Error("no frame could be taken from this clip");
+  return keyRelay("gemini_describe", { frames, seconds: Math.round(seconds) });
+}
+// The server's half: what Gemini sees in those stills, in the same concrete terms the video path asks for.
+async function describeFrames(frames, seconds) {
+  const models = [DEFAULTS.GEMINI_MODEL, ...DEFAULTS.GEMINI_FALLBACK_MODELS];
+  return withKey("gemini", async (key) => {
+    const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
+      contents: [{ parts: [...frames.map((f) => ({ inline_data: { mime_type: f.mime, data: f.data } })), { text: `These are ${frames.length} still frames, in order, from one video clip${seconds ? ` of ${seconds} seconds` : ""}. Say what is SEEN in the clip, in English, in one or two concrete sentences — who, where, what happens ("a rickshaw puller pedals through heavy rain on a crowded city street"), not a judgement ("a nice shot"). Plain text only.` }] }],
+      generationConfig: { maxOutputTokens: 400 } }) }) }));
+    const text = (body.candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join("").trim(), u = body.usageMetadata || {};
+    if (!text) throw new Error("Gemini said nothing about these frames");
+    return { seen: text.slice(0, 800), cost: tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), units: 1 };
+  });
 }
 // The clip that fits a phrase best, cut to the section's length from a part of it the last use did not show. The cut
 // is kept beside the engine's work files, so a retried render finds it again.
@@ -2134,12 +2172,14 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
     if (specs.photo_query === null) { const e = new Error("A library photo could mislead for this story, so it has none"); e.editorial = true; throw e; }
     const place = stockPlace(specs.country), searches = stockSearches(specs.photo_query || prompt || headline, place, 6);
     if (!searches.length) throw new Error("No stock photo search phrase for this story");
-    return withKey("pexels", async (key) => {
+    // The search is the only call that needs the key. On the PC without one it is the server's (KEY_RELAY); the photo
+    // itself is still fetched from Pexels' CDN here.
+    const pick = async (search) => {
       const wide = specs.width && specs.height ? specs.width / specs.height : 1;
       let pool = [], query = searches[0];
       for (const s of searches) {
         query = s;
-        const r = await fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" })}`, { headers: { Authorization: key } });
+        const r = await search({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" });
         // A photo of another country is never the stand-in for this one, so the place filter comes before freshness.
         const usable = (r.photos || []).filter((p) => p?.src && p.width >= 1000 && (wide < 1 || p.width >= p.height) && stockIsLocal(`${p.url} ${p.alt || ""}`, place) && !STOCK_LOADED.test(`${p.url} ${p.alt || ""}`.toLowerCase()));
         const fresh = usable.filter((p) => Date.now() - (pexelsUsed.get(p.id) || 0) > 14 * 86400e3);
@@ -2154,7 +2194,9 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
       const media = await storeImage(bytes, "image/jpeg", contentItemId, { provider: "pexels", photo_id: photo.id, photographer: photo.photographer, photo_url: photo.url, query, alt: photo.alt || null },
         {}, { headline, specs: { ...specs, photo_credit: credit } });
       return { ...media, cost: 0, units: 1 };
-    }, ctx.pin);
+    };
+    if (await relayKeyed("pexels")) return pick((p) => keyRelay("pexels_photos", { ...p, adapter: ctx.key }));
+    return withKey("pexels", (key) => pick((p) => fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form(p)}`, { headers: { Authorization: key } })), ctx.pin);
   } }) });
 // The photo the outlet ran with the story — the actual people, the actual place. It is what every Bangladeshi news page
 // on Facebook is built from, it is free, and no generated illustration competes with it for a story about real people.
@@ -2345,19 +2387,30 @@ impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSche
 // ---- 6i. Embeddings (stage EMBED). embed(text) -> number[] | null
 // embedMany(texts, {dimensions, task}) -> (number[] | null)[] — batched for the news desk, which embeds every new headline.
 impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { return null; }, async embedMany(texts) { return texts.map(() => null); } }) });
+// The two calls themselves, shared by the adapter and by the server's half of a relayed embedding (KEY_RELAY).
+async function geminiEmbedOne(model, text, pin = null) {
+  const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, pin);
+  return r.v;
+}
+async function geminiEmbedBatch(model, chunk, dimensions, task, pin = null) {
+  const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+    body: JSON.stringify({ requests: chunk.map((t) => ({ model: `models/${model}`, content: { parts: [{ text: String(t).slice(0, 2000) }] }, taskType: task, outputDimensionality: dimensions })) }) })); return { v: (b.embeddings || []).map((e) => e.values || null), units: 1, cost: 0 }; }, pin);
+  return chunk.map((_, j) => r.v[j] || null);
+}
+// On the PC without a Gemini key of its own the embedding is the server's (KEY_RELAY); without it the duplicate check
+// on the PC fell back to counting shared words, which misses the same story told in other words.
 impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg, ctx = {}) => ({
   async embed(text) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL;
-    const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
-    return r.v;
+    if (await relayKeyed("gemini")) return (await keyRelay("gemini_embed", { model, texts: [String(text)] })).vectors?.[0] || null;
+    return geminiEmbedOne(model, text, ctx.pin);
   },
   async embedMany(texts, { dimensions = 256, task = "CLUSTERING" } = {}) {
-    const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL; const out = [];
+    const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL, relay = await relayKeyed("gemini"), out = [];
     for (let i = 0; i < texts.length; i += 100) {
       const chunk = texts.slice(i, i + 100);
-      const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
-        body: JSON.stringify({ requests: chunk.map((t) => ({ model: `models/${model}`, content: { parts: [{ text: String(t).slice(0, 2000) }] }, taskType: task, outputDimensionality: dimensions })) }) })); return { v: (b.embeddings || []).map((e) => e.values || null), units: 1, cost: 0 }; }, ctx.pin);
-      out.push(...chunk.map((_, j) => r.v[j] || null));
+      if (relay) { const v = (await keyRelay("gemini_embed", { model, texts: chunk.map((t) => String(t).slice(0, 2000)), dimensions, task, batch: true })).vectors || []; out.push(...chunk.map((_, j) => v[j] || null)); }
+      else out.push(...(await geminiEmbedBatch(model, chunk, dimensions, task, ctx.pin)));
     }
     return out;
   } }) });
@@ -3564,6 +3617,10 @@ const llmFor = async (niche, fn) => {
 async function someUsable(keys) { for (const k of keys.filter(Boolean)) if (await adapterUsable(k)) return true; return false; }
 async function relayComplete(niche, request) {
   const id = await enqueue("LLM_RELAY", { nicheId: niche.id, request }, { queue: "text", priority: 9, maxAttempts: 2 });
+  return relayWait(id, "writing request");
+}
+// Waits for the server to answer a relayed job, and collects the answer it left in settings.
+async function relayWait(id, what) {
   const until = Date.now() + Number(ENV.RELAY_TIMEOUT_MS || 15 * 60000);
   for (;;) {
     const j = await one(`SELECT status, error_message FROM jobs WHERE id = $1`, [id]);
@@ -3578,12 +3635,80 @@ async function relayComplete(niche, request) {
       // Withdrawn if the server has not started it: answered later, it would spend the writer on an answer nobody reads.
       if (j?.status !== "FAILED") await q(`UPDATE jobs SET status='CANCELLED', finished_at=now(), error_message='the PC stopped waiting for this answer' WHERE id=$1 AND status='PENDING'`, [id]).catch(() => {});
       // The server's own reason, with its HTTP status where it gave one, so a spent allowance is still read as a quota.
-      const msg = j?.error_message || "the server did not answer the writing request in time";
+      const msg = j?.error_message || `the server did not answer the ${what} in time`;
       throw Object.assign(new Error(`via the server: ${msg}`), { status: Number((/-> (\d{3})/.exec(msg) || [])[1]) || undefined, transient: j?.status === "FAILED" ? undefined : true });   // a failure is judged by its own status; no answer in time is worth retrying
     }
     await sleep(Number(ENV.RELAY_POLL_MS || 2000));
   }
 }
+// The same crossing for the other keyed calls the PC makes: stock photos and footage from Pexels, Gemini embeddings for
+// the duplicate check, and Gemini's look at a clip of your own footage. The keys live in the server's environment and
+// the PC cannot read them, so without this every card made on the PC was a text card, every reel a photo sequence and
+// every duplicate check a word count. The server runs one of a few named operations with its own key and hands back
+// only what the PC needs — never a key, and never a call to an address or method the PC chose. Downloads from Pexels'
+// CDN stay on the PC: they need no key, and a video passing through the database would be absurd.
+// `relayKeyed` says whether this call should cross: only on the PC, and only when it has no key of its own for the
+// provider (a PC with its own key, and the server, behave exactly as before).
+const relayKeyed = async (provider) => IS_PC && !(await credentialsFor(provider)).length;
+// A server with no key either is remembered for ten minutes, so a reel's every section does not ask again and wait.
+const relayNoKey = new Map();                                                       // provider -> until when to stop asking
+const canUseKey = async (provider) => (await credentialsFor(provider)).length > 0 || (IS_PC && (relayNoKey.get(provider) || 0) < Date.now());
+async function keyRelay(op, params) {
+  const provider = KEY_RELAY_OPS[op].provider;
+  if ((relayNoKey.get(provider) || 0) > Date.now()) throw new Error(`No API key for "${provider}" on this PC or on the server`);
+  const id = await enqueue("KEY_RELAY", { op, params }, { queue: "text", priority: 9, maxAttempts: 1 });
+  try {
+    const out = await relayWait(id, `${op} request`);
+    if (out.error) {
+      if (/No API key/i.test(out.error)) relayNoKey.set(provider, Date.now() + 10 * 60000);
+      throw Object.assign(new Error(`via the server: ${out.error}`), { status: out.status || undefined, transient: typeof out.transient === "boolean" ? out.transient : undefined });
+    }
+    return out.result;
+  } finally {
+    // A frame or a batch of headlines has no business staying in the job history once it has been answered.
+    await q(`UPDATE jobs SET payload = $2 WHERE id = $1`, [id, JSON.stringify({ op })]).catch(() => {});
+  }
+}
+// What the PC may ask for, and nothing else. Every parameter is checked and rebuilt here, on the server: the addresses
+// are the server's own (its Pexels base, its footage setting, GEMINI_BASE), and only the fields used are sent back.
+const relayText = (v, max) => String(v ?? "").slice(0, max);
+const relayInt = (v, lo, hi, dflt) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
+const relayPick = (v, allowed, dflt) => (allowed.includes(v) ? v : dflt);
+const pexelsQuery = (p, orientations) => {
+  const query = relayText(p.query, 200).trim(); if (!query) throw new Error("a stock search needs a phrase");
+  return { query, per_page: relayInt(p.per_page, 1, 80, 15), orientation: relayPick(p.orientation, orientations, orientations[0]), ...(p.size ? { size: relayPick(p.size, ["large", "medium", "small"], "medium") } : {}) };
+};
+const MAX_RELAY_FRAME_BYTES = 400 * 1024, MAX_RELAY_FRAMES_BYTES = 1536 * 1024;
+const KEY_RELAY_OPS = {
+  // A Pexels photo search. The base address comes from the program's own pexels_stock instance, read here.
+  pexels_photos: { provider: "pexels", async run(p) {
+    const row = p.adapter ? (await instances()).find((r) => r.key === p.adapter && r.stage === "IMAGE" && r.impl === "pexels_stock") : null;
+    const base = P(row?.config)?.api_base || "https://api.pexels.com/v1";
+    const r = await withKey("pexels", (key) => fetchJson(`${base}/search?${form(pexelsQuery(p, ["landscape", "portrait", "square"]))}`, { headers: { Authorization: key } }), row?.credential_id || null);
+    return { photos: (r.photos || []).map((x) => ({ id: x.id, width: x.width, height: x.height, url: x.url, alt: x.alt || null, photographer: x.photographer, src: x.src ? { large2x: x.src.large2x, large: x.src.large, original: x.src.original } : null })) };
+  } },
+  // A Pexels video search, against the server's footage.api_base.
+  pexels_videos: { provider: "pexels", async run(p) {
+    const base = await setting("footage.api_base", "https://api.pexels.com/videos");
+    const r = await withKey("pexels", (key) => fetchJson(`${base}/search?${form(pexelsQuery(p, ["portrait", "landscape", "square"]))}`, { headers: { Authorization: key } }));
+    return { videos: (r.videos || []).map((v) => ({ id: v.id, duration: v.duration, url: v.url, user: { name: v.user?.name || null }, video_files: (v.video_files || []).map((f) => ({ file_type: f.file_type, width: f.width, height: f.height, link: f.link })) })) };
+  } },
+  // Gemini embeddings: one text (the duplicate check) or a batch of up to a hundred (the news desk).
+  gemini_embed: { provider: "gemini", async run(p) {
+    const model = relayText(p.model || DEFAULTS.GEMINI_EMBED_MODEL, 80); if (!/^[\w.-]+$/.test(model)) throw new Error("not an embedding model name");
+    const texts = (Array.isArray(p.texts) ? p.texts : []).slice(0, 100).map((t) => relayText(t, 8000)); if (!texts.length) throw new Error("nothing to embed");
+    if (!p.batch) return { vectors: [await geminiEmbedOne(model, texts[0])] };
+    return { vectors: await geminiEmbedBatch(model, texts, relayInt(p.dimensions, 1, 3072, 256), /^[A-Z_]{1,40}$/.test(p.task || "") ? p.task : "CLUSTERING") };
+  } },
+  // What is seen in a clip of your own footage, from a few still frames the PC took from it (7a).
+  gemini_describe: { provider: "gemini", async run(p) {
+    const frames = (Array.isArray(p.frames) ? p.frames : []).slice(0, 6).filter((f) => /^image\/(jpeg|png)$/.test(f?.mime || "") && typeof f.data === "string");
+    const sizes = frames.map((f) => Buffer.byteLength(f.data, "base64"));
+    if (!frames.length) throw new Error("no frames to describe");
+    if (sizes.some((n) => n > MAX_RELAY_FRAME_BYTES) || sizes.reduce((a, b) => a + b, 0) > MAX_RELAY_FRAMES_BYTES) throw new Error("the frames are larger than a relay carries");
+    return describeFrames(frames, relayInt(p.seconds, 0, 86400, 0));
+  } },
+};
 // `lead` puts an adapter in front of the program's own, without disturbing what the program is configured to use: the
 // story's own photo is tried first when it has one, and what the program would have drawn is the fallback.
 const imageFor = async (niche, fn, lead = null, tail = null) => {
@@ -3893,7 +4018,7 @@ async function generateReel(item, niche, style) {
   // Your own footage first where the programme has a library (7a), the stock library behind it.
   const library = mc.footage_dir ? await footageIndex(String(mc.footage_dir), { describe: Number(mc.describe_per_day ?? 5) }) : null;
   if (library && !library.length) warn(`footage folder ${mc.footage_dir} has no clips in it`);
-  const stockOk = mc.broll !== false && !(library && mc.own_footage_only) && (await credentialsFor("pexels")).length > 0;
+  const stockOk = mc.broll !== false && !(library && mc.own_footage_only) && (await canUseKey("pexels"));   // on the PC, the server's key counts
   const broll = stockOk || !!library?.length;
   const storyPlace = String(d.place || "").trim() || niche.country;
   const images = []; let noPics = null, footage = 0;
@@ -5072,6 +5197,16 @@ const HANDLERS = {
     const r = await llmFor(niche, (llm) => llm.complete(request));
     await putSetting(`relay.${job.id}`, { text: r.text, data: r.data ?? null, cost: r.cost || 0, model: r.model || null });
     return { answered: true };
+  },
+  // The server's half of a relayed keyed call (KEY_RELAY_OPS). A refusal is handed back as the answer rather than thrown:
+  // the PC is waiting on it now, and a retry an hour later, or a quota wait until midnight, would answer nobody.
+  async KEY_RELAY({ op, params }, job) {
+    const def = Object.hasOwn(KEY_RELAY_OPS, op) ? KEY_RELAY_OPS[op] : null; if (!def) throw new Error(`"${String(op).slice(0, 40)}" is not something the server does for the PC`);
+    let answer;
+    try { answer = { result: await def.run(params || {}) }; }
+    catch (e) { answer = { error: String(e.message || e).slice(0, 1000), status: Number(e.status) || null, transient: isTransient(e) }; }
+    await putSetting(`relay.${job.id}`, answer);
+    return { answered: !answer.error };
   },
   async PICK_CLIPS({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return pickOnServer(candidateId); },
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
