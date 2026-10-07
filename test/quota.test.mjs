@@ -116,6 +116,10 @@ test("a job queued long before it meets a per-minute limit still waits for it, w
 // gemini-flash-lite-latest answers a spent day with a bare 429 that names no limit, which reads as a per-minute one.
 // Two hours on, it is still refusing: that is the day's allowance, and the job waits for the reset — on 2026-10-06 it
 // went back to ordinary retries instead and every explainer failed.
+// The daily reset is five past midnight Pacific. Checked as that, not as "more than an hour away": in the hour before a
+// reset the next one is less than an hour off, and the old check failed there while the engine was right.
+const atReset = (t) => { const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", hour: "numeric", minute: "numeric", hourCycle: "h23" }).formatToParts(new Date(t)).map((x) => [x.type, Number(x.value)]));
+  return p.hour === 0 && p.minute >= 3 && p.minute <= 7; };   // the wait is counted in whole seconds from now, so it lands a moment either side
 test("a 'per-minute' limit still refusing after two hours waits for the daily reset instead of failing", async () => {
   await eng.api("POST", "/api/adapter-configs", { key: "llm_bare_429", stage: "SCRIPT", impl: "llm_mock", config: { fail_first: 99, fail_status: 429,
     fail_message: 'POST https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent -> 429: {"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}' } });
@@ -125,10 +129,10 @@ test("a 'per-minute' limit still refusing after two hours waits for the daily re
   await eng.query(`UPDATE jobs SET quota_since = now() - interval '3 hours', quota_kind = 'short', attempts = 6 WHERE content_item_id = $1`, [id]);
   await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: true } });
   const job = await waitFor(async () => { const [j] = await eng.query(`SELECT status, attempts, run_after FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [id]);
-    return (j?.status === "FAILED" || (j?.status === "PENDING" && new Date(j.run_after) > Date.now() + 3600e3)) && j; }, { timeout: 30000, what: "the job to settle" });
+    return (j?.status === "FAILED" || (j?.status === "PENDING" && atReset(j.run_after))) && j; }, { timeout: 30000, what: "the job to settle" });
   assert.equal(job.status, "PENDING", "the job is not failed");
   assert.equal(job.attempts, 6, "and spends no attempt");
-  assert.ok(new Date(job.run_after) > Date.now() + 3600e3, `it waits for the daily reset, not another minute (${job.run_after})`);
+  assert.ok(atReset(job.run_after), `it waits for the daily reset, not another minute (${job.run_after})`);
 });
 
 // Retry on the dashboard starts the job afresh — attempts, the quota wait and the failure on the item all go —

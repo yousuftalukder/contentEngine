@@ -683,14 +683,18 @@ impl("SCRIPT", "anthropic", { label: "Anthropic Claude", configSchema: { model: 
 // A model whose daily allowance is spent, and when it comes back. The free tier grants that allowance per model
 // (the quota Google names is PerDayPerProjectPerModel), so the rest of the account's models are untouched — this keeps
 // the engine from spending a call on a model it already knows is finished for the day.
-const modelSpent = new Map();
+const modelSpent = new Map(), modelRefusal = new Map();    // model -> until when; model -> the quota error that said so
 const spentUntil = (m) => modelSpent.get(m) || 0;
 const isSpent = (m) => spentUntil(m) > Date.now();
 // A model that is out for the day is skipped until it resets; one that is merely overloaded is skipped for a few
 // minutes, so the next job starts on a different model instead of walking into the same wall.
 function noteSpent(model, e) {
   const q = quotaWait(e);
-  if (q?.kind === "day") modelSpent.set(model, Date.now() + q.seconds * 1000);
+  // Any quota refusal is remembered for as long as it said (a minute limit's delay, a quarter of an hour for a 429 that
+  // names nothing), with the refusal itself: when every model is resting, the job is told so without asking each one
+  // again — every waiting job used to walk the whole list on every wake, hundreds of refused requests an hour.
+  if (q) modelRefusal.set(model, e);
+  if (q?.kind === "day" || q?.kind === "minute" || q?.kind === "unstated") modelSpent.set(model, Date.now() + q.seconds * 1000);
   // "limit: 0" is a model the plan does not include at all — a free key and any Pro model. No reset lifts it, so it is
   // set aside for a day instead of being asked again by every job.
   else if (q?.kind === "plan") modelSpent.set(model, Date.now() + 24 * 3600e3);
@@ -698,6 +702,10 @@ function noteSpent(model, e) {
 }
 async function withModelFallback(models, call) {
   const errs = [], all = [...new Set(models.filter(Boolean))], fresh = all.filter((m) => !isSpent(m));
+  if (all.length && !fresh.length && all.every((m) => modelRefusal.has(m))) {
+    const soonest = [...all].sort((a, b) => spentUntil(a) - spentUntil(b))[0];
+    throw modelRefusal.get(soonest);
+  }
   for (const model of (fresh.length ? fresh : all)) {
     try { return await retryTransient(() => call(model)); }
     catch (e) {
