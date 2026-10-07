@@ -16,7 +16,8 @@
 // =====================================================================
 
 import http from "node:http";
-import { readFile, writeFile, mkdir, unlink, rm, readdir, stat, open as openFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink, rm, readdir, stat, statfs, open as openFile } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, createWriteStream, readFileSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
@@ -525,19 +526,56 @@ async function serverBase() {
   const boot = P((await one(`SELECT value FROM settings WHERE key = 'boot.last'`))?.value) || {};
   return String(boot.url || own || `http://localhost:${PORT}`).replace(/\/$/, "");
 }
-async function storeFile(path, bytes, contentType) { return (await storageBackend()).put(path, bytes, contentType); }
+// A test or preview the server makes for someone waiting on the answer (hear a voice, see a picture adapter's work)
+// while files are kept on your PC: there is nowhere on the server to put the file, and sending a ten-second voice
+// check to the PC would mean no answer at all while it is off. The file comes back inside the answer instead
+// (a data: link), and nothing is recorded — it belongs to no draft. Everything else still goes to the PC.
+const inlineFiles = new AsyncLocalStorage();
+const inlinePreview = (fn) => inlineFiles.run(true, fn);
+async function storeFile(path, bytes, contentType) {
+  if (inlineFiles.getStore() && !IS_PC && (await filesOnPc())) return `data:${contentType || "application/octet-stream"};base64,${Buffer.from(bytes).toString("base64")}`;
+  return (await storageBackend()).put(path, bytes, contentType);
+}
 async function storeLocal(localPath, destPath, contentType) { return storeFile(destPath, await readFile(localPath), contentType); }
+// The path of a file kept on your PC, from its permanent address (…/pc/<path>), or null for anything else.
+async function pcPathOf(url) { if (!url || !/^https?:/.test(url) || !url.includes("/pc/")) return null; const base = `${await serverBase()}/pc/`; return url.startsWith(base) ? url.slice(base.length) : null; }
+// Where the PC's files can be fetched right now: its tunnel, but only while the PC is beating. A PC switched off at
+// the wall never says goodbye — its tunnel's address stayed in the database, links were sent on to a dead address,
+// and Facebook and the server's own reads got Cloudflare's error page instead of "the PC is off". Read from the
+// table, not setting(): both records are written by the PC, and setting() is cached per process.
+async function pcTunnel() {
+  const rows = await q(`SELECT key, value, EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key IN ('pc.tunnel', 'worker.pc')`).catch(() => []);
+  const url = P(rows.find((r) => r.key === "pc.tunnel")?.value)?.url, beat = rows.find((r) => r.key === "worker.pc");
+  return url && beat && Number(beat.age) < 90 ? String(url).replace(/\/$/, "") : null;
+}
+// A file this step needs is on your PC and the PC is off (or unreachable). Not a failure of the step: it waits, without
+// spending an attempt, and runs when the PC is back — a night with the PC off used to spend all seven retries in an
+// hour and fail the work for good.
+const pcOffError = (what = "A file this needs", why = "") => Object.assign(new Error(`${what} is kept on your PC, which is off or unreachable${why ? ` (${why})` : ""} — this waits until the PC worker is running (pc\\start.ps1)`), { status: 503, transient: true, waitMinutes: 10 });
 // Work out which backend/path a stored URL belongs to so it can be deleted later, whichever backend is active now.
 async function locateStored(url) {
   if (!url || !/^https?:/.test(url)) return null;
-  if (url.includes("/pc/") && url.startsWith(`${await serverBase()}/pc/`)) { const path = url.slice(`${await serverBase()}/pc/`.length); return IS_PC ? { backend: STORAGE.pc, path } : null; }
+  const pcPath = await pcPathOf(url); if (pcPath) return IS_PC ? { backend: STORAGE.pc, path: pcPath } : null;
   for (const k of ["r2", "supabase", "local"]) { const b = STORAGE[k]; if (!(await b.available().catch(() => false))) continue; let base; try { base = await b.publicBase(); } catch { continue; } if (url.startsWith(base + "/")) return { backend: b, path: url.slice(base.length + 1) }; }
   return null;
 }
-async function deleteStored(url) { const loc = await locateStored(url); if (!loc) return false; await loc.backend.del(loc.path); return true; }
+// A file kept on your PC, deleted from the server (an upload removed from the media library, a scene copy read and done
+// with): only the PC can delete it, so it is asked to. Before, the server found no backend for the address and left
+// the file on the PC's disk for ever. An upload the PC has not written out yet is let go here as well.
+async function deleteStored(url) {
+  const pcPath = !IS_PC ? await pcPathOf(url) : null;
+  if (pcPath) {
+    await q(`DELETE FROM pending_files WHERE path = $1`, [pcPath]);
+    await enqueue("DROP_FILE", { path: pcPath }, { queue: PC_LANE, priority: 1, dedupeKey: `drop:${pcPath}` });
+    return true;
+  }
+  const loc = await locateStored(url); if (!loc) return false; await loc.backend.del(loc.path); return true;
+}
 async function recordMedia({ contentItemId = null, kind, url, mime = null, duration = null, width = null, height = null, path = null, meta = {} }) {
   const id = newId();
-  if (!path) path = (await locateStored(url))?.path || null;
+  // A preview handed back inline (inlinePreview) is nobody's file: a row would only carry a megabyte of base64 around.
+  if (String(url).startsWith("data:")) return { id, kind, url, mime, duration_seconds: duration, width, height };
+  if (!path) path = (await locateStored(url))?.path || (await pcPathOf(url)) || null;
   await q(`INSERT INTO media_assets (id, content_item_id, kind, url, mime, width, height, duration_seconds, storage_path, meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`,
     [id, contentItemId, kind, url, mime, width, height, duration, path, JSON.stringify(meta)]);
   return { id, kind, url, mime, duration_seconds: duration };
@@ -598,9 +636,26 @@ async function toTmpFile(url, ext) {
   if (!url || url.startsWith("mock://")) throw new Error(`Cannot download mock/empty media "${url}" — a live render needs a real file`);
   const out = tmpPath(ext || (extname(url.split("?")[0]).slice(1) || "bin"));
   if (!/^https?:/.test(url)) { await writeFile(out, await readFile(url)); return out; }
-  // This engine's own files, read from disk — matched on the whole media path, because an outlet's photo under
-  // /uploads/media/ is somebody else's file, not one of ours.
-  if (IS_PC && url.startsWith(`${await serverBase()}/pc/`)) { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, decodeURIComponent(url.slice(`${await serverBase()}/pc/`.length))))); return out; }
+  // A file kept on your PC. On the PC it is read from disk — or, for an upload the PC has not written out yet, from the
+  // database where it waits (a logo uploaded a minute ago, used by the next card). Anywhere else it is fetched from the
+  // PC's tunnel directly rather than through the server's own /pc/ redirect, and a PC that is off makes the step wait
+  // instead of failing it: the server's read of a soundtrack the PC handed over failed outright on a 503 before.
+  const pcPath = await pcPathOf(url);
+  if (pcPath) {
+    const rel = decodeURIComponent(pcPath.split("?")[0]);
+    if (IS_PC) { try { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, rel))); return out; } catch (e) { if (e.code !== "ENOENT") throw e; } }
+    const waiting = await one(`SELECT data FROM pending_files WHERE path = $1`, [rel]);
+    if (waiting) { await writeFile(out, Buffer.from(waiting.data)); return out; }
+    if (await one(`SELECT id FROM media_assets WHERE url=$1 AND deleted_at IS NOT NULL`, [url])) throw new Error("This media file was already deleted by storage cleanup after publishing — regenerate the item to produce a new file");
+    if (IS_PC) throw Object.assign(new Error(`${rel} is not in this PC's media folder (${LOCAL_MEDIA_DIR}) — it was deleted, or kept by another PC`), { transient: false });
+    const tunnel = await pcTunnel(); if (!tunnel) throw pcOffError(`The file ${rel}`);
+    try {
+      const res = await fetch(`${tunnel}/media/${pcPath}`, { signal: AbortSignal.timeout(15 * 60000) });
+      if (res.status === 404) throw Object.assign(new Error(`${rel} is not on your PC any more (deleted from its media folder) — regenerate the item to make it again`), { status: 404, transient: false, gone: true });
+      if (!res.ok) throw new Error(`the PC's tunnel answered ${res.status}`);  // Cloudflare's 530/502 for a tunnel whose PC has gone
+      await pipeline(Readable.fromWeb(res.body), createWriteStream(out)); return out;
+    } catch (e) { if (e.gone) throw e; await cleanup(out); throw pcOffError(`The file ${rel}`, String(e.message).slice(0, 80)); }
+  }
   // Only this process's own address, port and all: another engine on the same machine (the PC beside a server, two
   // test engines) has a /media/ of its own, and the file is in its folder, not this one.
   if ((await storageBackend()).name === "local") {
@@ -1805,8 +1860,13 @@ async function brandFontsDir(kit) {
   if (!kit?.fonts_url) return null;
   if (fontsDirCache.has(kit.fonts_url)) return fontsDirCache.get(kit.fonts_url);
   const dir = join(TMP, "fonts", sha(kit.fonts_url).slice(0, 12)); await mkdir(dir, { recursive: true });
-  for (const u of String(kit.fonts_url).split(",").map((s) => s.trim()).filter(Boolean)) { try { await writeFile(join(dir, u.split("/").pop().split("?")[0] || "font.ttf"), await fetchBytes(u)); } catch (e) { warn(`brand font ${u}: ${e.message}`); } }
-  fontsDirCache.set(kit.fonts_url, dir); return dir;
+  // Through toTmpFile, so a font kept on your PC is read from the PC's disk there (it went out through the tunnel and
+  // back before, and without a tunnel every card lost the brand's font); and a set that came back incomplete is tried
+  // again ten minutes later — one fetch that failed while the PC was off left the brand without its font until restart.
+  let complete = true;
+  for (const u of String(kit.fonts_url).split(",").map((s) => s.trim()).filter(Boolean)) { let f = null; try { f = await toTmpFile(u, "ttf"); await writeFile(join(dir, u.split("/").pop().split("?")[0] || "font.ttf"), await readFile(f)); } catch (e) { complete = false; warn(`brand font ${u}: ${e.message}`); } finally { await cleanup(f); } }
+  fontsDirCache.set(kit.fonts_url, dir); if (!complete) setTimeout(() => fontsDirCache.delete(kit.fonts_url), 10 * 60000).unref?.();
+  return dir;
 }
 async function composePhotocard(inPath, headline, specs = {}) {
   const kit = specs.kit || {}, meta = specs.card_meta || {};
@@ -4577,6 +4637,12 @@ async function publishAsset(assetId) {
     await rollupItemStatus(found.content_item_id); return;
   }
   if (await setting("publishing.global_pause", false)) { await q(`UPDATE content_assets SET scheduled_for = now() + interval '10 minutes' WHERE id=$1`, [assetId]); return; }
+  // A picture or video kept on your PC reaches a platform through the PC's tunnel: Facebook fetches the link itself. With
+  // the tunnel down it would be refused, the post marked failed, and its two attempts spent — so it waits, unposted.
+  if (await filesOnPc()) {
+    const hero = await one(`SELECT m.url FROM content_items ci JOIN media_assets m ON m.id = ci.hero_media_id WHERE ci.id = $1`, [found.content_item_id]);
+    if ((await pcPathOf(hero?.url)) && !(await pcTunnel())) throw pcOffError("The picture or video for this post", "platforms fetch it through the PC's tunnel");
+  }
   const [asset] = await q(`UPDATE content_assets SET status='RENDERING' WHERE id=$1 AND status IN ('PENDING','FAILED','RENDERING','RENDERED') RETURNING *`, [assetId]); if (!asset) return;
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [asset.content_item_id]); const channel = await one(`SELECT * FROM channels WHERE id=$1`, [asset.channel_id]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   let res, caption, publisher;
@@ -4998,6 +5064,10 @@ const HANDLERS = {
     return { stored: f.path };
   },
   async RECOMPOSE_CARD({ itemId }) { return { redrawn: !!(await recomposeCard(itemId)) }; },
+  // A file kept on your PC that the server was asked to delete (deleteStored), and a cleanup asked for from the
+  // dashboard: both are the PC's to do, since only it can reach its disk.
+  async DROP_FILE({ path }) { let rel = ""; try { rel = decodeURIComponent(String(path || "")); } catch {} if (!rel || rel.split(/[\\/]/).includes("..")) return { skipped: true }; await STORAGE.pc.del(rel); return { dropped: rel }; },
+  async CLEAN_STORAGE() { await sweepStorageCleanup(); return { ok: true }; },
   // The server's half of a relayed writing request from the PC: answered with this programme's writers, kept for the
   // PC to collect (a job's own result is cut short, and an answer is often longer than that).
   async LLM_RELAY({ nicheId, request }, job) {
@@ -5014,6 +5084,18 @@ const HANDLERS = {
   async PLAN_PROGRAM({ nicheId }) { return planProgram(nicheId); },
   async SERIES_NEXT({ seriesId }) { return nextEpisode(seriesId); },
 };
+// Work that makes files, picked up by a worker that is not your PC while files are kept there: a job queued on its old
+// lane before the switch was turned on (or by anything that bypassed enqueue). Run here it could only fail — the server
+// has nowhere to put a file — and it failed the draft for good. It is handed to the PC's lane instead, no attempt spent.
+for (const type of FILE_JOBS) {
+  const run = HANDLERS[type];
+  HANDLERS[type] = async (payload, job) => {
+    if (IS_PC || !job?.id || job.queue === PC_LANE || !(await filesOnPc())) return run(payload, job);
+    await q(`UPDATE jobs SET queue = $2, status = 'PENDING', run_after = NULL, attempts = GREATEST(attempts - 1, 0), locked_by = NULL WHERE id = $1`, [job.id, PC_LANE]);
+    job._deferred = true; log(`${type} ${job.id}: files are kept on your PC, so it was handed to the PC's lane`);
+    return { handedToPc: true };
+  };
+}
 // Seconds until the next attempt, or null to give up. Transient failures (overloaded model, rate limit, network) back
 // off exponentially — 1, 2, 4 … 32 min, about an hour in all — for jobs that are safe to repeat. Publishing keeps its
 // own small attempt count so a slow platform cannot cause double posts. Permanent failures stop at once.
@@ -5432,7 +5514,7 @@ function startWorkers() {
   // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
   // leaving routed work to look stuck.
   if (LANES.includes(PC_LANE)) {
-    const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, lanes: LANES }).catch((e) => warn("pc heartbeat", e.message));
+    const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, lanes: LANES, media: pcMediaSize() }).catch((e) => warn("pc heartbeat", e.message));
     beat(); setInterval(beat, 30000);
     // The files this PC keeps: its tunnel opened (and reopened), and its own files cleaned up as the server's would be.
     if (IS_PC) { keepTunnel(); setInterval(() => keepTunnel().catch(() => {}), 60000); setInterval(() => sweepStorageCleanup().catch((e) => warn("cleanup", e.message)), 60 * 60000); }
@@ -5480,8 +5562,11 @@ const server = http.createServer(async (req, res) => {
   if (IS_PC && req.headers["cf-connecting-ip"] && !((req.method === "GET" || req.method === "HEAD") && pathname.startsWith("/media/"))) { res.writeHead(403, { "Content-Type": "text/plain" }); return res.end("Only media files are served here"); }
   // A file kept on your PC, asked for by its permanent address: sent on to wherever the PC's tunnel is today.
   if (pathname.startsWith("/pc/") && (req.method === "GET" || req.method === "HEAD")) {
-    const t = P((await one(`SELECT value FROM settings WHERE key = 'pc.tunnel'`).catch(() => null))?.value);
-    if (t?.url) { res.writeHead(302, { Location: `${t.url}/media/${url.pathname.slice(4)}${url.search}`, "Cache-Control": "no-store" }); return res.end(); }
+    const tunnel = await pcTunnel();
+    if (tunnel) { res.writeHead(302, { Location: `${tunnel}/media/${url.pathname.slice(4)}${url.search}`, "Cache-Control": "no-store" }); return res.end(); }
+    // An upload the PC has not written out yet is still here, waiting for it: the media library can show it meanwhile.
+    const waiting = await one(`SELECT mime, data FROM pending_files WHERE path = $1`, [pathname.slice(4)]).catch(() => null);
+    if (waiting) { res.writeHead(200, { "Content-Type": waiting.mime || "application/octet-stream", "Cache-Control": "no-store" }); return res.end(req.method === "HEAD" ? undefined : Buffer.from(waiting.data)); }
     res.writeHead(503, { "Content-Type": "text/plain", "Retry-After": "300" }); return res.end("This file is kept on your PC, which is off. It comes back when the PC worker is running.");
   }
   const isPublic = pathname === "/health" || pathname.startsWith("/api/public/") || pathname.startsWith("/media/") || pathname.startsWith("/a/");
@@ -5508,17 +5593,26 @@ app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
   json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), telegramChatEnv: !!ENV.TELEGRAM_CHAT_ID, quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses(), newsPaused: await newsPaused(),
-    storage: (await filesOnPc()) ? null : await storageUsage(), filesOnPc: await filesOnPc(), pcTunnel: (await setting("pc.tunnel", null))?.url || null, autoOn: await autoOn(),
+    storage: (await filesOnPc()) ? null : await storageUsage(), filesOnPc: await filesOnPc(), pcTunnel: await pcTunnel(), pcMedia: (await filesOnPc()) ? await pcMediaReport() : null, autoOn: await autoOn(),
     aiToday: (await q(`SELECT provider, SUM(units)::int AS requests FROM api_usage_daily WHERE day = CURRENT_DATE GROUP BY provider ORDER BY 2 DESC`)).filter((r) => r.requests > 0),
     newsPrograms: (await q(`SELECT id, display_name, content_type, is_active FROM niches WHERE content_type = ANY($1) ORDER BY display_name`, [[...DESK_TYPES]])).map((n) => ({ id: n.id, name: n.display_name, type: n.content_type, active: flag(n.is_active) })) });
 });
 // ---- storage
+// What the PC last said its media folder holds (written with its heartbeat), read from the table: the PC writes it.
+async function pcMediaReport() { return P((await one(`SELECT value FROM settings WHERE key = 'worker.pc'`).catch(() => null))?.value)?.media || null; }
 app.get("/api/storage", async (ctx) => {
   const b = await storageBackend(); const r2 = await r2Config();
   const [live, gone] = await Promise.all([one(`SELECT COUNT(*)::int AS n FROM media_assets WHERE deleted_at IS NULL AND url LIKE 'http%'`), one(`SELECT COUNT(*)::int AS n FROM media_assets WHERE deleted_at IS NOT NULL`)]);
-  json(ctx, 200, { backend: b.name, available: { r2: !!r2?.public_url, supabase: await STORAGE.supabase.available(), local: true }, r2: r2 ? { bucket: r2.bucket, public_url: r2.public_url || null, ready: !!r2.public_url, warning: r2.public_url ? null : "R2 keys are set but public_url is missing (R2_PUBLIC_URL or the r2 credential's public_url) — R2 is ignored until it is" } : null, filesLive: live.n, filesCleaned: gone.n, cleanupEnabled: await setting("storage.cleanup_enabled", true), cleanupAfterHours: await setting("storage.cleanup_after_publish_hours", 48) });
+  // Files kept on your PC: the backend is the PC, and what matters is whether it can be reached and how full it is.
+  const onPc = await filesOnPc();
+  json(ctx, 200, { backend: b.name, onPc, pc: onPc ? { tunnel: await pcTunnel(), media: await pcMediaReport(), waiting: (await one(`SELECT count(*)::int AS n FROM pending_files`)).n } : null, available: { r2: !!r2?.public_url, supabase: await STORAGE.supabase.available(), local: true }, r2: r2 ? { bucket: r2.bucket, public_url: r2.public_url || null, ready: !!r2.public_url, warning: r2.public_url ? null : "R2 keys are set but public_url is missing (R2_PUBLIC_URL or the r2 credential's public_url) — R2 is ignored until it is" } : null, filesLive: live.n, filesCleaned: gone.n, cleanupEnabled: await setting("storage.cleanup_enabled", true), cleanupAfterHours: await setting("storage.cleanup_after_publish_hours", 48) });
 });
-app.post("/api/storage/cleanup", async (ctx) => { await sweepStorageCleanup(); json(ctx, 200, { ok: true }); });
+// The server cleans only what it can reach; files kept on your PC are cleaned by the PC, so it is asked to (and does
+// so by itself every hour anyway). Run here, the sweep skipped every PC file and reported success.
+app.post("/api/storage/cleanup", async (ctx) => {
+  if ((await filesOnPc()) && !IS_PC) { await enqueue("CLEAN_STORAGE", {}, { queue: PC_LANE, priority: 2, dedupeKey: "clean-storage", maxAttempts: 1 }); return json(ctx, 200, { ok: true, onPc: true, note: "Your PC cleans the files it keeps; it will run the cleanup when it is on" }); }
+  await sweepStorageCleanup(); json(ctx, 200, { ok: true });
+});
 // ---- settings
 app.get("/api/settings", async (ctx) => json(ctx, 200, await settings()));
 app.put("/api/settings/:key", async (ctx) => { await putSetting(ctx.params.key, ctx.body.value); json(ctx, 200, { key: ctx.params.key, value: ctx.body.value }); });
@@ -5601,8 +5695,9 @@ app.delete("/api/adapter-configs/:id", async (ctx) => { await q(`DELETE FROM ada
 app.post("/api/adapter-configs/:key/test", async (ctx) => { const row = (await instances(true)).find((r) => r.key === ctx.params.key); if (!row) throw new ApiError(404, null, "Unknown adapter key"); const a = await resolve(row.stage, row.key); let result; if (row.stage === "SCRIPT") result = await a.complete({ prompt: "Reply with the single word OK.", mock: {} }); else if (row.stage === "INGEST") result = { items: (await a.fetchItems({ name: "test", config: ctx.body.config || row.config })).slice(0, 3) }; else if (row.stage === "EMBED") result = { dims: (await a.embed("test"))?.length ?? null };
   // Voice is the one stage whose output has to be heard: it speaks a line and hands back the file, so a program is not
   // committed to a voice nobody has listened to. Bangla by default, since that is where a voice usually disappoints.
-  else if (row.stage === "VOICE") { const m = await a.synthesize({ script: ctx.body.script || "আজকের খবর শুনুন। এটি একটি কণ্ঠস্বর পরীক্ষা।", contentItemId: null }); result = { url: m.url, seconds: m.duration_seconds, listen: "open the url to hear it" }; }
-  else if (row.stage === "IMAGE") { const m = await a.generate({ prompt: ctx.body.prompt || "a quiet street in Dhaka at dawn", headline: ctx.body.headline || "Voice and picture test", specs: { width: 1080, height: 1080, photo_query: ctx.body.prompt || "dhaka street" }, contentItemId: null }); result = { url: m.url, width: m.width, height: m.height }; }
+  // Both answer with the file inline while files are kept on your PC (inlinePreview): the server has nowhere to keep it.
+  else if (row.stage === "VOICE") { const m = await inlinePreview(() => a.synthesize({ script: ctx.body.script || "আজকের খবর শুনুন। এটি একটি কণ্ঠস্বর পরীক্ষা।", contentItemId: null })); result = { url: m.url, seconds: m.duration_seconds, listen: "open the url to hear it" }; }
+  else if (row.stage === "IMAGE") { const m = await inlinePreview(() => a.generate({ prompt: ctx.body.prompt || "a quiet street in Dhaka at dawn", headline: ctx.body.headline || "Voice and picture test", specs: { width: 1080, height: 1080, photo_query: ctx.body.prompt || "dhaka street" }, contentItemId: null })); result = { url: m.url, width: m.width, height: m.height }; }
   else result = { ok: true, note: "resolved; run it through a program to test end-to-end" }; json(ctx, 200, result); });
 // ---- brands
 app.get("/api/brands", async (ctx) => json(ctx, 200, await q(`SELECT * FROM brands ORDER BY created_at DESC`)));
@@ -5746,7 +5841,7 @@ app.post("/api/voices/test", async (ctx) => {
   const text = String(b.text || (lang.startsWith("bn") ? "সোনারগাঁয়ে মেঘনা নদীতে আজ দুপুরে একটি নৌকাডুবির ঘটনা ঘটেছে।" : "This is how the narration on your videos will sound.")).slice(0, 600);
   const v = await resolve("VOICE", key);
   const started = Date.now();
-  const out = await v.synthesize({ script: text, voiceId: b.voice || null, contentItemId: null, lang });
+  const out = await inlinePreview(() => v.synthesize({ script: text, voiceId: b.voice || null, contentItemId: null, lang }));
   json(ctx, 200, { adapter: key, url: out.url, duration_seconds: out.duration_seconds, voice: b.voice || null, ms: Date.now() - started });
 });
 // ---- What the engine makes: every variant in BLUEPRINT.md, where it runs, what it needs, and whether those needs are
@@ -6125,6 +6220,25 @@ async function keepTunnel() {
   tunnelProc.on("exit", (c) => { warn(`tunnel: cloudflared stopped (${c}); starting it again`); tunnelProc = null; q(`DELETE FROM settings WHERE key = 'pc.tunnel' AND value->>'worker' = $1`, [WORKER_ID]).catch(() => {}); });
 }
 process.on("exit", () => { try { tunnelProc?.kill(); } catch {} });
+// How much your PC's media folder holds, and how much room is left on its disk. Everything kept on the PC lands there
+// and nothing else said so until the disk filled. Walked in the background at most every ten minutes: the heartbeat
+// carries the last count and never waits for a walk, and the count is written beside the heartbeat as soon as it is in.
+const pcMedia = { at: 0, busy: false, value: null };
+function pcMediaSize() {
+  if (IS_PC && !pcMedia.busy && Date.now() - pcMedia.at > 10 * 60000) {
+    pcMedia.busy = true;
+    measureMedia().then((v) => { pcMedia.value = v; return q(`UPDATE settings SET value = value || jsonb_build_object('media', $1::jsonb) WHERE key = 'worker.pc'`, [JSON.stringify(v)]); })
+      .catch((e) => warn("media folder size:", e.message)).finally(() => { pcMedia.busy = false; pcMedia.at = Date.now(); });
+  }
+  return pcMedia.value;
+}
+async function measureMedia() {
+  const entries = await readdir(LOCAL_MEDIA_DIR, { recursive: true, withFileTypes: true }).catch((e) => { if (e.code === "ENOENT") return []; throw e; });
+  const list = entries.filter((d) => d.isFile()); let bytes = 0;
+  for (let i = 0; i < list.length; i += 64) for (const s of await Promise.all(list.slice(i, i + 64).map((d) => stat(join(d.parentPath || d.path, d.name)).then((x) => x.size).catch(() => 0)))) bytes += s;
+  let free = null; try { const f = await statfs(LOCAL_MEDIA_DIR); free = Number(f.bavail) * Number(f.bsize); } catch {}
+  return { mb: Math.round(bytes / 1048576), files: list.length, free_mb: free == null ? null : Math.round(free / 1048576), dir: LOCAL_MEDIA_DIR, at: nowIso() };
+}
 // === 11. boot ==============================================================
 (async () => {
   await mkdir(TMP, { recursive: true }).catch(() => {});
