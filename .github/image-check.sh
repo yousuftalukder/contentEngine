@@ -80,3 +80,13 @@ ffmpeg -hide_banner -loglevel error -y -i /tmp/plain.mp4 -filter_complex "[0:v]n
 rate=$(ffprobe -v error -select_streams a -show_entries stream=sample_rate -of csv=p=0 /tmp/finished.mp4)
 [ "$rate" = "48000" ] || { echo "FAIL: finished audio is ${rate} Hz"; exit 1; }
 echo "ok: the brand pass ran and wrote ${rate} Hz audio"
+
+echo "== the 4b voice-over ducks the clip under the voice on this ffmpeg =="
+# The summary voice-over drives the clip's own sound down with the voice (sidechaincompress), the voice padded so the
+# clip does not go silent when it ends. A new filter shape: run here, on the image's own ffmpeg, under a deadline.
+timeout 120 ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=330:duration=8" -f lavfi -i "sine=frequency=1000:duration=2" -filter_complex \
+  "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[src];[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asplit=2[vo][k];[k]apad[key];[src][key]sidechaincompress=threshold=0.015:ratio=12:attack=20:release=400[duck];[duck][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]" \
+  -map "[a]" /tmp/ducked.wav
+ddur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/ducked.wav)
+awk -v d="$ddur" 'BEGIN { exit (d > 7.5 ? 0 : 1) }' || { echo "FAIL: the ducked mix is ${ddur}s, not the clip's 8s — the clip went silent with the voice"; exit 1; }
+echo "ok: the voice-over mix ran and kept the whole ${ddur}s"

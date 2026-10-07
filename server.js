@@ -2597,16 +2597,30 @@ impl("RENDER", "ffmpeg", { label: "ffmpeg", create: () => ({
         await cleanup(main, vo, still, card); break;
       }
       case "VOICEOVER": {
-        // Our narration over the clip: the cut covers the whole narration, captions follow the new words, and the original
-        // sound stays underneath at a low level instead of being dropped.
+        // 4b: two or three sentences of ours over the opening of the clip, then the clip as it was. Its own sound is
+        // ducked by the voice itself — down while we speak, back up when we stop — rather than held at a whisper for
+        // the whole clip; and the host is in the corner when the programme has a reactor clip, as in 4a. The voice that
+        // drives the ducking is padded with silence: sidechaincompress stops at its shorter input, and the clip went silent
+        // the moment we stopped talking.
         if (!extras.audio?.url) throw new Error("VOICEOVER render needs extras.audio");
         const a = await toTmpFile(extras.audio.url, "mp3"); const nd = (await ffprobeDuration(a)) || extras.audio.duration_seconds || clip.end - clip.start;
-        const end = Math.max(clip.end, clip.start + nd + 0.3);
+        const end = Math.max(clip.end, clip.start + nd + 0.5);
         const main = await cutClip(sourcePath, clip.start, end, { vertical, layout, ass: caps[caps.push(await assFor(vertical, true, c.captions === false ? [] : [{ start: clip.start, end: clip.start + nd, text: extras.script || "" }], clip.start, end)) - 1] });
+        let pic = main; const ovUrl = c.overlay_video_url || c.reactor_url;
+        if (ovUrl) {
+          const ov = await toTmpFile(ovUrl, "mp4"), [W, H] = renderSize(vertical ? "9:16" : "16:9"), hostW = Math.round((W * (vertical ? 0.34 : 0.22)) / 2) * 2, margin = Math.round(W * 0.045);
+          pic = tmpPath("mp4");
+          await exec("ffmpeg", ["-y", "-i", main, "-stream_loop", "-1", "-i", ov, "-filter_complex",
+            `[0:v]fps=30,setsar=1[m];[1:v]fps=30,crop=min(iw\\,ih):min(iw\\,ih),scale=${hostW}:${hostW},setsar=1,pad=iw+8:ih+8:4:4:color=white[o];[m][o]overlay=W-w-${margin}:${Math.round(H * 0.1)}:shortest=1[v]`,
+            "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "copy", pic], { timeoutMs: 30 * 60000 });
+          await cleanup(ov);
+        }
         file = tmpPath("mp4");
-        if (await hasAudio(main)) await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-filter_complex", "[0:a]volume=0.12[bg];[1:a]volume=1.0[vo];[bg][vo]amix=inputs=2:duration=longest:dropout_transition=0[a]", "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-t", String(nd + 0.3), file]);
-        else await exec("ffmpeg", ["-y", "-i", main, "-i", a, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", file]);
-        await cleanup(main, a); break;
+        if (await hasAudio(pic)) await exec("ffmpeg", ["-y", "-i", pic, "-i", a, "-filter_complex",
+          `[0:a]${AFMT}[src];[1:a]${AFMT},asplit=2[vo][k];[k]apad[key];[src][key]sidechaincompress=threshold=0.015:ratio=12:attack=20:release=400[duck];[duck][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]`,
+          "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", file]);
+        else await exec("ffmpeg", ["-y", "-i", pic, "-i", a, "-filter_complex", "[1:a]apad[a]", "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-shortest", file]);
+        await cleanup(main, a); if (pic !== main) await cleanup(pic); break;
       }
       case "SCENE_RECAP":
       case "MOVIE_RECAP": {
@@ -4279,10 +4293,10 @@ async function renderClipItem(itemId, clipId) {
     // With scenes read from the picture, each line says what is on screen as well as what is said, and the beats are
     // matched to the picture; without them (5b, or a day Gemini was out) to the dialogue.
     const recapLines = transcript.segments.map((x) => (seen ? `[${x.start}-${x.end}] SEEN: ${x.visual || "?"}${x.text ? ` | SAID: ${x.text}` : ""}` : `[${x.start}-${x.end}] ${x.text}`)).join("\n").slice(0, 100000);
-    const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: recap ? 4000 : 1200,
-      system: `You write ${recap ? "gripping ~60 second movie recaps that preserve suspense and never spoil the ending" : "short punchy voice-over narration re-telling a clip in our own words"} for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
+    const r = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: recap ? 4000 : 600,
+      system: `You write ${recap ? "gripping ~60 second movie recaps that preserve suspense and never spoil the ending" : "a short spoken summary that introduces a clip in our own words"} for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)}`,
       prompt: recap ? `Film: ${cand.title}\n${seen ? "Its scenes, with what is seen and said in each" : "Timestamped transcript"}:\n${recapLines}\n\nWrite a ${methodCfg(niche).recap_seconds || 60}-second narrated recap in ${Math.max(6, Math.round((methodCfg(niche).recap_seconds || 60) / 6))} beats. For each beat pick the source timestamps ${seen ? "of the scene whose picture shows what that beat narrates" : "that visually match"}. Return JSON: {"title": "...", "beats": [{"narration": "...", "start": seconds, "end": seconds}], "hashtags": ["..."]}`
-        : `Clip transcript (${(c.end - c.start).toFixed(0)}s): ${script}\n\nWrite narration of the same length that re-tells this in our voice. Return JSON: {"title": "...", "narration": "...", "hashtags": ["..."]}`,
+        : `Clip transcript (${(c.end - c.start).toFixed(0)}s): ${script}\n\nWrite two or three sentences (at most 45 words) we say over the opening of this clip: what it is and why it is worth watching, in our own voice, using only what is said in it. The clip then plays on with its own sound. Return JSON: {"title": "...", "narration": "...", "hashtags": ["..."]}`,
       mock: recap ? { title: cand.title, beats: [{ narration: `Mock recap of ${cand.title}.`, start: 0, end: 10 }, { narration: "And then everything changes.", start: 30, end: 40 }], hashtags: ["recap"] } : { title: clip.title, narration: `Mock narration: ${script.slice(0, 200)}`, hashtags: ["clip"] } }));
     await addCost(itemId, r.cost); const d = r.data || {};
     script = recap ? (d.beats || []).map((b) => b.narration).join(" ") : d.narration || script;
@@ -5559,7 +5573,7 @@ const CATALOG = [
   { id: "3b", type: "News reel", name: "Telecast clip", what: "A TV report cut to its moment — nothing written, nothing narrated", runs: "pc", needs: ["pc"], status: "proven", note: "Proven on an English TV report; Bangla speech needs hosted transcription (local whisper cannot do Bangla)", setup: { contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc" }, loose: ["computeWhere"], sameAs: ["1a", "1b", "1c"] },
   { id: "3c", type: "News reel", name: "Telecast + intro", what: "3b with a narrated headline card in front", runs: "pc or server", needs: ["pc", "writer", "voice"], status: "proven", note: "Proven with a Bangla intro in front of an English report", setup: { contentType: "PODCAST_CLIP", productionMethod: "TELECAST_INTRO", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "4a", type: "Reaction", name: "Silent reaction", what: "The moment at 1.1× with your clip — split-screen or in the corner", runs: "pc or server", needs: ["pc", "persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY", computeWhere: "pc", methodConfig: { speed: 1.1 } }, loose: ["computeWhere", "speed"] },
-  { id: "4b", type: "Reaction", name: "Summary voiceover", what: "A few sentences of summary over the clip, its sound ducked", runs: "pc or server", needs: ["pc", "writer", "voice"], status: "proven", note: "As built it narrates over the clip; your reactor clip is not put in the frame", setup: { contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER", computeWhere: "pc" }, loose: ["computeWhere"] },
+  { id: "4b", type: "Reaction", name: "Summary voiceover", what: "A few sentences of summary over the clip, its sound ducked", runs: "pc or server", needs: ["pc", "writer", "voice"], status: "proven", note: "Two or three sentences over the opening, the clip's own sound ducked under them; your reactor clip in the corner when you set one (optional)", setup: { contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "4c", type: "Reaction", name: "Long-form reaction", what: "Play / comment beats: the source in segments, your commentary between", runs: "pc or server", needs: ["pc", "writer", "voice", "persona"], status: "proven", note: "Proven with a stock stand-in for the host; it needs your own clip to publish", setup: { contentType: "REACTION_CLIP", productionMethod: "REACTION_LONG", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "5a", type: "Recap", name: "Scene recap", what: "Gemini watches the video, picks scenes, the recap is cut and narrated over the film's own sound", runs: "pc", needs: ["pc", "writer", "voice", "gemini_video"], status: "proven", note: "Proven 2026-10-05 on Duck and Cover (1951): Gemini's free tier read the scenes and the recap narrates what is on screen. About 100 tokens a second of video, forty minutes per request; told from the dialogue (5b) on a day the allowance is spent", setup: { contentType: "MOVIE_RECAP", productionMethod: "SCENE_RECAP", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "5b", type: "Recap", name: "Transcript recap", what: "A dialogue-led video retold from its transcript, cut by timestamp", runs: "pc or server", needs: ["pc", "writer", "voice"], status: "proven", setup: { contentType: "MOVIE_RECAP", productionMethod: "MOVIE_RECAP", computeWhere: "pc" }, loose: ["computeWhere"] },
