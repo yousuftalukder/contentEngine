@@ -700,9 +700,11 @@ function noteSpent(model, e) {
   else if (q?.kind === "plan") modelSpent.set(model, Date.now() + 24 * 3600e3);
   else if (isOverloaded(e)) modelSpent.set(model, Date.now() + 180e3);
 }
-async function withModelFallback(models, call) {
-  const errs = [], all = [...new Set(models.filter(Boolean))], fresh = all.filter((m) => !isSpent(m));
-  if (all.length && !fresh.length && all.every((m) => modelRefusal.has(m))) {
+// remember: false for a request whose refusal says nothing about the model itself (one asking for web search, whose
+// allowance is separate): it neither skips models resting from other refusals nor marks them.
+async function withModelFallback(models, call, { remember = true } = {}) {
+  const errs = [], all = [...new Set(models.filter(Boolean))], fresh = remember ? all.filter((m) => !isSpent(m)) : all;
+  if (remember && all.length && !fresh.length && all.every((m) => modelRefusal.has(m))) {
     const soonest = [...all].sort((a, b) => spentUntil(a) - spentUntil(b))[0];
     throw modelRefusal.get(soonest);
   }
@@ -710,7 +712,7 @@ async function withModelFallback(models, call) {
     try { return await retryTransient(() => call(model)); }
     catch (e) {
       if (!isTransient(e) && e.status !== 404) throw e;
-      errs.push(e); noteSpent(model, e);
+      errs.push(e); if (remember) noteSpent(model, e);
       if (isTransient(e)) warn(`model ${model} unavailable (${e.status || ""} ${(quotaWait(e)?.kind || e.message).slice(0, 60)}), trying the next one`);
     }
   }
@@ -736,9 +738,10 @@ async function geminiReplacements(key, kind, tried, max = 3) {
 // Two reasons to look past the configured models: they all answered 404 (renamed or retired), or they have all spent
 // today's free allowance — which is granted per model, so the account's other models are a day's work the engine would
 // otherwise leave on the table. Only when every model of that kind is spent does the job wait for the reset.
-async function withGeminiModels(key, kind, models, call) {
-  try { return await withModelFallback(models, call); }
+async function withGeminiModels(key, kind, models, call, opts = {}) {
+  try { return await withModelFallback(models, call, opts); }
   catch (e) {
+    if (opts.remember === false) throw e;
     const spent = quotaWait(e)?.kind === "day";
     if (e.status !== 404 && !spent) throw e;
     const alt = await geminiReplacements(key, kind, models, spent ? 8 : 3).catch(() => []); if (!alt.length) throw e;
@@ -767,9 +770,14 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
       // the draft can carry "check the facts" rather than the whole item failing at its first step. A spent daily
       // allowance for the model is not a search refusal and is not retried.
       let model, body, searched = useSearch;
-      try { ({ model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }))); }
+      try { ({ model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }), { remember: !useSearch })); }
       catch (e) {
-        if (!useSearch || !searchRefused(e)) throw e;
+        // Search refused in so many words, or a quota refusal that names no limit of the model's own: the free tier's
+        // web-search allowance answers with the same bare 429 as anything else (every explainer, 2026-10-06 and 07,
+        // while plain writing on the same model went through). Asked again without search; if that is refused too, it
+        // was the model's allowance after all, and that refusal is the one reported.
+        const q = quotaWait(e);
+        if (!useSearch || !(searchRefused(e) || (q && q.kind !== "day" && q.kind !== "plan" && q.kind !== "billing"))) throw e;
         warn(`Gemini: web search refused (${String(e.message).slice(0, 160)}); researching without it`);
         req = { ...req, tools: undefined, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { ...req.generationConfig, responseMimeType: json ? "application/json" : undefined } };
         ({ model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }))); searched = false;
