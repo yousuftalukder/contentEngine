@@ -192,8 +192,11 @@ test("a desk story queued past the news window is dropped before drafting; one a
     ({ id: hand } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story asked for by hand yesterday" }));
     await eng.query(`UPDATE content_items SET cluster_id = 'cluster-yesterday' WHERE id = $1`, [desk]);
     await eng.query(`UPDATE content_items SET created_at = now() - interval '30 hours' WHERE id = ANY($1)`, [[desk, hand]]);
-    const other = await startEngine({ env: { DATABASE_URL: eng.databaseUrl, LANES: "metrics" } });
-    try { await waitFor(async () => (await eng.api("GET", `/api/content-items/${desk}`)).status === "REJECTED", { timeout: 30000, what: "the stale desk story dropped" }); }
+    const other = await startEngine({ env: { DATABASE_URL: eng.databaseUrl, LANES: "metrics", RUN_SWEEPS: "true" } });
+    try {
+      await waitFor(async () => (await eng.api("GET", `/api/content-items/${desk}`)).status === "REJECTED", { timeout: 30000, what: "the stale desk story dropped" })
+        .catch((e) => { throw new Error(`${e.message}\n${String(other.logs()).split("\n").filter((l) => /WARN|stale|desk|sweep/i.test(l)).slice(-12).join("\n")}`); });
+    }
     finally { await other.stop(); }
     const d = await eng.api("GET", `/api/content-items/${desk}`);
     assert.match(d.rejection_note, /Not drafted/);
