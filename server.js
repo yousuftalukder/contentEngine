@@ -5504,6 +5504,18 @@ async function sweepStaleNews() {
     WHERE status = 'PENDING_REVIEW' AND content_type IN ('NEWS_STATIC', 'NEWS_REEL') AND created_at < now() - ($1 || ' hours')::interval RETURNING id`,
     [String(hours), `Expired unreviewed: news older than ${hours} hours is not published (Settings → review.news_expiry_hours).`]);
   if (gone.length) log(`review: ${gone.length} news draft(s) older than ${hours} h set aside unreviewed`);
+  // Stories the desk queued that were never drafted: with files kept on your PC, a day with the PC off left them waiting,
+  // and they were all drafted when it came back — day-old news, each spending the writer's allowance. Not drafted at all
+  // once they are older than the same window; the desk's story is still there. Something asked for by hand (no desk
+  // story behind it) is always made.
+  const stale = await q(`UPDATE content_items ci SET status = 'REJECTED', rejection_note = $2
+    WHERE status = 'QUEUED' AND cluster_id IS NOT NULL AND created_at < now() - ($1 || ' hours')::interval
+      AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.content_item_id = ci.id AND j.status = 'RUNNING') RETURNING id`,
+    [String(hours), `Not drafted: the story was over ${hours} hours old before it could be made (your PC was off, or the writer's allowance was spent).`]);
+  if (stale.length) {
+    await q(`UPDATE jobs SET status = 'CANCELLED', finished_at = now(), error_message = 'the story went stale before it was drafted' WHERE status = 'PENDING' AND content_item_id = ANY($1)`, [stale.map((r) => r.id)]);
+    log(`desk: ${stale.length} queued stor(y/ies) older than ${hours} h dropped before drafting`);
+  }
 }
 async function sweepMetrics() {
   const rows = await q(`SELECT id FROM content_assets WHERE status='PUBLISHED' AND published_at > now() - interval '14 days' AND (last_metrics IS NULL OR (last_metrics->>'at')::timestamptz < now() - interval '6 hours') LIMIT 30`);

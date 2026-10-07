@@ -180,3 +180,25 @@ test("media of long-rejected drafts is deleted when the owner sets a retention, 
   const it = await eng.api("GET", `/api/content-items/${gone}`);
   assert.equal(it.status, "REJECTED", "the draft itself stays");
 });
+
+// A desk story still waiting to be drafted after the news window (a day with the PC off) is dropped, not drafted late;
+// something asked for by hand is always made.
+test("a desk story queued past the news window is dropped before drafting; one asked for by hand is kept", async () => {
+  const p = await program("stale_queue");
+  await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: false, video_local: false } });
+  let desk, hand;
+  try {
+    ({ id: desk } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story the desk queued yesterday" }));
+    ({ id: hand } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story asked for by hand yesterday" }));
+    await eng.query(`UPDATE content_items SET cluster_id = 'cluster-yesterday' WHERE id = $1`, [desk]);
+    await eng.query(`UPDATE content_items SET created_at = now() - interval '30 hours' WHERE id = ANY($1)`, [[desk, hand]]);
+    const other = await startEngine({ env: { DATABASE_URL: eng.databaseUrl, LANES: "metrics" } });
+    try { await waitFor(async () => (await eng.api("GET", `/api/content-items/${desk}`)).status === "REJECTED", { timeout: 30000, what: "the stale desk story dropped" }); }
+    finally { await other.stop(); }
+    const d = await eng.api("GET", `/api/content-items/${desk}`);
+    assert.match(d.rejection_note, /Not drafted/);
+    const [job] = await eng.query(`SELECT status FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [desk]);
+    assert.equal(job.status, "CANCELLED", "and its job will not run");
+    assert.equal((await eng.api("GET", `/api/content-items/${hand}`)).status, "QUEUED", "the one asked for by hand still waits to be made");
+  } finally { await eng.api("PUT", "/api/settings/queues.enabled", { value: {} }); }
+});
