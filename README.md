@@ -84,6 +84,9 @@ node --env-file=.env server.js
 
 Open http://localhost:4000. With no provider keys the engine runs on mock adapters end to end. ffmpeg (with libass) is needed
 for photocards and video; the studio needs `npm install` in `studio/` (it downloads Chrome Headless Shell on first render).
+Nothing is made on its own until **automatic production** is turned on (Overview → Turn on; setting `auto.enabled`, off by
+default): until then the feeds are not polled, the desk drafts nothing, the planner proposes nothing and series wait.
+*Generate* and pasted video links always work. Files go to `data/media` (`MEDIA_DIR`) unless cloud storage is configured.
 
 ```bash
 npm test                    # boots the real server against an in-process Postgres (PGlite) and drives every pipeline
@@ -103,9 +106,44 @@ yt-dlp, Bangla fonts, the studio and headless Chrome, and pre-builds the studio 
 
 - The free web plan sleeps after 15 minutes without visitors and then stops polling and publishing: use **Starter** or above.
 - The worker needs **Standard** (2 GB) for 1080p video and the studio.
-- The two services don't share a disk: set **Supabase Storage** (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`; the `media`
-  bucket is created automatically) or R2.
+- The two services don't share a disk: keep files on the owner's PC (below), or set **Supabase Storage** (`SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY`; the `media` bucket is created automatically) or R2.
 - Point an uptime monitor at `/health`: the engine can alert on everything except being down.
+
+## The PC worker and files kept on the PC
+
+Production runs one free Render instance plus the owner's Windows PC as a worker on the same database. The PC takes only
+the `video_local` lane: YouTube downloads (YouTube refuses Render's address), local whisper, heavy ffmpeg, the studio
+(Remotion) and Blender. Setting it up:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File pc\setup.ps1     # ffmpeg, yt-dlp, deno, cloudflared, whisper.cpp + base model, edge-tts; -Blender adds Blender 4.2
+copy .env.pc.example .env.pc                               # fill from Render → Environment (DATABASE_URL, SECRETS_KEY)
+powershell -ExecutionPolicy Bypass -File pc\start.ps1     # LANES=video_local, RUN_SWEEPS=false, PORT 4100
+powershell -ExecutionPolicy Bypass -File pc\autostart.ps1 # optional: start it at every sign-in (-Remove to undo)
+```
+
+Everything goes into the project's `.tools` folder; nothing is installed system-wide. The PC needs no AI key: a writing
+request it cannot answer goes to the server as an `LLM_RELAY` job and the server's writer answers. It does see keys stored
+in the dashboard vault (it has the same `SECRETS_KEY`), but not env vars set only on Render.
+
+**Files kept on the PC** (Settings → *Files are kept on your PC*, setting `storage.on_pc`; on in production since
+2026-10-07, when Supabase's free 1 GB of storage filled and was restricted). The server then stores nothing:
+
+- Every job that writes a file — `GENERATE_CONTENT`, `REGENERATE`, `PROCESS_CANDIDATE`, `RENDER_CLIP`, `STUDIO_RENDER`,
+  `PUBLISH_ASSET` (the `FILE_JOBS` set in `server.js`), plus `RECOMPOSE_CARD` — is queued to the PC lane whatever lane it
+  was meant for. A step that still tries to store a file on the server fails with a message saying so.
+- The PC writes to `MEDIA_DIR` (default `data/media`) and opens a Cloudflare quick tunnel to its own engine (`cloudflared
+  tunnel --url http://localhost:<PORT>`, no account), recording the address in the `pc.tunnel` setting. A quick tunnel's
+  address changes on every start, so stored links are the server's `https://<server>/pc/<path>`: the server redirects
+  (302) to today's tunnel, or answers 503 while the PC is off.
+- Through the tunnel the PC serves only `GET /media/*`; anything else Cloudflare relays (its API, its dashboard) gets 403.
+- An upload that reaches the server waits in `pending_files` until the PC writes it out (`STORE_FILE`); over 150 MB it
+  must be copied into the PC's media folder by hand.
+- Each side cleans up only the files it can delete; the PC runs the same storage cleanup (after publishing, and
+  `storage.cleanup_rejected_days` for rejected and failed drafts) on its own files.
+- The Overview shows whether the PC's files are reachable. The Supabase storage gauge appears only when files are in
+  cloud storage.
 
 ## Environment
 
@@ -115,7 +153,7 @@ yt-dlp, Bangla fonts, the studio and headless Chrome, and pre-builds the studio 
 | `DASHBOARD_PASSWORD` | yes | protects the dashboard and API (user `DASHBOARD_USERNAME`, default `admin`) |
 | `SECRETS_KEY` | yes | encrypts keys pasted on the API keys page (`openssl rand -hex 32`); never change it |
 | `PUBLIC_BASE_URL` | yes | the web service's URL (portal links) |
-| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | yes (split deploy) | media storage in the `media` bucket |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | only for cloud storage | media storage in the `media` bucket; unused while files are kept on the PC (`storage.on_pc`) |
 | `GEMINI_API_KEY` | yes | writing, images, embeddings, Bangla TTS, transcription (or add it on the API keys page) |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | recommended | alerts and the daily digest |
 | `PEXELS_API_KEY` | recommended | free stock photos when a picture cannot be generated (otherwise posts are text cards) |
@@ -123,8 +161,16 @@ yt-dlp, Bangla fonts, the studio and headless Chrome, and pre-builds the studio 
 | `YOUTUBE_CLIENT_ID`, `_SECRET`, `_REFRESH_TOKEN` | to publish | YouTube uploads (or per-channel keys) |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY` | optional | alternative or backup writers and voices |
 | `R2_*` | optional | Cloudflare R2 instead of Supabase Storage |
+| `MEDIA_DIR` | optional | the folder files are written to on local disk or the PC (default `data/media` in the project). The test harness gives each test engine its own, so tests stay out of the PC's store |
+| `PC_TUNNEL` | optional (PC) | `off` stops the PC worker opening its Cloudflare tunnel (the tests use it) |
+| `CLOUDFLARED_BIN` | optional (PC) | path to cloudflared; default `cloudflared` on PATH, which `pc\start.ps1` points at `.tools\bin` |
+| `AUTO_PRODUCTION_DEFAULT` | tests | `on` makes automatic production default to on when `auto.enabled` has never been set; the test harness uses it. Leave it unset in production |
 
 Everything else — model names, voices, lanes, retries, fonts — has defaults; see `.env.example`.
+
+Two switches are settings in the dashboard, not env vars: `auto.enabled` (Overview → Automatic production, off by
+default) and `storage.on_pc` (Settings → Files are kept on your PC). The PC worker's own file, `.env.pc`, is described
+in `.env.pc.example`.
 
 ## How it's built
 
@@ -135,6 +181,8 @@ Everything else — model names, voices, lanes, retries, fonts — has defaults;
 - `schema.sql` — one idempotent schema, applied at every boot; row-level security on every table (the server connects as the
   owner; Supabase's public API sees nothing).
 - `studio/` — Remotion compositions (NewsReel, Explainer) rendered by `studio/render.mjs` in a child process.
+- `blender/` — `explainer3d.py`, the procedural 3D scenes Blender renders for 3D explainers on the PC.
+- `pc/` — the PC worker's scripts: `setup.ps1` (tools), `start.ps1` (the worker), `autostart.ps1` (start at sign-in).
 - `frontend/` — the dashboard (vanilla JS).
 - `test/` — end-to-end tests on PGlite; CI runs them on every pull request.
 

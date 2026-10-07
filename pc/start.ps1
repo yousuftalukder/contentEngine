@@ -1,6 +1,9 @@
-# Starts this PC as a video worker. It claims only work routed to the PC (programmes set to "My PC") and nothing
-# else — no news, no publishing, no sweeps; the server keeps doing those. Stop it with Ctrl+C: running jobs are
-# handed back to the queue rather than left locked.
+# Starts this PC as a worker. It claims only work the server routes to the PC lane: programmes set to "My PC", and,
+# while files are kept on this PC (Settings -> storage.on_pc), every job that makes or sends a file -- news cards,
+# reels, clips, explainers, publishing. It reads no feeds and runs none of the server's sweeps; the server keeps doing
+# those. While files are kept here it writes them to data\media (MEDIA_DIR), cleans up its own, and opens a Cloudflare
+# quick tunnel (cloudflared from .tools\bin, installed by setup.ps1) so they can be fetched. Stop it with Ctrl+C:
+# running jobs are handed back to the queue rather than left locked.
 $ErrorActionPreference = "Stop"
 $root  = Split-Path $PSScriptRoot -Parent
 $tools = Join-Path $root ".tools"
