@@ -79,3 +79,64 @@ test("Twelve Labs recap: the video is indexed and its chapters become the scenes
     assert.deepEqual(programs.find((x) => x.id === p.id).variants, ["5c"], "and the programme is a Twelve Labs recap");
   } finally { await eng.stop(); await new Promise((r) => tl.close(r)); }
 });
+
+// A retry must not buy the job again: when the second clip fails to download, the retry finds the same Vizard project,
+// skips the clip already made, and finishes the second — one project, two clips, no duplicates.
+test("rented clips: a retry after a failed download neither buys a second project nor makes a clip twice", { skip: !hasFfmpeg && "ffmpeg not installed" }, async () => {
+  const clip = readFileSync(clipFile(4)); let created = 0, second = 0;
+  const vizard = await listen((req, res) => {
+    req.on("data", () => {}); req.on("end", () => {
+      const base = `http://127.0.0.1:${vizard.address().port}`;
+      if (req.url === "/project/create") { created++; return send(res, 200, { code: 2000, projectId: 88 }); }
+      if (req.url === "/project/query/88") return send(res, 200, { code: 2000, videos: [{ videoUrl: `${base}/one.mp4`, videoMsDuration: 4000, title: "First moment" }, { videoUrl: `${base}/two.mp4`, videoMsDuration: 4000, title: "Second moment" }] });
+      if (req.url === "/one.mp4") return send(res, 200, clip, "video/mp4");
+      if (req.url === "/two.mp4") { second++; return second === 1 ? send(res, 503, "busy for now", "text/plain") : send(res, 200, clip, "video/mp4"); }
+      send(res, 404, {});
+    });
+  });
+  const eng = await startEngine({ env: { VIZARDAI_API_KEY: "not-a-real-key", VIZARD_API_BASE: `http://127.0.0.1:${vizard.address().port}` } });
+  try {
+    await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const b = await eng.api("POST", "/api/brands", { name: "Rented twice" });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "rented_twice", displayName: "Rented twice", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "vizard",
+      useMocks: true, autoStyle: false, autoSources: false, methodConfig: { qa: { enabled: false }, clips_per_video: 2 } });
+    const cand = await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: "https://www.youtube.com/watch?v=def", title: "Another speech" });
+    const [job] = await waitFor(async () => { const j = await eng.query(`SELECT id, status FROM jobs WHERE type = 'PROCESS_CANDIDATE' AND payload::jsonb->>'candidateId' = $1`, [cand.id]); return second === 1 && j[0]?.status === "PENDING" && j; }, { timeout: 60000, what: "the failed download to be retried" });
+    await eng.query(`UPDATE jobs SET run_after = now() WHERE id = $1`, [job.id]);
+    await waitFor(async () => { const [c] = await eng.query(`SELECT status FROM video_candidates WHERE id = $1`, [cand.id]); return c.status === "PROCESSED"; }, { timeout: 60000, what: "the video processed" });
+    const items = await eng.query(`SELECT headline, status FROM content_items WHERE niche_id = $1 ORDER BY created_at`, [p.id]);
+    assert.equal(created, 1, "the project was bought once");
+    assert.equal(items.length, 2, `two clips, no duplicate: ${items.map((x) => x.headline).join(", ")}`);
+    assert.ok(items.every((x) => x.status === "PENDING_REVIEW"), items.map((x) => x.status).join(", "));
+    const [mark] = await eng.query(`SELECT 1 FROM settings WHERE key = $1`, [`vizard.project.${cand.id}`]);
+    assert.equal(mark, undefined, "and the project mark is cleared once every clip is made");
+  } finally { await eng.stop(); await new Promise((r) => vizard.close(r)); }
+});
+
+// Twelve Labs still indexing after the wait: the retry asks about the same task, it does not upload the video again.
+test("Twelve Labs: a retry while still indexing polls the same task instead of indexing again", { skip: !hasFfmpeg && "ffmpeg not installed" }, async () => {
+  const src = clipFile(20); let uploads = 0, polls = 0;
+  const tl = await listen((req, res) => {
+    req.on("data", () => {}); req.on("end", () => {
+      if (req.url === "/indexes") return send(res, 200, { _id: "idx2" });
+      if (req.url === "/tasks" && req.method === "POST") { uploads++; return send(res, 200, { _id: "t2", status: "indexing" }); }
+      if (req.url === "/tasks/t2") { polls++; return send(res, 200, polls < 3 ? { _id: "t2", status: "indexing" } : { _id: "t2", status: "ready", video_id: "v2" }); }
+      if (req.url === "/summarize") return send(res, 200, { chapters: [{ start_sec: 0, end_sec: 10, chapter_title: "Start", chapter_summary: "It begins" }, { start_sec: 10, end_sec: 20, chapter_title: "End", chapter_summary: "It ends" }] });
+      send(res, 404, {});
+    });
+  });
+  const eng = await startEngine({ env: { TWELVE_LABS_API_KEY: "not-a-real-key", TWELVE_LABS_API_BASE: `http://127.0.0.1:${tl.address().port}`, TWELVE_LABS_POLL_MS: "50" } });
+  try {
+    await eng.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    await eng.api("POST", "/api/adapter-configs", { key: "tl_impatient", stage: "TRANSCRIBE", impl: "twelve_labs", config: { max_wait_minutes: 0.001 } });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_recap2", stage: "SCRIPT", impl: "llm_mock", config: { respond: [{ match: "Its scenes", json: { title: "Two parts", beats: [{ narration: "It begins.", start: 0, end: 10 }, { narration: "It ends.", start: 10, end: 20 }], hashtags: [] } }] } });
+    const b = await eng.api("POST", "/api/brands", { name: "TL twice" });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "tl_twice", displayName: "TL twice", contentType: "MOVIE_RECAP", productionMethod: "SCENE_RECAP", transcriptAdapter: "tl_impatient",
+      useMocks: true, autoStyle: false, autoSources: false, downloadAdapter: "direct", scriptAdapter: "llm_recap2", scriptAdapterFallbacks: [], renderAdapter: "render_mock", methodConfig: { qa: { enabled: false } } });
+    const cand = await eng.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "Two parts" });
+    const [job] = await waitFor(async () => { const j = await eng.query(`SELECT id, status FROM jobs WHERE type = 'PROCESS_CANDIDATE' AND payload::jsonb->>'candidateId' = $1`, [cand.id]); return uploads === 1 && j[0]?.status === "PENDING" && j; }, { timeout: 60000, what: "the still-indexing retry" });
+    await eng.query(`UPDATE jobs SET run_after = now() WHERE id = $1`, [job.id]);
+    await waitFor(async () => { const [it] = await eng.query(`SELECT status, rejection_note FROM content_items WHERE niche_id = $1`, [p.id]); if (it?.status === "FAILED") throw new Error(it.rejection_note); return it?.status === "PENDING_REVIEW"; }, { timeout: 60000, what: "the recap" });
+    assert.equal(uploads, 1, "the video was indexed once");
+  } finally { await eng.stop(); await new Promise((r) => tl.close(r)); }
+});

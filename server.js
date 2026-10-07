@@ -16,7 +16,7 @@
 // =====================================================================
 
 import http from "node:http";
-import { readFile, writeFile, mkdir, unlink, rm, readdir, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink, rm, readdir, stat, open as openFile } from "node:fs/promises";
 import { existsSync, createWriteStream, readFileSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
@@ -79,6 +79,8 @@ let clockSkewMs = 0;
 const nowMs = () => Date.now() + clockSkewMs;
 const nowIso = () => new Date(nowMs()).toISOString();
 const sha = (s) => createHash("sha256").update(String(s)).digest("hex");
+// The start of a file without reading the rest of it (a long video does not fit in a small instance's memory).
+async function firstBytes(path, n) { let fh; try { fh = await openFile(path, "r"); const b = Buffer.alloc(n); const { bytesRead } = await fh.read(b, 0, n, 0); return b.subarray(0, bytesRead); } catch { return Buffer.alloc(0); } finally { await fh?.close().catch(() => {}); } }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const flag = (v) => v === true || v === 1 || v === "1" || v === "true";
 const J = (v) => (v === undefined || v === null ? null : JSON.stringify(v));
@@ -1204,7 +1206,12 @@ Times are seconds from the start of this video, as numbers. JSON only: [{"start"
 impl("TRANSCRIBE", "twelve_labs", { label: "Twelve Labs (video chapters: what happens, when)", configSchema: { api_base: { type: "string", default: "https://api.twelvelabs.io/v1.3" }, max_wait_minutes: { type: "number", default: 30 } }, create: (cfg, ctx = {}) => ({
   async transcribe({ path }) {
     const base = ENV.TWELVE_LABS_API_BASE || cfg.api_base || "https://api.twelvelabs.io/v1.3", proxy = tmpPath("mp4");
-    await exec("ffmpeg", ["-y", "-i", path, "-vf", "scale=-2:360", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", proxy], { timeoutMs: 60 * 60000 });
+    // The indexing task is remembered per video (its size and first megabyte): a retry after "still indexing" asks
+    // about the same task instead of uploading the video again and starting — and paying for — a new one each time.
+    const head = await firstBytes(path, 1 << 20), size = (await stat(path).catch(() => ({ size: 0 }))).size;
+    const mark = `twelve_labs.task.${sha(`${size}:${head.toString("base64")}`).slice(0, 24)}`;
+    const known = P((await one(`SELECT value FROM settings WHERE key = $1`, [mark]))?.value);
+    if (!known) await exec("ffmpeg", ["-y", "-i", path, "-vf", "scale=-2:360", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", proxy], { timeoutMs: 60 * 60000 });
     try {
       return await withKey("twelve_labs", async (key) => {
         const h = { "x-api-key": key };
@@ -1214,16 +1221,22 @@ impl("TRANSCRIBE", "twelve_labs", { label: "Twelve Labs (video chapters: what ha
             models: [{ model_name: "marengo2.7", model_options: ["visual", "audio"] }, { model_name: "pegasus1.2", model_options: ["visual", "audio"] }] }) });
           index = r._id || r.id; await putSetting("twelve_labs.index_id", index);
         }
-        const fd = new FormData(); fd.append("index_id", index); fd.append("video_file", new Blob([await readFile(proxy)], { type: "video/mp4" }), "source.mp4");
-        let task = await fetchJson(`${base}/tasks`, { method: "POST", headers: h, body: fd });
-        const id = task._id || task.id, until = Date.now() + (Number(cfg.max_wait_minutes) || 30) * 60000;
+        let task;
+        if (known?.task) task = await fetchJson(`${base}/tasks/${known.task}`, { headers: h });
+        else {
+          const fd = new FormData(); fd.append("index_id", index); fd.append("video_file", new Blob([await readFile(proxy)], { type: "video/mp4" }), "source.mp4");
+          task = await fetchJson(`${base}/tasks`, { method: "POST", headers: h, body: fd });
+          await putSetting(mark, { task: task._id || task.id });
+        }
+        const id = task._id || task.id || known?.task, until = Date.now() + (Number(cfg.max_wait_minutes) || 30) * 60000;
         while (task.status !== "ready") {
-          if (task.status === "failed") throw new Error("Twelve Labs could not index this video");
+          if (task.status === "failed") { await q(`DELETE FROM settings WHERE key = $1`, [mark]); throw new Error("Twelve Labs could not index this video"); }
           if (Date.now() > until) throw Object.assign(new Error("Twelve Labs is still indexing this video"), { transient: true });
           await sleep(ENV.TWELVE_LABS_POLL_MS ? Number(ENV.TWELVE_LABS_POLL_MS) : 10000); task = await fetchJson(`${base}/tasks/${id}`, { headers: h });
         }
         const sum = await fetchJson(`${base}/summarize`, { method: "POST", headers: { ...h, "content-type": "application/json" }, body: JSON.stringify({ video_id: task.video_id, type: "chapter" }) });
         const segments = (sum.chapters || []).map((c) => ({ start: Number(c.start_sec ?? c.start) || 0, end: Number(c.end_sec ?? c.end) || 0, text: "", visual: [c.chapter_title, c.chapter_summary].filter(Boolean).join(": ") })).filter((x) => x.end > x.start);
+        await q(`DELETE FROM settings WHERE key = $1`, [mark]);
         if (!segments.length) throw new Error("Twelve Labs returned no chapters for this video");
         return { segments, scenes: true, text: segments.map((x) => x.visual).join(" "), cost: 0, units: 1 };
       }, ctx.pin);
@@ -4014,18 +4027,23 @@ impl("CLIP", "vizard", { label: "Vizard (rented clipping, needs a key)", configS
     const base = ENV.VIZARD_API_BASE || cfg.api_base, mc = methodCfg(niche), mark = `vizard.project.${candidateId}`;
     return withKey("vizard", async (key) => {
       const h = { VIZARDAI_API_KEY: key, "content-type": "application/json" };
-      let project = (await setting(mark, null))?.id;
+      const marked = await one(`SELECT value FROM settings WHERE key = $1`, [mark]);   // not the cached copy: a retry must see it
+      let project = P(marked?.value)?.id;
       if (!project) {
         const youtube = /youtu\.?be/.test(url);
         const r = await fetchJson(`${base}/project/create`, { method: "POST", headers: h, body: JSON.stringify({ videoUrl: url, videoType: youtube ? 2 : 1, ...(youtube ? {} : { ext: (extname(url.split("?")[0]).slice(1) || "mp4") }),
           lang: (niche.language || "en").slice(0, 2), preferLength: cfg.prefer_length || [0], ratioOfClip: mc.orientation === "16:9" ? 4 : 1, maxClipNumber: mc.clips_per_video || cfg.max_clips || 3 }) });
         if (String(r.code) !== "2000" || !r.projectId) throw new Error(`Vizard would not start the project: ${r.errMsg || r.code}`);
-        project = r.projectId; await putSetting(mark, { id: project });
+        project = r.projectId; await putSetting(mark, { id: project, started: nowIso() });
       }
+      // Polled for at most six hours: a project Vizard never finishes is a failure to look at, not a job that waits for ever.
+      const started = P(marked?.value)?.started;
+      if (started && nowMs() - Date.parse(started) > 6 * 3600e3) { await q(`DELETE FROM settings WHERE key = $1`, [mark]); throw new Error("Vizard has not finished this video after six hours"); }
       const r = await fetchJson(`${base}/project/query/${project}`, { headers: h });
       if (String(r.code) === "1000") throw Object.assign(new Error("Vizard is still cutting this video"), { waitMinutes: Number(ENV.VIZARD_POLL_MINUTES) || 2 });
-      if (String(r.code) !== "2000") throw new Error(`Vizard failed on this video: ${r.errMsg || r.code}`);
-      await q(`DELETE FROM settings WHERE key = $1`, [mark]);
+      if (String(r.code) !== "2000") { await q(`DELETE FROM settings WHERE key = $1`, [mark]); throw new Error(`Vizard failed on this video: ${r.errMsg || r.code}`); }
+      // The mark stays until every clip has been made (rentedClips): a retry after a clip failed to download must find
+      // this project again — without it, it bought a second one and made the first clip twice.
       return { clips: (r.videos || []).filter((v) => v.videoUrl).map((v) => ({ url: v.videoUrl, seconds: (Number(v.videoMsDuration) || 0) / 1000, title: v.title || "", text: v.transcript || "", score: Number(v.viralScore) / 10 || null, reason: v.viralReason || "chosen by Vizard" })), units: 1 };
     }, ctx.pin);
   } }) });
@@ -4034,10 +4052,15 @@ async function rentedClips(cand, niche, clipper) {
   if (!clips.length) throw new Error("the clipping service found no clips in this video");
   const vertical = methodCfg(niche).orientation !== "16:9", style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   for (const cl of clips.slice(0, methodCfg(niche).clips_per_video || 3)) {
-    const clipId = newId();
-    await q(`INSERT INTO clips (id, video_candidate_id, niche_id, start_seconds, end_seconds, title, hook, score, reason, transcript_text) VALUES ($1,$2,$3,0,$4,$5,'',$6,$7,$8)`, [clipId, cand.id, niche.id, cl.seconds || 0, cl.title, cl.score, cl.reason, cl.text]);
-    const itemId = await createQueuedItem(niche, { topic: cl.title || cand.title, candidateId: cand.id, clipId, status: "RENDERING", sourceDataRef: { provider: "rented_clip", url: cand.source_url, title: cand.title, clip: cl } });
-    await q(`UPDATE clips SET content_item_id=$2 WHERE id=$1`, [clipId, itemId]);
+    // A retry after a later clip failed: the clips already made are skipped, and one left half-made is finished under
+    // its own item rather than made a second time.
+    const [made] = await q(`SELECT cl.id AS clip_id, ci.id AS item_id, ci.status FROM clips cl JOIN content_items ci ON ci.id = cl.content_item_id
+      WHERE cl.video_candidate_id = $1 AND ci.source_data_ref LIKE '%' || $2 || '%' ORDER BY ci.created_at LIMIT 1`, [cand.id, JSON.stringify(cl.url).slice(1, -1)]);
+    if (made && made.status !== "RENDERING") continue;
+    const clipId = made?.clip_id || newId();
+    if (!made) await q(`INSERT INTO clips (id, video_candidate_id, niche_id, start_seconds, end_seconds, title, hook, score, reason, transcript_text) VALUES ($1,$2,$3,0,$4,$5,'',$6,$7,$8)`, [clipId, cand.id, niche.id, cl.seconds || 0, cl.title, cl.score ?? 0, cl.reason, cl.text]);   // Vizard does not always send a score
+    const itemId = made?.item_id || await createQueuedItem(niche, { topic: cl.title || cand.title, candidateId: cand.id, clipId, status: "RENDERING", sourceDataRef: { provider: "rented_clip", url: cand.source_url, title: cand.title, clip: cl } });
+    if (!made) await q(`UPDATE clips SET content_item_id=$2 WHERE id=$1`, [clipId, itemId]);
     let file = tmpPath("mp4"); await writeFile(file, await fetchBytes(cl.url));
     let finish = "off"; if (methodCfg(niche).brand_finish !== false) ({ file, finish } = await brandFinish(file, niche, { vertical }));
     const video = await publishRender(file, itemId, { method: "RENTED_CLIP", provider: "vizard", orientation: vertical ? "9:16" : "16:9", brand_finish: finish });
@@ -4052,6 +4075,7 @@ async function rentedClips(cand, niche, clipper) {
     await finishGeneration(itemId, niche);
   }
   await q(`UPDATE video_candidates SET status='PROCESSED' WHERE id=$1`, [cand.id]);
+  await q(`DELETE FROM settings WHERE key = $1`, [`vizard.project.${cand.id}`]);
 }
 // ---- 8d. Video candidate: download → transcribe → pick clips → one content_item per clip → RENDER_CLIP jobs
 async function processCandidate(candidateId) {
@@ -4207,6 +4231,10 @@ async function renderClipItem(itemId, clipId) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); const clip = await one(`SELECT * FROM clips WHERE id=$1`, [clipId]);
   const cand = await one(`SELECT * FROM video_candidates WHERE id=$1`, [clip.video_candidate_id]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
+  // A clip the rented clipper cut has no range in the source to cut again (it is stored as 0 to its length): re-cut
+  // here, it came out as the opening of the long video, not the moment. Its video stays as it is.
+  // (Not thrown: a failed job would mark a good clip failed and take it out of Review.)
+  if (P(item.source_data_ref)?.provider === "rented_clip") { await setItem(itemId, { rejection_note: "This clip was cut by the clipping service, so it cannot be re-cut here: regenerate its caption, or add the link again for new clips." }); return { skipped: "rented clip" }; }
   await setItem(itemId, { status: "RENDERING" });
   const stored = P(cand.transcript) || { segments: [] }, transcript = stored.events ? stored : { ...stored, ...cleanTranscript(stored.segments) }; const c = { start: Number(clip.start_seconds), end: Number(clip.end_seconds), title: clip.title, hook: clip.hook };
   // Only the part being published is fetched. A reel is forty seconds of a video that may be two hours long, and
