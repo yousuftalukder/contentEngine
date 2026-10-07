@@ -55,6 +55,24 @@ test("voice-over reel: vertical blur-pad layout covering the whole narration", {
   assert.ok(item.script?.length > 0, "the narration is stored as the script");
 });
 
+// 4b as the blueprint has it: a few sentences of ours over the opening, the clip's own sound ducked under the voice and
+// back up after it, and the host in the corner (the reactor is set, so the overlay pass runs — on ffmpeg 5.1 here, as
+// on Render). The source hums at 330 Hz and the "voice" at 1000 Hz, so listening to
+// 330 Hz alone says how loud the clip's own sound is while we speak and after we stop.
+test("summary voice-over (4b): the clip's own sound dips under the voice and comes back, with a reactor in the corner", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
+  const voice = join(dir, "voice.mjs");
+  (await import("node:fs")).writeFileSync(voice, `import { spawnSync } from "node:child_process"; const r = spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=2", process.argv[2]]); process.exit(r.status ?? 1);`);
+  await eng.api("POST", "/api/adapter-configs", { key: "voice_tone", stage: "VOICE", impl: "tts_command", config: { command: process.execPath, args: [voice, "{out}"], format: "wav" } });
+  const p = await eng.api("POST", "/api/programs", { ...base(), voiceAdapter: "voice_tone", voiceAdapterFallbacks: [], key: "vo_duck", displayName: "Summaries", contentType: "VOICEOVER_CLIP", productionMethod: "VOICEOVER",
+    methodConfig: { clips_per_video: 1, reactor_url: join(dir, "reactor.mp4"), brand_finish: false } });
+  const { info } = await renderFrom(p), file = join(dir, "vo_duck.mp4");
+  assert.ok(Number(info.format.duration) > 8, `the clip plays on after the summary (${info.format.duration} s)`);
+  const level = (from) => { const r = spawnSync("ffmpeg", ["-hide_banner", "-ss", String(from), "-t", "1", "-i", file, "-af", "bandpass=f=330:width_type=q:w=8,astats=metadata=0", "-f", "null", "-"]);
+    return Number((/RMS level dB: (-?[\d.]+|-inf)/.exec(String(r.stderr)) || [])[1]); };
+  const during = level(0.5), after = level(6);
+  assert.ok(after - during > 6, `the clip's own sound is ducked under the voice: ${during.toFixed(1)} dB while we speak, ${after.toFixed(1)} dB after`);
+});
+
 // The split-screen reaction: the source on top, the host's own clip below, the source played 1.1× so the upload is not
 // the original frame for frame. Duration follows the speed, and both sounds are in the mix.
 test("reaction split-screen: source over host at 1.1×, vertical, shorter by the speed", { skip: !ffmpeg && "ffmpeg not installed" }, async () => {
