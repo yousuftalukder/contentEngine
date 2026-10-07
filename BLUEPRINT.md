@@ -135,7 +135,7 @@ stock pool, and a library of your own footage is the difference.
 | a Pexels key *(free)* | 2c, 7b |
 | a clipping subscription *(optional, the only paid item)* | 1b only |
 | your PC switched on | 1a, 1c, 3b, 3c, 4a–c, 5a–c, 6a–d, 7a |
-| a persona from you | 4a, 4c *(4b as built narrates over the clip without one)* |
+| a persona from you | 4a, 4c *(4b puts yours in the corner when you set one, and works without)* |
 | Gemini video input (free tier) | 5a |
 | a Twelve Labs key *(optional)* | 5c |
 | your footage folder | 7a |
