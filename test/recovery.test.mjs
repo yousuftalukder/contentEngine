@@ -157,3 +157,26 @@ test("a retried explainer reuses the research and plan it already paid for", asy
     assert.ok(it.voice_asset_url, "and the retry went on to narrate");
   } finally { await cheap.stop(); }
 });
+
+// Free storage fills with the pictures of drafts nobody will publish (1 GB in two weeks, then every file refused). With
+// a number of days set, the hourly cleanup deletes the media of drafts rejected or failed that long ago — and nothing a
+// live draft still uses. Off by default: deleting is the owner's choice.
+test("media of long-rejected drafts is deleted when the owner sets a retention, and a live draft's is kept", async () => {
+  const p = await program("retention");
+  const make = async (topic) => { const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic }); await waitFor(async () => (await eng.api("GET", `/api/content-items/${id}`)).status === "PENDING_REVIEW", { what: topic }); return id; };
+  const gone = await make("A story rejected a week ago"), kept = await make("A story still waiting for review");
+  await eng.query(`UPDATE content_items SET status = 'REJECTED' WHERE id = $1`, [gone]);
+  await backdate("content_items", gone, "updated_at", "7 days");
+  const media = async (id) => eng.query(`SELECT url, deleted_at FROM media_assets WHERE content_item_id = $1 AND url LIKE 'http%'`, [id]);
+  assert.ok((await media(gone)).length, "the rejected draft has stored media to begin with");
+  await eng.api("POST", "/api/storage/cleanup");
+  assert.ok((await media(gone)).every((m) => !m.deleted_at), "nothing is deleted while the retention is off");
+  await eng.api("PUT", "/api/settings/storage.cleanup_rejected_days", { value: 3 });
+  await eng.api("POST", "/api/storage/cleanup");
+  const after = await media(gone);
+  assert.ok(after.every((m) => m.deleted_at), "the rejected draft's media is deleted");
+  for (const m of after) assert.equal((await fetch(m.url.replace(/^https?:\/\/[^/]+/, eng.base))).status, 404, "and the file is gone from storage");
+  assert.ok((await media(kept)).every((m) => !m.deleted_at), "a draft still in Review keeps its media");
+  const it = await eng.api("GET", `/api/content-items/${gone}`);
+  assert.equal(it.status, "REJECTED", "the draft itself stays");
+});
