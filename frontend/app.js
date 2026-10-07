@@ -118,22 +118,76 @@ function formDialog(title, fields, onSave, { saveLabel = "Save", wide } = {}) {
 }
 function jsonDialog(title, obj) { modal(title, h("div", null, h("pre", null, JSON.stringify(obj, null, 2)))); }
 
+// Small things remembered in this browser only (which folds are open, whether "Start here" is hidden). A private window
+// can refuse storage: then everything simply starts as it would the first time.
+const remember = {
+  get: (k, d = null) => { try { const v = localStorage.getItem("ce." + k); return v == null ? d : v; } catch { return d; } },
+  set: (k, v) => { try { if (v == null) localStorage.removeItem("ce." + k); else localStorage.setItem("ce." + k, String(v)); } catch {} },
+};
+// A fold for what is rarely needed. Closed until opened once, then remembered — saving re-draws the page and would close
+// it again. Fields inside are still part of their form: readForm reads every [name] in it, open or closed.
+function fold(id, summary, ...children) {
+  const d = h("details", { class: "fold" }, h("summary", null, summary), h("div", { class: "fold-body" }, children));
+  d.open = remember.get("fold." + id) === "1";
+  d.addEventListener("toggle", () => remember.set("fold." + id, d.open ? "1" : null));
+  return d;
+}
+// The engine's own name for something, shown small beside the plain one for when it is asked for (support, a log).
+const tech = (s) => h("span", { class: "tech" }, s);
+// Whether your PC is working for the engine right now. With files kept on the PC, "on" means it can also be reached:
+// its heartbeat is fresh *and* its tunnel is up (stats.pcTunnel is null otherwise), because without the tunnel no picture
+// or video can be shown or posted. Otherwise it is the PC worker's heartbeat (/api/workers, fetched with the stats).
+function pcState() {
+  const online = !!workers?.pc?.online, waiting = workers?.pc?.waiting || 0;
+  if (stats?.filesOnPc) return { on: !!stats.pcTunnel, linkDown: online && !stats.pcTunnel, waiting, needed: true };
+  return { on: online, linkDown: false, waiting, needed: waiting > 0 };
+}
+// "Needs your PC": beside every control whose work runs on your PC while files are kept there. Only a marker — the
+// control does what it always did; while the PC is off the work waits in its queue and runs when the PC is back.
+const PC_ICON = '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="8.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 14h5M8 11v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+function pcMark(what = "This") {
+  if (!stats?.filesOnPc) return null;
+  return h("span", { class: "pc-mark", role: "img", "aria-label": "Needs your PC", html: PC_ICON + "<span>PC</span>",
+    title: `Needs your PC — ${what} runs on your PC, because files are kept there. While the PC is off it waits and runs when the PC is back; nothing is lost.` });
+}
+
 // ---------------------------------------------------------------- shell
 // Grouped by what the owner is doing: today's decisions, deciding what gets made, the one-time setup, and the engine's
-// own controls, which most days nobody opens.
+// own controls, which most days nobody opens. The routes (#/items, #/catalog…) never change: bookmarks keep working.
 const NAV = [
   ["Today", [["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["insights", "Insights"]]],
-  ["Make", [["catalog", "What it makes"], ["programs", "Programmes"], ["candidates", "Videos to clip"], ["ideas", "Ideas", "ideas"], ["desk", "News desk"]]],
+  ["Make", [["catalog", "What it makes"], ["programs", "Programmes"], ["candidates", "Videos to clip"], ["ideas", "Ideas", "ideas"]]],
   ["Set up", [["brands", "Brands"], ["sources", "Sources"], ["channels", "Channels"], ["keys", "API keys"]]],
-  ["Engine", [["adapters", "Adapters"], ["settings", "Settings"]]],
+  ["Engine (advanced)", [["desk", "News desk"], ["adapters", "Adapters"], ["settings", "Settings"]]],
+  ["Help", [["help", "What needs your PC"]]],
 ];
+// One plain sentence per page: under its title, and as the tooltip of its link in the menu.
+const INFO = {
+  overview: "What needs you today, and whether the engine and your PC are running.",
+  review: "Drafts waiting for you. Nothing is posted until you approve it, and you can edit anything first.",
+  items: "Everything the engine has made, newest first, and where each piece was posted.",
+  schedule: "Approved posts waiting for their time slot on each channel, and what went out in the last 48 hours.",
+  insights: "How your published posts did: views and likes by format, platform and hour. The idea planner reads the same numbers.",
+  catalog: "Every kind of video and post the engine can make, where the work runs, and whether it is ready. Start a programme from any of them.",
+  programs: "A programme is a recurring show: what it makes, where its material comes from, and how you review it.",
+  candidates: "Paste a video link, or let your sources bring videos in. The engine picks the best moments, cuts them into clips and sends each one to Review.",
+  ideas: "Suggestions for what to make next, from what performed well, your series and the stories you have not covered. Accept one and it is written.",
+  brands: "Your brand's look — logo, colours, font, music — used on every card and video. Also the media library: reactor clips and music.",
+  sources: "Where material comes from: news websites, YouTube channels, searches. The engine reads them on a schedule while automatic production is on.",
+  channels: "Where approved posts go: Facebook Pages, Instagram accounts, YouTube channels. Each channel takes the posts of the programmes you choose.",
+  keys: "Keys for the AI writers, voices, pictures and publishing. Stored encrypted; only their last 4 characters are ever shown.",
+  desk: "Every news story seen in the last 24 hours, grouped across outlets. Stories carried by more outlets rank higher; each news programme takes its best ones.",
+  adapters: "Which tool does each step — reading feeds, writing, pictures, voice, video, posting. The defaults work; change these only when you add a new service.",
+  settings: "Switches for the whole engine. What each programme does is set on the programme itself.",
+  help: "What has to wait for your PC to be on, and what the server does on its own.",
+};
 const PAGES = NAV.flatMap(([, items]) => items);
-let health = null, stats = null;
+let health = null, stats = null, workers = null;
 
 function renderRail(active) {
   const links = $("#railLinks"); links.innerHTML = "";
   for (const [group, items] of NAV) { links.appendChild(h("div", { class: "rail-group" }, group)); for (const [id, label, badge] of items) {
-    const a = h("a", { href: "#/" + id, class: active === id ? "active" : "" }, label);
+    const a = h("a", { href: "#/" + id, class: active === id ? "active" : "", title: INFO[id] || "" }, label);
     if (badge === "review") { const n = stats?.items?.PENDING_REVIEW || 0; if (n) a.appendChild(h("span", { class: "count" }, n)); }
     if (badge === "ideas") { const n = stats?.ideas || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n)); }
     if (id === "items") { const n = stats?.items?.FAILED || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n + " failed")); }
@@ -146,9 +200,31 @@ function renderRail(active) {
     h("div", null, "Storage ", h("b", null, health.storage), " · ffmpeg ", h("b", null, health.ffmpeg ? "yes" : "no")),
     stats?.globalPause ? h("div", { style: "color:var(--amber)" }, "Publishing paused") : null,
   );
+  // The status strip is drawn by route(); here it is only brought up to date (the 30-second refresh, Generate now).
+  const strip = $("#statusStrip"); if (strip) strip.replaceWith(statusStrip());
 }
+// /api/workers rides along with the stats on the same 30-second refresh (no extra timer): it is the PC's heartbeat,
+// which the stats only reflect through the tunnel — and the tunnel exists only while files are kept on the PC.
 async function refreshMeta() {
-  [health, stats] = await Promise.all([get("/health").catch(() => ({ ok: false })), get("/api/stats").catch(() => null)]);
+  [health, stats, workers] = await Promise.all([get("/health").catch(() => ({ ok: false })), get("/api/stats").catch(() => null), get("/api/workers").catch(() => null)]);
+}
+// On every page, above everything: is your PC on, is automatic production on — each a link to where it is explained or
+// switched — and, when the PC is off, what is waiting for it. Read-only: it shows what the stats already say.
+function statusStrip() {
+  if (!stats) return h("div", { id: "statusStrip", class: "strip warn" }, h("div", { class: "row" }, h("span", { class: "pill" }, h("span", { class: "dot off" }), "The engine is not answering — check that it is running")));
+  const pc = pcState(), auto = !!stats.autoOn;
+  const pcPill = h("a", { class: "pill", href: "#/help", title: pc.on ? "Your PC worker is running. See what needs it." : pc.linkDown ? "Your PC worker is running but its tunnel is down, so files on it cannot be reached. See what needs it." : "Your PC worker is not running. See what waits for it and how to start it." },
+    h("span", { class: "dot" + (pc.on ? "" : pc.needed ? " off" : " idle") }), "Your PC: ", h("b", null, pc.on ? "on" : pc.linkDown ? "on, but not reachable" : "off"));
+  const autoPill = h("a", { class: "pill", href: "#/overview", title: auto ? "The engine reads the feeds and makes things by itself. Turn it off on the Overview." : "Nothing is made unless you ask. Turn it on on the Overview." },
+    h("span", { class: "dot" + (auto ? "" : " idle") }), "Automatic production: ", h("b", null, auto ? "on" : "off"));
+  const waits = !pc.on && pc.needed ? h("div", { class: "strip-note" },
+    stats.filesOnPc ? "Waiting for your PC: making and re-rendering content, cutting clips, playing media in Review, saving uploads and publishing." : "Video work set to run on your PC is waiting for it.",
+    pc.waiting ? ` ${pc.waiting} job${pc.waiting > 1 ? "s" : ""} queued for it.` : "", " Start it with pc\\start.ps1 on your PC.") : null;
+  return h("div", { id: "statusStrip", class: "strip" + (waits ? " warn" : "") },
+    h("div", { class: "row" }, pcPill, autoPill,
+      stats.globalPause ? h("a", { class: "pill", href: "#/settings", title: "Approved posts wait until publishing is resumed (Settings)" }, h("span", { class: "dot off" }), h("b", null, "Publishing paused")) : null,
+      h("a", { class: "small right", href: "#/help" }, "What needs my PC?")),
+    waits);
 }
 async function route() {
   const id = (location.hash.replace(/^#\/?/, "").split("/")[0]) || "overview";
@@ -159,9 +235,10 @@ async function route() {
   renderRail(id);
   $("#rail").classList.remove("open");
   const page = pages[id] || pages.overview;
-  try { main.innerHTML = ""; main.appendChild(await page(sub)); }
-  catch (e) { main.innerHTML = ""; main.appendChild(h("div", { class: "empty" }, h("b", null, "This page could not load"), e.message)); }
+  try { main.innerHTML = ""; main.appendChild(statusStrip()); main.appendChild(await page(sub)); }
+  catch (e) { main.innerHTML = ""; main.appendChild(statusStrip()); main.appendChild(h("div", { class: "empty" }, h("b", null, "This page could not load"), e.message)); }
 }
+// desc may be text or nodes (a plain sentence, then a quieter line for the technical detail some pages carry).
 function pageHead(title, desc, ...actions) {
   return h("div", { class: "page-head" }, h("div", null, h("h1", null, title), desc ? h("p", null, desc) : null), actions.length ? h("div", { class: "actions" }, actions) : null);
 }
@@ -187,8 +264,10 @@ pages.catalog = async () => {
   const rows = await get("/api/catalog");
   const types = [...new Set(rows.map((r) => r.type))];
   return h("div", null,
-    pageHead("What it makes", "Every kind of video and post in the blueprint, where the work happens, and whether what it needs is in place right now. Start a programme from any variant that is built.",
+    pageHead("What it makes", INFO.catalog,
       h("button", { class: "btn", onclick: () => route() }, "Refresh")),
+    // With files on the PC, "runs on server" still needs the PC to store and post what it makes — said once, here.
+    stats?.filesOnPc ? h("p", { class: "small mute", style: "margin:-10px 0 12px;max-width:90ch" }, pcMark("making any of these"), " Files are kept on your PC, so whatever \"runs on\" says below, the work that makes any of these runs on your PC and waits while it is off. Making a programme does not need it. ",h("a", { href: "#/help" }, "What needs my PC?")) : null,
     h("div", { class: "stat-list", style: "grid-template-columns:repeat(4,1fr);margin-bottom:6px" },
       stat(rows.filter((r) => r.ready).length, "ready to run now", "green"), stat(rows.filter((r) => r.status === "proven").length, "proven in production"),
       stat(rows.filter((r) => r.status === "built").length, "built, not yet proven"), stat(rows.filter((r) => r.status === "to build").length, "still to build")),
@@ -200,7 +279,7 @@ function variantCard(r) {
   const [tone, label] = STATUS_TAG[r.status] || ["", r.status];
   return h("div", { class: "variant" + (r.ready ? " ready" : "") },
     h("div", { class: "row", style: "align-items:baseline" }, h("span", { class: "vid" }, r.id), h("b", { class: "grow", style: "font-weight:600" }, r.name)),
-    h("div", { class: "row", style: "gap:6px;margin:6px 0" }, h("span", { class: `tag ${tone}` }, label), h("span", { class: "tag" }, WHERE[r.runs] || r.runs), r.ready ? h("span", { class: "tag green" }, "ready now") : null),
+    h("div", { class: "row", style: "gap:6px;margin:6px 0" }, h("span", { class: `tag ${tone}` }, label), h("span", { class: "tag", title: "Where the work for this runs" }, "runs on ", WHERE[r.runs] || r.runs), r.ready ? h("span", { class: "tag green" }, "ready now") : null),
     h("div", { class: "sub", style: "font-size:13px;color:var(--paper-dim)" }, r.what),
     r.note ? h("div", { class: "small mute", style: "margin-top:4px" }, r.note) : null,
     h("div", { class: "needs" }, r.needs.length ? r.needs.map((n) => h("div", { class: n.ok ? "ok" : "no", title: n.detail }, n.ok ? "✓ " : "✗ ", h("span", null, n.label), h("span", { class: "mute" }, " — ", n.detail)))
@@ -227,7 +306,7 @@ function pcSlotsRow(sets) {
     h("button", { class: "btn sm", onclick: () => { const n = Math.round(Number(box.value)); if (!(n >= 1 && n <= 6)) return toast("Enter 1 to 6", true); run(() => put("/api/settings/worker.pc_concurrency", { value: n }), `Your PC will run up to ${n} at once`).then(route); } }, "Save"));
 }
 pages.overview = async () => {
-  const [programs, sources, channels, alerts, setup, blueprint, sets] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null), get("/api/catalog").catch(() => null), get("/api/settings").catch(() => ({}))]);
+  const [programs, sources, channels, alerts, setup, blueprint, sets, brands] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null), get("/api/catalog").catch(() => null), get("/api/settings").catch(() => ({})), get("/api/brands").catch(() => [])]);
   const it = stats?.items || {}, as = stats?.assets || {};
   const pending = it.PENDING_REVIEW || 0;
   const seeded = programs.length > 0;
@@ -238,32 +317,39 @@ pages.overview = async () => {
   const queues = stats?.queues || {};
 
   const root = h("div", null,
-    pageHead("Overview", "Everything that needs a decision from you shows up in Review. The rest runs on its own.",
+    pageHead("Overview", [INFO.overview, " Everything that needs a decision from you shows up in ", h("a", { href: "#/review" }, "Review"), "."],
       h("button", { class: "btn", onclick: () => route() }, "Refresh")),
+    startHere({ brands, programs, channels, setup, generated, published }),
     h("div", { class: "desk" },
       h("a", { class: "big", href: "#/review", style: "text-decoration:none;color:inherit" },
         h("div", { class: "n" + (pending ? "" : " zero") }, pending),
         h("div", { class: "l" }, pending === 1 ? "item waiting for your review" : "items waiting for your review")),
       h("div", { class: "stat-list" },
-        stat(["QUEUED", "FETCHING_DATA", "DRAFTING", "RENDERING"].reduce((n, s) => n + (it[s] || 0), 0), "Generating now"),
+        stat(["QUEUED", "FETCHING_DATA", "DRAFTING", "RENDERING"].reduce((n, s) => n + (it[s] || 0), 0), "Being made now"),
         stat(as.PUBLISHED || 0, "Published"),
         stat((it.FAILED || 0) + (as.FAILED || 0), "Failed", (it.FAILED || as.FAILED) ? "red" : ""),
         stat(stats?.activeSources ?? 0, "Active sources"))),
-
-    (stats?.quotaPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber)" },
-      h("b", { style: "font-weight:500" }, "Waiting for the AI quota to reset"),
-      stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
-      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free Gemini key allows about 20 requests a day per model; add a second free writer (Groq or Mistral, on API keys) and it takes over while this one waits.")) : null,
 
     autoPanel(stats),
     stats?.autoOn && stats?.newsPrograms?.length ? newsControls(stats) : null,
 
     // Files on your PC: whether anyone can see them right now depends on the PC and its tunnel being up.
     stats?.filesOnPc ? h("div", { class: "panel", style: `margin-top:12px${stats.pcTunnel ? "" : ";border-color:var(--amber)"}` },
-      h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Files are kept on your PC"), h("span", { class: `tag${stats.pcTunnel ? " green" : ""}` }, stats.pcTunnel ? "reachable" : "PC off")),
+      h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Files are kept on your PC"), h("span", { class: `tag${stats.pcTunnel ? " green" : ""}` }, stats.pcTunnel ? "reachable" : "PC off"),
+        h("a", { class: "small right", href: "#/help" }, "What needs my PC →")),
       h("div", { class: "sub" }, stats.pcTunnel ? "Pictures and videos are stored on your PC and served from it while it runs. Work that makes them runs on your PC too."
         : "Your PC (or its tunnel) is off, so pictures and videos can't be shown or posted, and work that makes them waits. Start pc\\start.ps1."),
       pcMediaLine(stats.pcMedia)) : null,
+
+    (stats?.quotaPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber);margin-top:12px" },
+      h("b", { style: "font-weight:500" }, "Waiting for the AI quota to reset"),
+      stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free Gemini key allows about 20 requests a day per model; add a second free writer (Groq or Mistral, on API keys) and it takes over while this one waits.")) : null,
+    (stats?.backlogPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber);margin-top:12px" },
+      h("b", { style: "font-weight:500" }, "Waiting for you to review"),
+      stats.backlogPauses.map((p) => h("div", { class: "sub" }, `${p.program}: ${p.waiting} drafts are waiting, so it has stopped drafting until fewer than ${p.limit} are`)),
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Review them (or let them expire) and it starts again by itself. This keeps the free AI allowance for work you will see — change the limit in Settings → Review and news.")) : null,
+
     // Free storage is 1 GB; past it Supabase refuses every file, so how full it is belongs on the first page.
     stats?.storage ? h("div", { class: "panel", style: `margin-top:12px${stats.storage.share >= 0.8 ? ";border-color:var(--amber)" : ""}` },
       h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Storage"), h("span", { class: `tag${stats.storage.share >= 0.8 ? "" : " green"}` }, `${stats.storage.usedMb} of ${stats.storage.limitMb} MB (${Math.round(stats.storage.share * 100)}%)`)),
@@ -274,11 +360,6 @@ pages.overview = async () => {
         (stats.aiToday || []).map((r) => h("span", { class: "tag" }, `${r.provider}: ${r.requests}`))),
       h("div", { class: "sub" }, "A free Gemini key allows about 20 requests a day per model, so this is what limits how much gets made. A clipped video uses about one; a news draft two or three. A second free writer (Groq, on API keys) adds its own allowance.")) : null,
 
-    (stats?.backlogPauses || []).length ? h("div", { class: "panel", style: "border-color:var(--amber);margin-top:12px" },
-      h("b", { style: "font-weight:500" }, "Waiting for you to review"),
-      stats.backlogPauses.map((p) => h("div", { class: "sub" }, `${p.program}: ${p.waiting} drafts are waiting, so it has stopped drafting until fewer than ${p.limit} are`)),
-      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Review them (or let them expire) and it starts again by itself. This keeps the free AI allowance for work you will see — change the limit in Settings → review.max_waiting.")) : null,
-
     h("h2", null, "Alerts", stats?.alerts ? h("span", { class: "tag red", style: "margin-left:8px" }, `${stats.alerts} new`) : null),
     h("div", { class: "panel" }, alerts.length ? [
       alerts.map((a) => h("div", { class: "row", style: `padding:8px 0;border-bottom:1px solid var(--ink-3);align-items:flex-start;opacity:${a.read_at ? 0.6 : 1}` },
@@ -286,22 +367,24 @@ pages.overview = async () => {
       h("div", { class: "row", style: "margin-top:10px" }, h("button", { class: "btn sm", onclick: () => run(() => post("/api/notifications/read-all"), "Marked as read").then(route) }, "Mark all read"), h("a", { class: "small", href: "#/settings" }, "Send alerts to Telegram"))]
       : h("p", { class: "muted", style: "margin:0" }, "No alerts. Problems you need to act on — a rejected or unpaid AI key, a failing feed, an expired publishing token, the budget cap — show up here and, if you connect Telegram, on your phone.")),
 
-    h("h2", null, "Worker lanes"),
-    h("div", { class: "panel" },
+    blueprint ? h("h2", null, "What it makes ", h("a", { class: "small", href: "#/catalog", style: "font-family:var(--sans);font-weight:400" }, "all variants →")) : null,
+    blueprint ? h("div", { class: "variants compact" }, blueprint.map((r) => { const [tone] = STATUS_TAG[r.status] || [""];
+      return h("a", { class: "variant mini" + (r.ready ? " ready" : ""), href: "#/catalog", title: r.what }, h("span", { class: "vid" }, r.id), h("span", { class: "grow" }, r.name),
+        h("span", { class: `tag ${r.ready ? "green" : tone}` }, r.ready ? "ready" : r.status === "to build" ? "to build" : r.needs.filter((n) => !n.ok).map((n) => n.label).join(", ") || r.status)); })) : null,
+
+    // The engine's own work queues: rarely touched, so folded away — every lane and the PC's job count are inside.
+    h("div", { style: "margin-top:26px" }, fold("overview.lanes", [h("b", { style: "font-weight:500" }, "Advanced: worker lanes"), h("span", { class: "small mute" }, " — pause one kind of work, and how many jobs your PC runs at once")],
       h("p", { class: "muted", style: "margin:0 0 10px" }, "Click a lane to pause or resume it. Paused lanes keep their jobs and pick them up when resumed."),
       h("div", { class: "lanes" }, lanes.map((l) => h("button", { class: "lane" + (queues[l] === false ? " off" : ""), onclick: async () => {
         const next = { ...queues, [l]: queues[l] === false };
         await run(() => put("/api/settings/queues.enabled", { value: next }), `${LANE_LABEL[l] || l} lane ${next[l] === false ? "paused" : "resumed"}`); route();
       } }, h("span", { class: "dot" }), LANE_LABEL[l] || l))),
       pcSlotsRow(sets),
-      stats?.globalPause ? h("p", { style: "margin:12px 0 0;color:var(--amber)" }, "Publishing is globally paused (Settings). Approved items will wait.") : null),
+      stats?.globalPause ? h("p", { style: "margin:12px 0 0;color:var(--amber)" }, "Publishing is globally paused (Settings). Approved items will wait.") : null)),
 
-    blueprint ? h("h2", null, "What it makes ", h("a", { class: "small", href: "#/catalog", style: "font-family:var(--sans);font-weight:400" }, "all variants →")) : null,
-    blueprint ? h("div", { class: "variants compact" }, blueprint.map((r) => { const [tone] = STATUS_TAG[r.status] || [""];
-      return h("a", { class: "variant mini" + (r.ready ? " ready" : ""), href: "#/catalog", title: r.what }, h("span", { class: "vid" }, r.id), h("span", { class: "grow" }, r.name),
-        h("span", { class: `tag ${r.ready ? "green" : tone}` }, r.ready ? "ready" : r.status === "to build" ? "to build" : r.needs.filter((n) => !n.ok).map((n) => n.label).join(", ") || r.status)); })) : null,
-
-    setup ? h("h2", null, "Setup ", h("span", { class: `tag ${setup.done === setup.total ? "green" : "amber"}` }, `${setup.done} of ${setup.total}`)) : null,
+    // The install's own checklist from the engine — keys, Render settings, a real channel. Different from "Start here",
+    // which is the owner's first steps; this is what stands between the install and running on its own.
+    setup ? h("h2", null, "Going-live checklist ", h("span", { class: `tag ${setup.done === setup.total ? "green" : "amber"}` }, `${setup.done} of ${setup.total}`)) : null,
     setup ? h("div", { class: "panel" }, h("ol", { class: "steps" }, setup.items.map((s) => step(s.ok, h("span", null, h("b", { style: "font-weight:500" }, s.title), " — ", s.link && !s.ok ? h("a", { href: s.link }, s.detail) : s.detail))))) : null,
 
     seeded ? null : h("h2", null, "Try it with mock data"),
@@ -311,13 +394,43 @@ pages.overview = async () => {
           !seeded ? h("button", { class: "btn primary sm", onclick: () => run(async () => { const r = await post("/api/seed"); jsonDialog("Starter setup created", r); route(); }, "Starter setup created") }, "Create starter setup") : null)),
         step(sources.some((s) => s.item_count > 0), h("span", null, "Poll the mock source so it drops a few headlines into the inbox. ",
           seeded && !generated ? h("button", { class: "btn sm", onclick: () => run(async () => { for (const s of sources) await post(`/api/sources/${s.id}/poll`); }, "Polling queued — check back in ~30 s") }, "Poll all sources now") : null)),
-        step(generated, h("span", null, "The program picks up new headlines automatically, or you can generate one on demand from ", h("a", { href: "#/programs" }, "Programs"), ".")),
+        step(generated, h("span", null, "With automatic production on, the programme picks up new headlines by itself — or generate one now from ", h("a", { href: "#/programs" }, "Programmes"), ".")),
         step(pending > 0 || published, h("span", null, "Approve the item in ", h("a", { href: "#/review" }, "Review"), ".")),
         step(published, h("span", null, "It renders and publishes to every channel subscribed to the program (mock publisher for now), and lands in ", h("a", { href: "#/items" }, "Content"), ".")),
       )),
+    remember.get("startHidden") === "1" ? h("p", { class: "small mute", style: "margin-top:24px" }, h("a", { href: "#", onclick: (e) => { e.preventDefault(); remember.set("startHidden", null); route(); } }, "Show the “Start here” steps again")) : null,
   );
   return root;
 };
+// The first steps for a new owner, in order, each linking to its page and ticked when the data says it is done. Ticks
+// come only from what the Overview already loads (and the brands list). Open until the steps are done, then closed;
+// it can be hidden for good once done, which this browser remembers.
+function startHere({ brands, programs, channels, setup, generated, published }) {
+  if (remember.get("startHidden") === "1") return null;
+  const it = stats?.items || {};
+  const reviewed = published || ["APPROVED", "RENDERED", "READY_TO_PUBLISH", "PUBLISHING", "PUBLISHED", "REJECTED"].some((s) => it[s]);
+  const channelOk = setup?.items?.find((x) => x.key === "channel")?.ok ?? channels.length > 0;
+  const steps = [
+    { ok: brands.length > 0, title: "Make a brand", what: "its name, logo and colours go on every card and video.", links: [["#/brands", "Brands"]] },
+    { ok: programs.length > 0, title: "Make a programme", what: "pick what it makes — a clip reel, news cards, an explainer — and press “Make a programme”.", links: [["#/catalog", "What it makes"]] },
+    { ok: generated, title: "Make your first piece", what: "paste a video link under Videos to clip, or press “Generate now” on a programme.", links: [["#/candidates", "Videos to clip"], ["#/programs", "Programmes"]], pc: true },
+    { ok: reviewed, title: "Review it", what: "approve, edit or reject it. Nothing is posted without you.", links: [["#/review", "Review"]] },
+    { ok: channelOk, title: "Connect a channel when you are ready", what: "a Facebook Page, Instagram account or YouTube channel, with its token.", links: [["#/channels", "Channels"]] },
+    { ok: !!stats?.autoOn, title: "Turn on automatic production — only if you want it", what: "then the engine reads the feeds and makes things by itself. The switch is just below.", links: [], optional: true },
+  ];
+  const need = steps.filter((s) => !s.optional), done = need.filter((s) => s.ok).length, all = done === need.length;
+  const d = h("details", { class: "panel start" },
+    h("summary", null, h("b", null, "Start here"), " ", h("span", { class: `tag ${all ? "green" : "amber"}` }, all ? "all done" : `${done} of ${need.length} done`),
+      h("span", { class: "small mute" }, all ? "" : " — the steps to your first post, in order")),
+    h("ol", { class: "steps", style: "margin-top:8px" }, steps.map((s) => step(s.ok, h("span", null, h("b", { style: "font-weight:500" }, s.title), s.pc ? [" ", pcMark("making it")] : null, " — ", s.what, " ",
+      s.links.map(([href, label], i) => [i ? " or " : "", h("a", { href }, label, " →")]))))),
+    all ? h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "small mute grow" }, "Everything here is done."), h("button", { class: "btn sm", onclick: () => { remember.set("startHidden", "1"); route(); } }, "Hide this")) : null);
+  // Open while there is something left to do, unless it was closed by hand; once all done, closed unless opened by hand.
+  const saved = remember.get("startOpen");
+  d.open = saved == null ? !all : saved === "1";
+  d.addEventListener("toggle", () => remember.set("startOpen", d.open === !all ? null : d.open ? "1" : "0"));
+  return d;
+}
 // How full your PC's media folder is, from its heartbeat. Everything kept on the PC lands there and stays until cleanup
 // removes it, so a disk filling up is shown before it stops the work. Amber under 5 GB free.
 const fmtMb = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
@@ -361,7 +474,7 @@ function step(done, content) { return h("li", { class: done ? "done" : "" }, con
 pages.review = async (sub) => {
   const list = await get("/api/review");
   const clean = list.filter((it) => it.qa_status === "PASS");
-  const root = h("div", null, pageHead("Review", "Nothing publishes without your approval. Edit anything before you approve it.",
+  const root = h("div", null, pageHead("Review", INFO.review,
     clean.length > 1 ? h("button", { class: "btn primary", onclick: () => confirmModal(`Approve ${clean.length} drafts?`,
       `These are the ones the standards check passed. Each is scheduled on its channel's next free slot. ${list.length - clean.length ? `The ${list.length - clean.length} it flagged stay here for you.` : ""}`,
       () => run(async () => { const r = await post("/api/review/approve-clean", {}); toast(`Approved ${r.approved}${r.failed.length ? ` · ${r.failed.length} could not be approved` : ""}`); }).then(route), "Approve them") },
@@ -477,7 +590,7 @@ function proofView(it, onDone, notes = []) {
       h("button", { class: "btn link sm right", onclick: () => jsonDialog("Raw item", it) }, "Raw JSON")),
     field("Headline", headline),
     heroEl,
-    hero ? h("div", { class: "row small mute", style: "margin:-6px 0 10px" }, h("span", null, hero.kind, hero.width ? ` ${hero.width}×${hero.height}` : "", hero.duration_seconds ? ` ${Math.round(hero.duration_seconds)}s` : ""), h("a", { href: hero.url, target: "_blank" }, "Open"), !isVideo ? h("button", { class: "btn link sm", onclick: () => regen("image") }, "Regenerate image") : null) : null,
+    hero ? h("div", { class: "row small mute", style: "margin:-6px 0 10px" }, h("span", null, hero.kind, hero.width ? ` ${hero.width}×${hero.height}` : "", hero.duration_seconds ? ` ${Math.round(hero.duration_seconds)}s` : ""), h("a", { href: hero.url, target: "_blank" }, "Open"), !isVideo ? [h("button", { class: "btn link sm", onclick: () => regen("image") }, "Regenerate image"), pcMark("regenerating")] : null) : null,
     hero?.meta?.fallback ? h("p", { class: "small", style: "margin:-6px 0 10px;color:var(--amber)" }, "Text card — no picture could be made: ", hero.meta.fallback.slice(0, 160)) : null,
     // Only a photocard is redrawn from an edited headline. A video's words are already spoken and burned in.
     isVideo ? h("p", { class: "small mute", style: "margin:-6px 0 10px" }, "Edits here change the post's title, caption and text, not the video itself. To change what is said or shown, regenerate it.") : null,
@@ -490,13 +603,15 @@ function proofView(it, onDone, notes = []) {
     src.url || src.provider ? h("p", { class: "small mute" }, "Source: ", nice(src.provider || ""), " ", src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener" }, src.url) : null) : null,
     it.assets?.length ? h("div", { class: "small mute" }, "Will publish to: ", it.assets.map((a) => `${a.channel_name} (${a.platform})`).join(", ")) : null,
     h("div", { class: "bar" },
-      h("button", { class: "btn primary", onclick: approve }, "Approve & publish"),
+      h("button", { class: "btn primary", onclick: approve }, "Approve & publish"), pcMark("rendering and posting it after you approve (the approval itself is saved at once)"),
       h("span", { class: "small mute" }, "or schedule for"), schedule,
       h("button", { class: "btn", onclick: save }, "Save draft"),
       !isVideo ? h("button", { class: "btn", onclick: () => regen("headline") }, "Regenerate headline")
         : reRender ? h("button", { class: "btn", title: reRender === "render" ? "Draws the stored plan again on your PC: same script, narration and pictures" : "Cuts and renders the same moment again", onclick: () => regen(reRender, reRender === "render" ? "Re-rendering on your PC" : "Re-rendering") }, "Re-render") : null,
       !isVideo ? h("button", { class: "btn", onclick: () => regen("captions") }, "Regenerate captions") : null,
-      h("button", { class: "btn", onclick: () => regen("all") }, "Regenerate everything")),
+      h("button", { class: "btn", onclick: () => regen("all") }, "Regenerate everything"),
+      // Every regenerate and re-render is a job that makes files, so it runs on your PC while files are kept there.
+      stats?.filesOnPc ? h("span", { class: "small mute" }, pcMark("regenerating or re-rendering"), " = runs on your PC") : null),
     h("div", { class: "row" }, note, h("button", { class: "btn danger", onclick: reject }, "Reject")),
   );
 }
@@ -520,7 +635,7 @@ pages.items = async (sub) => {
   const filters = ["", "PENDING_REVIEW", "APPROVED", "RENDERING", "PUBLISHED", "FAILED", "REJECTED", "QUEUED", "DRAFTING"];
   let status = sub || "";
   const wrap = h("div", null);
-  const root = h("div", null, pageHead("Content", "Every item the engine has produced, newest first."), wrap);
+  const root = h("div", null, pageHead("Content", INFO.items), wrap);
   const draw = async () => {
     wrap.innerHTML = "";
     const tabs = h("div", { class: "tabs" }, filters.map((f) => h("button", { class: f === status ? "active" : "", onclick: () => { status = f; history.replaceState(null, "", "#/items/" + f); draw(); } }, f ? nice(f) : "All")));
@@ -536,7 +651,7 @@ pages.items = async (sub) => {
           h("td", { class: "small" }, usd(r.generation_cost_usd)),
           h("td", { class: "row" },
             r.status === "PENDING_REVIEW" ? h("a", { class: "btn sm", href: `#/review/${r.id}` }, "Review") : null,
-            r.status === "FAILED" ? h("button", { class: "btn sm", onclick: () => run(() => post(`/api/content-items/${r.id}/regenerate`, { part: "all" }), "Regenerating").then(draw) }, "Retry") : null,
+            r.status === "FAILED" ? [h("button", { class: "btn sm", onclick: () => run(() => post(`/api/content-items/${r.id}/regenerate`, { part: "all" }), "Regenerating").then(draw) }, "Retry"), pcMark("making it again")] : null,
             ["FAILED", "REJECTED"].includes(r.status) ? h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete item?", "This removes the item and its media records.", () => run(() => del(`/api/content-items/${r.id}`), "Deleted").then(draw)) }, "Delete") : null)))))));
   };
   await draw();
@@ -555,10 +670,10 @@ async function openItem(id) {
       h("td", null, a.channel_name, h("span", { class: "sub" }, a.platform)), h("td", null, tag(a.status), a.error_message ? h("span", { class: "sub", style: "color:var(--red)" }, a.error_message) : null),
       h("td", { class: "small" }, a.published_url ? h("a", { href: a.published_url, target: "_blank" }, "View post") : a.scheduled_for ? "scheduled " + fmtDate(a.scheduled_for) : ""),
       h("td", { class: "row" },
-        a.status === "FAILED" ? h("button", { class: "btn sm", onclick: () => run(() => post(`/api/assets/${a.id}/retry`), "Retry queued") }, "Retry") : null,
+        a.status === "FAILED" ? [h("button", { class: "btn sm", onclick: () => run(() => post(`/api/assets/${a.id}/retry`), "Retry queued") }, "Retry"), pcMark("posting it")] : null,
         a.status === "PUBLISHED" ? h("button", { class: "btn sm", onclick: () => run(async () => jsonDialog("Metrics", await post(`/api/assets/${a.id}/poll-metrics`))) }, "Pull metrics") : null,
         a.status === "PUBLISHED" ? h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post(`/api/assets/${a.id}/check-repurpose`); toast(r.repurposed ? "Queued a repurposed draft" : "Not above the view threshold yet"); }) }, "Check repurpose") : null)))))) : h("p", { class: "mute" }, "No channels yet — assets are created on approval."),
-    it.status === "APPROVED" || it.assets?.some((a) => ["PENDING", "FAILED"].includes(a.status)) ? h("button", { class: "btn", style: "margin-top:8px", onclick: () => run(() => post(`/api/content-items/${id}/publish-now`), "Publishing now") }, "Publish now") : null,
+    it.status === "APPROVED" || it.assets?.some((a) => ["PENDING", "FAILED"].includes(a.status)) ? h("div", { class: "row", style: "margin-top:8px" }, h("button", { class: "btn", onclick: () => run(() => post(`/api/content-items/${id}/publish-now`), "Publishing now") }, "Publish now"), pcMark("posting it")) : null,
     h("h3", { style: "margin-top:14px" }, "Jobs"),
     jobs.length ? h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, jobs.map((j) => h("tr", null,
       h("td", { class: "mono" }, j.type), h("td", null, tag(j.status)), h("td", { class: "small" }, "attempt ", j.attempts, j.error_message ? h("span", { class: "sub", style: "color:var(--red)" }, j.error_message) : null), h("td", { class: "small" }, fmtDate(j.created_at)),
@@ -571,7 +686,7 @@ async function openItem(id) {
 pages.programs = async () => {
   const [programs, brands, sources, channels, adapters, styles] = await Promise.all([get("/api/programs"), get("/api/brands"), get("/api/sources"), get("/api/channels"), get("/api/adapters"), get("/api/style-profiles")]);
   const root = h("div", null,
-    pageHead("Programmes", "A programme is a recurring show: which variant of the blueprint it makes, where its material comes from, who writes and voices it, and how strictly you review it.",
+    pageHead("Programmes", INFO.programs,
       h("a", { class: "btn", href: "#/catalog" }, "Start from a variant"),
       h("button", { class: "btn", onclick: () => brandDialog(brands) }, "Brands"),
       h("button", { class: "btn", onclick: () => styleDialog(styles, brands) }, "Style profiles"),
@@ -611,14 +726,14 @@ function programCard(p, brands, sources, channels, adapters, styles) {
       h("div", null, h("div", { class: "small muted" }, "Publishes to"),
         h("div", { class: "row", style: "margin-top:4px" }, (p.channels || []).map((c) => h("span", { class: "tag green" }, c.name, " ", h("a", { href: "#", title: "Unsubscribe", onclick: (e) => { e.preventDefault(); run(() => del(`/api/channels/${c.id}/niches/${p.id}`), "Channel unsubscribed").then(route); } }, "×"))),
           linkPicker(channels.filter((c) => !(p.channels || []).some((x) => x.id === c.id)).map((c) => ({ id: c.id, name: c.display_name })), (id) => run(() => post(`/api/channels/${id}/niches/${p.id}`), "Channel subscribed").then(route), "Add channel")))),
-    h("div", { class: "small mute", style: "margin-top:8px" }, "Writes with: ", [p.script_adapter, ...(p.script_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(default)",
-      isVideo ? ` · picks moments with: ${[p.clip_adapter, ...(p.clip_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(default)"}` : ""),
+    h("div", { class: "small mute", style: "margin-top:8px" }, "Writer: ", h("span", { class: "mono" }, [p.script_adapter, ...(p.script_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(the engine's choice)"),
+      isVideo ? [" · picks moments with: ", h("span", { class: "mono" }, [p.clip_adapter, ...(p.clip_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(the engine's choice)")] : ""),
     h("div", { class: "small mute", style: "margin-top:2px" }, "Style: ", p.style_profile_id ? (styles.find((s) => s.id === p.style_profile_id)?.name || "linked") : h("span", null, "none yet (being generated, or pick one in Edit)"),
       " · quality check: ", p.method_config?.qa?.enabled == null ? "as in Settings" : p.method_config.qa.enabled ? `on${p.method_config.qa.auto_fix === false ? "" : p.method_config.qa.auto_fix ? " with auto-fix" : " (auto-fix as in Settings)"}` : "off",
       p.method_config?.autopilot?.topics_per_day ? ` · autopilot: ${p.method_config.autopilot.topics_per_day} idea(s)/day` : ""),
     h("div", { class: "row", style: "margin-top:12px" },
-      isVideo ? h("span", { class: "small mute" }, "Video programmes make clips from the links under Videos to clip, not from a topic.") : [topic, genBtn],
-      isVideo ? h("button", { class: "btn sm", onclick: () => candidateDialog(p.id) }, "Add a video URL") : null,
+      isVideo ? h("span", { class: "small mute" }, "Video programmes make clips from the links under Videos to clip, not from a topic.") : [topic, genBtn, pcMark("making it")],
+      isVideo ? [h("button", { class: "btn sm", onclick: () => candidateDialog(p.id) }, "Add a video URL"), pcMark("processing the video and cutting its clips")] : null,
       h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post(`/api/programs/${p.id}/plan`); toast(`${r.created} new idea(s)`); location.hash = `#/ideas/${p.id}`; }) }, "Plan ideas now"),
       h("button", { class: "btn sm", onclick: () => seriesDialog(p) }, "Series"),
       h("a", { class: "btn sm link", href: `#/ideas/${p.id}` }, "Ideas"),
@@ -633,7 +748,7 @@ async function seriesDialog(p) {
     list.length ? h("div", { class: "table-wrap" }, h("table", null, h("tbody", null, list.map((s) => h("tr", null,
       h("td", null, s.display_name, h("span", { class: "sub" }, s.premise || "")), h("td", { class: "small" }, s.episode_counter, " episodes", s.auto_generate ? h("span", { class: "sub" }, "next ", fmtDate(s.next_due_at)) : null),
       h("td", { class: "row" },
-        h("button", { class: "btn sm", onclick: () => run(() => post(`/api/series/${s.id}/next`), "Next episode is being written") }, "Next episode now"),
+        h("button", { class: "btn sm", onclick: () => run(() => post(`/api/series/${s.id}/next`), "Next episode is being written") }, "Next episode now"), pcMark("making the episode"),
         h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/series/${s.id}`, { autoGenerate: !yes(s.auto_generate), nextDueAt: yes(s.auto_generate) ? null : new Date().toISOString() }), "Saved").then(() => { close(); seriesDialog(p); }) }, yes(s.auto_generate) ? "Stop auto" : "Auto"))))))) : h("p", { class: "mute" }, "No series yet. A series keeps a running premise; each episode is written with the earlier ones as context."),
     h("h3", { style: "margin-top:14px" }, "New series"), form, field("Premise", premise),
     h("div", { class: "foot" }, h("button", { class: "btn primary", onclick: () => run(async () => { const v = readForm(form); await post("/api/series", { nicheId: p.id, ...v, key: v.key || v.displayName.toLowerCase().replace(/\W+/g, "_"), premise: premise.value, nextDueAt: v.autoGenerate ? new Date().toISOString() : null }); close(); seriesDialog(p); }, "Series created") }, "Create series"))), { wide: true });
@@ -696,46 +811,48 @@ async function programDialog(p, brands, sources, adapters, styles, done, start =
   // The programme's own choice is always an option, even when it is not an enabled instance: otherwise the select shows
   // "(default)" and saving would quietly swap it for the engine's choice.
   const opt = (keys, cur) => select(null, [["", "(default)"], ...[...new Set([...(keys || []), ...(cur ? [cur] : [])])].map((k) => [k, k])], cur || "");
+  // The essentials first; what is rarely changed sits in the "Advanced" folds below. Every field is still in the form
+  // (readForm reads them all, open or folded), so what is saved is exactly what it always was.
   const f = h("div", null,
     h("div", { class: "grid2" },
       field("Name", text("displayName", p?.display_name)),
       p ? null : field("Key", text("key", "", { placeholder: "e.g. bd_news" }), "Short unique id, letters/underscores."),
       p ? null : field("Brand", select("brandId", brands.map((b) => [b.id, b.name]))),
-      field("Content type", select("contentType", CONTENT_TYPES.map((t) => [t, nice(t)]), p?.content_type || "NEWS_STATIC", { onchange: (e) => showFor(e.target.closest(".dialog") || document) })),
-      field("Language", text("language", p?.language || "en")),
+      field("Content type", select("contentType", CONTENT_TYPES.map((t) => [t, nice(t)]), p?.content_type || "NEWS_STATIC", { onchange: (e) => showFor(e.target.closest(".dialog") || document) }), "Set by “What it makes” above; change it only if you know you need to."),
+      field("Language", text("language", p?.language || "en"), "bn for Bangla, en for English."),
       field("Country", text("country", p?.country || "Bangladesh")),
-      field("Review", select("approvalMode", [["MANUAL", "Manual — waits for me"], ["AUTO_AFTER_WINDOW", "Auto-approve after a window"], ["AUTO", "Auto — publish immediately"]], p?.approval_mode || "MANUAL")),
+      field("How you review it", select("approvalMode", [["MANUAL", "Manual — waits for me"], ["AUTO_AFTER_WINDOW", "Auto-approve after a window"], ["AUTO", "Auto — publish immediately"]], p?.approval_mode || "MANUAL")),
       h("div", { "data-for": "video" }, field("Video work runs on", select("computeWhere", [["server", "Server — always on, slower, YouTube blocked"], ["pc", "My PC — fast, free, YouTube works; waits while it's off"]], p?.compute_where || "server"),
-        "Only video steps move. News, review and publishing stay on the server.")),
-      field("Review window (minutes)", num("reviewWindowMinutes", p?.review_window_minutes ?? 60)),
+        stats?.filesOnPc ? "Only video steps move. Files are kept on your PC, so making anything needs the PC whichever you pick here." : "Only video steps move. News, review and publishing stay on the server.")),
+      field("Auto-approve window (minutes)", num("reviewWindowMinutes", p?.review_window_minutes ?? 60), "Only used with “Auto-approve after a window”: how long a draft waits for you."),
       field("Max items per day", num("maxItemsPerDay", p?.max_items_per_day), "Leave empty for no cap."),
-      field("Style profile", select("styleProfileId", [["", "(none)"], ...styles.map((s) => [s.id, s.name])], p?.style_profile_id || "")),
+      field("House style", select("styleProfileId", [["", "(none)"], ...styles.map((s) => [s.id, s.name])], p?.style_profile_id || ""), "How it writes: tone, rules, banned words (Programmes → Style profiles)."),
       h("div", { "data-for": "clips" }, field("Videos it takes", select("licensePolicy", [["ANY", "Any licence"], ["CC_ONLY", "Creative Commons only"]], p?.license_policy || "ANY"),
         "From its sources' feeds. A source set to Creative Commons only stays that way whatever this says."))),
-    field("Tone", text("tone", p?.tone || "clear, factual, click-worthy")),
+    field("Tone of writing", text("tone", p?.tone || "clear, factual, click-worthy")),
     check("publishToPortal", "Also publish an article to the news portal", p ? yes(p.publish_to_portal) : true),
-    h("details", { class: "engine-choices" }, h("summary", null, "Engine choices — which adapter does each step, and who stands in when it cannot"),
-      h("div", { class: "grid3", style: "margin-top:10px" },
-        field("Topic source", Object.assign(opt(a.topicSources, p?.topic_source_adapter), { name: "topicSourceAdapter" })),
-        field("Script / LLM", Object.assign(opt(a.scriptAdapters, p?.script_adapter), { name: "scriptAdapter" })),
-        field("Image", Object.assign(opt(a.imageAdapters, p?.image_adapter), { name: "imageAdapter" })),
-        field("Voice", Object.assign(opt(a.voiceAdapters, p?.voice_adapter), { name: "voiceAdapter" })),
+    p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name])), "Leave empty for a Bangladesh program: it starts with the verified sources for its language (TV channels for video programs)."),
+    h("div", { "data-for": "video" }, videoFields(p, uploads)),
+    fold("prog.stories", [h("b", { style: "font-weight:500" }, "Advanced: which stories, accuracy and pictures"), h("span", { class: "small mute" }, " — story filters, duplicate check, priority, card layout")], filterFields(p)),
+    fold("prog.automation", [h("b", { style: "font-weight:500" }, "Advanced: quality check, autopilot and news timing"), h("span", { class: "small mute" }, " — each follows Settings unless set here")], automationFields(p?.method_config || {})),
+    fold("prog.engine", [h("b", { style: "font-weight:500" }, "Advanced: which tool does each step"), h("span", { class: "small mute" }, " — and who stands in when it cannot. Empty = the engine's choice")],
+      h("div", { class: "grid3" },
+        field(["Where topics come from", tech("topic source")], Object.assign(opt(a.topicSources, p?.topic_source_adapter), { name: "topicSourceAdapter" })),
+        field(["Writer (AI)", tech("script")], Object.assign(opt(a.scriptAdapters, p?.script_adapter), { name: "scriptAdapter" })),
+        field(["Pictures", tech("image")], Object.assign(opt(a.imageAdapters, p?.image_adapter), { name: "imageAdapter" })),
+        field(["Voice", tech("voice")], Object.assign(opt(a.voiceAdapters, p?.voice_adapter), { name: "voiceAdapter" })),
         h("div", { "data-for": "voiced" }, field("Voice name", text("voiceId", p?.voice_id || "", { placeholder: "(the voice's default for the language)" }), "Optional: a voice of the adapter above, e.g. bn-BD-PradeepNeural for edge-tts.")),
-        field("Render", Object.assign(opt(a.renderAdapters, p?.render_adapter), { name: "renderAdapter" })),
-        field("Embeddings (dedup)", Object.assign(opt(a.embedAdapters, p?.embed_adapter), { name: "embedAdapter" })),
-        field("Download (video)", Object.assign(opt(a.downloadAdapters, p?.download_adapter), { name: "downloadAdapter" })),
-        field("Transcript (video)", Object.assign(opt(a.transcriptAdapters, p?.transcript_adapter), { name: "transcriptAdapter" })),
-        field("Clipper (video)", Object.assign(opt(a.clipAdapters, p?.clip_adapter), { name: "clipAdapter" }))),
+        field(["Putting the video together", tech("render")], Object.assign(opt(a.renderAdapters, p?.render_adapter), { name: "renderAdapter" })),
+        field(["Duplicate check", tech("embeddings")], Object.assign(opt(a.embedAdapters, p?.embed_adapter), { name: "embedAdapter" })),
+        field(["Video download", tech("download")], Object.assign(opt(a.downloadAdapters, p?.download_adapter), { name: "downloadAdapter" })),
+        field(["Transcriber", tech("transcript")], Object.assign(opt(a.transcriptAdapters, p?.transcript_adapter), { name: "transcriptAdapter" })),
+        field(["Moment picker", tech("clipper")], Object.assign(opt(a.clipAdapters, p?.clip_adapter), { name: "clipAdapter" }))),
       h("div", { class: "grid2" },
         chainField("Writers after the first", "scriptAdapterFallbacks", p?.script_adapter_fallbacks, a.scriptAdapters, "Tried in order when the writer above has spent its allowance."),
         chainField("Voices after the first", "voiceAdapterFallbacks", p?.voice_adapter_fallbacks, a.voiceAdapters),
         chainField("Pictures after the first", "imageAdapterFallbacks", p?.image_adapter_fallbacks, a.imageAdapters),
         chainField("Moment pickers after the first", "clipAdapterFallbacks", p?.clip_adapter_fallbacks, a.clipAdapters),
         chainField("Transcribers after the first", "transcriptAdapterFallbacks", p?.transcript_adapter_fallbacks, a.transcriptAdapters))),
-    h("div", { "data-for": "video" }, videoFields(p, uploads)),
-    automationFields(p?.method_config || {}),
-    filterFields(p),
-    p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name])), "Leave empty for a Bangladesh program: it starts with the verified sources for its language (TV channels for video programs)."),
   );
   // What it makes, as the blueprint names it: picking a variant sets the type, method and pickers it needs.
   const buildable = catalog.filter((v) => v.setup && v.status !== "to build");
@@ -781,37 +898,41 @@ async function programDialog(p, brands, sources, adapters, styles, done, start =
 const PRODUCTION_METHODS = [["", "(default for the type)"], ["PODCAST_HIGHLIGHT", "Highlight clips — cut the best moments"], ["VOICEOVER", "Voice-over — our narration over the clip"], ["TELECAST_INTRO", "Telecast with intro — a narrated headline card, then the report"], ["REACTION_OVERLAY", "Reaction short — your clip with the source (split-screen or corner)"], ["REACTION_LONG", "Reaction long-form — commentary between segments"], ["MOVIE_RECAP", "Recap from the transcript — narrated summary (5b)"], ["SCENE_RECAP", "Scene recap — Gemini watches the video, the film's sound stays under the narration (5a)"]];
 function videoFields(p, uploads) {
   const mc = p?.method_config || {}, reactors = uploads.filter((u) => u.meta?.purpose === "reactor"), music = uploads.filter((u) => u.meta?.purpose === "music");
+  // What most video programmes set up top; layout, speed, clip lengths and the illustrated cast in the fold below.
   return h("fieldset", null, h("legend", null, "Video"),
     h("div", { class: "grid3" },
-      field("Production method (clips)", select("productionMethod", PRODUCTION_METHODS, p?.production_method || "")),
+      field(["How clips are made", tech("production method")], select("productionMethod", PRODUCTION_METHODS, p?.production_method || "")),
       // The engine's default is vertical; a long video and a long-form reaction are landscape whatever this says.
       field("Orientation", select("_orientation", [["", "(default: vertical 9:16)"], ["9:16", "Vertical 9:16"], ["16:9", "Landscape 16:9"]], mc.orientation || "")),
-      field("Vertical layout for landscape footage", select("_verticalLayout", [["crop", "Crop to fill"], ["blurpad", "Whole picture on a blurred fill"]], mc.vertical_layout || "crop")),
       field("Reactor clip", select("_reactor", [["", reactors.length ? "(none)" : "(none — upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || mc.overlay_video_url || ""),
         "Reaction shorts (4a) cannot be made without one. A long-form reaction without one shows a waveform beside the commentary."),
       field("Reaction short layout", select("_reactionLayout", [["stack", "Split-screen — source on top, you below"], ["pip", "Corner — you over the whole source"]], mc.reaction_layout || "stack")),
-      field("When the AI picker is out of allowance", select("_pickerFallback", [["", "Wait for it — the best moment, a few hours later"], ["now", "Use the free picker now — sooner, weaker picks"]], mc.picker_fallback || "")),
-      field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame."),
       field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
       field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 })),
       field("Explainer style", select("_explainerStyle", [["", "General — the six layouts mixed"], ["data", "Data — charts, figures and timelines from the research's own numbers"], ["illustrated", "Illustrated — drawn scenes and the series' characters, moved in code"], ["3d", "3D (Blender) — 3D titles, growing bars and words; renders on your PC with Blender"]], mc.explainer_style || ""))),
-    // The clip keys the engine reads from method_config, with its own defaults as placeholders: empty keeps the default.
-    h("div", { class: "grid3", "data-for": "clips" },
-      field("Clips per video", num("_clipsPerVideo", mc.clips_per_video, { min: 1, max: 10, placeholder: "3" })),
-      field("Shortest clip (seconds)", num("_clipMin", mc.clip_min_seconds, { min: 5, placeholder: "25" })),
-      field("Longest clip (seconds)", num("_clipMax", mc.clip_max_seconds, { min: 10, placeholder: "75" })),
-      field("Clip videos from sources scoring at least (0-1)", num("_minScore", mc.min_score, { step: "0.05", min: 0, max: 1, placeholder: "0.5" }), "Videos a source brings in below this wait under Videos to clip for you to process by hand.")),
-    h("div", { class: "grid3" },
-      h("div", { "data-for": "recap" }, field("Recap length (seconds)", num("_recapSeconds", mc.recap_seconds, { min: 20, placeholder: "60" }))),
-      h("div", { "data-for": "reaction" }, field("Long reaction: source played, at most (minutes)", num("_maxPlay", mc.max_play_minutes, { min: 1, placeholder: "6" })))),
     h("div", { class: "grid2" },
-      field("Cast (illustrated)", area("_cast", (mc.characters || []).map((c) => `${c.name}: ${c.look}`).join("\n"), { placeholder: "One per line — Name: how they look\nRafi: a cheerful Bangladeshi rickshaw driver in a green lungi and white vest, thin moustache", style: "min-height:70px" }),
-        "The same characters come back every episode, drawn the same way. Leave empty and each story names its own."),
-      field("Art style (illustrated)", text("_artStyle", mc.art_style || "", { placeholder: "flat vector illustration, clean lines, soft warm colours, storybook style" })),
       field("Your footage folder (on the PC)", text("_footageDir", mc.footage_dir || "", { placeholder: "D:\\Footage" }), "Script videos take each section's footage from here first: clips found by their names, a .txt note beside them, or what Gemini sees in them. Set video work to run on My PC."),
       h("div", null, field("Clips Gemini describes per day", num("_describe", mc.describe_per_day ?? 5, { min: 0, max: 50 }), "Only clips without a name or note that says what they are; each is described once."),
         check("_ownOnly", "Own footage only — never stock", !!mc.own_footage_only))),
-    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false && mc.subtitles !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false && mc.subtitles !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)),
+    fold("prog.video", [h("b", { style: "font-weight:500" }, "More video options"), h("span", { class: "small mute" }, " — layout, speed, clip lengths, the illustrated cast")],
+      h("div", { class: "grid3" },
+        field("Vertical layout for landscape footage", select("_verticalLayout", [["crop", "Crop to fill"], ["blurpad", "Whole picture on a blurred fill"]], mc.vertical_layout || "crop")),
+        field("When the AI picker is out of allowance", select("_pickerFallback", [["", "Wait for it — the best moment, a few hours later"], ["now", "Use the free picker now — sooner, weaker picks"]], mc.picker_fallback || "")),
+        field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame.")),
+      // The clip keys the engine reads from method_config, with its own defaults as placeholders: empty keeps the default.
+      h("div", { class: "grid3", "data-for": "clips" },
+        field("Clips per video", num("_clipsPerVideo", mc.clips_per_video, { min: 1, max: 10, placeholder: "3" })),
+        field("Shortest clip (seconds)", num("_clipMin", mc.clip_min_seconds, { min: 5, placeholder: "25" })),
+        field("Longest clip (seconds)", num("_clipMax", mc.clip_max_seconds, { min: 10, placeholder: "75" })),
+        field("Clip videos from sources scoring at least (0-1)", num("_minScore", mc.min_score, { step: "0.05", min: 0, max: 1, placeholder: "0.5" }), "Videos a source brings in below this wait under Videos to clip for you to process by hand.")),
+      h("div", { class: "grid3" },
+        h("div", { "data-for": "recap" }, field("Recap length (seconds)", num("_recapSeconds", mc.recap_seconds, { min: 20, placeholder: "60" }))),
+        h("div", { "data-for": "reaction" }, field("Long reaction: source played, at most (minutes)", num("_maxPlay", mc.max_play_minutes, { min: 1, placeholder: "6" })))),
+      h("div", { class: "grid2" },
+        field("Cast (illustrated)", area("_cast", (mc.characters || []).map((c) => `${c.name}: ${c.look}`).join("\n"), { placeholder: "One per line — Name: how they look\nRafi: a cheerful Bangladeshi rickshaw driver in a green lungi and white vest, thin moustache", style: "min-height:70px" }),
+          "The same characters come back every episode, drawn the same way. Leave empty and each story names its own."),
+        field("Art style (illustrated)", text("_artStyle", mc.art_style || "", { placeholder: "flat vector illustration, clean lines, soft warm colours, storybook style" })))));
 }
 function readVideo(v, mc) {
   // Explainers read "subtitles", footage videos "captions": one box, both keys, so the box means the same on either.
@@ -936,7 +1057,7 @@ function styleDialog(styles, brands) {
 // ---------------------------------------------------------------- brands (+ brand kit)
 pages.brands = async () => {
   const [brands, uploads] = await Promise.all([get("/api/brands"), get("/api/uploads").catch(() => [])]);
-  const root = h("div", null, pageHead("Brands", "A brand owns programs and channels. Its kit — logo, colours, font, page handle, music — styles every photocard and video.",
+  const root = h("div", null, pageHead("Brands", [INFO.brands, h("span", { class: "sub" }, "A brand owns programmes and channels.")],
     h("button", { class: "btn primary", onclick: () => run(async () => { const name = prompt("Brand name"); if (name) { await post("/api/brands", { name }); route(); } }) }, "New brand")));
   if (!brands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No brands yet"), "Create one, then give it a kit."));
   for (const b of brands) root.appendChild(brandKitPanel(b, uploads.filter((u) => u.meta?.purpose === "music")));
@@ -952,7 +1073,7 @@ function mediaLibrary(uploads) {
   const rows = uploads.filter((u) => ["reactor", "music"].includes(u.meta?.purpose));
   return h("div", { class: "panel" }, h("h3", null, "Media library"),
     h("p", { class: "muted small", style: "margin:0 0 10px" }, "Reactor clips are looped beside the source in reaction videos (film yourself or a presenter reacting, 10-60 s). Music beds play quietly under reels and explainers — use tracks you have the rights to."),
-    h("div", { class: "row", style: "gap:16px;flex-wrap:wrap" }, h("span", { class: "small" }, "Add a reactor clip"), up("reactor", "video/mp4,video/webm,video/quicktime"), h("span", { class: "small" }, "Add a music bed"), up("music", "audio/mpeg,audio/mp4,audio/wav,audio/ogg")),
+    h("div", { class: "row", style: "gap:16px;flex-wrap:wrap" }, h("span", { class: "small" }, "Add a reactor clip"), up("reactor", "video/mp4,video/webm,video/quicktime"), h("span", { class: "small" }, "Add a music bed"), up("music", "audio/mpeg,audio/mp4,audio/wav,audio/ogg"), pcMark("saving an upload (it waits on the server until your PC stores it)")),
     rows.length ? h("div", { class: "table-wrap", style: "margin-top:10px" }, h("table", null, h("tbody", null, rows.map((u) => h("tr", null,
       h("td", null, h("span", { class: "tag" }, u.meta.purpose)), h("td", null, h("a", { href: u.url, target: "_blank" }, u.meta?.name || u.id)),
       h("td", { class: "small" }, u.duration_seconds ? `${Math.round(u.duration_seconds)} s` : ""), h("td", { class: "small" }, ago(u.created_at)),
@@ -967,20 +1088,23 @@ function brandKitPanel(b, music = []) {
     h("div", { class: "grid2" }, field("Name", text("name", b.name)), field("Description", text("description", b.description || ""), "Used when the AI writes the house style.")),
     h("div", { class: "grid3" },
       field("Panel colour", color("primary_color", k.primary_color || "#b3121f")), field("Accent colour", color("accent_color", k.accent_color || "#ffc400")), field("Text colour", color("text_color", k.text_color || "#ffffff"))),
-    field("Logo", h("div", { class: "row" }, logo, upload)),
+    field("Logo", h("div", { class: "row" }, logo, upload, pcMark("saving the uploaded logo"))),
     h("div", { class: "grid2" },
       field("Page handle / website", text("handle", k.handle, { placeholder: "fb.com/yourpage" })),
-      field("Font", text("font", k.font, { placeholder: "Noto Sans Bengali" }), "Installed font name, or a font file below."),
-      field("Font file URL(s)", text("fonts_url", k.fonts_url, { placeholder: "https://…/HindSiliguri-Bold.ttf" }), "Comma-separated .ttf/.otf."),
-      field("Picture share of the card", num("image_ratio", k.image_ratio ?? 0.6, { step: "0.05", min: 0.4, max: 0.75 })),
+      field("Font", text("font", k.font, { placeholder: "Noto Sans Bengali" }), "Installed font name, or a font file (under More kit options)."),
       field("Name on the cards", text("display_name", k.display_name, { placeholder: b.name }), "If it differs from the brand's name here."),
-      field("Website", text("website", k.website, { placeholder: "https://yoursite.com" }), "Where a post links when the programme does not publish to the news portal."),
-      field("Logo size (share of the width)", num("logo_scale", k.logo_scale ?? 0.17, { step: "0.01", min: 0.08, max: 0.35 })),
-      field("Label text colour", color("label_color", k.label_color || "#141414"), "The small category label on the accent colour.")),
-    field("How to say it", area("pronounce", Object.entries(k.pronounce || {}).map(([w, s]) => `${w} = ${s}`).join("\n"), { placeholder: "One per line — written = how the voice should say it\nBRTA = B R T A\nDhaka Tribune = ঢাকা ট্রিবিউন", style: "min-height:60px" }),
-      "For every narrated video of this brand. A programme can add its own."),
+      field("Website", text("website", k.website, { placeholder: "https://yoursite.com" }), "Where a post links when the programme does not publish to the news portal.")),
     check("credit_sources", "Credit the source outlets on the card", k.credit_sources !== false),
-    music.length ? field("Music beds for this brand's videos", h("select", { name: "music_urls", multiple: true, style: "min-height:70px" }, music.map((m) => h("option", { value: m.url, selected: (k.music_urls || []).includes(m.url) }, m.meta?.name || m.id))), "One is picked at random per video. Ctrl/Cmd-click to choose several.") : null);
+    music.length ? field("Music beds for this brand's videos", h("select", { name: "music_urls", multiple: true, style: "min-height:70px" }, music.map((m) => h("option", { value: m.url, selected: (k.music_urls || []).includes(m.url) }, m.meta?.name || m.id))), "One is picked at random per video. Ctrl/Cmd-click to choose several.") : null,
+    // Rarely changed after the first day. Still part of the form, so Save sends them exactly as before.
+    fold("brand.more", [h("b", { style: "font-weight:500" }, "More kit options"), h("span", { class: "small mute" }, " — font files, card proportions, logo size, label colour, how the voice says names")],
+      h("div", { class: "grid2" },
+        field("Font file URL(s)", text("fonts_url", k.fonts_url, { placeholder: "https://…/HindSiliguri-Bold.ttf" }), "Comma-separated .ttf/.otf."),
+        field("Picture share of the card", num("image_ratio", k.image_ratio ?? 0.6, { step: "0.05", min: 0.4, max: 0.75 })),
+        field("Logo size (share of the width)", num("logo_scale", k.logo_scale ?? 0.17, { step: "0.01", min: 0.08, max: 0.35 })),
+        field("Label text colour", color("label_color", k.label_color || "#141414"), "The small category label on the accent colour.")),
+      field("How to say it", area("pronounce", Object.entries(k.pronounce || {}).map(([w, s]) => `${w} = ${s}`).join("\n"), { placeholder: "One per line — written = how the voice should say it\nBRTA = B R T A\nDhaka Tribune = ঢাকা ট্রিবিউন", style: "min-height:60px" }),
+        "For every narrated video of this brand. A programme can add its own.")));
   const preview = h("div", { class: "kit-preview" });
   const collect = () => { const v = readForm(form); const sel = form.querySelector("[name=music_urls]");
     const kit = { ...k, primary_color: v.primary_color, accent_color: v.accent_color, text_color: v.text_color, logo_url: v.logo_url || undefined, handle: v.handle || undefined, font: v.font || undefined, fonts_url: v.fonts_url || undefined, image_ratio: v.image_ratio ?? 0.6, credit_sources: v.credit_sources,
@@ -1001,7 +1125,7 @@ function brandKitPanel(b, music = []) {
 pages.schedule = async () => {
   const s = await get("/api/schedule");
   const thumb = (r) => r.hero_url ? (r.hero_kind === "VIDEO" ? h("span", { class: "tag blue" }, "video") : h("img", { src: r.hero_url, alt: "", style: "width:54px;height:54px;object-fit:cover;border-radius:4px" })) : h("span", { class: "tag" }, "text");
-  const root = h("div", null, pageHead("Schedule", "Approved posts waiting for their slot, per channel's posting windows, gaps and daily limits — and what went out in the last 48 hours.",
+  const root = h("div", null, pageHead("Schedule", INFO.schedule,
     h("button", { class: "btn", onclick: () => route() }, "Refresh")));
   root.appendChild(h("h2", null, "Coming up"));
   root.appendChild(!s.upcoming.length ? h("div", { class: "empty" }, h("b", null, "Nothing scheduled"), "Approved items get a slot on every channel subscribed to their program.") :
@@ -1024,7 +1148,7 @@ pages.schedule = async () => {
 const KIND_COLOR = { TOPIC: "blue", SERIES_EPISODE: "violet", NEW_SERIES: "violet", FORMAT: "amber", TIMING: "amber", NEW_PROGRAM: "green" };
 pages.ideas = async (sub) => {
   const [ideas, programs] = await Promise.all([get(`/api/suggestions${sub ? `?nicheId=${sub}` : ""}`), get("/api/programs")]);
-  const root = h("div", null, pageHead("Ideas", "The planner reads what performed, your series and the trending stories you haven't covered, and suggests what to make next. Accept one and it is written; programs on autopilot accept their best ideas themselves.",
+  const root = h("div", null, pageHead("Ideas", [INFO.ideas, " Programmes on autopilot accept their best ideas themselves."],
     select(null, [["", "All programs"], ...programs.map((p) => [p.id, p.display_name])], sub || "", { style: "width:auto", onchange: (e) => (location.hash = `#/ideas/${e.target.value}`) }),
     sub ? h("button", { class: "btn primary", onclick: () => run(async () => { const r = await post(`/api/programs/${sub}/plan`); toast(`${r.created} new idea(s)`); route(); }) }, "Plan now") : null));
   if (!ideas.length) { root.appendChild(h("div", { class: "empty" }, h("b", null, "No open ideas"), "Ideas appear once a day per program, or pick a program and press Plan now.")); return root; }
@@ -1033,7 +1157,7 @@ pages.ideas = async (sub) => {
     h("td", null, h("b", { style: "font-weight:500" }, s.title), h("span", { class: "sub" }, s.rationale), s.payload?.summary ? h("span", { class: "sub" }, "Covers: ", s.payload.summary) : null),
     h("td", { class: "small" }, s.program_name, h("span", { class: "sub" }, "score ", Number(s.score).toFixed(2), " · ", ago(s.created_at))),
     h("td", { class: "row" },
-      ["TOPIC", "SERIES_EPISODE", "NEW_SERIES"].includes(s.kind) ? h("button", { class: "btn sm primary", onclick: () => run(async () => { const r = await post(`/api/suggestions/${s.id}/accept`); toast(r.itemId ? "Being written — it will land in Review" : r.seriesId ? "Series created; the first episode is on its way" : "Accepted"); route(); }) }, s.kind === "NEW_SERIES" ? "Start series" : "Write it") : h("button", { class: "btn sm", onclick: () => run(() => post(`/api/suggestions/${s.id}/accept`), "Noted").then(route) }, "Noted"),
+      ["TOPIC", "SERIES_EPISODE", "NEW_SERIES"].includes(s.kind) ? [h("button", { class: "btn sm primary", onclick: () => run(async () => { const r = await post(`/api/suggestions/${s.id}/accept`); toast(r.itemId ? "Being written — it will land in Review" : r.seriesId ? "Series created; the first episode is on its way" : "Accepted"); route(); }) }, s.kind === "NEW_SERIES" ? "Start series" : "Write it"), pcMark("making it")] : h("button", { class: "btn sm", onclick: () => run(() => post(`/api/suggestions/${s.id}/accept`), "Noted").then(route) }, "Noted"),
       h("button", { class: "btn sm", onclick: () => run(() => post(`/api/suggestions/${s.id}/dismiss`), "Dismissed").then(route) }, "Dismiss"))))))));
   return root;
 };
@@ -1041,7 +1165,7 @@ pages.ideas = async (sub) => {
 // ---------------------------------------------------------------- news desk
 pages.desk = async () => {
   const clusters = await get("/api/desk?hours=24");
-  const root = h("div", null, pageHead("News desk", "Every story seen in the last 24 hours, grouped across outlets and languages. Stories carried by more (and weightier) outlets rank higher; each program takes its best uncovered ones.",
+  const root = h("div", null, pageHead("News desk", INFO.desk,
     h("button", { class: "btn", onclick: () => run(() => post("/api/desk/run"), "Desk pass queued").then(route) }, "Run a desk pass now")), newsControls(stats));
   if (!clusters.length) { root.appendChild(h("div", { class: "empty" }, h("b", null, "No stories yet"), "Link sources to a news program; stories appear as feeds are polled.")); return root; }
   root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
@@ -1065,7 +1189,7 @@ pages.insights = async (sub) => {
       h("td", null, h("div", { class: "bar-cell" }, h("div", { class: "meter", style: `width:${Math.max(2, (r.avg_views / max) * 100)}%` }), h("span", { class: "small mute" }, r.avg_views, " avg views"))),
       h("td", { class: "small mute" }, r.posts, " posts · ", r.avg_likes, " likes")))))) : h("p", { class: "mute small" }, "No published posts with metrics yet.");
   };
-  const root = h("div", null, pageHead("Insights", "What worked, per program: formats, platforms, posting hours and the posts that led. The planner reads the same numbers.",
+  const root = h("div", null, pageHead("Insights", INFO.insights,
     h("div", { class: "tabs", style: "margin:0" }, [7, 30, 90].map((n) => h("button", { class: n === days ? "active" : "", onclick: () => (location.hash = `#/insights/${n}`) }, `${n} days`)))),
     h("div", { class: "desk" }, h("div", { class: "stat-list" },
       stat(d.totals.published, "Posts published"), stat(d.totals.views, "Views"), stat(d.totals.likes, "Likes"), stat(d.totals.comments, "Comments"),
@@ -1087,12 +1211,12 @@ pages.sources = async (sub) => {
   const configs = await get("/api/adapter-configs");
   const ingestKeys = configs.filter((c) => c.stage === "INGEST" && yes(c.enabled)).map((c) => [c.key, `${c.label} (${c.key})`]);
   const root = h("div", null,
-    pageHead("Sources", "Feeds the engine polls for new headlines and videos. Articles go to the news desk, which groups the same story across outlets; videos go to video programs.",
+    pageHead("Sources", [INFO.sources, h("span", { class: "sub" }, "Articles go to the news desk, which groups the same story across outlets; videos go to video programmes.")],
       h("button", { class: "btn", onclick: () => catalogDialog(programs) }, "Bangladesh catalog"),
       h("button", { class: "btn primary", onclick: () => sourceDialog(null, ingestKeys, programs, brands) }, "New source")));
   if (!sources.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No sources yet"), "Add an RSS feed, a NewsAPI query, a YouTube channel — or the mock feed for testing."));
   else root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
-    h("thead", null, h("tr", null, h("th", null, "Source"), h("th", null, "Adapter"), h("th", null, "Every"), h("th", null, "Feeds"), h("th", null, "Items"), h("th", null, "Last polled"), h("th"))),
+    h("thead", null, h("tr", null, h("th", null, "Source"), h("th", { title: "Which reader fetches it (the adapter)" }, "Kind"), h("th", null, "Read every"), h("th", null, "Feeds programmes"), h("th", null, "Items"), h("th", null, "Last read"), h("th"))),
     h("tbody", null, sources.map((s) => h("tr", null,
       h("td", null, s.name, yes(s.is_active) ? null : h("span", { class: "tag red", style: "margin-left:6px" }, "paused"), h("span", { class: "sub mono" }, Object.keys(s.config || {}).length ? JSON.stringify(s.config).slice(0, 80) : "")),
       h("td", { class: "mono" }, s.adapter_key), h("td", null, s.poll_interval_minutes, " min"),
@@ -1127,11 +1251,11 @@ function sourceDialog(s, ingestKeys, programs, brands) {
   const adapter = select("adapterKey", ingestKeys, s?.adapter_key || "rss", { onchange: (e) => { if (!s && SOURCE_HINTS[e.target.value]) cfg.value = SOURCE_HINTS[e.target.value]; } });
   if (!s) cfg.value = SOURCE_HINTS.rss;
   formDialog(s ? "Edit source" : "New source", h("div", null,
-    h("div", { class: "grid2" }, field("Name", text("name", s?.name)), field("Adapter", adapter), field("Poll every (minutes)", num("pollIntervalMinutes", s?.poll_interval_minutes ?? 30)),
-      field("License policy", select("licensePolicy", [["ANY", "Any"], ["CC_ONLY", "Creative Commons only"], ["OWN", "Own content only"]], s?.license_policy || "ANY")),
+    h("div", { class: "grid2" }, field("Name", text("name", s?.name)), field(["Kind of source", tech("adapter")], adapter, "RSS feed, Google News search, YouTube channel…"), field("Read it every (minutes)", num("pollIntervalMinutes", s?.poll_interval_minutes ?? 30)),
+      field("Which videos it may take", select("licensePolicy", [["ANY", "Any"], ["CC_ONLY", "Creative Commons only"], ["OWN", "Own content only"]], s?.license_policy || "ANY")),
       s ? null : field("Brand", select("brandId", [["", "(none)"], ...brands.map((b) => [b.id, b.name])]))),
-    field("Adapter config (JSON)", cfg, "What the adapter needs: feed URL, query, channel id…"),
-    s ? null : field("Programs to feed", multi("nicheIds", programs.map((p) => [p.id, p.display_name])))),
+    field(["Where to read it (JSON)", tech("config")], cfg, "The feed's address, the search words or the channel id — the example filled in shows the shape for the kind above."),
+    s ? null : field("Programmes it feeds", multi("nicheIds", programs.map((p) => [p.id, p.display_name])))),
     async (v) => { if (!s) { v.nicheIds = Array.from(document.querySelector("[name=nicheIds]").selectedOptions).map((o) => o.value); if (!v.brandId) delete v.brandId; await post("/api/sources", v); } else { delete v.brandId; await patch(`/api/sources/${s.id}`, v); } toast("Source saved"); route(); });
 }
 function previewDialog(s, items) {
@@ -1152,8 +1276,8 @@ pages.candidates = async () => {
   const [cands, programs] = await Promise.all([get("/api/video-candidates"), get("/api/programs")]);
   const videoPrograms = programs.filter((p) => VIDEO_TYPES.has(p.content_type));
   const root = h("div", null,
-    pageHead("Videos to clip", "Paste a link, or let the sources bring videos in. Each is transcribed, its best moments picked and cut, and every clip goes to Review.",
-      h("button", { class: "btn primary", disabled: !videoPrograms.length, title: videoPrograms.length ? "" : "Create a video-type program first", onclick: () => candidateDialog(null, videoPrograms) }, "Add a video URL")));
+    pageHead("Videos to clip", INFO.candidates,
+      h("button", { class: "btn primary", disabled: !videoPrograms.length, title: videoPrograms.length ? "" : "Create a video-type program first", onclick: () => candidateDialog(null, videoPrograms) }, "Add a video URL"), pcMark("processing the video and cutting its clips")));
   if (!cands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No candidates yet"), videoPrograms.length ? "Add a video URL, or link a YouTube source to a video program." : "Create a program with a clip content type (Podcast clip, Reaction clip, …) first."));
   else root.appendChild(h("div", { class: "table-wrap" }, h("table", null,
     h("thead", null, h("tr", null, h("th", null, "Video"), h("th", null, "Program"), h("th", null, "Score"), h("th", null, "Status"), h("th", null, "Clips"), h("th"))),
@@ -1162,7 +1286,7 @@ pages.candidates = async () => {
       h("td", null, c.program_name), h("td", null, Number(c.score || 0).toFixed(2), h("span", { class: "sub" }, c.score_reason)),
       h("td", null, tag(c.status), c.error_message ? h("span", { class: "sub", style: "color:var(--red)" }, c.error_message) : null), h("td", null, c.clip_count),
       h("td", { class: "row" },
-        h("button", { class: "btn sm", onclick: () => run(() => post(`/api/video-candidates/${c.id}/process`), "Processing queued").then(route) }, c.status === "FAILED" ? "Retry" : "Process"),
+        h("button", { class: "btn sm", onclick: () => run(() => post(`/api/video-candidates/${c.id}/process`), "Processing queued").then(route) }, c.status === "FAILED" ? "Retry" : "Process"), pcMark("processing the video and cutting its clips"),
         c.clip_count ? h("button", { class: "btn sm", onclick: () => run(async () => { const full = await get(`/api/video-candidates/${c.id}`); clipsDialog(full); }) }, "Clips") : null,
         c.status !== "IGNORED" ? h("button", { class: "btn sm", onclick: () => run(() => post(`/api/video-candidates/${c.id}/ignore`), "Ignored").then(route) }, "Ignore") : null)))))));
   return root;
@@ -1170,7 +1294,8 @@ pages.candidates = async () => {
 async function candidateDialog(nicheId, videoPrograms) {
   if (!videoPrograms) videoPrograms = (await get("/api/programs")).filter((p) => VIDEO_TYPES.has(p.content_type));
   formDialog("Add a video", h("div", null,
-    field("Program", select("nicheId", videoPrograms.map((p) => [p.id, p.display_name]), nicheId)),
+    stats?.filesOnPc ? h("p", { class: "small mute", style: "margin:0 0 10px" }, pcMark("processing the video"), " The link is saved now; downloading it, picking its moments and cutting the clips run on your PC, and start when it is on.") : null,
+    field("Programme", select("nicheId", videoPrograms.map((p) => [p.id, p.display_name]), nicheId)),
     field("Video URL", h("input", { type: "url", name: "url", placeholder: "https://www.youtube.com/watch?v=…" })),
     field("Title (optional)", text("title")),
     field("License", select("license", [["UNKNOWN", "Unknown"], ["CC", "Creative Commons"], ["OWN", "Own content"], ["PERMISSION", "Have permission"]]))),
@@ -1226,7 +1351,7 @@ async function connectFacebook(brands, programs) {
 pages.channels = async () => {
   const [channels, brands, programs, configs, creds] = await Promise.all([get("/api/channels"), get("/api/brands"), get("/api/programs"), get("/api/adapter-configs"), get("/api/credentials")]);
   const publishers = configs.filter((c) => c.stage === "PUBLISH" && yes(c.enabled)).map((c) => [c.key, `${c.label} (${c.key})`]);
-  const root = h("div", null, pageHead("Channels", "Where approved content goes: a Facebook page, an Instagram account, a YouTube channel. Each channel subscribes to programs.",
+  const root = h("div", null, pageHead("Channels", INFO.channels,
     h("div", { class: "row" },
       h("button", { class: "btn", disabled: !brands.length, onclick: () => connectFacebook(brands, programs) }, "Connect Facebook"),
       h("button", { class: "btn primary", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers, creds) }, "New channel"))));
@@ -1240,7 +1365,7 @@ pages.channels = async () => {
         const r = await post(`/api/channels/${c.id}/check`, {});
         jsonDialog(r.ok ? `Connected${r.account ? ` to ${r.account.name}` : ""}` : "Cannot connect", r);
       }) }, "Check"),
-      h("button", { class: "btn sm", onclick: () => confirmModal("Publish a test post?", `This puts a real post on ${c.display_name}. Delete it on the platform afterwards.`,
+      h("button", { class: "btn sm", title: "Posts a short text to the Page from the server — no PC needed", onclick: () => confirmModal("Publish a test post?", `This puts a real post on ${c.display_name}. Delete it on the platform afterwards.`,
         () => run(async () => jsonDialog("Test publish result", await post(`/api/channels/${c.id}/test-publish`, { message: "Content Engine connection test" })))) }, "Test post"),
       h("button", { class: "btn sm", onclick: () => channelDialog(c, brands, programs, publishers, creds) }, "Edit"),
       h("button", { class: "btn sm", onclick: () => run(() => patch(`/api/channels/${c.id}`, { isActive: !yes(c.is_active) }), "Saved").then(route) }, yes(c.is_active) ? "Pause" : "Activate"),
@@ -1277,25 +1402,27 @@ function channelDialog(c, brands, programs, publishers, creds = []) {
       field("Platform", platSel),
       field("Publishing token", credSel, 'Add tokens on the API keys page (provider "meta" or "youtube_oauth"), then pick one here. One token per page / channel.'),
       field("Format", select("format", FORMATS, c?.format || "STATIC_IMAGE_CAPTION"), "Short vertical is the only format that triggers 9:16 rendering and #Shorts tagging."),
-      field("Publisher adapter", select("publisherAdapter", [["", "(platform default)"], ...publishers], c?.publisher_adapter || "")),
       field("Platform account id", text("platformAccountId", c?.platform_account_id), "Facebook Page ID, IG business account id, or YouTube channel id."),
       field("Timezone", text("timezone", c?.timezone || "Asia/Dhaka")),
       field("Max posts per day", num("maxPostsPerDay", c?.max_posts_per_day ?? 12)),
       field("Minimum gap (minutes)", num("minGapMinutes", c?.min_gap_minutes ?? 30))),
     field("Posting windows", area("_windows", windowsText(c?.posting_windows), { placeholder: "Any time. Or one per line:\nMon-Fri 08:00-22:00\nSat,Sun 10:00-14:00", style: "min-height:60px" }),
       "When approved posts may go out, in the time zone above. Empty: any time, within the daily cap and gap."),
-    field("Caption template", area("captionTemplate", c?.caption_template, { placeholder: "{caption}\n\n{hashtags}" }), "Placeholders: {caption} {headline} {hashtags} {portal_url}"),
-    field("Platform config (JSON)", area("platformConfig", JSON.stringify(c?.platform_config || {}, null, 2), { "data-json": "obj", class: "mono" }), 'e.g. {"token_env": "META_ACCESS_TOKEN_PAGE2"} to use a different token for this page.'),
-    c ? null : field("Subscribe to programs", multi("nicheIds", programs.map((p) => [p.id, p.display_name])))),
+    c ? null : field("Takes the posts of these programmes", multi("nicheIds", programs.map((p) => [p.id, p.display_name]))),
+    // Rarely changed; still in the form, so Save sends them exactly as before.
+    fold("channel.advanced", [h("b", { style: "font-weight:500" }, "Advanced: caption template, publisher and platform settings"), h("span", { class: "small mute" }, " — the defaults work for most channels")],
+      field(["Publisher", tech("publisher adapter")], select("publisherAdapter", [["", "(platform default)"], ...publishers], c?.publisher_adapter || ""), "What posts to the platform. Leave it on the platform default unless you are testing."),
+      field("Caption template", area("captionTemplate", c?.caption_template, { placeholder: "{caption}\n\n{hashtags}" }), "Placeholders: {caption} {headline} {hashtags} {portal_url}"),
+      field(["Platform settings (JSON)", tech("platform_config")], area("platformConfig", JSON.stringify(c?.platform_config || {}, null, 2), { "data-json": "obj", class: "mono" }), 'e.g. {"token_env": "META_ACCESS_TOKEN_PAGE2"} to use a different token for this page.'))),
     async (v) => { v.postingWindows = parseWindows(v._windows); delete v._windows; if (!v.publisherAdapter) delete v.publisherAdapter; if (!v.credentialId) v.credentialId = null; if (c) await patch(`/api/channels/${c.id}`, v); else { v.nicheIds = Array.from(document.querySelector("[name=nicheIds]").selectedOptions).map((o) => o.value); await post("/api/channels", v); } toast("Channel saved"); route(); }, { wide: true });
 }
 
 // ---------------------------------------------------------------- adapters
 const STAGE_ORDER = ["INGEST", "TOPIC", "SCRIPT", "IMAGE", "VOICE", "RENDER", "DOWNLOAD", "TRANSCRIBE", "CLIP", "EMBED", "PUBLISH"];
-const STAGE_HELP = { INGEST: "Pull items from feeds", TOPIC: "Pick a topic on demand", SCRIPT: "Write headlines, articles, captions (LLM)", IMAGE: "Generate the hero image", VOICE: "Text to speech", RENDER: "Assemble the video", DOWNLOAD: "Fetch source video", TRANSCRIBE: "Speech to text", CLIP: "Choose clip moments", EMBED: "Embeddings for duplicate detection", PUBLISH: "Post to a platform" };
+const STAGE_HELP = { INGEST: "Reading feeds and channels", TOPIC: "Picking a topic when you ask for one", SCRIPT: "Writing headlines, articles and captions (the AI writer)", IMAGE: "Making the main picture", VOICE: "Turning text into speech", RENDER: "Putting the video together", DOWNLOAD: "Fetching a source video", TRANSCRIBE: "Turning speech into text", CLIP: "Choosing the moments to clip", EMBED: "Spotting duplicate stories (compares meaning)", PUBLISH: "Posting to a platform" };
 pages.adapters = async () => {
   const [configs, impls, creds] = await Promise.all([get("/api/adapter-configs"), get("/api/adapter-impls"), get("/api/credentials")]);
-  const root = h("div", null, pageHead("Adapters", "Each pipeline stage has named adapter instances. Mocks let everything run without keys; switch a program to a live instance when its key is in place.",
+  const root = h("div", null, pageHead("Adapters", [INFO.adapters, h("span", { class: "sub" }, "Each step has named instances (an adapter is one tool set up for one step). Mocks let everything run without keys; switch a programme to a live instance when its key is in place.")],
     h("button", { class: "btn primary", onclick: () => adapterDialog(null, impls, creds) }, "New instance")));
   for (const stage of STAGE_ORDER) {
     const rows = configs.filter((c) => c.stage === stage);
@@ -1328,9 +1455,9 @@ function adapterDialog(c, impls, creds) {
   const showSchema = () => { const i = (impls[stageSel.value] || []).find((x) => x.id === implSel.value); schema.textContent = i && Object.keys(i.configSchema || {}).length ? "Config keys: " + Object.entries(i.configSchema).map(([k, v]) => `${k} (${typeof v === "string" ? v : v?.type || "any"})`).join(", ") : "No config needed."; };
   stageSel.onchange = fillImpls; implSel.onchange = showSchema; fillImpls();
   formDialog(c ? "Edit adapter instance" : "New adapter instance", h("div", null,
-    h("div", { class: "grid2" }, field("Stage", stageSel), field("Implementation", implSel), c ? null : field("Key", text("key", "", { placeholder: "e.g. anthropic_live" }), "How programs refer to it."), field("Label", text("label", c?.label)),
+    h("div", { class: "grid2" }, field("Step", stageSel), field(["Tool", tech("implementation")], implSel), c ? null : field(["Short name", tech("key")], text("key", "", { placeholder: "e.g. anthropic_live" }), "How programmes refer to it."), field("Label", text("label", c?.label)),
       field("Pinned key", select("credentialId", [["", "(auto: rotate through the provider's keys)"], ...creds.map((k) => [k.id, `${k.provider}: ${k.label}`])], c?.credential_id || ""), "Use one specific key for this instance, e.g. a separate Gemini key for images. Falls back to the pool if it's cooling down.")),
-    field("Config (JSON)", area("config", JSON.stringify(c?.config || {}, null, 2), { "data-json": "obj", class: "mono" }), schema),
+    field(["Options (JSON)", tech("config")], area("config", JSON.stringify(c?.config || {}, null, 2), { "data-json": "obj", class: "mono" }), schema),
     check("enabled", "Enabled", c ? yes(c.enabled) : true)),
     async (v) => { if (!v.credentialId) v.credentialId = null; if (c) { delete v.stage; await patch(`/api/adapter-configs/${c.id}`, v); } else await post("/api/adapter-configs", v); toast("Adapter saved"); route(); });
 }
@@ -1339,7 +1466,7 @@ function adapterDialog(c, impls, creds) {
 pages.keys = async () => {
   const [creds, usage, meta] = await Promise.all([get("/api/credentials"), get("/api/usage"), get("/api/credentials/meta")]);
   PROVIDERS = meta.providers; PROVIDER_ENV = meta.defaultEnv; MULTI_FIELD = meta.multiField;
-  const root = h("div", null, pageHead("API keys", "Paste a key here and it is encrypted and stored in the database (AES-256-GCM under SECRETS_KEY on Render). Keys are never shown again, only their last 4 characters. You can still point a credential at a Render env var instead.",
+  const root = h("div", null, pageHead("API keys", [INFO.keys, h("span", { class: "sub" }, "Encrypted in the database (AES-256-GCM under SECRETS_KEY on Render). You can still point a key at a Render env var instead.")],
     h("button", { class: "btn primary", onclick: () => credDialog(null) }, "Add a key")));
   if (!meta.vault) root.appendChild(h("div", { class: "panel", style: "border-color:var(--amber)" }, h("b", null, "Vault is off. "), "Set ", h("span", { class: "mono" }, "SECRETS_KEY"), " on Render (any long random string, e.g. ", h("span", { class: "mono" }, "openssl rand -hex 32"), ") and redeploy. Until then you can only register env-var names, not paste secrets."));
   root.appendChild(h("div", { class: "panel" }, h("h3", null, "How keys are used"),
@@ -1425,36 +1552,18 @@ pages.settings = async () => {
   // The engine's own bookkeeping (boot records, quota pauses, relayed answers, cached descriptions) is not a setting.
   const internal = /^(boot\.|worker\.|quota\.|provider\.refused\.|relay\.|upgrade\.|vizard\.project\.|twelve_labs\.|footage\.seen\.|catalog)/;
   const other = Object.entries(s).filter(([k]) => !known.includes(k) && !internal.test(k));
-  return h("div", null, pageHead("Settings", "Global switches. Program-level behaviour lives on each program."),
+  return h("div", null, pageHead("Settings", INFO.settings),
     h("div", { class: "panel" }, h("h3", null, "Publishing"),
       h("div", { class: "row" }, h("span", { class: "grow" }, val("publishing.global_pause", false) ? "Publishing is paused. Approved items wait and retry every 10 minutes." : "Publishing is running."),
         h("button", { class: "btn" + (val("publishing.global_pause", false) ? " ok" : " danger"), onclick: () => save("publishing.global_pause", !val("publishing.global_pause", false), val("publishing.global_pause", false) ? "Publishing resumed" : "Publishing paused") }, val("publishing.global_pause", false) ? "Resume publishing" : "Pause all publishing"))),
-    h("div", { class: "panel" }, h("h3", null, "Ingestion"),
-      h("div", { class: "row" }, h("span", { class: "grow" }, val("ingest.enabled", true) ? "Sources are polled on their schedules." : "Automatic polling is off. You can still poll manually."),
-        h("button", { class: "btn", onclick: () => save("ingest.enabled", !val("ingest.enabled", true)) }, val("ingest.enabled", true) ? "Stop automatic polling" : "Start automatic polling")),
-      toggle("ingest.fetch_article_text", true, "Each story's article is read from the outlet's page, so the writer has more than the headline.", "Articles are not fetched: stories are written from the feed's headline and summary."),
-      numRow("ingest.max_age_hours", 72, "Skip feed articles older than this many hours", { min: 1 }),
-      numRow("retention.source_items_days", 14, "Forget feed items nothing was made from after this many days", { min: 1 })),
     h("div", { class: "panel" }, h("h3", null, "Review and news"),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val("news.paused", false) ? "News is paused: feeds are read, nothing is drafted." : "News is running."),
         h("button", { class: `btn sm${val("news.paused", false) ? " primary" : ""}`, onclick: () => save("news.paused", !val("news.paused", false), val("news.paused", false) ? "News resumed" : "News paused") }, val("news.paused", false) ? "Resume news" : "Pause news")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Set aside news nobody has reviewed after this many hours (0 = never)"), expiry, h("button", { class: "btn sm", onclick: () => save("review.news_expiry_hours", Number(expiry.value) || 0) }, "Save")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "A hand-reviewed programme stops drafting while this many drafts wait for review (0 = never stop)"), waiting, h("button", { class: "btn sm", onclick: () => save("review.max_waiting", Number(waiting.value) || 0) }, "Save")),
       toggle("storage.on_pc", false, "Files are kept on your PC: the server stores nothing, and work that makes pictures and videos runs on your PC (it must be on).", "Files are kept in cloud storage (Supabase or R2)."),
+      h("div", { class: "small mute", style: "margin:-2px 0 4px" }, "Where pictures, videos and audio are kept decides what needs your PC. ", h("a", { href: "#/help" }, "What needs my PC?")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Delete the pictures and videos of rejected and failed drafts after this many days (0 = keep them). The drafts stay; this is what keeps free storage from filling up"), keepDays, h("button", { class: "btn sm", onclick: () => save("storage.cleanup_rejected_days", Number(keepDays.value) || 0) }, "Save"))),
-    h("div", { class: "panel" }, h("h3", null, "Automation"),
-      toggle("desk.enabled", true, "News desk: articles are grouped into stories across outlets before writing.", "News desk is off: every new article is written on its own."),
-      toggle("qa.enabled", true, "Quality check runs on every draft (programs can override).", "Quality check is off — automatic programs publish unchecked."),
-      toggle("qa.auto_fix", true, "Flagged drafts are revised once from the report before a person sees them.", "Flagged drafts go straight to Review."),
-      toggle("planner.enabled", true, "The planner proposes ideas once a day per program.", "The daily planner is off."),
-      toggle("style.auto_refine", true, "House styles learn from reviewers' edits and the best-performing posts.", "House styles only change by hand."),
-      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Pass score for the quality check (0-1)"), minScore, h("button", { class: "btn sm", onclick: () => save("qa.min_score", Number(minScore.value)) }, "Save")),
-      numRow("desk.similarity", 0.84, "News desk: how alike two reports must be to count as one story, compared by meaning (0-1)", { step: "0.01", min: 0, max: 1 }),
-      numRow("desk.word_overlap", 0.5, "News desk: share of headline words two reports must share to count as one story, when meanings cannot be compared (0-1)", { step: "0.05", min: 0, max: 1 }),
-      toggle("image.text_card_fallback", true, "A story no picture could be made for goes out as a typographic text card.", "A story no picture could be made for fails instead of becoming a text card."),
-      chainRow("llm.default_fallbacks", "Backup writers when a programme has none of its own", adapters.scriptAdapters, "e.g. groq_live, mistral_live"),
-      chainRow("image.default_fallbacks", "Backup pictures when a programme has none of its own", adapters.imageAdapters, "e.g. pexels_stock, pollinations"),
-      chainRow("voice.default_fallbacks", "Backup voices when a programme has none of its own", adapters.voiceAdapters, "e.g. tts_edge, tts_piper")),
     h("div", { class: "panel" }, h("h3", null, "Alerts on Telegram"),
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "1. Create a bot with @BotFather and add its token on the API keys page (provider Telegram) or as TELEGRAM_BOT_TOKEN on Render. 2. Send your bot a message, then open api.telegram.org/bot<token>/getUpdates to find your chat id. 3. Paste it here."),
       // TELEGRAM_CHAT_ID on the server wins over this box, so saving here would look like it did something.
@@ -1464,9 +1573,6 @@ pages.settings = async () => {
     h("div", { class: "panel" }, h("h3", null, "Daily spend cap"),
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "When today's provider spend reaches this, generation pauses until tomorrow. Spent today: ", usd(stats?.spentTodayUsd), ". Set 0 for no cap."),
       h("div", { class: "row" }, h("span", null, "$"), cap, h("button", { class: "btn", onclick: () => save("budget.daily_cap_usd", Number(cap.value)) }, "Save cap"))),
-    h("div", { class: "panel" }, h("h3", null, "Repurposing threshold"),
-      h("p", { class: "muted small", style: "margin:0 0 8px" }, "Once a published post crosses this many views, a new draft is queued to repurpose it into other formats (still goes through Review)."),
-      h("div", { class: "row" }, thr, h("span", { class: "small mute" }, "views"), h("button", { class: "btn", onclick: () => save("repurpose.view_threshold", Number(thr.value)) }, "Save threshold"))),
     h("div", { class: "panel" }, h("h3", null, "Media storage"),
       // Files kept on your PC: the backend is the PC, and the cloud backends (and their warnings) don't apply.
       storage.onPc ? h("p", { class: "muted small", style: "margin:0 0 8px" }, "Active backend: ", h("b", null, "Your PC"), " ", h("span", { class: `tag${storage.pc?.tunnel ? " green" : ""}` }, storage.pc?.tunnel ? "reachable" : "off"),
@@ -1476,12 +1582,79 @@ pages.settings = async () => {
         storage.backend === "local" ? " Local disk is wiped on every deploy — add R2 (API keys → Cloudflare R2, or R2_* env vars) before going live." : ""),
       storage.onPc ? pcMediaLine(storage.pc?.media) : null,
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "Cleanup deletes an item's media from storage once every channel has published it and this many hours have passed (platforms keep their own copy). Rows and metrics stay.", storage.onPc ? " Your PC runs it on the files it keeps, every hour while it is on." : ""),
-      h("div", { class: "row" }, h("button", { class: "btn", onclick: () => save("storage.cleanup_enabled", !val("storage.cleanup_enabled", true)) }, val("storage.cleanup_enabled", true) ? "Disable cleanup" : "Enable cleanup"), h("span", null, "after"), hrs, h("span", { class: "small mute" }, "hours"), h("button", { class: "btn", onclick: () => save("storage.cleanup_after_publish_hours", Number(hrs.value)) }, "Save"), h("button", { class: "btn", onclick: () => run(() => post("/api/storage/cleanup"), storage.onPc ? "Cleanup asked of your PC" : "Cleanup run").then(route) }, "Run cleanup now"))),
-    h("div", { class: "panel" }, h("h3", null, "Worker lanes"), h("p", { class: "muted small", style: "margin:0" }, "Pause and resume individual lanes from the ", h("a", { href: "#/overview" }, "Overview"), " page.")),
-    other.length ? h("div", { class: "panel" }, h("h3", null, "Other settings"), other.map(([k, v]) => h("div", { class: "row small", style: "padding:4px 0" }, h("span", { class: "mono" }, k), h("span", { class: "mute" }, JSON.stringify(v))))) : null,
-    h("div", { class: "panel" }, h("h3", null, "Engine"),
-      h("div", { class: "small muted" }, "Worker ", h("span", { class: "mono" }, health?.worker), " · storage ", health?.storage, " · vault ", health?.vault ? "on" : "off (set SECRETS_KEY)", " · ffmpeg ", health?.ffmpeg ? "available" : "missing", " · yt-dlp ", health?.ytdlp ? "available" : "missing (video download will use the mock)")),
+      h("div", { class: "row" }, h("button", { class: "btn", onclick: () => save("storage.cleanup_enabled", !val("storage.cleanup_enabled", true)) }, val("storage.cleanup_enabled", true) ? "Disable cleanup" : "Enable cleanup"), h("span", null, "after"), hrs, h("span", { class: "small mute" }, "hours"), h("button", { class: "btn", onclick: () => save("storage.cleanup_after_publish_hours", Number(hrs.value)) }, "Save"), h("button", { class: "btn", onclick: () => run(() => post("/api/storage/cleanup"), storage.onPc ? "Cleanup asked of your PC" : "Cleanup run").then(route) }, "Run cleanup now"), pcMark("the cleanup"))),
+    // Engine tuning most owners never touch, in one fold. Each row keeps its own Save button and saves what it always did.
+    fold("settings.advanced", [h("b", { style: "font-weight:500" }, "Advanced: engine tuning"), h("span", { class: "small mute" }, " — feed reading, quality check, news desk matching, backup tools, repurposing, the engine's own details")],
+      h("div", { class: "panel" }, h("h3", null, "Reading the feeds"),
+        h("div", { class: "row" }, h("span", { class: "grow" }, val("ingest.enabled", true) ? "Sources are polled on their schedules." : "Automatic polling is off. You can still poll manually."),
+          h("button", { class: "btn", onclick: () => save("ingest.enabled", !val("ingest.enabled", true)) }, val("ingest.enabled", true) ? "Stop automatic polling" : "Start automatic polling")),
+        toggle("ingest.fetch_article_text", true, "Each story's article is read from the outlet's page, so the writer has more than the headline.", "Articles are not fetched: stories are written from the feed's headline and summary."),
+        numRow("ingest.max_age_hours", 72, "Skip feed articles older than this many hours", { min: 1 }),
+        numRow("retention.source_items_days", 14, "Forget feed items nothing was made from after this many days", { min: 1 })),
+      h("div", { class: "panel" }, h("h3", null, "Quality check, planner and news desk"),
+        toggle("desk.enabled", true, "News desk: articles are grouped into stories across outlets before writing.", "News desk is off: every new article is written on its own."),
+        toggle("qa.enabled", true, "Quality check runs on every draft (programs can override).", "Quality check is off — automatic programs publish unchecked."),
+        toggle("qa.auto_fix", true, "Flagged drafts are revised once from the report before a person sees them.", "Flagged drafts go straight to Review."),
+        toggle("planner.enabled", true, "The planner proposes ideas once a day per program.", "The daily planner is off."),
+        toggle("style.auto_refine", true, "House styles learn from reviewers' edits and the best-performing posts.", "House styles only change by hand."),
+        h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Pass score for the quality check (0-1)"), minScore, h("button", { class: "btn sm", onclick: () => save("qa.min_score", Number(minScore.value)) }, "Save")),
+        numRow("desk.similarity", 0.84, "News desk: how alike two reports must be to count as one story, compared by meaning (0-1)", { step: "0.01", min: 0, max: 1 }),
+        numRow("desk.word_overlap", 0.5, "News desk: share of headline words two reports must share to count as one story, when meanings cannot be compared (0-1)", { step: "0.05", min: 0, max: 1 }),
+        toggle("image.text_card_fallback", true, "A story no picture could be made for goes out as a typographic text card.", "A story no picture could be made for fails instead of becoming a text card."),
+        chainRow("llm.default_fallbacks", "Backup writers when a programme has none of its own", adapters.scriptAdapters, "e.g. groq_live, mistral_live"),
+        chainRow("image.default_fallbacks", "Backup pictures when a programme has none of its own", adapters.imageAdapters, "e.g. pexels_stock, pollinations"),
+        chainRow("voice.default_fallbacks", "Backup voices when a programme has none of its own", adapters.voiceAdapters, "e.g. tts_edge, tts_piper")),
+      h("div", { class: "panel" }, h("h3", null, "Repurposing threshold"),
+        h("p", { class: "muted small", style: "margin:0 0 8px" }, "Once a published post crosses this many views, a new draft is queued to repurpose it into other formats (still goes through Review)."),
+        h("div", { class: "row" }, thr, h("span", { class: "small mute" }, "views"), h("button", { class: "btn", onclick: () => save("repurpose.view_threshold", Number(thr.value)) }, "Save threshold"))),
+      h("div", { class: "panel" }, h("h3", null, "Worker lanes"), h("p", { class: "muted small", style: "margin:0" }, "Pause and resume individual lanes from the ", h("a", { href: "#/overview" }, "Overview"), " page.")),
+      other.length ? h("div", { class: "panel" }, h("h3", null, "Other settings"), other.map(([k, v]) => h("div", { class: "row small", style: "padding:4px 0" }, h("span", { class: "mono" }, k), h("span", { class: "mute" }, JSON.stringify(v))))) : null,
+      h("div", { class: "panel" }, h("h3", null, "Engine"),
+        h("div", { class: "small muted" }, "Worker ", h("span", { class: "mono" }, health?.worker), " · storage ", health?.storage, " · vault ", health?.vault ? "on" : "off (set SECRETS_KEY)", " · ffmpeg ", health?.ffmpeg ? "available" : "missing", " · yt-dlp ", health?.ytdlp ? "available" : "missing (video download will use the mock)"))
+    ),
   );
+};
+
+// ---------------------------------------------------------------- help: what needs your PC
+// The split as the engine makes it (server.js): with files kept on your PC (storage.on_pc), every job that makes, stores
+// or posts a file runs on the PC's lane — generating, processing a video, rendering, re-rendering, publishing — uploads
+// wait in the database until the PC saves them, and media is served from the PC's tunnel. The writing, moment picking
+// and transcription inside those jobs are asked of the server. Everything else is the server's alone.
+const NEEDS_PC = [
+  ["Generating any content", "Generate now on a programme, Write it on an idea, a series' next episode, and news drafted by automatic production"],
+  ["Processing a pasted video link and cutting its clips", "Videos to clip: Add a video URL, Process, Retry"],
+  ["Rendering and re-rendering", "Review: Re-render and every Regenerate button; Content: Retry"],
+  ["Playing pictures, videos and audio", "in Review and Content — they are served from your PC"],
+  ["Saving uploads", "logos, reactor clips and music beds wait on the server until your PC stores them"],
+  ["Publishing", "rendering and posting after you approve, Publish now, retrying a post — platforms fetch each file from your PC"],
+  ["Cleaning up old files", "Settings → Media storage: your PC deletes the files it keeps"],
+];
+const SERVER_ONLY = [
+  ["This dashboard", "on your desktop and your phone"],
+  ["Settings, brands, programmes, channels, sources and API keys", "creating and changing every one of them"],
+  ["Reading the feeds and grouping the news", "only while automatic production is on"],
+  ["Writing", "the AI writer — your PC asks the server for it"],
+  ["Picking the best moments of a video", null],
+  ["Bangla transcription", null],
+  ["Planning ideas", "Plan ideas now, and the daily planner"],
+  ["Approving and rejecting drafts, and editing their text", "what happens after approval — rendering and posting — needs the PC"],
+  ["Schedules, alerts and metrics", null],
+  ["Brand card previews and a channel's Test post", "a test post is text only"],
+];
+pages.help = async () => {
+  const pc = pcState(), list = (rows) => h("ul", { class: "help-list" }, rows.map(([t, d]) => h("li", null, h("b", { style: "font-weight:500" }, t), d ? h("span", { class: "sub" }, d) : null)));
+  return h("div", null, pageHead("What needs your PC", "Pictures, videos and audio are kept on your PC. Anything that makes, cuts, plays, stores or posts one of them needs the PC worker running; everything else the server does on its own, day and night."),
+    h("div", { class: "panel", style: pc.on ? "" : "border-color:var(--amber)" },
+      h("div", { class: "row" }, h("b", { style: "font-weight:500" }, pc.on ? "Your PC is on" : pc.linkDown ? "Your PC is on, but its tunnel is down" : "Your PC is off"),
+        h("span", { class: `tag${pc.on ? " green" : ""}` }, pc.on ? "working" : "not reachable"), pc.waiting ? h("span", { class: "tag amber" }, `${pc.waiting} job${pc.waiting > 1 ? "s" : ""} waiting for it`) : null,
+        workers?.pc?.seen_seconds_ago != null ? h("span", { class: "small mute" }, `last heard from ${ago(Date.now() - workers.pc.seen_seconds_ago * 1000)}`) : null),
+      h("div", { class: "sub" }, pc.on ? "Work that needs it runs as soon as it is queued." : "To start it: on your PC, run pc\\start.ps1 in the project folder. Work that needs it waits until then — nothing is lost, and nothing needs pressing again."),
+      stats?.filesOnPc ? null : h("p", { class: "small", style: "margin:8px 0 0;color:var(--amber)" }, "Right now files are kept in cloud storage (Settings → Review and news), so only video programmes set to “Video work runs on: My PC” need your PC. The list below is how it works with files kept on your PC.")),
+    h("div", { class: "grid2", style: "margin-top:12px;align-items:start" },
+      h("div", { class: "panel" }, h("h3", null, "Needs your PC ", h("span", { class: "pc-mark", html: PC_ICON + "<span>PC</span>" })), list(NEEDS_PC)),
+      h("div", { class: "panel" }, h("h3", null, "The server does on its own"), list(SERVER_ONLY))),
+    h("p", { class: "small mute", style: "margin-top:14px;max-width:80ch" }, "Buttons marked ", h("span", { class: "pc-mark", html: PC_ICON + "<span>PC</span>" }), " put work on your PC. They still work while it is off: the work is queued and starts when the PC is back. Automatic production is a separate switch, on the ",
+      h("a", { href: "#/overview" }, "Overview"), ": while it is off, nothing is made unless you ask, whether the PC is on or not."));
 };
 
 // ---------------------------------------------------------------- boot
