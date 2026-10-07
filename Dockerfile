@@ -101,6 +101,8 @@ RUN cd studio && node render.mjs --bundle-only
 COPY server.js schema.sql ./
 COPY frontend ./frontend
 COPY fonts ./fonts
+# The PC installer the dashboard's "Set up a PC" command downloads; the server fills in its address and a one-time token.
+COPY pc/install.ps1 ./pc/
 ENV NODE_ENV=production PORT=4000 WORK_DIR=/tmp
 EXPOSE 4000
 # The port comes from the environment: Render runs this on 10000, and a healthcheck hardcoded to 4000 reported the

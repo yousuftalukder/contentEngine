@@ -157,7 +157,7 @@ function pcMark(what = "This") {
 const NAV = [
   ["Today", [["overview", "Overview"], ["review", "Review", "review"], ["items", "Content"], ["schedule", "Schedule"], ["insights", "Insights"]]],
   ["Make", [["catalog", "What it makes"], ["programs", "Programmes"], ["candidates", "Videos to clip"], ["ideas", "Ideas", "ideas"]]],
-  ["Set up", [["brands", "Brands"], ["sources", "Sources"], ["channels", "Channels"], ["keys", "API keys"]]],
+  ["Set up", [["brands", "Brands"], ["sources", "Sources"], ["channels", "Channels"], ["keys", "API keys"], ["pc-setup", "Set up a PC"]]],
   ["Engine (advanced)", [["desk", "News desk"], ["adapters", "Adapters"], ["settings", "Settings"]]],
   ["Help", [["help", "What needs your PC"]]],
 ];
@@ -176,6 +176,7 @@ const INFO = {
   sources: "Where material comes from: news websites, YouTube channels, searches. The engine reads them on a schedule while automatic production is on.",
   channels: "Where approved posts go: Facebook Pages, Instagram accounts, YouTube channels. Each channel takes the posts of the programmes you choose.",
   keys: "Keys for the AI writers, voices, pictures and publishing. Stored encrypted; only their last 4 characters are ever shown.",
+  "pc-setup": "Connect a Windows PC as the video worker with one command: it installs itself, and this page shows it come online.",
   desk: "Every news story seen in the last 24 hours, grouped across outlets. Stories carried by more outlets rank higher; each news programme takes its best ones.",
   adapters: "Which tool does each step — reading feeds, writing, pictures, voice, video, posting. The defaults work; change these only when you add a new service.",
   settings: "Switches for the whole engine. What each programme does is set on the programme itself.",
@@ -1524,6 +1525,71 @@ function credDialog(k) {
 }
 
 // ---------------------------------------------------------------- settings
+// ---------------------------------------------------------------- set up a PC
+// One command instead of an afternoon: the page makes a one-time PowerShell command, the owner pastes it on the new PC,
+// and the PC downloads the engine, installs its tools and connects itself (pc/install.ps1). The page then watches the
+// PC's heartbeat, so the owner sees it come online without asking anyone. The command is good for one use, 30 minutes.
+pages["pc-setup"] = async () => {
+  const blender = h("input", { type: "checkbox" }), autostart = h("input", { type: "checkbox", checked: true }), takeover = h("input", { type: "checkbox" });
+  const opt = (box, label, help) => h("label", { class: "check", style: "align-items:flex-start" }, box, h("span", null, label, help ? h("span", { class: "small mute", style: "display:block" }, help) : null));
+  const out = h("div"), status = h("div", { class: "small" }, "Checking…");
+  const copy = async (textValue, box) => {
+    try { await navigator.clipboard.writeText(textValue); toast("Copied. Paste it into PowerShell on the new PC."); }
+    catch { box.select(); document.execCommand("copy"); toast("Copied"); }
+  };
+  const make = async (btn) => {
+    btn.disabled = true;
+    try {
+      const r = await run(() => post("/api/pc/setup-token", { blender: blender.checked, autostart: autostart.checked, takeover: takeover.checked }));
+      const box = h("textarea", { readonly: true, rows: 4, class: "mono", style: "width:100%;resize:vertical", onclick: (e) => e.target.select() }, r.command);
+      out.innerHTML = "";
+      out.append(h("div", { style: "margin-top:12px" },
+        h("div", { class: "row", style: "margin-bottom:6px" }, h("b", { class: "grow" }, "Paste this into PowerShell on the new PC"), h("button", { class: "btn primary sm", onclick: () => copy(r.command, box) }, "Copy")),
+        box,
+        h("p", { class: "small", style: "margin:6px 0 0;color:var(--amber)" }, `Works once, until ${fmtDate(r.expires_at)}. Do not share it or paste it into a chat: until it is used, whoever runs it gets your database connection.`),
+        h("p", { class: "small mute", style: "margin:4px 0 0" }, "On the PC: press Start, type PowerShell, open it, paste (right-click), press Enter. It prints each step; the first run takes several minutes.")));
+    } finally { btn.disabled = false; }
+  };
+  // The PC's state, every five seconds while this page is open.
+  const draw = (s) => {
+    const pc = s.pc || {}, setup = s.setup || {};
+    status.innerHTML = "";
+    status.append(...[
+      h("div", { class: "row" }, h("span", { class: "tag " + (pc.online ? "green" : pc.seen_seconds_ago != null ? "amber" : "") }, pc.online ? "online" : pc.seen_seconds_ago != null ? "off" : "never connected"),
+        h("span", null, pc.online ? `Your PC${pc.host ? ` (${pc.host})` : ""} is the worker — last heard from ${pc.seen_seconds_ago}s ago.` : pc.seen_seconds_ago != null ? `Last heard from ${pc.host ? `${pc.host} ` : ""}${ago(new Date(Date.now() - pc.seen_seconds_ago * 1000))}.` : "No PC has run the worker yet.")),
+      s.filesOnPc ? h("div", { class: "row", style: "margin-top:6px" }, h("span", { class: "tag " + (s.tunnel ? "green" : "") }, s.tunnel ? "files reachable" : "files unreachable"),
+        h("span", null, s.tunnel ? "Files kept on the PC are served through its tunnel." : "Files are kept on the PC; they can be shown and posted once its tunnel is up (it starts with the worker).")) : null,
+      setup.made_at ? h("div", { class: "small mute", style: "margin-top:6px" }, setup.used_at ? `The last setup command was used ${ago(setup.used_at)}${pc.online ? "." : " — the PC is installing its tools; it shows online here when it starts."}` : new Date(setup.expires_at) > new Date() ? `The last setup command (made ${ago(setup.made_at)}) has not been used yet.` : `The last setup command expired unused.`) : null].filter(Boolean));      // the DOM's append writes null as "null"
+  };
+  const poll = async () => { try { draw(await get("/api/pc/setup-status")); } catch (e) { status.textContent = e.message; } };
+  const timer = setInterval(() => { if (!document.body.contains(status)) return clearInterval(timer); if (!document.hidden) poll(); }, 5000);
+  poll();
+  const makeBtn = h("button", { class: "btn primary", onclick: (e) => make(e.currentTarget).catch(() => {}) }, "Make a setup command");
+  return h("div", null, pageHead("Set up a PC", "Your PC does the video work: clips, reels, explainers, and keeping the files. Setting one up is one command."),
+    h("div", { class: "panel" }, h("h3", null, "What happens"),
+      h("ol", { class: "small", style: "margin:0;padding-left:18px;line-height:1.7" },
+        h("li", null, "Press the button below: it makes a command that works once, for 30 minutes."),
+        h("li", null, "Paste it into PowerShell on the PC: it downloads the engine, installs its tools and connects itself to this server. No files to copy, nothing to type in."),
+        h("li", null, "This page shows the PC come online. Leave its minimised PowerShell window open: that is the worker."))),
+    h("div", { class: "panel" }, h("h3", null, "Before you start, on the PC"),
+      h("ul", { class: "small", style: "margin:0;padding-left:18px;line-height:1.7" },
+        h("li", null, h("b", null, "Node.js"), " (the LTS version) from ", h("a", { href: "https://nodejs.org", target: "_blank", rel: "noopener" }, "nodejs.org"), " — the default options are fine."),
+        h("li", null, h("b", null, "Python"), " from ", h("a", { href: "https://www.python.org/downloads/", target: "_blank", rel: "noopener" }, "python.org"), " — tick ", h("i", null, "Add python.exe to PATH"), " on its first screen."),
+        h("li", null, "Git is not needed. The command checks for both and says which one is missing; install it and paste the same command again.")),
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "It installs everything else (ffmpeg, yt-dlp, whisper, the voices, cloudflared) into the engine's own folder, ", h("span", { class: "mono" }, "ContentEngine"), " in your user folder. Nothing needs administrator rights.")),
+    h("div", { class: "panel" }, h("h3", null, "Make a setup command"),
+      opt(blender, "Include Blender (3D explainers, about 350 MB)", "Only the 3D explainer variant uses it; it can be added later by running this again."),
+      opt(autostart, "Start the worker at every sign-in", "Adds one Task Scheduler entry for your account, so the PC takes work whenever it is on."),
+      opt(takeover, "This PC replaces my old one", "Lets its first start take over from the old PC. See \"Moving from an old PC\" below."),
+      makeBtn, out),
+    h("div", { class: "panel" }, h("h3", null, "Your PC"), status),
+    h("div", { class: "panel" }, h("h3", null, "Moving from an old PC"),
+      h("ol", { class: "small", style: "margin:0;padding-left:18px;line-height:1.7" },
+        h("li", null, "Stop the worker on the old PC (close its window, or Ctrl+C in it). Only one PC is the worker at a time: a second one refuses to start while the first is running."),
+        h("li", null, "Copy the old PC's ", h("span", { class: "mono" }, "data\\media"), " folder (the files it keeps) into ", h("span", { class: "mono" }, "ContentEngine\\data\\media"), " in your user folder on the new PC. It can be done before or after setup; setup never deletes it."),
+        h("li", null, "Make the command with ", h("i", null, "This PC replaces my old one"), " ticked and run it on the new PC. Files not copied stop playing in Review.")),
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "Running the command again on a PC that is already set up updates it to the latest version and keeps its files and settings.")));
+};
 pages.settings = async () => {
   const [s, storage, adapters] = await Promise.all([get("/api/settings"), get("/api/storage"), get("/api/adapters").catch(() => ({}))]);
   const val = (k, d) => (s[k] === undefined ? d : s[k]);
@@ -1648,7 +1714,8 @@ pages.help = async () => {
       h("div", { class: "row" }, h("b", { style: "font-weight:500" }, pc.on ? "Your PC is on" : pc.linkDown ? "Your PC is on, but its tunnel is down" : "Your PC is off"),
         h("span", { class: `tag${pc.on ? " green" : ""}` }, pc.on ? "working" : "not reachable"), pc.waiting ? h("span", { class: "tag amber" }, `${pc.waiting} job${pc.waiting > 1 ? "s" : ""} waiting for it`) : null,
         workers?.pc?.seen_seconds_ago != null ? h("span", { class: "small mute" }, `last heard from ${ago(Date.now() - workers.pc.seen_seconds_ago * 1000)}`) : null),
-      h("div", { class: "sub" }, pc.on ? "Work that needs it runs as soon as it is queued." : "To start it: on your PC, run pc\\start.ps1 in the project folder. Work that needs it waits until then — nothing is lost, and nothing needs pressing again."),
+      h("div", { class: "sub" }, pc.on ? "Work that needs it runs as soon as it is queued." : "To start it: on your PC, run pc\\start.ps1 in the project folder. Work that needs it waits until then — nothing is lost, and nothing needs pressing again.",
+        " A new PC, or none set up yet? ", h("a", { href: "#/pc-setup" }, "Set up a PC"), " with one command."),
       stats?.filesOnPc ? null : h("p", { class: "small", style: "margin:8px 0 0;color:var(--amber)" }, "Right now files are kept in cloud storage (Settings → Review and news), so only video programmes set to “Video work runs on: My PC” need your PC. The list below is how it works with files kept on your PC.")),
     h("div", { class: "grid2", style: "margin-top:12px;align-items:start" },
       h("div", { class: "panel" }, h("h3", null, "Needs your PC ", h("span", { class: "pc-mark", html: PC_ICON + "<span>PC</span>" })), list(NEEDS_PC)),
