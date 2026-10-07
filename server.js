@@ -4014,18 +4014,36 @@ async function generateExplainer(item, niche, style) {
   if (research.searched === false) await noteNoSearch(item.id);
   const sceneCount = Math.max(4, Math.round(minutes * 3.5));
   const three = mc.explainer_style === "3d", layouts = three ? THREE_D_LAYOUTS : EXPLAINER_LAYOUTS;
-  const plan = kept?.plan || await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
-    system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
+  const askPlan = (extra = "") => llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
+    system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes. Every spoken line adds something new: never repeat a phrase or a sentence pattern from another line.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(layouts).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
 ` : ""}${mc.explainer_style === "illustrated" ? `${ILLUSTRATED_STYLE(castOf(mc))}
 ` : ""}${three ? `${THREE_D_STYLE(lang)}
-` : ""}Start with a ${three ? "Title3D" : "TitleCard"}; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
+` : ""}Start with a ${three ? "Title3D" : "TitleCard"}; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).${extra}\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
     mock: { title: m.title, description: `About ${m.title}`, hashtags: ["explained"], scenes: [
       { layout: "TitleCard", chapter: "Intro", data: { title: m.title, subtitle: "Explained" }, parts: [`Here is ${m.title}, explained.`] },
       { layout: "BulletReveal", chapter: "Key points", data: { heading: "Key points", bullets: ["First", "Second"] }, parts: ["The first point.", "The second point."] },
       { layout: "FullQuote", chapter: "Wrap-up", data: { quote: "Mock quote", attribution: "Mock" }, parts: ["That is the story."] }] } }));
-  if (!kept?.plan) { await addCost(item.id, plan.cost); if (item._job) await keep({ plan: { data: plan.data } }); }
-  const p = plan.data || {}; const scenes = (p.scenes || []).filter((s) => s && layouts[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
+  // A plan is checked against what was asked before it is used. On 2026-10-07 the small fallback model answered a
+  // one-minute data explainer with two scenes, neither a chart, and the same sentence four times over — and it was
+  // rendered as it came. Short of the scenes asked for, or (for a data explainer whose research holds numbers) short of
+  // scenes built from them, it is asked once more, told what was missing, and the better of the two is used.
+  const usable = (d) => ((d || {}).scenes || []).filter((s) => s && layouts[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
+  const numbers = notes.filter((n) => /\d/.test(String(n.fact || ""))).length >= 2, wantData = mc.explainer_style === "data" && numbers;
+  const minScenes = Math.max(3, Math.ceil(sceneCount * 0.6)), dataScenes = (sc) => sc.filter((s) => ["DataChart", "BigNumber", "Timeline"].includes(s.layout)).length;
+  const shortOf = (sc) => [sc.length < minScenes ? `only ${sc.length} usable scene(s), and at least ${minScenes} are needed` : null, wantData && dataScenes(sc) < 2 ? `only ${dataScenes(sc)} scene(s) built from DataChart, BigNumber or Timeline, and at least 2 are needed from the numbers in the notes` : null].filter(Boolean);
+  let plan = kept?.plan;
+  if (!plan) {
+    plan = await askPlan(); await addCost(item.id, plan.cost);
+    const missing = shortOf(usable(plan.data));
+    if (missing.length) {
+      log(`explainer ${item.id}: the plan came back with ${missing.join("; ")} — asking once more`);
+      const again = await askPlan(`\nYOUR LAST PLAN WAS REJECTED: it had ${missing.join("; ")}. Write the full plan again and meet both.`).catch((e) => { warn(`explainer ${item.id}: second plan failed: ${e.message}`); return null; });
+      if (again) { await addCost(item.id, again.cost); const a = usable(again.data), b = usable(plan.data); if (shortOf(a).length < shortOf(b).length || (shortOf(a).length === shortOf(b).length && a.length > b.length)) plan = again; }
+    }
+    if (item._job) await keep({ plan: { data: plan.data } });
+  }
+  const p = plan.data || {}; const scenes = usable(p);
   if (!scenes.length) throw new Error("The explainer plan came back without usable scenes");
   const texts = scenes.map((s) => [s.intro, ...s.parts].filter(Boolean).join(" "));
   const title = p.title || m.title;

@@ -67,3 +67,27 @@ test("a 3D explainer plans in 3D layouts and renders every scene through Blender
     assert.match(it.captions.youtube, /^3D PLAN/);
   } finally { await eng.stop(); }
 });
+
+// A plan short of what was asked is not used as it came: the writer is told what was missing and asked once more, and
+// the better plan is the one rendered. (2026-10-07: two scenes for a one-minute data explainer, rendered as they were.)
+test("a plan short of the scenes asked for is sent back once, and the fuller plan is used", async () => {
+  const eng = await startEngine({ env: { STUDIO_MIN_MEMORY_MB: "999999" } });
+  try {
+    const scene = (layout, data, line) => ({ layout, chapter: layout, data, parts: [line] });
+    await eng.api("POST", "/api/adapter-configs", { key: "llm_short_then_full", stage: "SCRIPT", impl: "llm_mock", config: { respond: [
+      { match: "YOUR LAST PLAN WAS REJECTED", json: { title: "Full", description: "FULL PLAN", hashtags: [], scenes: [
+        scene("TitleCard", { title: "Dhaka metro", subtitle: "in numbers" }, "This is the Dhaka metro."),
+        scene("BigNumber", { heading: "Riders", value: 410000, label: "a day" }, "Four hundred and ten thousand ride it a day."),
+        scene("BulletReveal", { heading: "Why", bullets: ["Fast", "Cheap"] }, "It is fast and cheap."),
+        scene("FullQuote", { quote: "It changed my day", attribution: "A rider" }, "One rider says it changed her day.")] } },
+      { match: "3D explainer", json: {} },
+      { match: "You script animated explainer videos", json: { title: "Short", description: "SHORT PLAN", hashtags: [], scenes: [
+        scene("TitleCard", { title: "Dhaka metro", subtitle: "" }, "The metro."), scene("BulletReveal", { heading: "Why", bullets: ["Fast"] }, "The metro is fast.")] } }] } });
+    const b = await eng.api("POST", "/api/brands", { name: "Plans" });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "plan_check", displayName: "Plan check", contentType: "ANIMATED_EXPLAINER", useMocks: true, autoStyle: false, autoSources: false,
+      scriptAdapter: "llm_short_then_full", scriptAdapterFallbacks: [], methodConfig: { explainer_minutes: 1, qa: { enabled: false } } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Dhaka metro ridership" });
+    const it = await waitFor(async () => { const x = await eng.api("GET", `/api/content-items/${id}`); if (x.status === "FAILED" && !x.captions?.youtube) throw new Error(x.rejection_note); return x.captions?.youtube && x; }, { timeout: 60000, what: "the plan accepted" });
+    assert.match(it.captions.youtube, /^FULL PLAN/, "the plan sent back for being short was replaced by the full one");
+  } finally { await eng.stop(); }
+});
