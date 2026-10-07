@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startEngine } from "./harness.mjs";
+import { startEngine, waitFor } from "./harness.mjs";
 
 // The "What it makes" page: every variant in the blueprint, and whether what it needs is there right now. It is only
 // useful if it is true, so each need is checked against the engine's real state, not assumed.
@@ -32,6 +32,9 @@ test("the catalog lists every variant and says what is missing for each, from th
     }
     assert.equal(by("4a").setup.methodConfig.speed, 1.1, "a silent reaction starts at the 1.1× it promises");
 
+    // The boot's own adapter upgrade runs in the background; on a busy machine it could still be going when the key
+    // below is added, and it would then move the new programmes' pickers behind the LLM. It is finished first.
+    await waitFor(async () => (await eng.query(`SELECT 1 FROM settings WHERE key = 'upgrade.catalog_sync'`)).length, { timeout: 60000, what: "the boot upgrade" });
     await eng.api("POST", "/api/credentials", { provider: "gemini", label: "test", envVar: "CATALOG_TEST_KEY" });
     const brand = await eng.api("POST", "/api/brands", { name: "Catalog brand" });
     await eng.api("POST", "/api/programs", { brandId: brand.id, key: "pc_clips", displayName: "PC clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc", clipAdapter: "clip_meaning", useMocks: true, autoStyle: false, autoSources: false });
