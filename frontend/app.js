@@ -682,6 +682,7 @@ async function programDialog(p, brands, sources, adapters, styles, done, start =
         chainField("Transcribers after the first", "transcriptAdapterFallbacks", p?.transcript_adapter_fallbacks, a.transcriptAdapters))),
     h("div", { "data-for": "video" }, videoFields(p, uploads)),
     automationFields(p?.method_config || {}),
+    filterFields(p),
     p ? null : field("Sources to link", multi("sourceIds", sources.map((s) => [s.id, s.name])), "Leave empty for a Bangladesh program: it starts with the verified sources for its language (TV channels for video programs)."),
   );
   // What it makes, as the blueprint names it: picking a variant sets the type, method and pickers it needs.
@@ -707,9 +708,10 @@ async function programDialog(p, brands, sources, adapters, styles, done, start =
     const variant = buildable.find((x) => x.id === variantPick.value);
     if (variant?.setup?.methodConfig?.footage_dir === true && !String(v._footageDir || "").trim()) throw new Error(`${variant.id} ${variant.name} needs your footage folder: fill in "Your footage folder (on the PC)" under Video`);
     if (!String(v.displayName || "").trim()) throw new Error("Give the programme a name");
+    Object.assign(v, readFilters(v, p));                                 // before readAutomation, which drops the _fields
     v.methodConfig = readAutomation(v, readVideo(v, p?.method_config || {}));
     if (preset?._topics) v.methodConfig.topics = preset._topics;          // which desk of its country the program takes
-    if (preset?._exclude) v.topicFilters = { exclude: preset._exclude.split(",").map((x) => x.trim()).filter(Boolean) };
+    if (preset?._exclude) v.topicFilters = { ...v.topicFilters, exclude: [...new Set([...(v.topicFilters.exclude || []), ...preset._exclude.split(",").map((x) => x.trim()).filter(Boolean)])] };
     // An emptied field on an existing programme is sent as null, which the engine takes as "back to the default" (the
     // engine's own adapter, no country, no style). Dropping it, as before, meant a value once set could never be cleared.
     // A new programme leaves empty fields out: the engine fills in its defaults.
@@ -776,6 +778,46 @@ function readVideo(v, mc) {
   if (v._pickerFallback) out.picker_fallback = v._pickerFallback; else delete out.picker_fallback;
   const speed = Number(v._speed); if (speed > 1) out.speed = Math.min(1.5, speed); else delete out.speed;
   if (v._music === "none") out.music = false; else if (v._music) out.music = v._music; else delete out.music;
+  return out;
+}
+// Which stories a programme takes, how its writing treats claims, and how its pictures are made: columns the engine
+// reads (topic_filters, dedup_threshold, fact_check_strict, priority, image_specs) that nothing on the dashboard set —
+// a filter came only from a preset at creation and could never be changed afterwards. Keys these fields do not show
+// (topic_filters.min_score, image_specs.width…) are kept as they are.
+function filterFields(p) {
+  const tf = p?.topic_filters || {}, is = p?.image_specs || {}, list = (x) => (Array.isArray(x) ? x : []).join(", ");
+  const words = is.render_text ? "model" : is.overlay === false ? "none" : "";
+  return h("fieldset", null, h("legend", null, "Stories, accuracy and pictures"),
+    h("div", { class: "grid2", "data-for": "news" },
+      field("Only stories that mention", text("_fInclude", list(tf.include), { placeholder: "any story — e.g. flood, ferry, Padma" }), "Comma-separated; a story has to mention at least one."),
+      field("Skip stories that mention", text("_fExclude", list(tf.exclude), { placeholder: "e.g. cricket, horoscope" }), "Comma-separated; on top of the desk's own noise list.")),
+    h("div", { class: "grid3" },
+      h("div", { "data-for": "news" }, field("Skip feed stories older than (hours)", num("_fMaxAge", tf.max_age_hours, { min: 1, placeholder: "no limit" }))),
+      h("div", { "data-for": "written" }, field("Too similar to an earlier one at (0-1)", num("_fDedup", p?.dedup_threshold, { step: "0.01", min: 0.5, max: 1, placeholder: "0.82" }), "A new draft this close in meaning to a recent one is skipped. Higher lets close follow-ups through.")),
+      field("Priority", num("_fPriority", p?.priority, { placeholder: "0" }), "When the queue is busy, higher programmes' work goes first.")),
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" },
+      h("span", { "data-for": "news" }, check("_fNoise", "Leave out deals, galleries and horoscopes (the desk's noise list)", tf.desk_noise !== false)),
+      h("span", { "data-for": "written" }, check("_fStrict", "Attribute every claim to its source in the writing", p ? yes(p.fact_check_strict) : true))),
+    h("div", { class: "grid3", "data-for": "written" },
+      field("Card layout", select("_iLayout", [["", "(default) Photo card — picture above, headline band below"], ["photocard", "Photo card"], ["overlay", "Headline over the photo"]], is.layout || "")),
+      field("Headline on the picture", select("_iWords", [["", "Set by the engine (shapes Bangla correctly)"], ["model", "Drawn by the picture model"], ["none", "No words on the picture"]], words)),
+      field("Picture style", text("_iStyle", is.style || "", { placeholder: "editorial illustration, cinematic light, clearly not a photograph" }), "For generated pictures. News pictures are illustrations by default: a realistic \"photo\" of a real event would mislead.")));
+}
+function readFilters(v, p) {
+  const words = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const tf = { ...(p?.topic_filters || {}) }, inc = words(v._fInclude), exc = words(v._fExclude);
+  if (inc.length) tf.include = inc; else delete tf.include;
+  if (exc.length) tf.exclude = exc; else delete tf.exclude;
+  if (v._fMaxAge == null) delete tf.max_age_hours; else tf.max_age_hours = v._fMaxAge;
+  if (v._fNoise === false) tf.desk_noise = false; else delete tf.desk_noise;
+  const is = { ...(p?.image_specs || {}) };
+  if (v._iLayout) is.layout = v._iLayout; else delete is.layout;
+  delete is.render_text; delete is.overlay; if (v._iWords === "model") is.render_text = true; else if (v._iWords === "none") is.overlay = false;
+  if (String(v._iStyle || "").trim()) is.style = v._iStyle.trim(); else delete is.style;
+  const out = { topicFilters: tf, imageSpecs: is, factCheckStrict: v._fStrict === false ? 0 : 1 };
+  // Emptied on an existing programme: back to the engine's default (the PATCH takes null as that).
+  if (v._fDedup != null) out.dedupThreshold = v._fDedup; else if (p?.dedup_threshold != null) out.dedupThreshold = null;
+  if (v._fPriority != null) out.priority = v._fPriority; else if (p?.priority) out.priority = null;
   return out;
 }
 // method_config.qa / .desk / .autopilot, edited as plain fields and merged back into the program's method_config.
@@ -878,12 +920,21 @@ function brandKitPanel(b, music = []) {
       field("Page handle / website", text("handle", k.handle, { placeholder: "fb.com/yourpage" })),
       field("Font", text("font", k.font, { placeholder: "Noto Sans Bengali" }), "Installed font name, or a font file below."),
       field("Font file URL(s)", text("fonts_url", k.fonts_url, { placeholder: "https://…/HindSiliguri-Bold.ttf" }), "Comma-separated .ttf/.otf."),
-      field("Picture share of the card", num("image_ratio", k.image_ratio ?? 0.6, { step: "0.05", min: 0.4, max: 0.75 }))),
+      field("Picture share of the card", num("image_ratio", k.image_ratio ?? 0.6, { step: "0.05", min: 0.4, max: 0.75 })),
+      field("Name on the cards", text("display_name", k.display_name, { placeholder: b.name }), "If it differs from the brand's name here."),
+      field("Website", text("website", k.website, { placeholder: "https://yoursite.com" }), "Where a post links when the programme does not publish to the news portal."),
+      field("Logo size (share of the width)", num("logo_scale", k.logo_scale ?? 0.17, { step: "0.01", min: 0.08, max: 0.35 })),
+      field("Label text colour", color("label_color", k.label_color || "#141414"), "The small category label on the accent colour.")),
+    field("How to say it", area("pronounce", Object.entries(k.pronounce || {}).map(([w, s]) => `${w} = ${s}`).join("\n"), { placeholder: "One per line — written = how the voice should say it\nBRTA = B R T A\nDhaka Tribune = ঢাকা ট্রিবিউন", style: "min-height:60px" }),
+      "For every narrated video of this brand. A programme can add its own."),
     check("credit_sources", "Credit the source outlets on the card", k.credit_sources !== false),
     music.length ? field("Music beds for this brand's videos", h("select", { name: "music_urls", multiple: true, style: "min-height:70px" }, music.map((m) => h("option", { value: m.url, selected: (k.music_urls || []).includes(m.url) }, m.meta?.name || m.id))), "One is picked at random per video. Ctrl/Cmd-click to choose several.") : null);
   const preview = h("div", { class: "kit-preview" });
   const collect = () => { const v = readForm(form); const sel = form.querySelector("[name=music_urls]");
-    const kit = { ...k, primary_color: v.primary_color, accent_color: v.accent_color, text_color: v.text_color, logo_url: v.logo_url || undefined, handle: v.handle || undefined, font: v.font || undefined, fonts_url: v.fonts_url || undefined, image_ratio: v.image_ratio ?? 0.6, credit_sources: v.credit_sources, music_urls: sel ? Array.from(sel.selectedOptions).map((o) => o.value) : k.music_urls };
+    const kit = { ...k, primary_color: v.primary_color, accent_color: v.accent_color, text_color: v.text_color, logo_url: v.logo_url || undefined, handle: v.handle || undefined, font: v.font || undefined, fonts_url: v.fonts_url || undefined, image_ratio: v.image_ratio ?? 0.6, credit_sources: v.credit_sources,
+      display_name: String(v.display_name || "").trim() || undefined, website: String(v.website || "").trim() || undefined, logo_scale: v.logo_scale ?? undefined, label_color: v.label_color || undefined,
+      pronounce: Object.fromEntries(String(v.pronounce || "").split("\n").map((l) => l.split("=")).filter((x) => x.length > 1 && x[0].trim()).map(([w, ...s]) => [w.trim(), s.join("=").trim()])),
+      music_urls: sel ? Array.from(sel.selectedOptions).map((o) => o.value) : k.music_urls };
     for (const x of Object.keys(kit)) if (kit[x] === undefined) delete kit[x]; return { name: v.name, description: v.description, brandKit: kit }; };
   const show = (lang) => run(async () => { const r = await post(`/api/brands/${b.id}/preview-card`, { brandKit: collect().brandKit, language: lang }); preview.innerHTML = ""; preview.appendChild(h("img", { src: r.url, alt: "Photocard preview" })); });
   return h("div", { class: "panel" }, h("div", { class: "grid2", style: "align-items:start" },
@@ -1130,7 +1181,7 @@ pages.channels = async () => {
   if (!channels.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No channels yet"), "Add one and subscribe it to a program."));
   for (const c of channels) root.appendChild(h("div", { class: "panel" }, h("div", { class: "row" },
     h("div", null, h("h3", { style: "margin:0" }, c.display_name, " ", yes(c.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
-      h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · token ", c.credential_id ? h("span", { class: "tag green" }, creds.find((k) => k.id === c.credential_id)?.label || "linked") : h("span", { class: "tag" }, "env default"), " · ", c.max_posts_per_day ? `up to ${c.max_posts_per_day}/day` : "no daily limit", ", ", c.min_gap_minutes ?? 0, " min apart · ", c.timezone),
+      h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · token ", c.credential_id ? h("span", { class: "tag green" }, creds.find((k) => k.id === c.credential_id)?.label || "linked") : h("span", { class: "tag" }, "env default"), " · ", c.max_posts_per_day ? `up to ${c.max_posts_per_day}/day` : "no daily limit", ", ", c.min_gap_minutes ?? 0, " min apart · ", c.posting_windows?.length ? `posts ${windowsText(c.posting_windows).split("\n").join("; ")} · ` : "", c.timezone),
       h("div", { class: "small", style: "margin-top:4px" }, "Programs: ", (c.niches || []).length ? c.niches.map((n) => n.display_name).join(", ") : h("span", { class: "mute" }, "none — subscribe from Programs"))),
     h("div", { class: "right row" },
       h("button", { class: "btn sm", onclick: () => run(async () => {
@@ -1144,6 +1195,23 @@ pages.channels = async () => {
       h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete channel?", "Only works if nothing was ever published to it.", () => run(() => del(`/api/channels/${c.id}`), "Deleted").then(route)) }, "Delete")))));
   return root;
 };
+// Posting windows as people write them, one per line — "Mon-Fri 08:00-22:00", "Sat,Sun 10:00-14:00", or "07:00-23:00"
+// for every day — stored as the scheduler reads them: [{days: [0-6, Sunday is 0], start, end}] in the channel's time zone.
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function windowsText(ws) { return (ws || []).map((w) => `${w.days?.length ? `${w.days.map((d) => WEEKDAYS[d]).join(",")} ` : ""}${w.start || "00:00"}-${w.end || "23:59"}`).join("\n"); }
+function parseWindows(s) {
+  return String(s || "").split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+    const m = /^(?:([A-Za-z, -]+?)\s+)?(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/.exec(l);
+    if (!m) throw new Error(`Posting window "${l}": write it like "Mon-Fri 08:00-22:00", or "07:00-23:00" for every day`);
+    const day = (x) => WEEKDAYS.findIndex((d) => d.toLowerCase() === String(x).trim().slice(0, 3).toLowerCase()), days = [];
+    for (const part of (m[1] || "").split(",").map((x) => x.trim()).filter(Boolean)) {
+      const [a, b] = part.split("-").map(day);
+      if (a < 0 || b < 0) throw new Error(`Posting window "${l}": "${part}" is not a day (Mon, Tue, … Sun)`);
+      if (b === undefined) days.push(a); else for (let i = a; ; i = (i + 1) % 7) { days.push(i); if (i === b) break; }
+    }
+    return { ...(days.length ? { days: [...new Set(days)] } : {}), start: m[2].padStart(5, "0"), end: m[3].padStart(5, "0") };
+  });
+}
 function channelDialog(c, brands, programs, publishers, creds = []) {
   const platSel = select("platform", PLATFORMS, c?.platform || "FACEBOOK");
   const credSel = select("credentialId", [], c?.credential_id || "");
@@ -1162,10 +1230,12 @@ function channelDialog(c, brands, programs, publishers, creds = []) {
       field("Timezone", text("timezone", c?.timezone || "Asia/Dhaka")),
       field("Max posts per day", num("maxPostsPerDay", c?.max_posts_per_day ?? 12)),
       field("Minimum gap (minutes)", num("minGapMinutes", c?.min_gap_minutes ?? 30))),
+    field("Posting windows", area("_windows", windowsText(c?.posting_windows), { placeholder: "Any time. Or one per line:\nMon-Fri 08:00-22:00\nSat,Sun 10:00-14:00", style: "min-height:60px" }),
+      "When approved posts may go out, in the time zone above. Empty: any time, within the daily cap and gap."),
     field("Caption template", area("captionTemplate", c?.caption_template, { placeholder: "{caption}\n\n{hashtags}" }), "Placeholders: {caption} {headline} {hashtags} {portal_url}"),
     field("Platform config (JSON)", area("platformConfig", JSON.stringify(c?.platform_config || {}, null, 2), { "data-json": "obj", class: "mono" }), 'e.g. {"token_env": "META_ACCESS_TOKEN_PAGE2"} to use a different token for this page.'),
     c ? null : field("Subscribe to programs", multi("nicheIds", programs.map((p) => [p.id, p.display_name])))),
-    async (v) => { if (!v.publisherAdapter) delete v.publisherAdapter; if (!v.credentialId) v.credentialId = null; if (c) await patch(`/api/channels/${c.id}`, v); else { v.nicheIds = Array.from(document.querySelector("[name=nicheIds]").selectedOptions).map((o) => o.value); await post("/api/channels", v); } toast("Channel saved"); route(); }, { wide: true });
+    async (v) => { v.postingWindows = parseWindows(v._windows); delete v._windows; if (!v.publisherAdapter) delete v.publisherAdapter; if (!v.credentialId) v.credentialId = null; if (c) await patch(`/api/channels/${c.id}`, v); else { v.nicheIds = Array.from(document.querySelector("[name=nicheIds]").selectedOptions).map((o) => o.value); await post("/api/channels", v); } toast("Channel saved"); route(); }, { wide: true });
 }
 
 // ---------------------------------------------------------------- adapters
