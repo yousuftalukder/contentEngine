@@ -262,7 +262,8 @@ pages.overview = async () => {
     stats?.filesOnPc ? h("div", { class: "panel", style: `margin-top:12px${stats.pcTunnel ? "" : ";border-color:var(--amber)"}` },
       h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Files are kept on your PC"), h("span", { class: `tag${stats.pcTunnel ? " green" : ""}` }, stats.pcTunnel ? "reachable" : "PC off")),
       h("div", { class: "sub" }, stats.pcTunnel ? "Pictures and videos are stored on your PC and served from it while it runs. Work that makes them runs on your PC too."
-        : "Your PC (or its tunnel) is off, so pictures and videos can't be shown or posted, and work that makes them waits. Start pc\start.ps1.")) : null,
+        : "Your PC (or its tunnel) is off, so pictures and videos can't be shown or posted, and work that makes them waits. Start pc\\start.ps1."),
+      pcMediaLine(stats.pcMedia)) : null,
     // Free storage is 1 GB; past it Supabase refuses every file, so how full it is belongs on the first page.
     stats?.storage ? h("div", { class: "panel", style: `margin-top:12px${stats.storage.share >= 0.8 ? ";border-color:var(--amber)" : ""}` },
       h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Storage"), h("span", { class: `tag${stats.storage.share >= 0.8 ? "" : " green"}` }, `${stats.storage.usedMb} of ${stats.storage.limitMb} MB (${Math.round(stats.storage.share * 100)}%)`)),
@@ -317,6 +318,16 @@ pages.overview = async () => {
   );
   return root;
 };
+// How full your PC's media folder is, from its heartbeat. Everything kept on the PC lands there and stays until cleanup
+// removes it, so a disk filling up is shown before it stops the work. Amber under 5 GB free.
+const fmtMb = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
+function pcMediaLine(m) {
+  if (!m) return h("div", { class: "small mute", style: "margin-top:6px" }, "How much the PC's media folder holds shows here once the PC has reported in.");
+  const low = m.free_mb != null && m.free_mb < 5120;
+  return h("div", { class: "small", style: `margin-top:6px${low ? ";color:var(--amber)" : ""}` },
+    `Media folder: ${fmtMb(m.mb)} in ${m.files} file${m.files === 1 ? "" : "s"}`, m.free_mb != null ? ` · ${fmtMb(m.free_mb)} free on that disk` : "", ` · measured ${ago(m.at)}`,
+    low ? " — the disk is nearly full: turn on cleanup of rejected drafts (Settings → storage.cleanup_rejected_days), or free some space." : "");
+}
 // Pause or resume news drafting in one click, and each news programme on its own. "Pause news" keeps reading the
 // feeds (so resuming starts on today's stories); a paused programme takes nothing until it is resumed.
 // The one switch for everything the engine does by itself. Off (the default): nothing is made unless you ask — the
@@ -384,10 +395,12 @@ function proofView(it, onDone, notes = []) {
   const reRender = VIDEO_TYPES.has(it.content_type) ? "all" : it.content_type === "ANIMATED_EXPLAINER" && it.script_meta?.studio ? "render" : null;
   const caps = it.captions || {};
   const hero = it.hero_media;
+  // A file kept on your PC can't be fetched while the PC is off: say so in its place rather than show a broken player.
+  const onPcOff = (e) => { if (!String(hero.url).includes("/pc/")) return; e.target.replaceWith(h("div", { class: "panel warn small" }, "This file is kept on your PC, which is off. It shows here once the PC worker is running (pc\\start.ps1).")); };
   const heroEl = !hero ? null
-    : hero.kind === "VIDEO" ? h("video", { src: hero.url, controls: true })
-    : hero.kind === "AUDIO" ? h("audio", { src: hero.url, controls: true })
-    : h("img", { class: "hero", src: hero.url, alt: "" });
+    : hero.kind === "VIDEO" ? h("video", { src: hero.url, controls: true, onerror: onPcOff })
+    : hero.kind === "AUDIO" ? h("audio", { src: hero.url, controls: true, onerror: onPcOff })
+    : h("img", { class: "hero", src: hero.url, alt: "", onerror: onPcOff });
 
   const headline = h("textarea", { class: "serif", name: "headline", style: "min-height:52px;font-size:22px;font-weight:600" }, it.headline || "");
   const summary = h("textarea", { name: "summary", style: "min-height:60px" }, it.summary || "");
@@ -1455,10 +1468,15 @@ pages.settings = async () => {
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "Once a published post crosses this many views, a new draft is queued to repurpose it into other formats (still goes through Review)."),
       h("div", { class: "row" }, thr, h("span", { class: "small mute" }, "views"), h("button", { class: "btn", onclick: () => save("repurpose.view_threshold", Number(thr.value)) }, "Save threshold"))),
     h("div", { class: "panel" }, h("h3", null, "Media storage"),
-      h("p", { class: "muted small", style: "margin:0 0 8px" }, "Active backend: ", h("b", null, storage.backend), storage.backend === "r2" && storage.r2 ? ` (bucket ${storage.r2.bucket}${storage.r2.public_url ? "" : " — public_url missing, platforms can't fetch files"})` : "", " · configured: ", ["r2", "supabase", "local"].filter((k) => storage.available[k]).join(", "), " · ", storage.filesLive, " files live, ", storage.filesCleaned, " cleaned up.",
+      // Files kept on your PC: the backend is the PC, and the cloud backends (and their warnings) don't apply.
+      storage.onPc ? h("p", { class: "muted small", style: "margin:0 0 8px" }, "Active backend: ", h("b", null, "Your PC"), " ", h("span", { class: `tag${storage.pc?.tunnel ? " green" : ""}` }, storage.pc?.tunnel ? "reachable" : "off"),
+        storage.pc?.tunnel ? " — files are served through its tunnel." : " — its tunnel is down, so files can't be shown or posted until the PC worker runs (pc\\start.ps1).",
+        " · ", storage.filesLive, " files live, ", storage.filesCleaned, " cleaned up.", storage.pc?.waiting ? ` · ${storage.pc.waiting} upload${storage.pc.waiting > 1 ? "s" : ""} waiting for the PC to save ${storage.pc.waiting > 1 ? "them" : "it"}.` : "")
+      : h("p", { class: "muted small", style: "margin:0 0 8px" }, "Active backend: ", h("b", null, storage.backend), storage.backend === "r2" && storage.r2 ? ` (bucket ${storage.r2.bucket}${storage.r2.public_url ? "" : " — public_url missing, platforms can't fetch files"})` : "", " · configured: ", ["r2", "supabase", "local"].filter((k) => storage.available[k]).join(", "), " · ", storage.filesLive, " files live, ", storage.filesCleaned, " cleaned up.",
         storage.backend === "local" ? " Local disk is wiped on every deploy — add R2 (API keys → Cloudflare R2, or R2_* env vars) before going live." : ""),
-      h("p", { class: "muted small", style: "margin:0 0 8px" }, "Cleanup deletes an item's media from storage once every channel has published it and this many hours have passed (platforms keep their own copy). Rows and metrics stay."),
-      h("div", { class: "row" }, h("button", { class: "btn", onclick: () => save("storage.cleanup_enabled", !val("storage.cleanup_enabled", true)) }, val("storage.cleanup_enabled", true) ? "Disable cleanup" : "Enable cleanup"), h("span", null, "after"), hrs, h("span", { class: "small mute" }, "hours"), h("button", { class: "btn", onclick: () => save("storage.cleanup_after_publish_hours", Number(hrs.value)) }, "Save"), h("button", { class: "btn", onclick: () => run(() => post("/api/storage/cleanup"), "Cleanup run").then(route) }, "Run cleanup now"))),
+      storage.onPc ? pcMediaLine(storage.pc?.media) : null,
+      h("p", { class: "muted small", style: "margin:0 0 8px" }, "Cleanup deletes an item's media from storage once every channel has published it and this many hours have passed (platforms keep their own copy). Rows and metrics stay.", storage.onPc ? " Your PC runs it on the files it keeps, every hour while it is on." : ""),
+      h("div", { class: "row" }, h("button", { class: "btn", onclick: () => save("storage.cleanup_enabled", !val("storage.cleanup_enabled", true)) }, val("storage.cleanup_enabled", true) ? "Disable cleanup" : "Enable cleanup"), h("span", null, "after"), hrs, h("span", { class: "small mute" }, "hours"), h("button", { class: "btn", onclick: () => save("storage.cleanup_after_publish_hours", Number(hrs.value)) }, "Save"), h("button", { class: "btn", onclick: () => run(() => post("/api/storage/cleanup"), storage.onPc ? "Cleanup asked of your PC" : "Cleanup run").then(route) }, "Run cleanup now"))),
     h("div", { class: "panel" }, h("h3", null, "Worker lanes"), h("p", { class: "muted small", style: "margin:0" }, "Pause and resume individual lanes from the ", h("a", { href: "#/overview" }, "Overview"), " page.")),
     other.length ? h("div", { class: "panel" }, h("h3", null, "Other settings"), other.map(([k, v]) => h("div", { class: "row small", style: "padding:4px 0" }, h("span", { class: "mono" }, k), h("span", { class: "mute" }, JSON.stringify(v))))) : null,
     h("div", { class: "panel" }, h("h3", null, "Engine"),
