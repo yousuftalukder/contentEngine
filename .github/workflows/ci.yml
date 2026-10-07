@@ -16,13 +16,19 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # A mirror that stops answering once held this step for the job's whole 45 minutes (2026-10-07) and the tests never
-      # ran: apt gives up on a silent mirror after 30 s and tries again, and the step itself stops after 10 minutes.
+      # The runner's own Ubuntu mirror (azure.archive.ubuntu.com) stopped serving packages on 2026-10-07 — once it held
+      # this step for the job's whole 45 minutes and the tests never ran, then it refused every download. So: a few
+      # minutes on that mirror, then Ubuntu's main archive instead; apt gives up on a silent server after 30 s.
       - name: Video tools (same packages as the Dockerfile)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
-          sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends ffmpeg fontconfig fonts-noto-core fonts-dejavu-core
+          APT="-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          PKGS="ffmpeg fontconfig fonts-noto-core fonts-dejavu-core"
+          if ! timeout 300 sh -c "sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends $PKGS"; then
+            echo "The runner's mirror is not answering; using archive.ubuntu.com"
+            sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+            sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends $PKGS
+          fi
       - run: npm ci
       - run: node --check server.js
       - run: npm test
