@@ -247,6 +247,12 @@ stand-ins for the services, and none has yet been made from real material in pro
 
 ## Proven working
 
+**6c, 2026-10-07:** an illustrated story made end to end on the PC with files kept there: "A Rickshaw Driver's Day
+in Dhaka During the Monsoon", drawn monsoon street scenes with cut-out figures moved in code, scene titles and burned
+captions, 23 s, 1920x1080. The free picture service's drawings are loose (the rickshaw driver came out as a motorbike
+rider) and keep a small corner logo without a token; the pale disc behind a cut-out figure stays. With it, every
+variant that needs nothing paid is proven; 1b (Vizard) and 5c (Twelve Labs) wait only for their paid keys.
+
 **6b and 6d, 2026-10-07:** both made end to end on the PC in production with the files kept there: the job ran on the
 PC from plan to narration to render, and the finished video was stored and served by the PC. 6b (data explainer,
 Remotion): "How Dhaka's Metro Rail Changed Daily Commuting", 23 s, 1920×1080. 6d (Blender 3D: the narrated plan in procedural 3D layouts — extruded titles, growing bars, key words —
