@@ -248,6 +248,11 @@ pages.overview = async () => {
     autoPanel(stats),
     stats?.autoOn && stats?.newsPrograms?.length ? newsControls(stats) : null,
 
+    // Files on your PC: whether anyone can see them right now depends on the PC and its tunnel being up.
+    stats?.filesOnPc ? h("div", { class: "panel", style: `margin-top:12px${stats.pcTunnel ? "" : ";border-color:var(--amber)"}` },
+      h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Files are kept on your PC"), h("span", { class: `tag${stats.pcTunnel ? " green" : ""}` }, stats.pcTunnel ? "reachable" : "PC off")),
+      h("div", { class: "sub" }, stats.pcTunnel ? "Pictures and videos are stored on your PC and served from it while it runs. Work that makes them runs on your PC too."
+        : "Your PC (or its tunnel) is off, so pictures and videos can't be shown or posted, and work that makes them waits. Start pc\start.ps1.")) : null,
     // Free storage is 1 GB; past it Supabase refuses every file, so how full it is belongs on the first page.
     stats?.storage ? h("div", { class: "panel", style: `margin-top:12px${stats.storage.share >= 0.8 ? ";border-color:var(--amber)" : ""}` },
       h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Storage"), h("span", { class: `tag${stats.storage.share >= 0.8 ? "" : " green"}` }, `${stats.storage.usedMb} of ${stats.storage.limitMb} MB (${Math.round(stats.storage.share * 100)}%)`)),
@@ -1376,6 +1381,7 @@ pages.settings = async () => {
   const expiry = num(null, val("review.news_expiry_hours", 24), { min: 0, style: "max-width:100px" });
   const waiting = num(null, val("review.max_waiting", 30), { min: 0, style: "max-width:100px" });
   const keepDays = num(null, val("storage.cleanup_rejected_days", 0), { min: 0, style: "max-width:100px" });
+  known.push("storage.on_pc", "pc.tunnel");
   const tgChat = text(null, val("alerts.telegram_chat_id", "") || "", { placeholder: "chat id, e.g. 123456789", style: "max-width:220px" });
   known.push("alerts.telegram_chat_id", "upgrade.catalog_v1", "news.paused", "review.news_expiry_hours", "review.max_waiting", "storage.cleanup_rejected_days",
     "voice.default_fallbacks", "desk.similarity", "desk.word_overlap", "ingest.max_age_hours", "retention.source_items_days", "ingest.fetch_article_text", "image.text_card_fallback");
@@ -1404,6 +1410,7 @@ pages.settings = async () => {
         h("button", { class: `btn sm${val("news.paused", false) ? " primary" : ""}`, onclick: () => save("news.paused", !val("news.paused", false), val("news.paused", false) ? "News resumed" : "News paused") }, val("news.paused", false) ? "Resume news" : "Pause news")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Set aside news nobody has reviewed after this many hours (0 = never)"), expiry, h("button", { class: "btn sm", onclick: () => save("review.news_expiry_hours", Number(expiry.value) || 0) }, "Save")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "A hand-reviewed programme stops drafting while this many drafts wait for review (0 = never stop)"), waiting, h("button", { class: "btn sm", onclick: () => save("review.max_waiting", Number(waiting.value) || 0) }, "Save")),
+      toggle("storage.on_pc", false, "Files are kept on your PC: the server stores nothing, and work that makes pictures and videos runs on your PC (it must be on).", "Files are kept in cloud storage (Supabase or R2)."),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Delete the pictures and videos of rejected and failed drafts after this many days (0 = keep them). The drafts stay; this is what keeps free storage from filling up"), keepDays, h("button", { class: "btn sm", onclick: () => save("storage.cleanup_rejected_days", Number(keepDays.value) || 0) }, "Save"))),
     h("div", { class: "panel" }, h("h3", null, "Automation"),
       toggle("desk.enabled", true, "News desk: articles are grouped into stories across outlets before writing.", "News desk is off: every new article is written on its own."),

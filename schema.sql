@@ -519,6 +519,14 @@ CREATE TABLE IF NOT EXISTS api_usage_daily (
   UNIQUE(credential_id, provider, day)
 );
 
+-- An upload that reached the server while files are kept on the PC: held here until the PC writes it out (STORE_FILE).
+CREATE TABLE IF NOT EXISTS pending_files (
+  id         TEXT PRIMARY KEY,
+  path       TEXT NOT NULL,
+  mime       TEXT,
+  data       BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
   value      JSONB NOT NULL,

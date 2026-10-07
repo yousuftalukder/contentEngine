@@ -54,10 +54,12 @@ PC switched off mid-render) goes back to the queue on its own — but the third 
 and says so, rather than looping. **Retry** on the job starts it completely afresh. A post that was interrupted while
 it was being sent is never sent again on its own: it is marked *check the channel first*, because it may already be up.
 
-**Storage.** The free Supabase plan holds 1 GB, and past it Supabase refuses *every* file — videos in Review stop
-playing and nothing can be posted (it happened on 2026-10-07, mostly from the pictures of rejected news). The Overview
-shows how full it is and alerts at 80%. **Settings → Review and news → delete the pictures and videos of rejected and
-failed drafts after N days** keeps it from filling (the drafts themselves stay). It is off until you set it.
+**Storage: files are kept on your PC** (Settings → *Files are kept on your PC*). The server stores nothing; every
+step that makes a picture or a video runs on your PC and writes it there (`data\media` in the project folder). While
+the PC worker runs, it opens a free Cloudflare tunnel so the dashboard on your phone can play the videos and the
+publishers can fetch them; links always go through the server, so they keep working after the PC restarts. When the
+PC is off, pictures and videos can't be shown or posted, and the work that makes them waits. (Supabase's free 1 GB
+filled on 2026-10-07 and its storage was shut; the Overview shows how full cloud storage is if you switch back.)
 
 **Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
 Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each
