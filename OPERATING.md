@@ -146,6 +146,27 @@ tunnel's address when it opens; if cloudflared is missing it says so — run `pc
   added deno, which yt-dlp needs to keep reading YouTube; 2026-10-07 added cloudflared, the tunnel that serves the
   PC's files.
 
+## Setting up a PC, or moving to a new one
+
+You run everything from the dashboard; no Claude or programming tool is needed. The PC only has to run the worker.
+
+**A new PC, once** (Windows):
+1. Install **Node.js** (LTS, from nodejs.org), **Python** (python.org, tick *Add python.exe to PATH*) and **Git**.
+2. Get the project: `git clone https://github.com/yousuftalukder/contentEngine` and open the folder.
+3. Run `powershell -ExecutionPolicy Bypass -File pc\setup.ps1` (add `-Blender` for 3D explainers). It installs
+   everything else into the project folder and says when it is ready.
+4. Copy `.env.pc` from your old PC (or fill it in from Render's Environment tab). It holds the database password and
+   the vault key: keep it private.
+5. Start it: `powershell -ExecutionPolicy Bypass -File pc\start.ps1` — or `pc\autostart.ps1` once, to start it at
+   every sign-in.
+
+**Only one PC is the worker at a time.** Each PC keeps the files it made, in `data\media`. A second PC started while the
+first is running refuses to start and says so. To move for good: stop the worker on the old PC, copy its `data\media`
+folder into the new PC's project folder, and start the new one once with `PC_TAKEOVER=1` set
+(`$env:PC_TAKEOVER = "1"; pc\start.ps1`). Files left behind on the old PC stop playing in Review.
+
+**Updating** after a change is merged: `git pull` in the project folder, then restart the worker.
+
 ## What adding each thing unlocks
 
 Nothing here needs a card. Every variant in the blueprint runs on free allowances; the two paid services are optional

@@ -25,7 +25,7 @@ import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { dirname, join, extname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir, totalmem } from "node:os";
+import { tmpdir, totalmem, hostname } from "node:os";
 import pg from "pg";
 
 // === 1. config & utils ================================================
@@ -518,6 +518,7 @@ async function storageBackend() {
 }
 // This process is your PC's worker (it takes only the PC's lane), and whether files are kept there.
 const IS_PC = LANES.includes(PC_LANE) && !LANES.includes("text");
+const PC_HOST = ENV.PC_HOSTNAME || hostname();                        // which machine this worker is (PC_HOSTNAME: tests)
 const filesOnPc = async () => flag(await setting("storage.on_pc", false));
 // The server's own public address, as the server records it at boot — known to the PC too, through the database.
 async function serverBase() {
@@ -5752,7 +5753,7 @@ function startWorkers() {
   // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
   // leaving routed work to look stuck.
   if (LANES.includes(PC_LANE)) {
-    const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, lanes: LANES, media: pcMediaSize() }).catch((e) => warn("pc heartbeat", e.message));
+    const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, host: PC_HOST, lanes: LANES, media: pcMediaSize() }).catch((e) => warn("pc heartbeat", e.message));
     beat(); setInterval(beat, 30000);
     // The files this PC keeps: its tunnel opened (and reopened), and its own files cleaned up as the server's would be.
     if (IS_PC) { keepTunnel(); setInterval(() => keepTunnel().catch(() => {}), 60000); setInterval(() => sweepStorageCleanup().catch((e) => warn("cleanup", e.message)), 60 * 60000); }
@@ -6483,6 +6484,18 @@ async function measureMedia() {
   await migrate();
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
   await syncClock(); setInterval(syncClock, 10 * 60000).unref?.();
+  // One PC keeps the files. A second PC started as the worker would make files of its own that the first does not have,
+  // and the tunnel address would follow whichever started last — links to the other one's files would break. So while
+  // files are kept on a PC, a worker on another machine does not start while that PC is beating; moving to a new PC is
+  // deliberate: copy data\media across and start once with PC_TAKEOVER=1. A restart on the same machine is always fine.
+  if (IS_PC && ENV.PC_TAKEOVER !== "1" && (await filesOnPc())) {
+    const hb = await one(`SELECT value, updated_at > now() - interval '90 seconds' AS fresh FROM settings WHERE key = 'worker.pc'`);
+    const other = P(hb?.value)?.host;
+    if (hb?.fresh && other && other !== PC_HOST) {
+      console.error(`Another PC ("${other}") is the worker right now and keeps the files. Stop the worker there first. To move to this PC for good, copy its data\\media folder here and start once with PC_TAKEOVER=1.`);
+      process.exit(1);
+    }
+  }
   await recoverAbandonedWork();
   // Render sends SIGTERM before it replaces an instance or spins one down. A job this worker was in the middle of would
   // otherwise sit RUNNING until recovery gives up on it — LOCK_TIMEOUT_MIN later — and with several deploys a day that
