@@ -127,3 +127,36 @@ test("Gemini: research the web search is refused for is done without it, and the
     assert.ok(research.every((x) => x.search), `a spent daily allowance is not retried without search: ${JSON.stringify(research.filter((x) => !x.search))}`);
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
+
+// What the free tier actually sent on 2026-10-06 and 07: the search-grounded research refused with a bare 429 — a help
+// link, no limit named, nothing about search — while plain writing on the same model went through. Read as the model's
+// allowance, every explainer waited for a reset that never helped. It is asked again without search, and written.
+test("Gemini: research refused with a bare 429 is asked again without search, and the draft is written", async () => {
+  const seen = [];
+  const stub = http.createServer((req, res) => {
+    let raw = ""; req.on("data", (d) => (raw += d)); req.on("end", () => {
+      const url = new URL(req.url, "http://x");
+      if (!/:generateContent$/.test(url.pathname)) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ models: [] })); }
+      const body = JSON.parse(raw), research = /meticulous researcher/.test(JSON.stringify(body.system_instruction));
+      seen.push({ research, search: !!body.tools });
+      if (body.tools) { res.writeHead(429, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "You exceeded your current quota, please check your plan and billing details.", details: [{ "@type": "type.googleapis.com/google.rpc.Help", links: [] }] } })); }
+      const answer = research ? { notes: [{ fact: "The bridge carries 30,000 vehicles a day.", source_url: "https://example.com/bridge", source_name: "Example" }], angle: "what it changed" }
+        : { headline: "The bridge, a year on", post: "It carries 30,000 vehicles a day.", hashtags: ["bridge"], image_prompt: "a bridge" };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50 } }));
+    });
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  const eng = await startEngine({ env: { GEMINI_API_KEY: "not-a-real-key", GEMINI_API_BASE: `http://127.0.0.1:${stub.address().port}` } });
+  try {
+    const brand = await eng.api("POST", "/api/brands", { name: "Bare 429" });
+    const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "bare_search", displayName: "Bare search", contentType: "LONG_POST",
+      useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "gemini_live", scriptAdapterFallbacks: [], methodConfig: { qa: { enabled: false }, cover_image: false } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "The Padma bridge a year on" });
+    const it = await waitFor(async () => { const x = await eng.api("GET", `/api/content-items/${id}`); if (x.status === "FAILED") throw new Error(x.rejection_note); return x.status === "PENDING_REVIEW" && x; }, { timeout: 60000, what: "the draft" });
+    assert.match(it.body, /30,000/, "written from the research done without search");
+    const src = typeof it.source_data_ref === "string" ? JSON.parse(it.source_data_ref) : it.source_data_ref;
+    assert.equal(src.research_searched, false, "and it says the research had no web search");
+    assert.ok(seen.some((x) => x.research && !x.search), "the research was asked again without search");
+  } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
+});
