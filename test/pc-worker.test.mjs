@@ -99,7 +99,7 @@ test("Bangla speech is never given to local whisper: a PC without a key sends th
   const http = await import("node:http"), { spawnSync } = await import("node:child_process"), { mkdtempSync } = await import("node:fs"), { tmpdir } = await import("node:os"), { join } = await import("node:path");
   const src = join(mkdtempSync(join(tmpdir(), "ce-bn-")), "report.mp4");
   spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=40", "-f", "lavfi", "-i", "sine=frequency=220:duration=40", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src]);
-  let uploads = 0;
+  let uploads = 0; const heard = [];
   const gemini = http.createServer((req, res) => { const chunks = []; req.on("data", (d) => chunks.push(d)); req.on("end", () => {
     const base = `http://127.0.0.1:${gemini.address().port}`, send = (b, h = {}) => { res.writeHead(200, { "content-type": "application/json", ...h }); res.end(JSON.stringify(b)); };
     if (req.url.startsWith("/upload/v1beta/files")) { uploads++; return send({}, { "x-goog-upload-url": `${base}/up` }); }
@@ -107,6 +107,13 @@ test("Bangla speech is never given to local whisper: a PC without a key sends th
     if (req.method === "DELETE") return send({});
     if (!/:generateContent/.test(req.url)) return send({ models: [] });
     const body = JSON.parse(Buffer.concat(chunks).toString());
+    // The first model's day is spent: the transcriber goes on down the list instead of waiting for tomorrow.
+    const model = /models\/([^:]+):/.exec(req.url)[1];
+    if (/file_data/.test(JSON.stringify(body.contents))) {
+      heard.push(model);
+      if (model === "gemini-flash-latest") { res.writeHead(429, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { code: 429, message: "Quota exceeded for metric: generate_content_free_tier_requests, limit: 20", details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }] } })); }
+    }
     const text = /file_data/.test(JSON.stringify(body.contents))
       ? [0, 8, 16, 24, 32].map((t) => ({ start: t, end: t + 8, text: `পাটুরিয়ায় ফেরি চলাচল আবার শুরু হয়েছে, যাত্রীরা স্বস্তি পেয়েছেন ${t}` }))
       : [{ start: 8, end: 30, title: "ফেরি চলাচল শুরু", hook: "", score: 0.9, reason: "the server read the Bangla transcript" }];
@@ -130,6 +137,7 @@ test("Bangla speech is never given to local whisper: a PC without a key sends th
     assert.match(clip.transcript_text, /ফেরি চলাচল/, "the words are the hosted transcriber's Bangla, not whisper's");
     assert.match(clip.reason, /server read the Bangla transcript/);
     assert.equal(uploads, 1, "the soundtrack went to the hosted transcriber once");
+    assert.deepEqual(heard, ["gemini-flash-latest", "gemini-flash-lite-latest"], "the spent model was passed over for the next one, the same day");
     const jobs = (await server.query(`SELECT type, queue FROM jobs ORDER BY created_at`)).filter((j) => ["PROCESS_CANDIDATE", "PICK_CLIPS", "RENDER_CLIP"].includes(j.type)).map((j) => `${j.type}@${j.queue}`);
     assert.deepEqual(jobs, ["PROCESS_CANDIDATE@video_local", "PICK_CLIPS@text", "RENDER_CLIP@video_local"]);
   } finally { await pc?.stop(); await server.stop(); await new Promise((r) => gemini.close(r)); }
