@@ -11,6 +11,30 @@ $wdir  = Join-Path $tools "whisper"
 $wbin  = Join-Path $wdir "bin"
 New-Item -ItemType Directory -Force $bin, $wbin | Out-Null
 
+# Two things this script cannot install for you, checked first so a new PC fails here with a clear message instead of
+# later with a cryptic one: Node.js runs the engine itself (20 or newer), Python runs the free voices (edge-tts).
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Error "Node.js is not installed. Install the LTS version from https://nodejs.org, then run this again."; exit 1 }
+$nodeMajor = [int]((& node -v).TrimStart("v").Split(".")[0])
+if ($nodeMajor -lt 20) { Write-Error "Node.js $(& node -v) is too old. Install version 20 or newer from https://nodejs.org, then run this again."; exit 1 }
+$pyOk = $false; try { $null = & python --version 2>$null; $pyOk = ($LASTEXITCODE -eq 0) } catch {}
+if (-not $pyOk) { Write-Error "Python is not installed (the free voices need it). Install it from https://python.org with 'Add python.exe to PATH' ticked, then run this again."; exit 1 }
+
+# The engine's own packages, and the video studio's (animated explainers and reels) with the browser it renders in.
+# A fresh copy of the project has none of these; this PC had them only because they were installed by hand.
+if (-not (Test-Path (Join-Path $root "node_modules\pg"))) {
+  Write-Host "engine packages (npm ci)"
+  Push-Location $root; npm ci --omit=dev --no-audit --no-fund; $rc = $LASTEXITCODE; Pop-Location
+  if ($rc) { Write-Error "Installing the engine's packages failed (npm ci)."; exit 1 }
+} else { Write-Host "engine packages: already present" }
+$studio = Join-Path $root "studio"
+if (-not (Test-Path (Join-Path $studio "node_modules\@remotion\renderer"))) {
+  Write-Host "video studio packages (npm ci)"
+  Push-Location $studio; npm ci --no-audit --no-fund; $rc = $LASTEXITCODE; Pop-Location
+  if ($rc) { Write-Error "Installing the video studio's packages failed (npm ci)."; exit 1 }
+} else { Write-Host "video studio packages: already present" }
+Write-Host "video studio browser"
+Push-Location $studio; npx --no-install remotion browser ensure; if ($LASTEXITCODE) { Write-Host "  (the studio fetches its browser on the first render instead)" }; Pop-Location
+
 function Fetch($url, $dest) {
   Write-Host "  downloading $url"
   Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
@@ -101,7 +125,7 @@ Write-Host "Checking the tools run:"
 # error under "Stop" — which would report a working tool as broken.
 $ErrorActionPreference = "Continue"
 $bad = @()
-foreach ($t in @(@((Join-Path $bin "ffmpeg.exe"), "-version"), @((Join-Path $bin "yt-dlp.exe"), "--version"), @((Join-Path $bin "deno.exe"), "--version"), @((Join-Path $wbin "whisper-cli.exe"), "--help"), @((Join-Path $edge "Scripts\edge-tts.exe"), "--version"))) {
+foreach ($t in @(@((Join-Path $bin "ffmpeg.exe"), "-version"), @((Join-Path $bin "yt-dlp.exe"), "--version"), @((Join-Path $bin "deno.exe"), "--version"), @((Join-Path $bin "cloudflared.exe"), "--version"), @((Join-Path $wbin "whisper-cli.exe"), "--help"), @((Join-Path $edge "Scripts\edge-tts.exe"), "--version"))) {
   $null = & $t[0] $t[1] 2>$null
   if ($LASTEXITCODE -eq 0) { Write-Host "  ok   $(Split-Path $t[0] -Leaf)" } else { Write-Host "  FAIL $(Split-Path $t[0] -Leaf) (exit $LASTEXITCODE)"; $bad += $t[0] }
 }
