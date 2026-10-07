@@ -274,7 +274,9 @@ async function settings() {
   if (Date.now() - settingsCache.at < 10000) return settingsCache.map;
   // settings.value is JSONB, so the driver hands back the value already parsed. Parsing it again turned every string
   // setting into null — a Telegram chat id set here was read as "not configured", and alerts went nowhere.
-  settingsCache.map = Object.fromEntries((await q(`SELECT key, value FROM settings WHERE key NOT LIKE 'relay.%'`)).map((r) => [r.key, typeof r.value === "string" ? r.value : P(r.value)]));
+  // Neither the relay's answers nor the PC setup records (pc.setup.<hash of a token>, pc.setup_status) are settings,
+  // and the setup records are kept out of /api/settings on purpose.
+  settingsCache.map = Object.fromEntries((await q(`SELECT key, value FROM settings WHERE key NOT LIKE 'relay.%' AND key NOT LIKE 'pc.setup%'`)).map((r) => [r.key, typeof r.value === "string" ? r.value : P(r.value)]));
   settingsCache.at = Date.now();
   return settingsCache.map;
 }
@@ -6148,7 +6150,7 @@ app.get("/api/catalog", async (ctx) => {
   const writers = haveWriters.filter((w) => !refusing(w.prov)).map((w) => w.name);
   const refusedWriters = haveWriters.filter((w) => refusing(w.prov)).map((w) => `${w.name}: ${refusing(w.prov)}`);
   const needs = {
-    pc: { ok: pcOnline, label: "your PC on", detail: pcOnline ? "online now" : beat ? "off — work waits for it" : "never connected — run pc\\start.ps1" },
+    pc: { ok: pcOnline, label: "your PC on", detail: pcOnline ? "online now" : beat ? "off — work waits for it" : "never connected — Set up → Set up a PC" },
     writer: { ok: writers.length > 0, label: "a writer that works", detail: [writers.join(" + "), ...refusedWriters].filter(Boolean).join("; ") || "add a free Gemini or Groq key" },
     voice: { ok: voice, label: "a voice", detail: voice ? "edge-tts (free)" : "edge-tts is not installed here" },
     persona: { ok: persona.n > 0, label: "your reactor clip", detail: persona.n ? `${persona.n} uploaded` : "upload one under Brands → Media library" },
@@ -6178,6 +6180,87 @@ app.get("/api/workers", async (ctx) => {
   const beat = rows.find((x) => x.key === "worker.pc"), age = beat ? Math.max(0, Number(beat.age)) : null;
   const waiting = (await one(`SELECT count(*)::int AS n FROM jobs WHERE queue = $1 AND status = 'PENDING'`, [PC_LANE])).n;
   json(ctx, 200, { server, pc: { online: age != null && age < 90, seen_seconds_ago: age == null ? null : Math.round(age), boot: pcBoot, waiting } });
+});
+// ---- set up a PC from the dashboard (Set up a PC). The owner presses a button, copies one PowerShell command and pastes
+// it on the new PC; the PC installs itself (pc/install.ps1, served below) and connects without anyone copying .env.pc.
+// Security, in short:
+//  - The command carries a one-time token: 24 random bytes, valid 30 minutes. Only its sha256 is stored (settings key
+//    pc.setup.<hash>), so the database and its backups never hold a usable token.
+//  - The installer it downloads holds no secrets (the address, the token, the options). Fetching it does not use the
+//    token up, so a PC missing Node.js or Python can install them and paste the same command again.
+//  - The secrets come from one call, POST /api/public/pc/config, which deletes the token as it reads it (one DELETE …
+//    RETURNING: two racing calls cannot both get them) and answers only DATABASE_URL, SECRETS_KEY and the Supabase pair
+//    when set. No AI keys: the PC reads those from the vault and borrows the server's through the key relay.
+//  - Both public calls are refused over plain http (except on localhost), rate-limited per address, and answer a used,
+//    expired or unknown token with the same plain 410. The token is never logged; each use leaves a dashboard notice.
+const PC_SETUP_MINUTES = 30;
+const pcSetupKey = (token) => `pc.setup.${createHash("sha256").update(token).digest("hex")}`;
+const pcSetupTokenOf = (ctx) => { const t = String(ctx.req.headers["x-setup-token"] || ctx.query.get("t") || "").trim(); return /^[A-Za-z0-9_-]{32}$/.test(t) ? t : null; };
+const isLocalHost = (host) => /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(String(host || ""));
+// Render ends TLS in front of the service and says so in X-Forwarded-Proto; a request that came in as plain http from
+// anywhere but this machine must not be handed a database password.
+const overHttps = (req) => String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase() === "https" || isLocalHost(req.headers.host);
+const plainText = (ctx, status, text) => { ctx.res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }); ctx.res.end(text); };
+const PC_SETUP_GONE = "This setup command was already used or has expired (each one works once, for 30 minutes). Make a new one on the dashboard: Set up a PC.";
+// The gate both public calls pass first. Returns true when it has already answered.
+function pcSetupRefused(ctx) {
+  // A token is 192 random bits, so this is not what stops guessing; it stops anyone hammering the database through it.
+  if (rateLimited(`pc-setup:${ctx.ip}`, 20)) { plainText(ctx, 429, "Too many tries from this address. Wait a minute and try again."); return true; }
+  if (!overHttps(ctx.req)) { plainText(ctx, 403, "PC setup works only over https."); return true; }
+  return false;
+}
+app.post("/api/pc/setup-token", async (ctx) => {
+  const base = await serverBase();
+  if (!/^https:\/\//i.test(base) && !isLocalHost(base.replace(/^http:\/\//i, "").split("/")[0])) throw new ApiError(400, null, `This server's address is ${base}, not https — a PC's settings are only sent over https. Set RENDER_EXTERNAL_URL or PUBLIC_BASE_URL to its https address.`);
+  if (!/^[A-Za-z0-9:/._\[\]-]+$/.test(base)) throw new ApiError(400, null, `This server's address (${base}) cannot be put into a command`);
+  const options = { blender: !!ctx.body.blender, autostart: ctx.body.autostart !== false, takeover: !!ctx.body.takeover };
+  const token = randomBytes(24).toString("base64url");
+  // Expired commands nobody used are cleared whenever a new one is made; the expiry is the database's clock, like the
+  // check that reads it, so a server clock running fast or slow cannot stretch or cut the 30 minutes.
+  await q(`DELETE FROM settings WHERE key LIKE 'pc.setup.%' AND (value->>'expires_at')::timestamptz < now()`);
+  const row = await one(`INSERT INTO settings (key, value) VALUES ($1, $2::jsonb || jsonb_build_object('created_at', now(), 'expires_at', now() + make_interval(mins => $3::int))) RETURNING value->>'expires_at' AS expires_at`, [pcSetupKey(token), JSON.stringify(options), PC_SETUP_MINUTES]);
+  await putSetting("pc.setup_status", { made_at: nowIso(), expires_at: row.expires_at, options, used_at: null });
+  log(`pc setup: a setup command was made (valid ${PC_SETUP_MINUTES} min; blender ${options.blender}, autostart ${options.autostart}, takeover ${options.takeover})`);
+  // The token travels in a header, not the address: Render's request log records every address, and a used-up token
+  // in a log is harmless but an unused one is not.
+  const command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm -UseBasicParsing -Headers @{ 'X-Setup-Token' = '${token}' } '${base}/api/public/pc/install.ps1' | iex"`;
+  json(ctx, 201, { command, expires_at: row.expires_at, options });
+});
+// The installer, with the address, the token and the options filled in. Checks the token without using it up.
+app.get("/api/public/pc/install.ps1", async (ctx) => {
+  if (pcSetupRefused(ctx)) return;
+  const token = pcSetupTokenOf(ctx);
+  const row = token ? await one(`SELECT value, (value->>'expires_at')::timestamptz > now() AS live FROM settings WHERE key = $1`, [pcSetupKey(token)]) : null;
+  if (!row?.live) return plainText(ctx, 410, PC_SETUP_GONE);
+  const o = P(row.value) || {}, base = await serverBase();
+  const fill = { __CE_SERVER__: base, __CE_TOKEN__: token, __CE_BLENDER__: o.blender ? "1" : "0", __CE_AUTOSTART__: o.autostart ? "1" : "0", __CE_TAKEOVER__: o.takeover ? "1" : "0" };
+  // Every value goes inside a single-quoted PowerShell string; a quote in one is doubled, which is how PowerShell escapes it.
+  const script = (await readFile(join(__dirname, "pc", "install.ps1"), "utf8")).replace(/__CE_[A-Z]+__/g, (m) => (m in fill ? String(fill[m]).replace(/'/g, "''") : m));
+  plainText(ctx, 200, script);
+});
+// The PC's settings, once: the token is deleted in the same statement that reads it.
+app.post("/api/public/pc/config", async (ctx) => {
+  if (pcSetupRefused(ctx)) return;
+  const token = pcSetupTokenOf(ctx);
+  const row = token ? await one(`DELETE FROM settings WHERE key = $1 RETURNING value, (value->>'expires_at')::timestamptz > now() AS live`, [pcSetupKey(token)]) : null;
+  if (!row?.live) return plainText(ctx, 410, PC_SETUP_GONE);
+  // Node's --env-file reads KEY=value; a value with a space, # or quote is quoted so it reads back exactly.
+  const line = (k, v) => { v = String(v); return `${k}=${/^[\w.:/@%+=?&,~!*-]*$/.test(v) ? v : !v.includes("'") ? `'${v}'` : `"${v.replace(/"/g, '\\"')}"`}`; };
+  const vars = [["DATABASE_URL", ENV.DATABASE_URL], ["SECRETS_KEY", ENV.SECRETS_KEY], ["SUPABASE_URL", ENV.SUPABASE_URL], ["SUPABASE_SERVICE_ROLE_KEY", ENV.SUPABASE_SERVICE_ROLE_KEY]].filter(([, v]) => v);
+  const prev = P((await one(`SELECT value FROM settings WHERE key = 'pc.setup_status'`))?.value) || {};
+  await putSetting("pc.setup_status", { ...prev, used_at: nowIso(), used_from: ctx.ip || null });
+  log(`pc setup: a PC at ${ctx.ip} was sent its settings (${vars.map(([k]) => k).join(", ")}); the setup command is used up`);
+  // A notice on the dashboard (and Telegram, when set), so a command that leaked and was used by someone else is seen.
+  notify("pc", "A PC was connected with a setup command", `From ${ctx.ip || "an unknown address"}. If that was not you, change the database password and SECRETS_KEY on Render.`, { level: "info", key: `pc-setup:${Date.now()}`, cooldownHours: 0 }).catch((e) => warn("pc setup notice:", e.message));
+  plainText(ctx, 200, vars.map(([k, v]) => line(k, v)).join("\n") + "\n");
+});
+// What the Set up a PC page shows while it waits: the PC's heartbeat, its tunnel, and whether the command was used.
+app.get("/api/pc/setup-status", async (ctx) => {
+  const rows = await q(`SELECT key, value, EXTRACT(EPOCH FROM (now() - updated_at))::float AS age FROM settings WHERE key IN ('worker.pc', 'boot.pc', 'pc.setup_status')`);
+  const read = (k) => { const r = rows.find((x) => x.key === k); return r ? P(r.value) : null; };
+  const beat = rows.find((x) => x.key === "worker.pc"), age = beat ? Math.max(0, Number(beat.age)) : null, pc = read("worker.pc"), boot = read("boot.pc");
+  json(ctx, 200, { pc: { online: age != null && age < 90, seen_seconds_ago: age == null ? null : Math.round(age), host: pc?.host || null, started_at: boot?.at || null, blender: boot?.blender ?? null },
+    tunnel: await pcTunnel(), filesOnPc: await filesOnPc(), setup: read("pc.setup_status") });
 });
 app.delete("/api/niches/:id", async (ctx) => { const dep = await one(`SELECT COUNT(*)::int AS n FROM content_items WHERE niche_id=$1`, [ctx.params.id]); if (dep.n) throw new ApiError(409, null, `Program has ${dep.n} content items — deactivate it instead (PATCH isActive:false)`); await q(`DELETE FROM series WHERE niche_id=$1`, [ctx.params.id]); await q(`DELETE FROM niches WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), ctx.params.id, ctx.params.sourceId]); json(ctx, 200, { ok: true }); });

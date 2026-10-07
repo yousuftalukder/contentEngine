@@ -114,7 +114,10 @@ yt-dlp, Bangla fonts, the studio and headless Chrome, and pre-builds the studio 
 
 Production runs one free Render instance plus the owner's Windows PC as a worker on the same database. The PC takes only
 the `video_local` lane: YouTube downloads (YouTube refuses Render's address), local whisper, heavy ffmpeg, the studio
-(Remotion) and Blender. Setting it up:
+(Remotion) and Blender. The easy way to set it up is the dashboard: **Set up → Set up a PC** makes a one-time PowerShell
+command (one use, 30 minutes; only the token's sha256 is stored) that downloads the engine, gets its `.env.pc` from
+`POST /api/public/pc/config` (which deletes the token as it answers), runs the scripts below and starts the worker. The
+installer is `pc/install.ps1`, served by `GET /api/public/pc/install.ps1` with the address and token filled in. By hand:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File pc\setup.ps1     # ffmpeg, yt-dlp, deno, cloudflared, whisper.cpp + base model, edge-tts; -Blender adds Blender 4.2
@@ -182,7 +185,8 @@ in `.env.pc.example`.
   owner; Supabase's public API sees nothing).
 - `studio/` — Remotion compositions (NewsReel, Explainer) rendered by `studio/render.mjs` in a child process.
 - `blender/` — `explainer3d.py`, the procedural 3D scenes Blender renders for 3D explainers on the PC.
-- `pc/` — the PC worker's scripts: `setup.ps1` (tools), `start.ps1` (the worker), `autostart.ps1` (start at sign-in).
+- `pc/` — the PC worker's scripts: `setup.ps1` (tools), `start.ps1` (the worker), `autostart.ps1` (start at sign-in),
+  `install.ps1` (the dashboard's one-command setup, served with the server's address and a one-time token filled in).
 - `frontend/` — the dashboard (vanilla JS).
 - `test/` — end-to-end tests on PGlite; CI runs them on every pull request.
 

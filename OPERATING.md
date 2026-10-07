@@ -150,7 +150,21 @@ tunnel's address when it opens; if cloudflared is missing it says so — run `pc
 
 You run everything from the dashboard; no Claude or programming tool is needed. The PC only has to run the worker.
 
-**A new PC, once** (Windows):
+**From the dashboard (the easy way)** — Windows:
+1. On the PC, install **Node.js** (LTS, from nodejs.org) and **Python** (python.org, tick *Add python.exe to PATH*).
+   Git is not needed.
+2. On the dashboard, open **Set up → Set up a PC**, tick what you want (Blender for 3D explainers, start at every
+   sign-in, *this PC replaces my old one*) and press **Make a setup command**. Copy the command.
+3. On the PC, open PowerShell, paste it, press Enter. It downloads the engine into `ContentEngine` in your user folder,
+   writes `.env.pc` itself, installs the tools and starts the worker in a minimised window. The dashboard page shows
+   the PC come online.
+
+The command works **once, for 30 minutes**; don't share it or paste it into a chat — until it is used, whoever runs it
+gets your database connection. If Node.js or Python is missing it says so before using anything up: install it and
+paste the same command again. Each use leaves a notice on the dashboard (and on Telegram, if alerts go there). Running
+a new command on a PC that is already set up updates it and keeps its files and `.env.pc`.
+
+**By hand** (the same thing, step by step):
 1. Install **Node.js** (LTS, from nodejs.org), **Python** (python.org, tick *Add python.exe to PATH*) and **Git**.
 2. Get the project: `git clone https://github.com/yousuftalukder/contentEngine` and open the folder.
 3. Run `powershell -ExecutionPolicy Bypass -File pc\setup.ps1` (add `-Blender` for 3D explainers). It installs
@@ -163,9 +177,11 @@ You run everything from the dashboard; no Claude or programming tool is needed. 
 **Only one PC is the worker at a time.** Each PC keeps the files it made, in `data\media`. A second PC started while the
 first is running refuses to start and says so. To move for good: stop the worker on the old PC, copy its `data\media`
 folder into the new PC's project folder, and start the new one once with `PC_TAKEOVER=1` set
-(`$env:PC_TAKEOVER = "1"; pc\start.ps1`). Files left behind on the old PC stop playing in Review.
+(`$env:PC_TAKEOVER = "1"; pc\start.ps1`) — the dashboard's *this PC replaces my old one* does that for you. Files left
+behind on the old PC stop playing in Review.
 
-**Updating** after a change is merged: `git pull` in the project folder, then restart the worker.
+**Updating** after a change is merged: make a new setup command and run it on the PC (or `git pull` in the project
+folder), then restart the worker.
 
 ## What adding each thing unlocks
 
