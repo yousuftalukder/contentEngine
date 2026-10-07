@@ -71,7 +71,13 @@ const IMAGE_PRICE_USD = Number(ENV.IMAGE_PRICE_USD ?? 0.039);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const warn = (...a) => console.warn(new Date().toISOString(), "WARN", ...a);
 const newId = () => randomUUID();
-const nowIso = () => new Date().toISOString();
+// The database's clock, not this machine's. The PC's clock ran 56 minutes fast: a quota wait worked out on it woke
+// before Google's reset and missed it again, every day, and posts it scheduled went out late. Anything compared with a
+// time stored in the database, or written into it, goes through nowMs(); syncClock() measures the difference at boot
+// and every ten minutes.
+let clockSkewMs = 0;
+const nowMs = () => Date.now() + clockSkewMs;
+const nowIso = () => new Date(nowMs()).toISOString();
 const sha = (s) => createHash("sha256").update(String(s)).digest("hex");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const flag = (v) => v === true || v === 1 || v === "1" || v === "true";
@@ -176,7 +182,7 @@ function isOverloaded(e) {
 // (midnight Pacific — Google's and OpenAI's reset), a per-minute one for the delay the API names. null = not a quota error.
 function nextMidnightPacific() {
   const hour = (t) => Number(new Intl.DateTimeFormat("en-US", { hour: "numeric", hourCycle: "h23", timeZone: "America/Los_Angeles" }).format(t));
-  let t = new Date(Date.now() + 3600e3); t.setUTCMinutes(5, 0, 0);
+  let t = new Date(nowMs() + 3600e3); t.setUTCMinutes(5, 0, 0);
   for (let i = 0; i < 26 && hour(t) !== 0; i++) t = new Date(t.getTime() + 3600e3);
   return t;
 }
@@ -186,7 +192,13 @@ function nextMidnightPacific() {
 function quotaWait(e) {
   if (e?.causes?.length) {
     const qs = e.causes.map(quotaWait);
-    if (e.causes.some((c, i) => !qs[i] && isTransient(c))) return null;
+    // Gemini spent for the day and the next writer briefly down (a timeout, a 5xx) is still a wait: asked again in a
+    // quarter of an hour, without spending an attempt — not an hour of ordinary retries, each asking Gemini again, and
+    // then a failure. Two hours of that and it waits for the daily reset like any limit that never lifts.
+    if (e.causes.some((c, i) => !qs[i] && isTransient(c))) {
+      const spent = qs.filter((x) => x?.seconds).sort((a, b) => a.seconds - b.seconds)[0];
+      return spent ? { ...spent, kind: "unstated", seconds: Math.min(spent.seconds, 900) } : null;
+    }
     return qs.filter((x) => x?.seconds).sort((a, b) => a.seconds - b.seconds)[0] || qs.find(Boolean) || null;
   }
   const s = `${e?.message || ""} ${typeof e?.body === "string" ? e.body : JSON.stringify(e?.body || "")}`;
@@ -195,7 +207,7 @@ function quotaWait(e) {
   const freeTier = /free_tier|FreeTier/i.test(s), model = (/model: ([\w.-]+)/.exec(s) || [])[1] || null;
   if (/insufficient_quota/.test(s)) return { kind: "billing", seconds: null, freeTier, model };
   if (/limit: 0\b/.test(s)) return { kind: "plan", seconds: null, freeTier, model };
-  if (/PerDay|per day|\bRPD\b|\bTPD\b/i.test(s)) return { kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)), freeTier, model };
+  if (/PerDay|per day|\bRPD\b|\bTPD\b/i.test(s)) return { kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - nowMs()) / 1000)), freeTier, model };
   const d = Number((/(?:retry(?:Delay"?:\s*"| in )|try again in )(\d+(?:\.\d+)?)s/i.exec(s) || [])[1]);
   // A per-minute limit names itself and says when to try again. A 429 that does neither (Gemini's free tier answers a
   // spent day this way on some models: a help link, no limit, no delay) is not asked again every minute — across every
@@ -254,11 +266,18 @@ async function settings() {
   if (Date.now() - settingsCache.at < 10000) return settingsCache.map;
   // settings.value is JSONB, so the driver hands back the value already parsed. Parsing it again turned every string
   // setting into null — a Telegram chat id set here was read as "not configured", and alerts went nowhere.
-  settingsCache.map = Object.fromEntries((await q(`SELECT key, value FROM settings`)).map((r) => [r.key, typeof r.value === "string" ? r.value : P(r.value)]));
+  settingsCache.map = Object.fromEntries((await q(`SELECT key, value FROM settings WHERE key NOT LIKE 'relay.%'`)).map((r) => [r.key, typeof r.value === "string" ? r.value : P(r.value)]));
   settingsCache.at = Date.now();
   return settingsCache.map;
 }
 async function setting(key, def) { const m = await settings(); return m[key] === undefined ? def : m[key]; }
+async function syncClock() {
+  try {
+    const t0 = Date.now(), [{ t }] = await q(`SELECT now() AS t`), t1 = Date.now();
+    clockSkewMs = new Date(t).getTime() - (t0 + t1) / 2;
+    if (Math.abs(clockSkewMs) > 60000) log(`clock: this machine is ${Math.round(clockSkewMs / -60000)} min ${clockSkewMs < 0 ? "fast" : "slow"}; using the database's time`);
+  } catch (e) { warn("clock sync:", e.message); }
+}
 async function putSetting(key, value) {
   await q(`INSERT INTO settings (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [key, JSON.stringify(value)]);
   settingsCache.at = 0;
@@ -343,8 +362,24 @@ async function markProvider(provider, reason) {
   if (reason) await putSetting(`provider.refused.${provider}`, { reason }).catch(() => {});
   else await q(`DELETE FROM settings WHERE key = $1`, [`provider.refused.${provider}`]).catch(() => {});
 }
+// Every key this provider has is resting after a quota refusal (or has used its own daily cap): a wait, not a missing
+// key. Reported as "No API key", it was read as permanent — the job failed and a "no key" alert went out for half an
+// hour after any 429 on an only key.
+async function keysResting(provider) {
+  const r = await one(`SELECT MIN(c.cooldown_until) AS until, bool_or(c.daily_quota IS NOT NULL AND COALESCE(u.units,0) >= c.daily_quota) AS capped
+      FROM api_credentials c LEFT JOIN api_usage_daily u ON u.credential_id = c.id AND u.day = CURRENT_DATE
+     WHERE c.provider = $1 AND c.enabled::int = 1 AND ((c.cooldown_until IS NOT NULL AND c.cooldown_until > now()) OR (c.daily_quota IS NOT NULL AND COALESCE(u.units,0) >= c.daily_quota))`, [provider]);
+  if (r?.until) return Object.assign(new Error(`every ${provider} key is resting after a quota refusal; retry in ${Math.max(30, Math.round((new Date(r.until).getTime() - nowMs()) / 1000))}s`), { status: 429, transient: true });
+  if (r?.capped) return Object.assign(new Error(`every ${provider} key has used its daily cap (API keys page); it resets per day`), { status: 429, transient: true });
+  return null;
+}
+async function hasKey(provider) {
+  if (DEFAULT_ENV[provider] && ENV[DEFAULT_ENV[provider]]) return true;
+  return !!(await one(`SELECT 1 AS ok FROM api_credentials WHERE provider = $1 AND enabled::int = 1 LIMIT 1`, [provider]));
+}
 async function withKey(provider, fn, pin = null) {
   const creds = await credentialsFor(provider, pin);
+  if (!creds.length) { const resting = await keysResting(provider); if (resting) throw resting; }
   if (!creds.length) throw new Error(`No API key for "${provider}". Add one on the API keys page${DEFAULT_ENV[provider] ? ` (or set ${DEFAULT_ENV[provider]} on Render)` : ""}.`);
   let last;
   for (const c of creds) {
@@ -376,7 +411,7 @@ async function withKey(provider, fn, pin = null) {
 const hmac = (k, s) => createHmac("sha256", k).update(s).digest();
 const hex = (b) => Buffer.from(b).toString("hex");
 function sigV4({ method, host, path, headers, body, region, service, accessKey, secretKey }) {
-  const now = new Date(), amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ""), date = amzDate.slice(0, 8);
+  const now = new Date(nowMs()), amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ""), date = amzDate.slice(0, 8);
   const payloadHash = createHash("sha256").update(body || "").digest("hex");
   const hdr = { ...headers, host, "x-amz-date": amzDate, "x-amz-content-sha256": payloadHash };
   const signedKeys = Object.keys(hdr).map((k) => k.toLowerCase()).sort();
@@ -519,7 +554,9 @@ function exec(cmd, args, { timeoutMs = 45 * 60000, input = null } = {}) {
     const p = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
     let out = "", err = "";
     p.stdout.on("data", (d) => (out += d)); p.stderr.on("data", (d) => (err += d));
-    const t = setTimeout(() => { p.kill("SIGKILL"); reject(new Error(`${cmd} timed out`)); }, timeoutMs);
+    // A command that hangs will most likely hang again: retried as a network blip would be, seven times over, each wait
+    // as long as the timeout, and each retry redoing the writing that came before it.
+    const t = setTimeout(() => { p.kill("SIGKILL"); reject(Object.assign(new Error(`${cmd} timed out`), { transient: false })); }, timeoutMs);
     p.on("error", (e) => { clearTimeout(t); reject(new Error(`${cmd} is not available on this machine (${e.message}). On Render use the Dockerfile.`)); });
     // A process killed by a signal has no exit code, and reporting "exited null" hides the one thing worth knowing:
     // SIGKILL on a small instance is almost always the out-of-memory killer, not a fault in the command.
@@ -2962,7 +2999,7 @@ function passesFilters(item, niche) {
   }
   if (f.exclude?.length && f.exclude.some((k) => hay.includes(String(k).toLowerCase()))) return false;
   if (f.include?.length && !f.include.some((k) => hay.includes(String(k).toLowerCase()))) return false;
-  if (f.max_age_hours && item.published_at && Date.now() - Date.parse(item.published_at) > f.max_age_hours * 3600e3) return false;
+  if (f.max_age_hours && item.published_at && nowMs() - Date.parse(item.published_at) > f.max_age_hours * 3600e3) return false;
   return true;
 }
 async function underDailyCap(niche) {
@@ -2998,7 +3035,7 @@ const genQueue = (niche, type = niche?.content_type) => (MADE_VIDEO_TYPES.has(ty
 function scoreCandidate(item, niche) {
   const c = methodCfg(niche); let s = 0.35; const reasons = [];
   if (item.views) { const v = Math.min(1, Math.log10(item.views + 1) / 6.5); s += 0.3 * v; reasons.push(`views ${item.views}`); }
-  if (item.published_at) { const age = (Date.now() - Date.parse(item.published_at)) / 3600e3; if (age < 48) { s += 0.15; reasons.push("fresh"); } }
+  if (item.published_at) { const age = (nowMs() - Date.parse(item.published_at)) / 3600e3; if (age < 48) { s += 0.15; reasons.push("fresh"); } }
   if (item.duration) { if (item.duration < 60) { s -= 0.3; reasons.push("too short"); } else if (item.duration > (c.max_source_minutes || 240) * 60) { s -= 0.2; reasons.push("very long"); } else { s += 0.1; } }
   const f = P(niche.topic_filters) || {}; const hay = `${item.title} ${item.summary || ""}`.toLowerCase();
   if (f.include?.length && f.include.some((k) => hay.includes(String(k).toLowerCase()))) { s += 0.2; reasons.push("keyword match"); }
@@ -3201,7 +3238,11 @@ const deskSoon = () => { if (!deskTimer) deskTimer = setTimeout(() => { deskTime
 // One switch for all of it: "Pause news" on the dashboard. The feeds are still read and stories still grouped, so
 // that "Resume" starts on today's stories rather than on a backlog; nothing is drafted from them meanwhile.
 const newsPaused = async () => flag(await setting("news.paused", false));
-async function sweepNewsDesk() {
+// One sweep at a time: the minute tick, a fresh batch of stories (deskSoon) and "Run the desk" could overlap, and two
+// sweeps drafted the same story twice — the second dying at Dedup after spending an embedding.
+let deskSweeping = null;
+function sweepNewsDesk() { return deskSweeping ||= sweepNewsDeskOnce().finally(() => { deskSweeping = null; }); }
+async function sweepNewsDeskOnce() {
   if (!(await setting("desk.enabled", true)) || (await newsPaused())) return;
   const programs = (await q(`SELECT * FROM niches WHERE is_active::int = 1 ORDER BY priority DESC`)).filter((n) => DESK_TYPES.has(n.content_type));
   for (const niche of programs) {
@@ -3209,12 +3250,12 @@ async function sweepNewsDesk() {
     if (!(await underDailyCap(niche))) continue;
     // Don't take stories the writer cannot get to: while its quota is used up, and whenever work is already piling up.
     const pause = await setting(`quota.pause.${niche.id}`, null);
-    if (pause?.until && new Date(pause.until) > new Date()) continue;
+    if (pause?.until && new Date(pause.until).getTime() > nowMs()) continue;
     const pending = await one(`SELECT COUNT(*)::int AS n FROM jobs j JOIN content_items ci ON ci.id = j.content_item_id
       WHERE ci.niche_id = $1 AND j.status IN ('PENDING','RUNNING') AND j.type IN ('GENERATE_CONTENT','RENDER_CLIP','PROCESS_CANDIDATE')`, [niche.id]);
     if (pending.n >= cfg.max_pending) continue;
     const last = await one(`SELECT max(created_at) AS t FROM content_items WHERE niche_id = $1 AND cluster_id IS NOT NULL`, [niche.id]);
-    if (last?.t && Date.now() - new Date(last.t).getTime() < cfg.min_gap_minutes * 60000) continue;
+    if (last?.t && nowMs() - new Date(last.t).getTime() < cfg.min_gap_minutes * 60000) continue;
     // A story that came with a photograph and a summary makes a better post than one that is a bare headline, and the
     // desk has far more clusters than it will ever write: 264 in six hours against a couple of posts a day. So having
     // something to work with is part of the score, not a detail discovered later when the card turns out to be text.
@@ -3250,7 +3291,7 @@ function tzParts(ms, tz) {
   catch { const d = new Date(ms); return { dow: d.getUTCDay(), minutes: d.getUTCHours() * 60 + d.getUTCMinutes(), day: d.toISOString().slice(0, 10) }; }
 }
 const toMin = (s) => { const [h, m] = String(s || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
-async function nextSlot(channel, notBefore = Date.now()) {
+async function nextSlot(channel, notBefore = nowMs()) {
   const windows = P(channel.posting_windows) || []; const gap = (channel.min_gap_minutes || 0) * 60000; const max = channel.max_posts_per_day || 0;
   const rows = await q(`SELECT COALESCE(published_at, scheduled_for, created_at) AS t FROM content_assets WHERE channel_id = $1 AND status IN ('PENDING','RENDERING','RENDERED','PUBLISHING','PUBLISHED') AND COALESCE(published_at, scheduled_for, created_at) > now() - interval '3 days'`, [channel.id]);
   const taken = rows.map((r) => new Date(r.t).getTime()); if (channel.last_published_at) taken.push(new Date(channel.last_published_at).getTime());
@@ -3347,7 +3388,7 @@ async function finishGeneration(itemId, niche) {
   const qa = await qualityGate(itemId, niche), clean = (qa.status === "PASS" || qa.status === "SKIPPED") && !headlineOnly;
   if (mode === "AUTO" && qa.status === "REJECT") return one(`UPDATE content_items SET status='REJECTED', rejection_note=$2 WHERE id=$1 RETURNING *`, [itemId, `Quality gate: ${qa.report?.summary || "flagged as unsafe to publish"}`]);
   if (mode === "AUTO" && clean) { await q(`UPDATE content_items SET status='PENDING_REVIEW' WHERE id=$1`, [itemId]); return approveItem(itemId, { auto: true }); }
-  const deadline = mode === "AUTO_AFTER_WINDOW" && clean ? new Date(Date.now() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;
+  const deadline = mode === "AUTO_AFTER_WINDOW" && clean ? new Date(nowMs() + (niche.review_window_minutes || 60) * 60000).toISOString() : null;
   return one(`UPDATE content_items SET status='PENDING_REVIEW', review_deadline_at=$2 WHERE id=$1 RETURNING *`, [itemId, deadline]);
 }
 
@@ -3416,6 +3457,8 @@ async function relayComplete(niche, request) {
       return out;
     }
     if (j?.status === "FAILED" || Date.now() > until) {
+      // Withdrawn if the server has not started it: answered later, it would spend the writer on an answer nobody reads.
+      if (j?.status !== "FAILED") await q(`UPDATE jobs SET status='CANCELLED', finished_at=now(), error_message='the PC stopped waiting for this answer' WHERE id=$1 AND status='PENDING'`, [id]).catch(() => {});
       // The server's own reason, with its HTTP status where it gave one, so a spent allowance is still read as a quota.
       const msg = j?.error_message || "the server did not answer the writing request in time";
       throw Object.assign(new Error(`via the server: ${msg}`), { status: Number((/-> (\d{3})/.exec(msg) || [])[1]) || undefined, transient: j?.status === "FAILED" ? undefined : true });   // a failure is judged by its own status; no answer in time is worth retrying
@@ -3831,17 +3874,29 @@ async function generateExplainer(item, niche, style) {
   const orientation = mc.orientation === "9:16" ? "9:16" : "16:9", vertical = orientation === "9:16", minutes = Number(mc.explainer_minutes) || 3;
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, article_chars: String(m.text || "").length, summary: m.summary, photo: m.photo || null, photo_outlet: m.photo_outlet || null, photos: m.photos || [] }, topic_embedding: J(dedup.embedding) });
-  const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
+  // A retry of the same job (the voice failed, too few pictures came back, a deploy in the middle) picks up after the
+  // steps it already paid for: the research and the plan are kept on the item, marked with the job, and used again
+  // rather than asked for again — on the free tier each is one of the day's twenty requests per model, and an explainer
+  // retried from the top spent them on every attempt. A new job (Regenerate everything) starts afresh.
+  const kept = item._job && P(item.script_meta)?.draft?.job === item._job ? P(item.script_meta).draft : null;
+  const keep = async (part) => {
+    const sm = P((await one(`SELECT script_meta FROM content_items WHERE id=$1`, [item.id]))?.script_meta) || {};
+    await setItem(item.id, { script_meta: { ...sm, draft: { ...(sm.draft?.job === item._job ? sm.draft : {}), job: item._job, ...part } } });
+  };
+  const research = kept?.research || await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
     system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
     prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
     mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
-  await addCost(item.id, research.cost);
   const notes = research.data?.notes || [];
-  await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), researchBy(research)]);
+  if (!kept?.research) {
+    await addCost(item.id, research.cost);
+    await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), researchBy(research)]);
+    if (item._job) await keep({ research: { data: research.data, model: research.model || null, searched: research.searched } });
+  }
   if (research.searched === false) await noteNoSearch(item.id);
   const sceneCount = Math.max(4, Math.round(minutes * 3.5));
   const three = mc.explainer_style === "3d", layouts = three ? THREE_D_LAYOUTS : EXPLAINER_LAYOUTS;
-  const plan = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
+  const plan = kept?.plan || await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
     system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(layouts).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
 ` : ""}${mc.explainer_style === "illustrated" ? `${ILLUSTRATED_STYLE(castOf(mc))}
@@ -3851,7 +3906,7 @@ async function generateExplainer(item, niche, style) {
       { layout: "TitleCard", chapter: "Intro", data: { title: m.title, subtitle: "Explained" }, parts: [`Here is ${m.title}, explained.`] },
       { layout: "BulletReveal", chapter: "Key points", data: { heading: "Key points", bullets: ["First", "Second"] }, parts: ["The first point.", "The second point."] },
       { layout: "FullQuote", chapter: "Wrap-up", data: { quote: "Mock quote", attribution: "Mock" }, parts: ["That is the story."] }] } }));
-  await addCost(item.id, plan.cost);
+  if (!kept?.plan) { await addCost(item.id, plan.cost); if (item._job) await keep({ plan: { data: plan.data } }); }
   const p = plan.data || {}; const scenes = (p.scenes || []).filter((s) => s && layouts[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
   if (!scenes.length) throw new Error("The explainer plan came back without usable scenes");
   const texts = scenes.map((s) => [s.intro, ...s.parts].filter(Boolean).join(" "));
@@ -4274,8 +4329,9 @@ JSON: {"title": "video title", "beats": [{"type": "comment", "text": "...", "cha
   await finishGeneration(itemId, niche);
 }
 // ---- 8e. entry point for every text/slideshow item
-async function runGeneration(itemId) {
+async function runGeneration(itemId, job = null) {
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]); if (!item) return;
+  item._job = job?.id || null;
   const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
   const style = niche.style_profile_id ? await one(`SELECT * FROM style_profiles WHERE id=$1`, [niche.style_profile_id]) : null;
   await setItem(itemId, { status: "FETCHING_DATA", rejection_note: null });
@@ -4302,26 +4358,45 @@ async function regenerate(itemId, part) {
   await setItem(itemId, upd);
 }
 // ---- 8f. publish one asset
+// A post must never go out twice. The asset is claimed in one statement, so two runs cannot both start posting it; one
+// found mid-post (its worker stopped while the platform had the upload — it may or may not have gone out) is not posted
+// again on its own but marked for a person to check the channel; and once the platform has taken it, nothing that goes
+// wrong in the bookkeeping afterwards can mark it failed and so post it again on the retry.
 async function publishAsset(assetId) {
-  const asset = await one(`SELECT * FROM content_assets WHERE id=$1`, [assetId]); if (!asset || asset.status === "PUBLISHED") return;
+  const found = await one(`SELECT * FROM content_assets WHERE id=$1`, [assetId]); if (!found || found.status === "PUBLISHED") return;
+  if (found.status === "PUBLISHING" || found.external_id) {
+    await q(`UPDATE content_assets SET status='FAILED', error_message=$2 WHERE id=$1 AND status <> 'PUBLISHED'`, [assetId, "Interrupted while posting: it may already be on the channel. Check the channel first; Retry posts it again."]);
+    await rollupItemStatus(found.content_item_id); return;
+  }
   if (await setting("publishing.global_pause", false)) { await q(`UPDATE content_assets SET scheduled_for = now() + interval '10 minutes' WHERE id=$1`, [assetId]); return; }
+  const [asset] = await q(`UPDATE content_assets SET status='RENDERING' WHERE id=$1 AND status IN ('PENDING','FAILED','RENDERING','RENDERED') RETURNING *`, [assetId]); if (!asset) return;
   const item = await one(`SELECT * FROM content_items WHERE id=$1`, [asset.content_item_id]); const channel = await one(`SELECT * FROM channels WHERE id=$1`, [asset.channel_id]); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [item.niche_id]);
+  let res, caption, publisher;
   try {
     if (!flag(channel.is_active)) throw new Error("channel is inactive");
     const media = item.hero_media_id ? await one(`SELECT * FROM media_assets WHERE id=$1`, [item.hero_media_id]) : null;
-    await q(`UPDATE content_assets SET status='RENDERING' WHERE id=$1`, [assetId]);
     const renderer = await resolve("RENDER", niche.render_adapter || "render_mock");
     const rendered = await renderer.renderForChannel({ media, channel, item, niche });
     await q(`UPDATE content_assets SET status='RENDERED', render_url=$2 WHERE id=$1`, [assetId, rendered.url]);
     const pubKey = channel.publisher_adapter || PLATFORM_DEFAULT_PUBLISHER[channel.platform] || "publish_mock";
-    const publisher = await resolve("PUBLISH", pubKey);
+    publisher = await resolve("PUBLISH", pubKey);
     await q(`UPDATE content_assets SET status='PUBLISHING' WHERE id=$1`, [assetId]);
     const thumb = await one(`SELECT url FROM media_assets WHERE content_item_id=$1 AND kind='THUMBNAIL' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`, [item.id]);
     // The asset keeps exactly what went out. An asset made without a caption (approval renders one, other paths may
     // not) gets the body written back here, so the record never shows a comment under a post it cannot quote.
-    const caption = asset.caption || renderCaption(item, channel, null, niche);
-    const res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption, title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
-    await q(`UPDATE content_assets SET status='PUBLISHED', published_url=$2, external_id=$3, caption=$4, published_at=now(), error_message=NULL WHERE id=$1`, [assetId, res.publishedUrl, res.externalId, caption]);
+    caption = asset.caption || renderCaption(item, channel, null, niche);
+    res = await publisher.publish({ channel, mediaUrl: rendered.url, mediaKind: rendered.kind, caption, title: item.headline || item.topic, hashtags: P(item.hashtags) || [], thumbnailUrl: thumb?.url || null });
+  } catch (e) {
+    await q(`UPDATE content_assets SET status='FAILED', error_message=$2, retry_count=retry_count+1 WHERE id=$1`, [assetId, String(e.message).slice(0, 1500)]);
+    await rollupItemStatus(item.id); throw e;
+  }
+  // It is out. A database blip from here on is retried in place and never fails the job (a failed job would be retried
+  // and post it again); left PUBLISHING at worst, the asset is marked for checking by the next run, not re-posted.
+  for (let i = 1; ; i++) {
+    try { await q(`UPDATE content_assets SET status='PUBLISHED', published_url=$2, external_id=$3, caption=$4, published_at=now(), error_message=NULL WHERE id=$1`, [assetId, res.publishedUrl, res.externalId, caption]); break; }
+    catch (e) { if (i >= 5) { warn(`asset ${assetId} was posted (${res.externalId}) but could not be recorded: ${e.message}`); return; } await sleep(2000 * i); }
+  }
+  try {
     await q(`UPDATE channels SET last_published_at=now() WHERE id=$1`, [channel.id]);
     // The first comment carries the source link on the platforms where the body must not. The post is out by now, so a
     // comment that fails is logged and left visible on the asset — text without an id — rather than failing the post.
@@ -4331,11 +4406,8 @@ async function publishAsset(assetId) {
       try { const c = await publisher.comment({ channel, externalId: res.externalId, message: line }); await q(`UPDATE content_assets SET comment_id=$2 WHERE id=$1`, [assetId, c?.id || null]); }
       catch (e) { warn(`first comment on ${assetId}: ${String(e.message).slice(0, 300)}`); }
     }
-  } catch (e) {
-    await q(`UPDATE content_assets SET status='FAILED', error_message=$2, retry_count=retry_count+1 WHERE id=$1`, [assetId, String(e.message).slice(0, 1500)]);
-    await rollupItemStatus(item.id); throw e;
-  }
-  await rollupItemStatus(item.id);
+  } catch (e) { warn(`asset ${assetId} posted; bookkeeping after it failed: ${String(e.message).slice(0, 300)}`); }
+  await rollupItemStatus(item.id).catch((e) => warn("rollup", e.message));
 }
 // ---- 8g. metrics + repurposing
 async function pollMetrics(assetId) {
@@ -4685,7 +4757,7 @@ const HANDLERS = {
       const maxAgeMs = Number(await setting("ingest.max_age_hours", 72)) * 3600e3;
       for (const it of items) {
         // Stale articles (feeds that never rotate, indexed archive pages) are not taken in at all; old videos still are.
-        if ((it.kind || "ARTICLE") === "ARTICLE" && it.published_at && Date.now() - Date.parse(it.published_at) > maxAgeMs) continue;
+        if ((it.kind || "ARTICLE") === "ARTICLE" && it.published_at && nowMs() - Date.parse(it.published_at) > maxAgeMs) continue;
         const hash = sha(it.url); const id = newId();
         const ins = await q(`INSERT INTO source_items (id, source_id, external_id, url, url_hash, title, summary, published_at, thumbnail_url, kind, raw) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT (url_hash) DO NOTHING RETURNING id`,
           [id, sourceId, it.external_id || null, it.url, hash, tidyTitle(it.title).slice(0, 500), it.summary || null, it.published_at || null, it.thumbnail || null, it.kind || "ARTICLE", JSON.stringify({ ...(it.raw || {}), duration: it.duration, views: it.views, platform: it.platform, license: it.license })]);
@@ -4699,7 +4771,7 @@ const HANDLERS = {
       return { fetched: items.length, added, routed, clustered: toCluster.length };
     } catch (e) { await q(`UPDATE sources SET last_polled_at=now(), last_error=$2 WHERE id=$1`, [sourceId, String(e.message).slice(0, 800)]); throw e; }
   },
-  async GENERATE_CONTENT({ itemId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return runGeneration(itemId); },
+  async GENERATE_CONTENT({ itemId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return runGeneration(itemId, job); },
   async REGENERATE({ itemId, part }) { return regenerate(itemId, part); },
   async PROCESS_CANDIDATE({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return processCandidate(candidateId); },
   async RENDER_CLIP({ itemId, clipId }) { return renderClipItem(itemId, clipId); },
@@ -4744,21 +4816,25 @@ async function deferForQuota(job, payload, quota, msg) {
   // left waiting while your PC was off, had used up its "two hours of waiting" before it ever met a limit, fell back to
   // ordinary retries and spent the day's allowance retrying (two explainers, 7 attempts each, 2026-10-05).
   const cap = quota.kind === "minute" || quota.kind === "unstated" ? 2 * 3600e3 : quota.kind === "busy" ? 8 * 3600e3 : QUOTA_MAX_WAIT_DAYS * 86400e3;
-  const [{ since }] = await q(`UPDATE jobs SET quota_since = COALESCE(quota_since, now()) WHERE id = $1 RETURNING quota_since AS since`, [job.id]);
-  const waited = Date.now() - new Date(since).getTime();
+  // Timed per kind of limit: a job that waited out a day and then meets a per-minute limit at its next step has not been
+  // waiting on that minute limit for a day. With one clock for both, it was sent to wait for the next reset (and its
+  // programme paused) over a limit that lifts in a minute; an outage after a daily wait failed at once.
+  const family = quota.kind === "minute" || quota.kind === "unstated" ? "short" : quota.kind;
+  const [{ since }] = await q(`UPDATE jobs SET quota_since = CASE WHEN quota_kind IS DISTINCT FROM $2 THEN now() ELSE COALESCE(quota_since, now()) END, quota_kind = $2 WHERE id = $1 RETURNING quota_since AS since`, [job.id, family]);
+  const waited = nowMs() - new Date(since).getTime();
   // A "per-minute" limit that is still refusing two hours later is the day's allowance under another name: Gemini's
   // free tier does not always say which limit it hit (gemini-flash-lite-latest answers a bare 429). Treated as a
   // minute limit, the job went back to ordinary retries and failed — every explainer, 2026-10-06. It waits for the
   // daily reset instead, within the same few days' limit as any daily quota.
   if ((quota.kind === "minute" || quota.kind === "unstated") && waited > cap && waited <= QUOTA_MAX_WAIT_DAYS * 86400e3)
-    quota = { ...quota, kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - Date.now()) / 1000)) };
+    quota = { ...quota, kind: "day", seconds: Math.max(300, Math.round((nextMidnightPacific() - nowMs()) / 1000)) };
   else if (waited > cap) return false;
   const itemId = job.content_item_id || payload.itemId || null;
   const item = itemId ? await one(`SELECT * FROM content_items WHERE id=$1`, [itemId]) : null;
   const niche = item || payload.nicheId ? await one(`SELECT * FROM niches WHERE id=$1`, [item?.niche_id || payload.nicheId]) : null;
-  const back = new Date(Date.now() + quota.seconds * 1000);
+  const back = new Date(nowMs() + quota.seconds * 1000);
   if (niche && quota.seconds > 600) await putSetting(`quota.pause.${niche.id}`, { until: back.toISOString(), reason: msg.slice(0, 300) });
-  const ageHours = item ? (Date.now() - new Date(item.created_at).getTime()) / 3600e3 + quota.seconds / 3600 : 0;
+  const ageHours = item ? (nowMs() - new Date(item.created_at).getTime()) / 3600e3 + quota.seconds / 3600 : 0;
   if (item?.cluster_id && niche && ageHours > deskCfg(niche).max_age_hours) {
     const note = `Skipped: the writer ${quota.kind === "busy" ? "could not be reached" : "ran out of quota"} and this story would be about ${Math.round(ageHours)} hours old before it comes back.`;
     await q(`UPDATE jobs SET status='CANCELLED', error_message=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, note]);
@@ -4787,7 +4863,7 @@ async function backlogPauses() {
     .filter((r) => r.limit > 0 && r.waiting >= r.limit);
 }
 async function quotaPauses() {
-  const m = await settings(); const now = Date.now(), out = [];
+  const m = await settings(); const now = nowMs(), out = [];
   for (const [k, v] of Object.entries(m)) {
     if (!k.startsWith("quota.pause.") || !v?.until || new Date(v.until).getTime() <= now) continue;
     const n = await one(`SELECT display_name FROM niches WHERE id=$1`, [k.slice("quota.pause.".length)]);
@@ -4802,21 +4878,30 @@ async function notifyQuota(quota, msg) {
     `The model has been answering "high demand" for the past hour, so work is waiting rather than failing. It resumes on its own; stories that would be stale by then are skipped. Nothing to do unless this is still here tomorrow.`,
     { level: "warn", key: `busy:${provider}`, cooldownHours: 6 });
   if (quota.kind !== "day") return;
-  const back = dhakaTime(new Date(Date.now() + quota.seconds * 1000));
+  const back = dhakaTime(new Date(nowMs() + quota.seconds * 1000));
   await notify("quota", quota.freeTier ? `${provider} free tier: today's requests are used up` : `${provider} daily quota reached`,
     (quota.freeTier
       ? `A free key allows only about 20 requests a day per model${quota.model ? ` — this one ran out on ${quota.model}` : ""}, which is a handful of posts. Work waits for the reset; add a second free writer (a Groq or Mistral key, on API keys) and it carries on meanwhile.`
       : `Raise the project's quota with the provider, or add a second key on the API keys page.`)
     + `\n\nWork resumes on its own around ${back} (Dhaka). Until then new stories are not started, and ones that would be stale by then are skipped.`,
-    { level: "error", key: `quota:${provider}:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 20 });
+    { level: "error", key: `quota:${provider}:${nowIso().slice(0, 10)}`, cooldownHours: 20 });
 }
 async function runJob(job) {
   const h = HANDLERS[job.type]; const payload = P(job.payload) || {};
+  // A Blender or studio render can run for over an hour; without a fresh lock it looked abandoned at 45 minutes and was
+  // handed to another worker while still running here.
+  const beat = setInterval(() => q(`UPDATE jobs SET locked_at = now() WHERE id = $1 AND locked_by = $2 AND status = 'RUNNING'`, [job.id, WORKER_ID]).catch(() => {}), 60000);
+  try { await runJobInner(job, h, payload); } finally { clearInterval(beat); }
+}
+async function runJobInner(job, h, payload) {
+  // Final writes only while this worker still owns the job: one handed to another worker (by recovery, or by this
+  // process's own shutdown) must not have its new state overwritten by the run that lost it.
+  const mine = `id=$1 AND locked_by IS NOT DISTINCT FROM '${String(WORKER_ID).replace(/'/g, "''")}'`;
   try {
     if (!h) throw new Error(`no handler for ${job.type}`);
     const result = await h(payload, job);
     if (job._deferred) return;
-    await q(`UPDATE jobs SET status='SUCCEEDED', result=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, J(result ?? null)?.slice(0, 5000) ?? null]);
+    await q(`UPDATE jobs SET status='SUCCEEDED', result=$2, finished_at=now(), locked_by=NULL WHERE ${mine}`, [job.id, J(result ?? null)?.slice(0, 5000) ?? null]);
   } catch (e) {
     const msg = String(e?.message || e).slice(0, 1500);
     // Waiting on an outside service that is still working (a rented clipper cutting the video): not a failure, so no
@@ -4830,11 +4915,14 @@ async function runJob(job) {
     // A limit no reset will lift (a plan without this model, an empty prepaid balance) is a person's problem, not a retry's.
     const delay = quota && !quota.seconds ? null : retryDelay(job, e);
     warn(`job ${job.type} ${job.id} failed (attempt ${job.attempts}${delay != null ? `, retrying in ${delay}s` : ", giving up"}): ${msg}`);
-    if (delay != null) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE id=$1`, [job.id, msg, String(delay)]);
+    if (delay != null) await q(`UPDATE jobs SET status='PENDING', error_message=$2, run_after=now() + ($3 || ' seconds')::interval, locked_by=NULL WHERE ${mine}`, [job.id, msg, String(delay)]);
     else {
+      const [owned] = await q(`UPDATE jobs SET status='FAILED', error_message=$2, finished_at=now(), locked_by=NULL WHERE ${mine} RETURNING id`, [job.id, msg]);
+      if (!owned) return;
       await alertOnFailure(job, msg).catch((err) => warn("alert", err.message));
-      await q(`UPDATE jobs SET status='FAILED', error_message=$2, finished_at=now(), locked_by=NULL WHERE id=$1`, [job.id, msg]);
-      const itemId = job.content_item_id || payload.itemId; if (itemId) await q(`UPDATE content_items SET status='FAILED', rejection_note=$2 WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED','REJECTED')`, [itemId, msg]);
+      // Rewriting one part of a finished draft (a headline, a caption) that fails leaves the draft as it was, in Review.
+      const partOnly = job.type === "REGENERATE" && payload.part && payload.part !== "all";
+      const itemId = partOnly ? null : job.content_item_id || payload.itemId; if (itemId) await q(`UPDATE content_items SET status='FAILED', rejection_note=$2 WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED','REJECTED')`, [itemId, msg]);
       if (payload.candidateId) await q(`UPDATE video_candidates SET status='FAILED', error_message=$2 WHERE id=$1`, [payload.candidateId, msg]);
     }
   }
@@ -4879,10 +4967,31 @@ async function sweepMetrics() {
   const rows = await q(`SELECT id FROM content_assets WHERE status='PUBLISHED' AND published_at > now() - interval '14 days' AND (last_metrics IS NULL OR (last_metrics->>'at')::timestamptz < now() - interval '6 hours') LIMIT 30`);
   for (const a of rows) await enqueue("POLL_METRICS", { assetId: a.id }, { queue: "metrics", dedupeKey: `metrics:${a.id}`, maxAttempts: 1 });
 }
+// A running job renews its lock every minute (runJob), so a lock older than LOCK_TIMEOUT_MIN means the worker under it
+// is gone — killed for memory, the PC switched off — and the job is handed back. A job that kills its worker every time
+// used to be handed back forever (the hand-back returned its attempt, the claim took it again), asking the writer again
+// on every lap; the third time one job is found like this it fails and says why. A deploy's own shutdown hands work
+// back before it goes (handBack at boot) and is not counted.
+const MAX_RECLAIMS = Number(ENV.JOB_MAX_RECLAIMS) || 3;
 async function recoverAbandonedWork() {
-  const r1 = await q(`UPDATE jobs SET status='PENDING', locked_by=NULL, attempts=GREATEST(attempts-1,0) WHERE status='RUNNING' AND locked_at < now() - ($1 || ' minutes')::interval RETURNING id`, [String(LOCK_TIMEOUT_MIN)]);
-  const r2 = await q(`UPDATE content_items ci SET status='FAILED', rejection_note='Recovered at boot: generation was interrupted (process restarted). Regenerate to retry.' WHERE status IN ('FETCHING_DATA','DRAFTING','RENDERING') AND updated_at < now() - interval '90 minutes' AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.content_item_id = ci.id AND j.status IN ('PENDING','RUNNING')) RETURNING id`);
-  if (r1.length || r2.length) log(`recovered ${r1.length} jobs, failed ${r2.length} stuck items`);
+  const stale = `status='RUNNING' AND locked_at < now() - ($1 || ' minutes')::interval`;
+  const dead = await q(`UPDATE jobs SET status='FAILED', locked_by=NULL, finished_at=now(), error_message=$2 WHERE ${stale} AND reclaims + 1 >= $3 RETURNING id, content_item_id, payload`,
+    [String(LOCK_TIMEOUT_MIN), `The worker running this job stopped ${MAX_RECLAIMS} times in the middle of it (out of memory, or the machine switched off), so it is not tried again on its own. Retry it once the cause is fixed.`, MAX_RECLAIMS]);
+  for (const j of dead) {
+    const payload = P(j.payload) || {}, itemId = j.content_item_id || payload.itemId;
+    if (itemId) await q(`UPDATE content_items SET status='FAILED', rejection_note='Its worker stopped mid-job three times — see the job on the Jobs page.' WHERE id=$1 AND status NOT IN ('PUBLISHED','PARTIALLY_PUBLISHED','REJECTED','PENDING_REVIEW','APPROVED')`, [itemId]);
+    if (payload.candidateId) await q(`UPDATE video_candidates SET status='FAILED', error_message='Its worker stopped mid-job three times.' WHERE id=$1`, [payload.candidateId]);
+  }
+  const r1 = await q(`UPDATE jobs SET status='PENDING', locked_by=NULL, reclaims = reclaims + 1 WHERE ${stale} RETURNING id`, [String(LOCK_TIMEOUT_MIN)]);
+  // Work whose job is gone. A job names its item in content_item_id or in its payload (itemId), and a video in its
+  // payload (candidateId). Queued items with no job counted towards a programme's review backlog and could stop it
+  // drafting for good; a video left "processing" stayed so forever.
+  const live = (col) => `SELECT 1 FROM jobs j WHERE j.status IN ('PENDING','RUNNING') AND (j.content_item_id = ${col} OR j.payload LIKE '%' || ${col} || '%')`;
+  const r2 = await q(`UPDATE content_items ci SET status='FAILED', rejection_note='Recovered: its job was lost (a restart in the middle of it). Regenerate to try again.' WHERE status IN ('QUEUED','FETCHING_DATA','DRAFTING','RENDERING') AND updated_at < now() - interval '90 minutes' AND NOT EXISTS (${live("ci.id")}) RETURNING id`);
+  const r3 = await q(`UPDATE video_candidates vc SET status='FAILED', error_message='Recovered: its job was lost (a restart in the middle of it). Add the link again to retry.' WHERE status='PROCESSING' AND created_at < now() - interval '2 hours' AND NOT EXISTS (${live("vc.id")}) RETURNING id`);
+  // Relay answers nobody came back for (the PC gave up waiting, or restarted).
+  await q(`DELETE FROM settings WHERE key LIKE 'relay.%' AND updated_at < now() - interval '1 hour'`).catch(() => {});
+  if (r1.length || dead.length || r2.length || r3.length) log(`recovered ${r1.length} jobs, failed ${dead.length} that kept stopping their worker, ${r2.length} stuck items and ${r3.length} stuck videos`);
 }
 // ---- 9b. Alerts. Problems a person has to act on — an AI key rejected or out of credit, a feed that keeps failing, an
 // expired publishing token, the budget cap, a stalled pipeline, a growing review queue — are recorded for the dashboard and
@@ -4923,12 +5032,12 @@ async function alertOnFailure(job, msg) {
   if (rule) await notify("provider", rule[1], `${rule[2]}\n\nLast error (${job.type}): ${msg.slice(0, 400)}`, { level: "error", key: `provider:${rule[1]}`, cooldownHours: 6 });
 }
 async function sweepHealth() {
-  const tz = "Asia/Dhaka", hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(new Date()));
+  const tz = "Asia/Dhaka", hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(new Date(nowMs())));
   for (const s of await q(`SELECT s.name, s.last_error FROM sources s WHERE s.is_active::int = 1 AND s.last_error IS NOT NULL AND s.last_polled_at > now() - interval '2 hours'
       AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.source_id = s.id) AND NOT EXISTS (SELECT 1 FROM source_items si WHERE si.source_id = s.id AND si.created_at > now() - interval '24 hours')`))
     await notify("source", `Source "${s.name}" keeps failing`, s.last_error.slice(0, 500), { key: `source:${s.name}`, cooldownHours: 24 });
   const cap = Number(await setting("budget.daily_cap_usd", 0));
-  if (cap && (await spentTodayUsd()) >= cap) await notify("budget", `Daily budget of $${cap} reached`, "Generation is paused until tomorrow (Settings → Daily spend cap).", { key: `budget:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 24 });
+  if (cap && (await spentTodayUsd()) >= cap) await notify("budget", `Daily budget of $${cap} reached`, "Generation is paused until tomorrow (Settings → Daily spend cap).", { key: `budget:${nowIso().slice(0, 10)}`, cooldownHours: 24 });
   const gen = await one(`SELECT COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed, COUNT(*)::int AS total, (array_agg(left(error_message, 300) ORDER BY finished_at DESC) FILTER (WHERE status = 'FAILED'))[1] AS last FROM jobs WHERE type IN ('GENERATE_CONTENT','RENDER_CLIP','PROCESS_CANDIDATE') AND finished_at > now() - interval '2 hours'`);
   if (gen.total >= 5 && gen.failed / gen.total > 0.5) await notify("failures", `${gen.failed} of ${gen.total} generation jobs failed in 2 hours`, `Most recent error: ${gen.last || "?"}`, { key: "failures", cooldownHours: 4 });
   const active = await one(`SELECT COUNT(*)::int AS n FROM niches n WHERE n.is_active::int = 1 AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.niche_id = n.id)`);
@@ -4956,7 +5065,7 @@ async function sweepHealth() {
       (SELECT COUNT(*)::int FROM content_items WHERE created_at > now() - interval '24 hours') AS made, (SELECT COUNT(*)::int FROM content_items WHERE status='FAILED' AND updated_at > now() - interval '24 hours') AS failed,
       (SELECT COUNT(*)::int FROM content_items WHERE status='PENDING_REVIEW') AS waiting`);
     const top = await one(`SELECT ci.headline, (a.last_metrics->>'views')::int AS views FROM content_assets a JOIN content_items ci ON ci.id = a.content_item_id WHERE a.published_at > now() - interval '48 hours' AND a.last_metrics IS NOT NULL ORDER BY (a.last_metrics->>'views')::int DESC NULLS LAST LIMIT 1`);
-    await notify("digest", `Today: ${d.published} posts published, ${d.made} made`, `${d.failed} failed · ${d.waiting} waiting in Review · spent $${(await spentTodayUsd()).toFixed(2)}${top ? `\nTop post: ${top.headline} (${top.views} views)` : ""}`, { level: "info", key: `digest:${new Date().toISOString().slice(0, 10)}`, cooldownHours: 20 });
+    await notify("digest", `Today: ${d.published} posts published, ${d.made} made`, `${d.failed} failed · ${d.waiting} waiting in Review · spent $${(await spentTodayUsd()).toFixed(2)}${top ? `\nTop post: ${top.headline} (${top.views} views)` : ""}`, { level: "info", key: `digest:${nowIso().slice(0, 10)}`, cooldownHours: 20 });
   }
 }
 // Programs created before the source catalog existed get its sources (and a house style) once.
@@ -5013,7 +5122,7 @@ async function adapterUsable(key) {
   const row = await one(`SELECT impl, config FROM adapter_configs WHERE key=$1 AND enabled::int=1`, [key]);
   if (!row) return false;
   const provider = row.impl === "openai_compat" ? (P(row.config)?.provider || "groq") : IMPL_PROVIDER[row.impl];
-  return provider ? (await credentialsFor(provider)).length > 0 : true;                    // mocks and local tools need no key
+  return provider ? hasKey(provider) : true;                    // mocks and local tools need no key; a key resting after a 429 still counts
 }
 // Runs on every boot. A key added today has to reach the programs that already exist — that is the whole point of
 // noticing it, and a key is almost always added after the program it is for. Every repair here is conditional on the
@@ -5097,7 +5206,7 @@ function startWorkers() {
   // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
   // leaving routed work to look stuck.
   if (LANES.includes(PC_LANE)) {
-    const beat = () => putSetting("worker.pc", { at: new Date().toISOString(), worker: WORKER_ID, lanes: LANES }).catch((e) => warn("pc heartbeat", e.message));
+    const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, lanes: LANES }).catch((e) => warn("pc heartbeat", e.message));
     beat(); setInterval(beat, 30000);
   }
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
@@ -5672,7 +5781,8 @@ app.patch("/api/content-items/:id", async (ctx) => {
 app.delete("/api/content-items/:id", async (ctx) => { await q(`DELETE FROM content_items WHERE id=$1 AND status IN ('FAILED','REJECTED')`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 app.post("/api/content-items/:id/publish-now", async (ctx) => { await q(`UPDATE content_assets SET scheduled_for=now(), status='PENDING', error_message=NULL WHERE content_item_id=$1 AND status IN ('PENDING','FAILED')`, [ctx.params.id]); await sweepDueAssets(); json(ctx, 202, { ok: true }); });
 // ---- assets / performance
-app.post("/api/assets/:id/retry", async (ctx) => { await q(`UPDATE content_assets SET status='PENDING', scheduled_for=now(), error_message=NULL WHERE id=$1`, [ctx.params.id]); await enqueue("PUBLISH_ASSET", { assetId: ctx.params.id }, { queue: "publish", priority: 5, dedupeKey: `publish:${ctx.params.id}`, maxAttempts: 1 }); json(ctx, 202, { ok: true }); });
+// Only a failed post is retried: one already out (or on its way) is never sent again from here.
+app.post("/api/assets/:id/retry", async (ctx) => { const [a] = await q(`UPDATE content_assets SET status='PENDING', scheduled_for=now(), error_message=NULL, external_id=NULL WHERE id=$1 AND status='FAILED' RETURNING id`, [ctx.params.id]); if (!a) throw new ApiError(409, null, "Only a failed post can be retried"); await enqueue("PUBLISH_ASSET", { assetId: ctx.params.id }, { queue: "publish", priority: 5, dedupeKey: `publish:${ctx.params.id}`, maxAttempts: 1 }); json(ctx, 202, { ok: true }); });
 app.post("/api/assets/:id/performance", async (ctx) => { const b = ctx.body; const id = newId(); await q(`INSERT INTO performance_metrics (id, asset_id, views, avg_view_percent, ctr, likes, comments) VALUES ($1,$2,$3,$4,$5,$6,$7)`, [id, ctx.params.id, b.views ?? 0, b.avgViewPercent ?? null, b.ctr ?? null, b.likes ?? 0, b.comments ?? 0]); json(ctx, 201, await one(`SELECT * FROM performance_metrics WHERE id=$1`, [id])); });
 app.get("/api/assets/:id/performance", async (ctx) => json(ctx, 200, await q(`SELECT * FROM performance_metrics WHERE asset_id=$1 ORDER BY captured_at DESC`, [ctx.params.id])));
 app.post("/api/assets/:id/check-repurpose", async (ctx) => { const r = await checkAndRepurpose(ctx.params.id); json(ctx, 200, { repurposed: !!r, newItem: r }); });
@@ -5707,6 +5817,7 @@ app.post("/api/seed", async (ctx) => {
   await mkdir(TMP, { recursive: true }).catch(() => {});
   await migrate();
   if (process.argv.includes("--migrate")) { log("migration done, exiting"); await pool.end(); process.exit(0); }
+  await syncClock(); setInterval(syncClock, 10 * 60000).unref?.();
   await recoverAbandonedWork();
   // Render sends SIGTERM before it replaces an instance or spins one down. A job this worker was in the middle of would
   // otherwise sit RUNNING until recovery gives up on it — LOCK_TIMEOUT_MIN later — and with several deploys a day that
@@ -5729,7 +5840,7 @@ app.post("/api/seed", async (ctx) => {
     // could say whether the new image was running at all.
     // A PC worker boots against the same database, and it must not overwrite the server's record of itself — that
     // record is how anyone tells which build the server is running. The PC writes its own.
-    putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: new Date().toISOString(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
+    putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: nowIso(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
       url: ENV.RENDER_EXTERNAL_URL || null, lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
       blender: await blenderAvailable(), memory_mb: memoryLimitMb(), cpu: cpuFeatures() }).catch((e) => warn("boot.last", e.message));
     // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.

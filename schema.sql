@@ -455,6 +455,10 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS queue        TEXT NOT NULL DEFAULT 'te
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS run_after    TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS quota_since  TIMESTAMPTZ;
+-- Which kind of limit quota_since is timing (short, day, busy): a new kind starts its own clock.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS quota_kind   TEXT;
+-- How many times recovery found this job's worker gone mid-run; the third time it fails instead of looping.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reclaims     INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_by    TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_at    TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3;

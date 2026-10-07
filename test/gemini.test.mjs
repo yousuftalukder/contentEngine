@@ -90,7 +90,7 @@ test("Gemini: research the web search is refused for is done without it, and the
       const url = new URL(req.url, "http://x");
       if (!/:generateContent$/.test(url.pathname)) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ models: [] })); }
       const body = JSON.parse(raw), text = JSON.stringify(body.contents), research = /meticulous researcher/.test(JSON.stringify(body.system_instruction));
-      seen.push({ research, search: !!body.tools });
+      seen.push({ research, search: !!body.tools, what: JSON.stringify(body.system_instruction || body.contents).slice(0, 160) });
       if (body.tools && mode === "refuse") { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT", message: "Search Grounding is not supported for this model." } })); }
       if (mode === "daily") { res.writeHead(429, { "content-type": "application/json" }); return res.end(daily("gemini-flash-latest")); }
       const answer = research ? { notes: [{ fact: "The ferry carried 4,000 people a day before the closure.", source_url: "https://example.com/ferry", source_name: "Example" }], angle: "what the closure cost" }
@@ -119,6 +119,8 @@ test("Gemini: research the web search is refused for is done without it, and the
     mode = "daily"; seen.length = 0;
     const { id: second } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "Metro rail extends its hours" });
     await waitFor(async () => { const [j] = await eng.query(`SELECT status, error_message FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [second]); return j?.status === "PENDING" && j.error_message && j; }, { timeout: 60000, what: "the job to wait for the reset" });
-    assert.ok(seen.length && seen.every((s) => s.search), "a spent daily allowance is not retried without search");
+    // Only the research is judged: a one-off boot upgrade may also ask for a house style for the new programme meanwhile.
+    const research = seen.filter((x) => x.research);
+    assert.ok(research.length && research.every((x) => x.search), `a spent daily allowance is not retried without search: ${JSON.stringify(research.filter((x) => !x.search))}`);
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
