@@ -533,6 +533,34 @@ async function sweepStorageCleanup() {
     catch (e) { warn(`cleanup ${m.id}: ${e.message}`); }
   }
   if (n) log(`storage cleanup: deleted ${n} file(s)`);
+  // Drafts that will never go out — rejected (including news set aside unreviewed) or failed — keep their pictures and
+  // videos for ever otherwise. On the free storage plan that filled 1 GB in two weeks (4,800 card pictures of rejected
+  // news) and the storage was shut until something was deleted: every video in Review and every post refused. Off
+  // unless the owner sets the number of days (Settings → storage.cleanup_rejected_days); the drafts themselves stay.
+  const days = Number(await setting("storage.cleanup_rejected_days", 0)) || 0;
+  if (days > 0) {
+    const old = await q(`SELECT m.id, m.url FROM media_assets m JOIN content_items ci ON ci.id = m.content_item_id
+      WHERE m.deleted_at IS NULL AND m.url LIKE 'http%' AND ci.status IN ('REJECTED','FAILED') AND ci.updated_at < now() - ($1 || ' days')::interval
+        AND NOT EXISTS (SELECT 1 FROM media_assets o JOIN content_items d ON d.id = o.content_item_id WHERE o.url = m.url AND o.id <> m.id AND d.status NOT IN ('REJECTED','FAILED'))
+        AND NOT EXISTS (SELECT 1 FROM content_items d WHERE d.hero_media_id = m.id AND d.status NOT IN ('REJECTED','FAILED'))
+        AND NOT EXISTS (SELECT 1 FROM portal_articles pa WHERE pa.hero_image_url = m.url)
+      LIMIT 500`, [String(days)]);
+    let k = 0;
+    for (const m of old) {
+      try { await deleteStored(m.url); await q(`UPDATE media_assets SET deleted_at = now() WHERE id=$1`, [m.id]); k++; }
+      catch (e) { warn(`cleanup ${m.id}: ${e.message}`); }
+    }
+    if (k) log(`storage cleanup: deleted ${k} file(s) of drafts rejected or failed over ${days} days ago`);
+  }
+}
+// How full storage is, where that can be measured: Supabase Storage keeps its file list in the same database. The
+// free plan's limit is 1 GB (storage.quota_mb to change it); past it, the project's storage refuses every file.
+async function storageUsage() {
+  try {
+    const [r] = await q(`SELECT COALESCE(SUM((metadata->>'size')::bigint), 0)::bigint AS bytes, count(*)::int AS files FROM storage.objects`);
+    const limitMb = Number(await setting("storage.quota_mb", 1024)) || 1024, usedMb = Math.round(Number(r.bytes) / 1048576);
+    return { usedMb, limitMb, files: r.files, share: usedMb / limitMb };
+  } catch { return null; }                                       // not Supabase (R2, local disk): nothing to measure here
 }
 // Materialise any media URL (remote, local /media, or file path) as a tmp file.
 async function toTmpFile(url, ext) {
@@ -5146,6 +5174,10 @@ async function alertOnFailure(job, msg) {
   if (rule) await notify("provider", rule[1], `${rule[2]}\n\nLast error (${job.type}): ${msg.slice(0, 400)}`, { level: "error", key: `provider:${rule[1]}`, cooldownHours: 6 });
 }
 async function sweepHealth() {
+  const st = await storageUsage();
+  if (st && st.share >= 0.8) await notify("storage", st.share >= 1 ? `Storage is full (${st.usedMb} of ${st.limitMb} MB) — files are being refused` : `Storage is ${Math.round(st.share * 100)}% full (${st.usedMb} of ${st.limitMb} MB)`,
+    `${st.share >= 1 ? "Supabase stops serving every file once the free plan's limit is passed: videos in Review do not play and nothing can be posted. " : ""}Most of it is usually the pictures and videos of drafts that will never go out. Set Settings → "Delete media of rejected and failed drafts after (days)" (for example 3), and the hourly cleanup removes them; the drafts themselves stay.`,
+    { level: st.share >= 1 ? "error" : "warn", key: `storage:${st.share >= 1 ? "full" : "high"}`, cooldownHours: 12 });
   const tz = "Asia/Dhaka", hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(new Date(nowMs())));
   for (const s of await q(`SELECT s.name, s.last_error FROM sources s WHERE s.is_active::int = 1 AND s.last_error IS NOT NULL AND s.last_polled_at > now() - interval '2 hours'
       AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.source_id = s.id) AND NOT EXISTS (SELECT 1 FROM source_items si WHERE si.source_id = s.id AND si.created_at > now() - interval '24 hours')`))
@@ -5385,6 +5417,7 @@ app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
   json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), telegramChatEnv: !!ENV.TELEGRAM_CHAT_ID, quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses(), newsPaused: await newsPaused(),
+    storage: await storageUsage(),
     aiToday: (await q(`SELECT provider, SUM(units)::int AS requests FROM api_usage_daily WHERE day = CURRENT_DATE GROUP BY provider ORDER BY 2 DESC`)).filter((r) => r.requests > 0),
     newsPrograms: (await q(`SELECT id, display_name, content_type, is_active FROM niches WHERE content_type = ANY($1) ORDER BY display_name`, [[...DESK_TYPES]])).map((n) => ({ id: n.id, name: n.display_name, type: n.content_type, active: flag(n.is_active) })) });
 });

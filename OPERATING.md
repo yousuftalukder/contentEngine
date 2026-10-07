@@ -50,6 +50,11 @@ PC switched off mid-render) goes back to the queue on its own — but the third 
 and says so, rather than looping. **Retry** on the job starts it completely afresh. A post that was interrupted while
 it was being sent is never sent again on its own: it is marked *check the channel first*, because it may already be up.
 
+**Storage.** The free Supabase plan holds 1 GB, and past it Supabase refuses *every* file — videos in Review stop
+playing and nothing can be posted (it happened on 2026-10-07, mostly from the pictures of rejected news). The Overview
+shows how full it is and alerts at 80%. **Settings → Review and news → delete the pictures and videos of rejected and
+failed drafts after N days** keeps it from filling (the drafts themselves stay). It is off until you set it.
+
 **Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
 Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each
 Page's token encrypted), attach it to your programmes, and approved posts go out with the source link as the first

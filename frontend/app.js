@@ -247,6 +247,11 @@ pages.overview = async () => {
 
     stats?.newsPrograms?.length ? newsControls(stats) : null,
 
+    // Free storage is 1 GB; past it Supabase refuses every file, so how full it is belongs on the first page.
+    stats?.storage ? h("div", { class: "panel", style: `margin-top:12px${stats.storage.share >= 0.8 ? ";border-color:var(--amber)" : ""}` },
+      h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "Storage"), h("span", { class: `tag${stats.storage.share >= 0.8 ? "" : " green"}` }, `${stats.storage.usedMb} of ${stats.storage.limitMb} MB (${Math.round(stats.storage.share * 100)}%)`)),
+      stats.storage.share >= 0.8 ? h("div", { class: "sub" }, stats.storage.share >= 1 ? "Full: Supabase refuses every file until some are deleted — videos in Review do not play and nothing can be posted. " : "Nearly full. ",
+        "Settings → Review and news → delete the pictures and videos of rejected and failed drafts after a few days.") : null) : null,
     (stats?.aiToday || []).length ? h("div", { class: "panel", style: "margin-top:12px" },
       h("div", { class: "row" }, h("b", { style: "font-weight:500" }, "AI requests today"),
         (stats.aiToday || []).map((r) => h("span", { class: "tag" }, `${r.provider}: ${r.requests}`))),
@@ -1358,8 +1363,9 @@ pages.settings = async () => {
   const minScore = num(null, val("qa.min_score", 0.75), { step: "0.05", min: 0, max: 1, style: "max-width:120px" });
   const expiry = num(null, val("review.news_expiry_hours", 24), { min: 0, style: "max-width:100px" });
   const waiting = num(null, val("review.max_waiting", 30), { min: 0, style: "max-width:100px" });
+  const keepDays = num(null, val("storage.cleanup_rejected_days", 0), { min: 0, style: "max-width:100px" });
   const tgChat = text(null, val("alerts.telegram_chat_id", "") || "", { placeholder: "chat id, e.g. 123456789", style: "max-width:220px" });
-  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1", "news.paused", "review.news_expiry_hours", "review.max_waiting",
+  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1", "news.paused", "review.news_expiry_hours", "review.max_waiting", "storage.cleanup_rejected_days",
     "voice.default_fallbacks", "desk.similarity", "desk.word_overlap", "ingest.max_age_hours", "retention.source_items_days", "ingest.fetch_article_text", "image.text_card_fallback");
   const toggle = (key, def, on, off) => h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val(key, def) ? on : off), h("button", { class: "btn sm", onclick: () => save(key, !val(key, def)) }, val(key, def) ? "Turn off" : "Turn on"));
   // A global fallback chain, used by every programme that has none of its own — the same comma list as a programme's.
@@ -1385,7 +1391,8 @@ pages.settings = async () => {
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val("news.paused", false) ? "News is paused: feeds are read, nothing is drafted." : "News is running."),
         h("button", { class: `btn sm${val("news.paused", false) ? " primary" : ""}`, onclick: () => save("news.paused", !val("news.paused", false), val("news.paused", false) ? "News resumed" : "News paused") }, val("news.paused", false) ? "Resume news" : "Pause news")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Set aside news nobody has reviewed after this many hours (0 = never)"), expiry, h("button", { class: "btn sm", onclick: () => save("review.news_expiry_hours", Number(expiry.value) || 0) }, "Save")),
-      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "A hand-reviewed programme stops drafting while this many drafts wait for review (0 = never stop)"), waiting, h("button", { class: "btn sm", onclick: () => save("review.max_waiting", Number(waiting.value) || 0) }, "Save"))),
+      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "A hand-reviewed programme stops drafting while this many drafts wait for review (0 = never stop)"), waiting, h("button", { class: "btn sm", onclick: () => save("review.max_waiting", Number(waiting.value) || 0) }, "Save")),
+      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Delete the pictures and videos of rejected and failed drafts after this many days (0 = keep them). The drafts stay; this is what keeps free storage from filling up"), keepDays, h("button", { class: "btn sm", onclick: () => save("storage.cleanup_rejected_days", Number(keepDays.value) || 0) }, "Save"))),
     h("div", { class: "panel" }, h("h3", null, "Automation"),
       toggle("desk.enabled", true, "News desk: articles are grouped into stories across outlets before writing.", "News desk is off: every new article is written on its own."),
       toggle("qa.enabled", true, "Quality check runs on every draft (programs can override).", "Quality check is off — automatic programs publish unchecked."),
