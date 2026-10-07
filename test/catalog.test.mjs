@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startEngine } from "./harness.mjs";
+import { startEngine, waitFor } from "./harness.mjs";
 
 // The "What it makes" page: every variant in the blueprint, and whether what it needs is there right now. It is only
 // useful if it is true, so each need is checked against the engine's real state, not assumed.
@@ -9,7 +9,7 @@ test("the catalog lists every variant and says what is missing for each, from th
   try {
     const before = await eng.api("GET", "/api/catalog");
     const ids = before.map((v) => v.id);
-    for (const id of ["1a", "1b", "1c", "1d", "2a", "2b", "2c", "3a", "3b", "3c", "4a", "4b", "4c", "5a", "5b", "5c", "6a", "6b", "6c", "7a", "7b", "7c"]) assert.ok(ids.includes(id), `${id} is listed`);
+    for (const id of ["1a", "1b", "1c", "1d", "2a", "2b", "2c", "3a", "3b", "3c", "4a", "4b", "4c", "5a", "5b", "5c", "6a", "6b", "6c", "6d", "7a", "7b", "7c"]) assert.ok(ids.includes(id), `${id} is listed`);
     const by = (id, list = before) => list.find((v) => v.id === id);
     const need = (id, key, list = before) => by(id, list).needs.find((n) => n.key === key);
 
@@ -20,8 +20,21 @@ test("the catalog lists every variant and says what is missing for each, from th
     assert.equal(need("1a", "pc").ok, false, "no PC has ever connected");
     assert.match(need("1a", "pc").detail, /never connected/);
     assert.equal(need("4a", "persona").ok, false, "no reactor clip uploaded");
-    assert.equal(by("1b").ready, false, "something still to build is never ready");
+    assert.equal(by("1b").ready, false, "a rented clip is not ready without the clipping service's key");
+    assert.equal(need("1b", "clip_service").ok, false);
+    assert.equal(need("2c", "pexels").ok, false, "a stock card needs a Pexels key, and there is none");
+    assert.equal(need("7b", "pexels").ok, false, "so does stock footage");
+    assert.equal(need("3a", "pexels"), undefined, "a photo reel is made from the outlets' photos without one");
+    // YouTube refuses the server, so the variants the blueprint puts on the PC start there and say they need it.
+    for (const id of ["1c", "3c", "4a", "4b", "4c", "5b"]) {
+      assert.equal(by(id).setup.computeWhere, "pc", `${id} starts on the PC`);
+      assert.ok(need(id, "pc"), `${id} says it needs the PC`);
+    }
+    assert.equal(by("4a").setup.methodConfig.speed, 1.1, "a silent reaction starts at the 1.1× it promises");
 
+    // The boot's own adapter upgrade runs in the background; on a busy machine it could still be going when the key
+    // below is added, and it would then move the new programmes' pickers behind the LLM. It is finished first.
+    await waitFor(async () => (await eng.query(`SELECT 1 FROM settings WHERE key = 'upgrade.catalog_sync'`)).length, { timeout: 60000, what: "the boot upgrade" });
     await eng.api("POST", "/api/credentials", { provider: "gemini", label: "test", envVar: "CATALOG_TEST_KEY" });
     const brand = await eng.api("POST", "/api/brands", { name: "Catalog brand" });
     await eng.api("POST", "/api/programs", { brandId: brand.id, key: "pc_clips", displayName: "PC clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", computeWhere: "pc", clipAdapter: "clip_meaning", useMocks: true, autoStyle: false, autoSources: false });
@@ -31,11 +44,38 @@ test("the catalog lists every variant and says what is missing for each, from th
     assert.match(need("2a", "writer", after).detail, /Gemini/);
     assert.deepEqual(by("1a", after).programs, ["PC clips"], "a programme set to run on the PC counts as a laptop clip");
     assert.deepEqual(by("1d", after).programs, [], "and not as a server clip");
-    assert.deepEqual(by("1c", after).programs, ["LLM clips"], "one whose moments an LLM picks is an LLM-picked clip");
-    // Each programme says which variant it makes, so the Programmes page can show it.
+    assert.deepEqual(by("1c", after).programs, ["LLM clips"], "one whose moments an LLM picks is an LLM-picked clip, wherever it runs");
+    // Each programme says which variant it makes, so the Programmes page can show it. A telecast clip (3b) is set up
+    // exactly as the clip it is cut like, so it is shown beside it rather than never at all.
     const programs = await eng.api("GET", "/api/programs"), variants = (name) => programs.find((p) => p.display_name === name).variants;
-    assert.deepEqual(variants("PC clips"), ["1a"]);
-    assert.deepEqual(variants("LLM clips"), ["1c"]);
+    assert.deepEqual(variants("PC clips"), ["1a", "3b"]);
+    assert.deepEqual(variants("LLM clips"), ["1c", "3b"]);
+    assert.deepEqual(by("3b", after).programs.sort(), ["LLM clips", "PC clips"]);
+    // A creation default is not what makes a variant: a reaction short played a little faster, or moved to the server, is
+    // still a reaction short.
+    await eng.api("POST", "/api/programs", { brandId: brand.id, key: "react", displayName: "Reactions", contentType: "REACTION_CLIP", productionMethod: "REACTION_OVERLAY", computeWhere: "server", methodConfig: { speed: 1.25 }, useMocks: true, autoStyle: false, autoSources: false });
+    assert.deepEqual((await eng.api("GET", "/api/programs")).find((p) => p.display_name === "Reactions").variants, ["4a"]);
+  } finally { await eng.stop(); }
+});
+
+// The free adapters every variant leans on are registered in code, and run without a row; but the dashboard's dropdowns
+// list rows. Without them a 1a programme made from the catalog lost clip_meaning (the select had no such option), and
+// the free voice every programme uses was not in the voice list.
+test("the free adapters are listed for the dashboard, and a programme keeps the free picker it was made with", async () => {
+  const eng = await startEngine();
+  try {
+    const a = await eng.api("GET", "/api/adapters");
+    for (const k of ["clip_meaning", "clip_signal"]) assert.ok(a.clipAdapters.includes(k), `${k} is a picker choice`);
+    for (const k of ["tts_edge", "tts_piper"]) assert.ok(a.voiceAdapters.includes(k), `${k} is a voice choice`);
+    assert.ok(a.transcriptAdapters.includes("whisper_cpp"));
+    assert.ok(a.imageAdapters.includes("source_photo"));
+    assert.ok(!a.voiceAdapters.includes("tts_command"), "a command voice with no command set stays out of the list until it is set up");
+    const row = (await eng.api("GET", "/api/adapter-configs")).find((r) => r.key === "tts_command");
+    assert.equal(Number(row.enabled), 0);
+    const b = await eng.api("POST", "/api/brands", { name: "Laptop" });
+    const p = await eng.api("POST", "/api/programs", { brandId: b.id, key: "laptop", displayName: "Laptop clips", contentType: "PODCAST_CLIP", productionMethod: "PODCAST_HIGHLIGHT", clipAdapter: "clip_meaning", computeWhere: "pc", autoStyle: false, autoSources: false });
+    assert.equal(p.clip_adapter, "clip_meaning");
+    assert.deepEqual((await eng.api("GET", "/api/programs")).find((x) => x.id === p.id).variants, ["1a", "3b"]);
   } finally { await eng.stop(); }
 });
 

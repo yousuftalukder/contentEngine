@@ -69,6 +69,9 @@ ALTER TABLE niches ADD COLUMN IF NOT EXISTS embed_adapter           TEXT NOT NUL
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS voice_adapter_fallbacks JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS transcript_adapter_fallbacks JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE niches ADD COLUMN IF NOT EXISTS compute_where TEXT NOT NULL DEFAULT 'server';   -- server | pc
+-- Which videos a programme takes, whatever its sources allow: ANY, or CC_ONLY (Creative Commons licensed only).
+-- A source's own policy still applies on top; the stricter of the two wins.
+ALTER TABLE niches ADD COLUMN IF NOT EXISTS license_policy TEXT NOT NULL DEFAULT 'ANY';
 
 CREATE TABLE IF NOT EXISTS channels (
   id             TEXT PRIMARY KEY,
@@ -94,6 +97,9 @@ ALTER TABLE channels ADD COLUMN IF NOT EXISTS posting_windows     JSONB NOT NULL
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS caption_template    TEXT;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_published_at   TIMESTAMPTZ;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS credential_id       TEXT;  -- api_credentials.id (meta / youtube_oauth) used to publish on this channel
+-- Instagram channels made by "Connect Facebook" were given the format "REEL_VIDEO", which nothing else knew: the
+-- renderer only turns videos vertical for SHORT_FORM_VOICEOVER, which is what an Instagram Reel is.
+UPDATE channels SET format = 'SHORT_FORM_VOICEOVER' WHERE format = 'REEL_VIDEO';
 
 CREATE TABLE IF NOT EXISTS channel_niches (
   id         TEXT PRIMARY KEY,
@@ -614,8 +620,11 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'gemini_video',     'TRANSCRIBE', 'gemini_video',     'Gemini watches the video (scenes)', '{}'),
   (gen_random_uuid()::text, 'twelve_labs',      'TRANSCRIBE', 'twelve_labs',      'Twelve Labs (video chapters)',   '{}'),
   (gen_random_uuid()::text, 'whisper_local',    'TRANSCRIBE', 'whisper_local',    'Whisper CLI (local, heavy)',     '{}'),
+  (gen_random_uuid()::text, 'whisper_cpp',      'TRANSCRIBE', 'whisper_cpp',      'whisper.cpp (on this machine, free)', '{}'),
   (gen_random_uuid()::text, 'clip_mock',        'CLIP',       'clip_mock',        'Mock clipper',                   '{}'),
   (gen_random_uuid()::text, 'llm_clipper',      'CLIP',       'llm_clipper',      'LLM reads transcript, picks clips', '{}'),
+  (gen_random_uuid()::text, 'clip_meaning',     'CLIP',       'clip_meaning',     'The moment that means something (free, no key)', '{}'),
+  (gen_random_uuid()::text, 'clip_signal',      'CLIP',       'clip_signal',      'Loudest moment (free, no key)',  '{}'),
   (gen_random_uuid()::text, 'vizard',           'CLIP',       'vizard',           'Vizard (rented clipping)',       '{}'),
   (gen_random_uuid()::text, 'llm_mock',         'SCRIPT',     'llm_mock',         'Mock LLM',                       '{}'),
   (gen_random_uuid()::text, 'anthropic_live',   'SCRIPT',     'anthropic',        'Anthropic Claude',               '{}'),
@@ -633,7 +642,10 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'gemini_image',     'IMAGE',      'gemini_image',     'Gemini image generation',        '{}'),
   (gen_random_uuid()::text, 'pexels_stock',     'IMAGE',      'pexels_stock',     'Stock photo (Pexels)',           '{}'),
   (gen_random_uuid()::text, 'pollinations',     'IMAGE',      'pollinations',     'Pollinations (free, no key)',    '{}'),
+  (gen_random_uuid()::text, 'source_photo',     'IMAGE',      'source_photo',     'The story''s own photo',         '{}'),
   (gen_random_uuid()::text, 'tts_mock',         'VOICE',      'tts_mock',         'Mock TTS (silent audio)',        '{}'),
+  (gen_random_uuid()::text, 'tts_edge',         'VOICE',      'tts_edge',         'Edge neural voices (free, no key, Bangla + English)', '{}'),
+  (gen_random_uuid()::text, 'tts_piper',        'VOICE',      'tts_piper',        'Piper (on this machine, free)',  '{}'),
   (gen_random_uuid()::text, 'elevenlabs',       'VOICE',      'elevenlabs',       'ElevenLabs TTS',                 '{}'),
   (gen_random_uuid()::text, 'gemini_tts',       'VOICE',      'gemini_tts',       'Gemini TTS (Bangla + English)',  '{}'),
   (gen_random_uuid()::text, 'render_mock',      'RENDER',     'render_mock',      'Mock renderer',                  '{}'),
@@ -644,4 +656,9 @@ INSERT INTO adapter_configs (id, key, stage, impl, label, config) VALUES
   (gen_random_uuid()::text, 'youtube_upload',   'PUBLISH',    'youtube_upload',   'YouTube Data API upload',        '{}'),
   (gen_random_uuid()::text, 'embed_mock',       'EMBED',      'embed_mock',       'No embeddings (Jaccard fallback)', '{}'),
   (gen_random_uuid()::text, 'gemini_embed',     'EMBED',      'gemini_embed',     'Gemini embeddings',              '{}')
+ON CONFLICT (key) DO NOTHING;
+-- A command voice does nothing until it is told which command to run (Adapters → tts_command → config.command), so it
+-- starts disabled and stays out of the programme dropdowns until someone sets it up and enables it.
+INSERT INTO adapter_configs (id, key, stage, impl, label, config, enabled) VALUES
+  (gen_random_uuid()::text, 'tts_command',      'VOICE',      'tts_command',      'Local speech engine (piper, espeak, any command)', '{}', 0)
 ON CONFLICT (key) DO NOTHING;

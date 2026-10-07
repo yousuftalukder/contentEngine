@@ -182,7 +182,7 @@ const BLUEPRINT = {
   "Script → video": ["7", "Script → video", "A script narrated over footage: your own library, stock of the right country, or photos with motion."],
 };
 const STATUS_TAG = { proven: ["green", "proven"], built: ["amber", "built — not yet run on real footage"], "to build": ["", "to build"] };
-const WHERE = { pc: "your PC", server: "server", rented: "rented API", "server or pc": "server or your PC" };
+const WHERE = { pc: "your PC", server: "server", rented: "rented API", "server or pc": "server or your PC", "pc or server": "your PC (the server for non-YouTube links)" };
 pages.catalog = async () => {
   const rows = await get("/api/catalog");
   const types = [...new Set(rows.map((r) => r.type))];
@@ -223,7 +223,8 @@ pages.overview = async () => {
   const seeded = programs.length > 0;
   const generated = Object.values(it).reduce((a, b) => a + b, 0) > 0;
   const published = (as.PUBLISHED || 0) > 0;
-  const lanes = ["ingest", "text", "image", "video", "publish", "metrics"];
+  // video_local is your PC's lane: the PC reads the same switch, so pausing it here holds PC work until it is resumed.
+  const lanes = ["ingest", "text", "image", "video", "video_local", "publish", "metrics"], LANE_LABEL = { video_local: "your PC" };
   const queues = stats?.queues || {};
 
   const root = h("div", null,
@@ -234,7 +235,7 @@ pages.overview = async () => {
         h("div", { class: "n" + (pending ? "" : " zero") }, pending),
         h("div", { class: "l" }, pending === 1 ? "item waiting for your review" : "items waiting for your review")),
       h("div", { class: "stat-list" },
-        stat(it.QUEUED + it.FETCHING_DATA + it.DRAFTING || 0, "Generating now"),
+        stat(["QUEUED", "FETCHING_DATA", "DRAFTING", "RENDERING"].reduce((n, s) => n + (it[s] || 0), 0), "Generating now"),
         stat(as.PUBLISHED || 0, "Published"),
         stat((it.FAILED || 0) + (as.FAILED || 0), "Failed", (it.FAILED || as.FAILED) ? "red" : ""),
         stat(stats?.activeSources ?? 0, "Active sources"))),
@@ -268,8 +269,8 @@ pages.overview = async () => {
       h("p", { class: "muted", style: "margin:0 0 10px" }, "Click a lane to pause or resume it. Paused lanes keep their jobs and pick them up when resumed."),
       h("div", { class: "lanes" }, lanes.map((l) => h("button", { class: "lane" + (queues[l] === false ? " off" : ""), onclick: async () => {
         const next = { ...queues, [l]: queues[l] === false };
-        await run(() => put("/api/settings/queues.enabled", { value: next }), `${l} lane ${next[l] === false ? "paused" : "resumed"}`); route();
-      } }, h("span", { class: "dot" }), l))),
+        await run(() => put("/api/settings/queues.enabled", { value: next }), `${LANE_LABEL[l] || l} lane ${next[l] === false ? "paused" : "resumed"}`); route();
+      } }, h("span", { class: "dot" }), LANE_LABEL[l] || l))),
       stats?.globalPause ? h("p", { style: "margin:12px 0 0;color:var(--amber)" }, "Publishing is globally paused (Settings). Approved items will wait.") : null),
 
     blueprint ? h("h2", null, "What it makes ", h("a", { class: "small", href: "#/catalog", style: "font-family:var(--sans);font-weight:400" }, "all variants →")) : null,
@@ -334,14 +335,20 @@ pages.review = async (sub) => {
       h("div", { class: "t" }, it.headline || it.topic || "(untitled)"),
       h("div", { class: "m" }, it.program_name, " · ", nice(it.content_type || it.program_type), it.review_deadline_at ? h("div", { class: "deadline" }, untilText(it.review_deadline_at)) : null)));
   };
-  const load = async () => { proof.innerHTML = ""; proof.appendChild(h("p", { class: "muted" }, "Loading…")); const full = await get(`/api/content-items/${activeId}`); proof.innerHTML = ""; proof.appendChild(proofView(full, () => route())); };
+  // A draft that cannot be fetched (deleted meanwhile, the server restarting) says so instead of "Loading…" for ever.
+  const load = async () => { proof.innerHTML = ""; proof.appendChild(h("p", { class: "muted" }, "Loading…"));
+    try { const [full, notes] = await Promise.all([get(`/api/content-items/${activeId}`), get(`/api/research-notes?contentItemId=${activeId}`).catch(() => [])]); proof.innerHTML = ""; proof.appendChild(proofView(full, () => route(), notes)); }
+    catch (e) { proof.innerHTML = ""; proof.appendChild(h("div", { class: "empty" }, h("b", null, "This draft could not load"), e.message, " ", h("button", { class: "btn sm", onclick: load }, "Try again"))); } };
   draw(); load();
   root.appendChild(h("div", { class: "review" }, queue, proof));
   return root;
 };
 
-function proofView(it, onDone) {
+function proofView(it, onDone, notes = []) {
   const isVideo = VIDEO_TYPES.has(it.content_type) || MADE_VIDEO_TYPES.has(it.content_type);
+  // A clip re-renders from its stored cut, and an explainer handed to the PC from its stored plan. The other made videos
+  // keep no plan, so "Re-render" for them was "Regenerate everything" under another name: new research, new script.
+  const reRender = VIDEO_TYPES.has(it.content_type) ? "all" : it.content_type === "ANIMATED_EXPLAINER" && it.script_meta?.studio ? "render" : null;
   const caps = it.captions || {};
   const hero = it.hero_media;
   const heroEl = !hero ? null
@@ -369,7 +376,7 @@ function proofView(it, onDone) {
   const save = () => run(() => patch(`/api/content-items/${it.id}`, collect()), "Draft saved");
   const approve = () => run(async () => { await patch(`/api/content-items/${it.id}`, collect()); await post(`/api/content-items/${it.id}/approve`, { scheduledFor: schedule.value ? new Date(schedule.value).toISOString() : null }); onDone(); }, "Approved — rendering and publishing");
   const reject = () => run(async () => { await post(`/api/content-items/${it.id}/reject`, { note: note.value }); onDone(); }, "Rejected");
-  const regen = (part) => run(async () => { await patch(`/api/content-items/${it.id}`, collect()); await post(`/api/content-items/${it.id}/regenerate`, { part }); onDone(); }, `Regenerating ${part}`);
+  const regen = (part, msg) => run(async () => { await patch(`/api/content-items/${it.id}`, collect()); await post(`/api/content-items/${it.id}/regenerate`, { part }); onDone(); }, msg || `Regenerating ${part}`);
 
   const src = it.source_data_ref || {};
   // A story no outlet's article could be read for is written from the headline and a one-line summary. That is worth
@@ -387,17 +394,32 @@ function proofView(it, onDone) {
   const mmss = (t) => { const x = Math.max(0, Math.round(Number(t) || 0)); return `${Math.floor(x / 60)}:${String(x % 60).padStart(2, "0")}`; };
   const atMoment = (url, t) => { if (!url) return null; const s = Math.floor(Number(t) || 0);
     return /youtu\.?be/.test(url) ? `${url}${url.includes("?") ? "&" : "?"}t=${s}s` : /^https?:/.test(url) ? `${url}#t=${s}` : null; };
+  // A rented clipper hands back a finished clip and does not say where in the source it came from, so there is no time
+  // to show — "0:00–0:00 (0s)" and a link to the start of the video said something false.
+  const timed = cl && src.provider !== "rented_clip" && Number.isFinite(Number(cl.start)) && Number(cl.end) > Number(cl.start);
   const why = cl ? h("div", { class: "panel", style: "margin-bottom:12px" },
     h("b", { style: "font-weight:500" }, "Why this moment"),
-    h("div", { class: "sub" }, `${mmss(cl.start)}–${mmss(cl.end)} (${Math.round((cl.end || 0) - (cl.start || 0))}s) of `,
-      atMoment(src.url, cl.start) ? h("a", { href: atMoment(src.url, cl.start), target: "_blank", rel: "noopener" }, src.title || "the source") : (src.title || "the source")),
+    timed ? h("div", { class: "sub" }, `${mmss(cl.start)}–${mmss(cl.end)} (${Math.round(cl.end - cl.start)}s) of `,
+      atMoment(src.url, cl.start) ? h("a", { href: atMoment(src.url, cl.start), target: "_blank", rel: "noopener" }, src.title || "the source") : (src.title || "the source"))
+      : h("div", { class: "sub" }, src.provider === "rented_clip" ? "Cut by the clipping service from " : "From ", src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener" }, src.title || "the source") : (src.title || "the source")),
     cl.reason ? h("div", { style: "margin-top:4px" }, cl.reason) : null,
     cl.score != null ? h("div", { class: "small mute" }, `score ${Number(cl.score).toFixed(2)}`) : null) : null;
+  // A warning the engine left on the draft (a caption the writer refused to write, say) is something to act on before
+  // approving, and it was only ever visible in the raw JSON.
+  const warning = it.status === "PENDING_REVIEW" && it.rejection_note ? h("div", { class: "panel", style: "border-color:var(--amber)" },
+    h("b", { style: "font-weight:500" }, "Check before approving"), h("div", { class: "sub", style: "white-space:pre-wrap" }, it.rejection_note)) : null;
+  // The research an explainer or long post was written from: the facts, each with where it came from.
+  const facts = notes.flatMap((n) => n.notes || []).filter((x) => x && x.fact);
+  const research = facts.length ? h("details", { class: "panel", style: "margin-bottom:12px" },
+    h("summary", null, h("b", { style: "font-weight:500" }, "Research notes"), h("span", { class: "small mute" }, ` — ${facts.length} fact${facts.length > 1 ? "s" : ""} it was written from`)),
+    h("ul", { class: "qa-list", style: "margin-top:8px" }, facts.map((x) => h("li", null, x.fact, x.source_url ? h("span", { class: "small mute" }, " — ", /^https?:/.test(x.source_url) ? h("a", { href: x.source_url, target: "_blank", rel: "noopener" }, x.source_name || x.source_url.replace(/^https?:\/\/(www\.)?/, "").split("/")[0]) : (x.source_name || x.source_url)) : x.source_name ? h("span", { class: "small mute" }, " — ", x.source_name) : null)))) : null;
   return h("div", { class: "proof" },
     headlineOnly,
     noSearch,
+    warning,
     why,
     qaPanel(it),
+    research,
     h("div", { class: "row small mute" }, tag(it.status), h("span", null, it.program_name), h("span", null, nice(it.content_type)), h("span", null, "created ", ago(it.created_at)), h("span", null, "cost ", usd(it.generation_cost_usd)),
       it.review_deadline_at ? h("span", { class: "deadline" }, untilText(it.review_deadline_at)) : null,
       h("button", { class: "btn link sm right", onclick: () => jsonDialog("Raw item", it) }, "Raw JSON")),
@@ -405,6 +427,8 @@ function proofView(it, onDone) {
     heroEl,
     hero ? h("div", { class: "row small mute", style: "margin:-6px 0 10px" }, h("span", null, hero.kind, hero.width ? ` ${hero.width}×${hero.height}` : "", hero.duration_seconds ? ` ${Math.round(hero.duration_seconds)}s` : ""), h("a", { href: hero.url, target: "_blank" }, "Open"), !isVideo ? h("button", { class: "btn link sm", onclick: () => regen("image") }, "Regenerate image") : null) : null,
     hero?.meta?.fallback ? h("p", { class: "small", style: "margin:-6px 0 10px;color:var(--amber)" }, "Text card — no picture could be made: ", hero.meta.fallback.slice(0, 160)) : null,
+    // Only a photocard is redrawn from an edited headline. A video's words are already spoken and burned in.
+    isVideo ? h("p", { class: "small mute", style: "margin:-6px 0 10px" }, "Edits here change the post's title, caption and text, not the video itself. To change what is said or shown, regenerate it.") : null,
     field("Summary", summary),
     body ? field(it.body != null ? "Article / post body" : "Script", body) : null,
     imgPrompt ? field("Image prompt", imgPrompt, "Edit and regenerate the image to get a different visual.") : null,
@@ -417,7 +441,8 @@ function proofView(it, onDone) {
       h("button", { class: "btn primary", onclick: approve }, "Approve & publish"),
       h("span", { class: "small mute" }, "or schedule for"), schedule,
       h("button", { class: "btn", onclick: save }, "Save draft"),
-      h("button", { class: "btn", onclick: () => regen(isVideo ? "all" : "headline") }, isVideo ? "Re-render" : "Regenerate headline"),
+      !isVideo ? h("button", { class: "btn", onclick: () => regen("headline") }, "Regenerate headline")
+        : reRender ? h("button", { class: "btn", title: reRender === "render" ? "Draws the stored plan again on your PC: same script, narration and pictures" : "Cuts and renders the same moment again", onclick: () => regen(reRender, reRender === "render" ? "Re-rendering on your PC" : "Re-rendering") }, "Re-render") : null,
       !isVideo ? h("button", { class: "btn", onclick: () => regen("captions") }, "Regenerate captions") : null,
       h("button", { class: "btn", onclick: () => regen("all") }, "Regenerate everything")),
     h("div", { class: "row" }, note, h("button", { class: "btn danger", onclick: reject }, "Reject")),
@@ -515,7 +540,9 @@ pages.programs = async () => {
 };
 function programCard(p, brands, sources, channels, adapters, styles) {
   const isVideo = VIDEO_TYPES.has(p.content_type);
-  const topic = h("input", { type: "text", placeholder: "Topic or headline", style: "max-width:320px" });
+  // The button says what it will do as the topic is typed: the label was worked out once, when the box was still empty.
+  const genBtn = h("button", { class: "btn sm", onclick: () => run(async () => { await post("/api/generate", { nicheId: p.id, topic: topic.value || undefined }); }, "Generating — it will land in Review").then(() => { topic.value = ""; genBtn.textContent = "Generate now"; refreshMeta().then(() => renderRail("programs")); }) }, "Generate now");
+  const topic = h("input", { type: "text", placeholder: "Topic or headline", style: "max-width:320px", oninput: () => { genBtn.textContent = topic.value.trim() ? "Generate from topic" : "Generate now"; } });
   return h("div", { class: "panel" },
     h("div", { class: "row" },
       h("div", null, h("h3", { style: "margin:0" }, (p.variants || []).length ? h("span", { class: "vid", title: p.variant_name || "" }, p.variants.join(" · ")) : null, " ", p.display_name, " ", yes(p.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
@@ -535,11 +562,10 @@ function programCard(p, brands, sources, channels, adapters, styles) {
     h("div", { class: "small mute", style: "margin-top:8px" }, "Writes with: ", [p.script_adapter, ...(p.script_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(default)",
       isVideo ? ` · picks moments with: ${[p.clip_adapter, ...(p.clip_adapter_fallbacks || [])].filter(Boolean).join(" → ") || "(default)"}` : ""),
     h("div", { class: "small mute", style: "margin-top:2px" }, "Style: ", p.style_profile_id ? (styles.find((s) => s.id === p.style_profile_id)?.name || "linked") : h("span", null, "none yet (being generated, or pick one in Edit)"),
-      " · quality check: ", (p.method_config?.qa?.enabled ?? true) ? `on${(p.method_config?.qa?.auto_fix ?? true) ? " with auto-fix" : ""}` : "off",
+      " · quality check: ", p.method_config?.qa?.enabled == null ? "as in Settings" : p.method_config.qa.enabled ? `on${p.method_config.qa.auto_fix === false ? "" : p.method_config.qa.auto_fix ? " with auto-fix" : " (auto-fix as in Settings)"}` : "off",
       p.method_config?.autopilot?.topics_per_day ? ` · autopilot: ${p.method_config.autopilot.topics_per_day} idea(s)/day` : ""),
     h("div", { class: "row", style: "margin-top:12px" },
-      isVideo ? h("span", { class: "small mute" }, "Video programmes make clips from the links under Videos to clip, not from a topic.") : [topic,
-        h("button", { class: "btn sm", onclick: () => run(async () => { await post("/api/generate", { nicheId: p.id, topic: topic.value || undefined }); }, "Generating — it will land in Review").then(() => { topic.value = ""; refreshMeta().then(() => renderRail("programs")); }) }, topic.value ? "Generate from topic" : "Generate now")],
+      isVideo ? h("span", { class: "small mute" }, "Video programmes make clips from the links under Videos to clip, not from a topic.") : [topic, genBtn],
       isVideo ? h("button", { class: "btn sm", onclick: () => candidateDialog(p.id) }, "Add a video URL") : null,
       h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post(`/api/programs/${p.id}/plan`); toast(`${r.created} new idea(s)`); location.hash = `#/ideas/${p.id}`; }) }, "Plan ideas now"),
       h("button", { class: "btn sm", onclick: () => seriesDialog(p) }, "Series"),
@@ -584,10 +610,17 @@ const PRESETS = {
   facts_series: { label: "Facts videos — daily, planner-driven", key: "facts", displayName: "Facts", contentType: "IMAGE_SLIDESHOW", language: "bn", country: "Bangladesh", approvalMode: "AUTO_AFTER_WINDOW", reviewWindowMinutes: 60, maxItemsPerDay: 3, _orientation: "9:16", _apTopics: 1, autoSources: false },
 };
 // A variant's setup, as the form's own fields. methodConfig keys live in the form under their "_" names.
-const SETUP_FIELDS = { explainer_style: "_explainerStyle", reaction_layout: "_reactionLayout", orientation: "_orientation", footage_dir: "_footageDir" };
+const SETUP_FIELDS = { explainer_style: "_explainerStyle", reaction_layout: "_reactionLayout", orientation: "_orientation", footage_dir: "_footageDir", speed: "_speed" };
+// What each field a variant can set goes back to when the next variant chosen does not set it. Switching 5c to 5a kept
+// Twelve Labs as the transcriber and 7a to 7b kept the PC and the footage folder, so the programme was still the old
+// variant under the new name. An adapter's "" is the engine's own choice.
+const SETUP_DEFAULTS = { productionMethod: "", clipAdapter: "", transcriptAdapter: "", computeWhere: "server", _explainerStyle: "", _reactionLayout: "stack", _orientation: "", _footageDir: "", _speed: 1 };
 function applySetup(f, setup) {
   const put = (name, val) => { const el = f.querySelector(`[name="${name}"]`); if (!el) return; if (el.type === "checkbox") el.checked = !!val; else el.value = val ?? ""; };
+  const named = new Set([...Object.keys(setup || {}).filter((k) => k !== "methodConfig"), ...Object.keys(setup?.methodConfig || {}).map((k) => SETUP_FIELDS[k]).filter(Boolean)]);
+  for (const [name, def] of Object.entries(SETUP_DEFAULTS)) if (!named.has(name)) put(name, def);
   for (const [k, v] of Object.entries(setup || {})) if (k !== "methodConfig") put(k, v);
+  // true means "this variant needs one" (7a's footage folder): what is already typed stays, and saving asks for it.
   for (const [k, v] of Object.entries(setup?.methodConfig || {})) if (SETUP_FIELDS[k] && v !== true) put(SETUP_FIELDS[k], v);
   f.querySelector("[name=contentType]")?.dispatchEvent(new Event("change"));
 }
@@ -595,7 +628,7 @@ function applySetup(f, setup) {
 const NEWS_TYPES = new Set(["NEWS_STATIC", "NEWS_REEL"]);
 function showFor(f) {
   const t = f.querySelector("[name=contentType]")?.value || "";
-  const on = { news: NEWS_TYPES.has(t), clips: VIDEO_TYPES.has(t), video: VIDEO_TYPES.has(t) || MADE_VIDEO_TYPES.has(t), explainer: t === "ANIMATED_EXPLAINER", written: !VIDEO_TYPES.has(t) };
+  const on = { news: NEWS_TYPES.has(t), clips: VIDEO_TYPES.has(t), video: VIDEO_TYPES.has(t) || MADE_VIDEO_TYPES.has(t), explainer: t === "ANIMATED_EXPLAINER", written: !VIDEO_TYPES.has(t), recap: t === "MOVIE_RECAP", reaction: t === "REACTION_CLIP", voiced: t !== "NEWS_STATIC" && t !== "NICHE_STATIC" && t !== "LONG_POST" };
   f.querySelectorAll("[data-for]").forEach((el) => { el.hidden = !el.dataset.for.split(" ").some((k) => on[k]); });
 }
 // An ordered fallback chain as an editable list. Only sent when changed, so a new programme keeps the engine's own
@@ -608,7 +641,9 @@ function chainField(label, name, current, options, help) {
 async function programDialog(p, brands, sources, adapters, styles, done, start = null) {
   const a = adapters || {}, uploads = await get("/api/uploads").catch(() => []); let preset = null;
   const catalog = await get("/api/catalog").catch(() => []);
-  const opt = (keys, cur) => select(null, [["", "(default)"], ...(keys || []).map((k) => [k, k])], cur || "");
+  // The programme's own choice is always an option, even when it is not an enabled instance: otherwise the select shows
+  // "(default)" and saving would quietly swap it for the engine's choice.
+  const opt = (keys, cur) => select(null, [["", "(default)"], ...[...new Set([...(keys || []), ...(cur ? [cur] : [])])].map((k) => [k, k])], cur || "");
   const f = h("div", null,
     h("div", { class: "grid2" },
       field("Name", text("displayName", p?.display_name)),
@@ -622,7 +657,9 @@ async function programDialog(p, brands, sources, adapters, styles, done, start =
         "Only video steps move. News, review and publishing stay on the server.")),
       field("Review window (minutes)", num("reviewWindowMinutes", p?.review_window_minutes ?? 60)),
       field("Max items per day", num("maxItemsPerDay", p?.max_items_per_day), "Leave empty for no cap."),
-      field("Style profile", select("styleProfileId", [["", "(none)"], ...styles.map((s) => [s.id, s.name])], p?.style_profile_id || ""))),
+      field("Style profile", select("styleProfileId", [["", "(none)"], ...styles.map((s) => [s.id, s.name])], p?.style_profile_id || "")),
+      h("div", { "data-for": "clips" }, field("Videos it takes", select("licensePolicy", [["ANY", "Any licence"], ["CC_ONLY", "Creative Commons only"]], p?.license_policy || "ANY"),
+        "From its sources' feeds. A source set to Creative Commons only stays that way whatever this says."))),
     field("Tone", text("tone", p?.tone || "clear, factual, click-worthy")),
     check("publishToPortal", "Also publish an article to the news portal", p ? yes(p.publish_to_portal) : true),
     h("details", { class: "engine-choices" }, h("summary", null, "Engine choices — which adapter does each step, and who stands in when it cannot"),
@@ -631,6 +668,7 @@ async function programDialog(p, brands, sources, adapters, styles, done, start =
         field("Script / LLM", Object.assign(opt(a.scriptAdapters, p?.script_adapter), { name: "scriptAdapter" })),
         field("Image", Object.assign(opt(a.imageAdapters, p?.image_adapter), { name: "imageAdapter" })),
         field("Voice", Object.assign(opt(a.voiceAdapters, p?.voice_adapter), { name: "voiceAdapter" })),
+        h("div", { "data-for": "voiced" }, field("Voice name", text("voiceId", p?.voice_id || "", { placeholder: "(the voice's default for the language)" }), "Optional: a voice of the adapter above, e.g. bn-BD-PradeepNeural for edge-tts.")),
         field("Render", Object.assign(opt(a.renderAdapters, p?.render_adapter), { name: "renderAdapter" })),
         field("Embeddings (dedup)", Object.assign(opt(a.embedAdapters, p?.embed_adapter), { name: "embedAdapter" })),
         field("Download (video)", Object.assign(opt(a.downloadAdapters, p?.download_adapter), { name: "downloadAdapter" })),
@@ -664,12 +702,21 @@ async function programDialog(p, brands, sources, adapters, styles, done, start =
   queueMicrotask(() => showFor(f));
   formDialog(p ? `Edit ${p.display_name}` : start ? `New programme — ${start.id} ${start.name}` : "New programme", f, async (v) => {
     if (preset?.autoSources === false) v.autoSources = false;
+    // A 7a programme without a folder is a stock-footage video under another name; it is asked for here, not discovered
+    // after the first video comes out made of stock.
+    const variant = buildable.find((x) => x.id === variantPick.value);
+    if (variant?.setup?.methodConfig?.footage_dir === true && !String(v._footageDir || "").trim()) throw new Error(`${variant.id} ${variant.name} needs your footage folder: fill in "Your footage folder (on the PC)" under Video`);
+    if (!String(v.displayName || "").trim()) throw new Error("Give the programme a name");
     v.methodConfig = readAutomation(v, readVideo(v, p?.method_config || {}));
     if (preset?._topics) v.methodConfig.topics = preset._topics;          // which desk of its country the program takes
     if (preset?._exclude) v.topicFilters = { exclude: preset._exclude.split(",").map((x) => x.trim()).filter(Boolean) };
-    for (const k of Object.keys(v)) if (v[k] === "" && k !== "tone") delete v[k];
+    // An emptied field on an existing programme is sent as null, which the engine takes as "back to the default" (the
+    // engine's own adapter, no country, no style). Dropping it, as before, meant a value once set could never be cleared.
+    // A new programme leaves empty fields out: the engine fills in its defaults.
+    const col = (k) => k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    for (const k of Object.keys(v)) if (v[k] === "" && k !== "tone") { if (p && p[col(k)] != null && p[col(k)] !== "") v[k] = null; else delete v[k]; }
     if (v.maxItemsPerDay == null) v.maxItemsPerDay = 0;                   // empty means no cap, which the engine stores as 0
-    if (v.reviewWindowMinutes == null) delete v.reviewWindowMinutes;
+    if (v.reviewWindowMinutes == null && !p) delete v.reviewWindowMinutes;
     f.querySelectorAll("[data-initial]").forEach((el) => { if (el.value.trim() === el.dataset.initial) delete v[el.name]; });
     if (v.sourceIds) v.sourceIds = Array.from(f.querySelector("[name=sourceIds]").selectedOptions).map((o) => o.value);
     if (p) { delete v.brandId; delete v.key; await patch(`/api/programs/${p.id}`, v); } else await post("/api/programs", v);
@@ -683,15 +730,26 @@ function videoFields(p, uploads) {
   return h("fieldset", null, h("legend", null, "Video"),
     h("div", { class: "grid3" },
       field("Production method (clips)", select("productionMethod", PRODUCTION_METHODS, p?.production_method || "")),
-      field("Orientation", select("_orientation", [["", "(default)"], ["9:16", "Vertical 9:16"], ["16:9", "Landscape 16:9"]], mc.orientation || "")),
+      // The engine's default is vertical; a long video and a long-form reaction are landscape whatever this says.
+      field("Orientation", select("_orientation", [["", "(default: vertical 9:16)"], ["9:16", "Vertical 9:16"], ["16:9", "Landscape 16:9"]], mc.orientation || "")),
       field("Vertical layout for landscape footage", select("_verticalLayout", [["crop", "Crop to fill"], ["blurpad", "Whole picture on a blurred fill"]], mc.vertical_layout || "crop")),
-      field("Reactor clip", select("_reactor", [["", reactors.length ? "(none — waveform instead)" : "(upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || mc.overlay_video_url || "")),
+      field("Reactor clip", select("_reactor", [["", reactors.length ? "(none)" : "(none — upload one under Brands → Media library)"], ...reactors.map((u) => [u.url, u.meta?.name || u.id])], mc.reactor_url || mc.overlay_video_url || ""),
+        "Reaction shorts (4a) cannot be made without one. A long-form reaction without one shows a waveform beside the commentary."),
       field("Reaction short layout", select("_reactionLayout", [["stack", "Split-screen — source on top, you below"], ["pip", "Corner — you over the whole source"]], mc.reaction_layout || "stack")),
       field("When the AI picker is out of allowance", select("_pickerFallback", [["", "Wait for it — the best moment, a few hours later"], ["now", "Use the free picker now — sooner, weaker picks"]], mc.picker_fallback || "")),
       field("Source speed", num("_speed", mc.speed ?? 1, { step: "0.05", min: 1, max: 1.5 }), "Reaction shorts: 1.1 plays the source a little faster, so it is not the original frame for frame."),
       field("Music bed", select("_music", [["", "(brand kit music)"], ["none", "No music"], ...music.map((u) => [u.url, u.meta?.name || u.id])], mc.music === false ? "none" : typeof mc.music === "string" ? mc.music : "")),
       field("Explainer length (minutes)", num("_explainerMinutes", mc.explainer_minutes ?? 3, { min: 1, max: 12 })),
       field("Explainer style", select("_explainerStyle", [["", "General — the six layouts mixed"], ["data", "Data — charts, figures and timelines from the research's own numbers"], ["illustrated", "Illustrated — drawn scenes and the series' characters, moved in code"], ["3d", "3D (Blender) — 3D titles, growing bars and words; renders on your PC with Blender"]], mc.explainer_style || ""))),
+    // The clip keys the engine reads from method_config, with its own defaults as placeholders: empty keeps the default.
+    h("div", { class: "grid3", "data-for": "clips" },
+      field("Clips per video", num("_clipsPerVideo", mc.clips_per_video, { min: 1, max: 10, placeholder: "3" })),
+      field("Shortest clip (seconds)", num("_clipMin", mc.clip_min_seconds, { min: 5, placeholder: "25" })),
+      field("Longest clip (seconds)", num("_clipMax", mc.clip_max_seconds, { min: 10, placeholder: "75" })),
+      field("Clip videos from sources scoring at least (0-1)", num("_minScore", mc.min_score, { step: "0.05", min: 0, max: 1, placeholder: "0.5" }), "Videos a source brings in below this wait under Videos to clip for you to process by hand.")),
+    h("div", { class: "grid3" },
+      h("div", { "data-for": "recap" }, field("Recap length (seconds)", num("_recapSeconds", mc.recap_seconds, { min: 20, placeholder: "60" }))),
+      h("div", { "data-for": "reaction" }, field("Long reaction: source played, at most (minutes)", num("_maxPlay", mc.max_play_minutes, { min: 1, placeholder: "6" })))),
     h("div", { class: "grid2" },
       field("Cast (illustrated)", area("_cast", (mc.characters || []).map((c) => `${c.name}: ${c.look}`).join("\n"), { placeholder: "One per line — Name: how they look\nRafi: a cheerful Bangladeshi rickshaw driver in a green lungi and white vest, thin moustache", style: "min-height:70px" }),
         "The same characters come back every episode, drawn the same way. Leave empty and each story names its own."),
@@ -699,10 +757,13 @@ function videoFields(p, uploads) {
       field("Your footage folder (on the PC)", text("_footageDir", mc.footage_dir || "", { placeholder: "D:\\Footage" }), "Script videos take each section's footage from here first: clips found by their names, a .txt note beside them, or what Gemini sees in them. Set video work to run on My PC."),
       h("div", null, field("Clips Gemini describes per day", num("_describe", mc.describe_per_day ?? 5, { min: 0, max: 50 }), "Only clips without a name or note that says what they are; each is described once."),
         check("_ownOnly", "Own footage only — never stock", !!mc.own_footage_only))),
-    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_captions", "Burned-in captions", mc.captions !== false && mc.subtitles !== false), check("_brandFinish", "Logo + loudness on footage videos", mc.brand_finish !== false)));
 }
 function readVideo(v, mc) {
-  const out = { ...mc, captions: !!v._captions, brand_finish: !!v._brandFinish, vertical_layout: v._verticalLayout || "crop", explainer_minutes: v._explainerMinutes ?? 3 };
+  // Explainers read "subtitles", footage videos "captions": one box, both keys, so the box means the same on either.
+  const out = { ...mc, captions: !!v._captions, subtitles: !!v._captions, brand_finish: !!v._brandFinish, vertical_layout: v._verticalLayout || "crop", explainer_minutes: v._explainerMinutes ?? 3 };
+  for (const [name, key] of [["_clipsPerVideo", "clips_per_video"], ["_clipMin", "clip_min_seconds"], ["_clipMax", "clip_max_seconds"], ["_minScore", "min_score"], ["_recapSeconds", "recap_seconds"], ["_maxPlay", "max_play_minutes"]])
+    if (v[name] == null) delete out[key]; else out[key] = v[name];
   if (v._explainerStyle) out.explainer_style = v._explainerStyle; else delete out.explainer_style;
   const cast = String(v._cast || "").split("\n").map((l) => l.split(":")).filter((x) => x[0].trim() && x.length > 1).map(([name, ...look]) => ({ name: name.trim(), look: look.join(":").trim() }));
   if (cast.length) out.characters = cast; else delete out.characters;
@@ -720,11 +781,14 @@ function readVideo(v, mc) {
 // method_config.qa / .desk / .autopilot, edited as plain fields and merged back into the program's method_config.
 function automationFields(mc) {
   const qa = mc.qa || {}, d = mc.desk || {}, ap = mc.autopilot || {};
+  // Each of these follows Settings unless the programme says otherwise. Writing on/off into every programme the dialog
+  // saved made the global switches do nothing for any programme edited here.
+  const tri = (name, v) => select(name, [["", "As in Settings"], ["on", "On"], ["off", "Off"]], v == null ? "" : v ? "on" : "off");
   return h("fieldset", null, h("legend", null, "Automation"),
-    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_qaEnabled", "Quality check every draft", qa.enabled ?? true), check("_qaAutoFix", "Let it fix flagged drafts once", qa.auto_fix ?? true),
-      check("_qaClips", "Check trimmed clips too (off: under hand review, you are the check — saves AI requests)", !!qa.check_clips)),
+    h("div", { class: "grid3" }, field("Quality check every draft", tri("_qaEnabled", qa.enabled)), field("Let it fix flagged drafts once", tri("_qaAutoFix", qa.auto_fix)),
+      field("Pass score (0-1)", num("_qaMinScore", qa.min_score, { step: "0.05", min: 0, max: 1, placeholder: "as in Settings (0.75)" }))),
+    h("div", { class: "row", style: "gap:18px;flex-wrap:wrap" }, check("_qaClips", "Check trimmed clips too (off: under hand review, you are the check — saves AI requests)", !!qa.check_clips)),
     h("div", { class: "grid3", style: "margin-top:8px" },
-      field("Pass score (0-1)", num("_qaMinScore", qa.min_score ?? 0.75, { step: "0.05", min: 0, max: 1 })),
       field("Autopilot ideas per day", num("_apTopics", ap.topics_per_day ?? 0, { min: 0 }), "The planner writes this many of its best ideas itself. 0 = off."),
       field("Stop drafting when this many wait for review", num("_backlog", mc.review_backlog ?? "", { min: 0, placeholder: "30 (Settings)" }), "Manual review only. Empty: the setting review.max_waiting (30); 0: never stop. Keeps the free AI allowance for work you will see.")),
     h("div", { class: "grid3", "data-for": "news" },
@@ -735,7 +799,10 @@ function automationFields(mc) {
       field("Minutes between stories", num("_deskGap", d.min_gap_minutes ?? 10, { min: 0 }))));
 }
 function readAutomation(v, mc) {
-  const out = { ...mc, qa: { ...(mc.qa || {}), enabled: !!v._qaEnabled, auto_fix: !!v._qaAutoFix, min_score: v._qaMinScore ?? 0.75, check_clips: !!v._qaClips },
+  const qa = { ...(mc.qa || {}), check_clips: !!v._qaClips };
+  for (const [name, key] of [["_qaEnabled", "enabled"], ["_qaAutoFix", "auto_fix"]]) if (v[name]) qa[key] = v[name] === "on"; else delete qa[key];
+  if (v._qaMinScore == null) delete qa.min_score; else qa.min_score = v._qaMinScore;
+  const out = { ...mc, qa,
     desk: { ...(mc.desk || {}), min_sources: v._deskMinSources ?? 1, settle_minutes: v._deskSettle ?? 5, max_age_hours: v._deskMaxAge ?? 12, per_sweep: v._deskPerSweep ?? 2, min_gap_minutes: v._deskGap ?? 10 },
     autopilot: { ...(mc.autopilot || {}), topics_per_day: v._apTopics ?? 0 } };
   if (v._backlog == null) delete out.review_backlog; else out.review_backlog = v._backlog;
@@ -951,7 +1018,7 @@ async function catalogDialog(programs) {
     group("English news", cat.filter((e) => e.kind === "ARTICLE" && e.language === "en")), group("বাংলা সংবাদ", cat.filter((e) => e.kind === "ARTICLE" && e.language === "bn")),
     group("TV news channels (video)", cat.filter((e) => e.kind === "VIDEO"))), { wide: true });
 }
-const SOURCE_HINTS = { google_news: '{"query": "Bangladesh cricket", "language": "en"}', youtube_rss: '{"channel_id": "UC..."}', sitemap: '{"url": "https://example.com/news-sitemap.xml"}', rss: '{"url": "https://example.com/feed.xml"}', newsapi: '{"q": "Bangladesh", "language": "en"}', youtube_api: '{"channelId": "UC...", "q": "search terms"}', ytdlp_list: '{"url": "https://www.youtube.com/@channel/videos", "limit": 20}', ingest_mock: "{}" };
+const SOURCE_HINTS = { google_news: '{"query": "Bangladesh cricket", "language": "en"}', youtube_rss: '{"channel_id": "UC..."}', sitemap: '{"url": "https://example.com/news-sitemap.xml"}', rss: '{"url": "https://example.com/feed.xml"}', newsapi: '{"query": "Bangladesh", "language": "en"}', youtube_api: '{"channel_id": "UC...", "query": "search terms"}', ytdlp_list: '{"url": "https://www.youtube.com/@channel/videos", "limit": 20}', ingest_mock: "{}" };
 function sourceDialog(s, ingestKeys, programs, brands) {
   const cfg = area("config", JSON.stringify(s?.config || {}, null, 2), { "data-json": "obj", class: "mono" });
   const adapter = select("adapterKey", ingestKeys, s?.adapter_key || "rss", { onchange: (e) => { if (!s && SOURCE_HINTS[e.target.value]) cfg.value = SOURCE_HINTS[e.target.value]; } });
@@ -1063,7 +1130,7 @@ pages.channels = async () => {
   if (!channels.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No channels yet"), "Add one and subscribe it to a program."));
   for (const c of channels) root.appendChild(h("div", { class: "panel" }, h("div", { class: "row" },
     h("div", null, h("h3", { style: "margin:0" }, c.display_name, " ", yes(c.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
-      h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · token ", c.credential_id ? h("span", { class: "tag green" }, creds.find((k) => k.id === c.credential_id)?.label || "linked") : h("span", { class: "tag" }, "env default"), " · up to ", c.max_posts_per_day ?? "∞", "/day, ", c.min_gap_minutes ?? 0, " min apart · ", c.timezone),
+      h("div", { class: "small mute" }, c.platform, " · ", nice(c.format), " · publisher ", h("span", { class: "mono" }, c.publisher_adapter || "(platform default)"), " · token ", c.credential_id ? h("span", { class: "tag green" }, creds.find((k) => k.id === c.credential_id)?.label || "linked") : h("span", { class: "tag" }, "env default"), " · ", c.max_posts_per_day ? `up to ${c.max_posts_per_day}/day` : "no daily limit", ", ", c.min_gap_minutes ?? 0, " min apart · ", c.timezone),
       h("div", { class: "small", style: "margin-top:4px" }, "Programs: ", (c.niches || []).length ? c.niches.map((n) => n.display_name).join(", ") : h("span", { class: "mute" }, "none — subscribe from Programs"))),
     h("div", { class: "right row" },
       h("button", { class: "btn sm", onclick: () => run(async () => {
@@ -1209,10 +1276,11 @@ function credDialog(k) {
 
 // ---------------------------------------------------------------- settings
 pages.settings = async () => {
-  const [s, storage] = await Promise.all([get("/api/settings"), get("/api/storage")]);
+  const [s, storage, adapters] = await Promise.all([get("/api/settings"), get("/api/storage"), get("/api/adapters").catch(() => ({}))]);
   const val = (k, d) => (s[k] === undefined ? d : s[k]);
   const save = (k, v, msg) => run(() => put(`/api/settings/${k}`, { value: v }), msg || "Saved").then(route);
-  const cap = num(null, val("budget.daily_cap_usd", 5), { step: "0.5", min: 0, style: "max-width:140px" });
+  // Unset means no cap, as the engine reads it; it showed 5 here when nothing was set.
+  const cap = num(null, val("budget.daily_cap_usd", null), { step: "0.5", min: 0, placeholder: "0 = no cap", style: "max-width:140px" });
   const thr = num(null, val("repurpose.view_threshold", 500), { min: 0, style: "max-width:140px" });
   const hrs = num(null, val("storage.cleanup_after_publish_hours", 48), { min: 1, style: "max-width:120px" });
   const known = ["queues.enabled", "publishing.global_pause", "budget.daily_cap_usd", "ingest.enabled", "repurpose.view_threshold", "storage.cleanup_enabled", "storage.cleanup_after_publish_hours",
@@ -1221,9 +1289,15 @@ pages.settings = async () => {
   const expiry = num(null, val("review.news_expiry_hours", 24), { min: 0, style: "max-width:100px" });
   const waiting = num(null, val("review.max_waiting", 30), { min: 0, style: "max-width:100px" });
   const tgChat = text(null, val("alerts.telegram_chat_id", "") || "", { placeholder: "chat id, e.g. 123456789", style: "max-width:220px" });
-  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1", "news.paused", "review.news_expiry_hours", "review.max_waiting");
-  const fb = text(null, (val("llm.default_fallbacks", []) || []).join(", "), { placeholder: "e.g. openai_live, anthropic_live", style: "max-width:360px" });
+  known.push("alerts.telegram_chat_id", "upgrade.catalog_v1", "news.paused", "review.news_expiry_hours", "review.max_waiting",
+    "voice.default_fallbacks", "desk.similarity", "desk.word_overlap", "ingest.max_age_hours", "retention.source_items_days", "ingest.fetch_article_text", "image.text_card_fallback");
   const toggle = (key, def, on, off) => h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val(key, def) ? on : off), h("button", { class: "btn sm", onclick: () => save(key, !val(key, def)) }, val(key, def) ? "Turn off" : "Turn on"));
+  // A global fallback chain, used by every programme that has none of its own — the same comma list as a programme's.
+  const chainRow = (key, label, options, placeholder) => { const box = text(null, (val(key, []) || []).join(", "), { placeholder, style: "max-width:360px" });
+    return h("div", { style: "padding:4px 0" }, h("div", { class: "row" }, h("span", { class: "grow" }, label), box, h("button", { class: "btn sm", onclick: () => save(key, box.value.split(",").map((x) => x.trim()).filter(Boolean)) }, "Save")),
+      options?.length ? h("div", { class: "small mute" }, "Available: ", options.join(", ")) : null); };
+  const numRow = (key, def, label, extra = {}) => { const box = num(null, val(key, def), { style: "max-width:100px", ...extra });
+    return h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, label), box, h("button", { class: "btn sm", onclick: () => { if (box.value === "") return toast("Enter a number", true); save(key, Number(box.value)); } }, "Save")); };
   // The engine's own bookkeeping (boot records, quota pauses, relayed answers, cached descriptions) is not a setting.
   const internal = /^(boot\.|worker\.|quota\.|provider\.refused\.|relay\.|upgrade\.|vizard\.project\.|twelve_labs\.|footage\.seen\.|catalog)/;
   const other = Object.entries(s).filter(([k]) => !known.includes(k) && !internal.test(k));
@@ -1233,7 +1307,10 @@ pages.settings = async () => {
         h("button", { class: "btn" + (val("publishing.global_pause", false) ? " ok" : " danger"), onclick: () => save("publishing.global_pause", !val("publishing.global_pause", false), val("publishing.global_pause", false) ? "Publishing resumed" : "Publishing paused") }, val("publishing.global_pause", false) ? "Resume publishing" : "Pause all publishing"))),
     h("div", { class: "panel" }, h("h3", null, "Ingestion"),
       h("div", { class: "row" }, h("span", { class: "grow" }, val("ingest.enabled", true) ? "Sources are polled on their schedules." : "Automatic polling is off. You can still poll manually."),
-        h("button", { class: "btn", onclick: () => save("ingest.enabled", !val("ingest.enabled", true)) }, val("ingest.enabled", true) ? "Stop automatic polling" : "Start automatic polling"))),
+        h("button", { class: "btn", onclick: () => save("ingest.enabled", !val("ingest.enabled", true)) }, val("ingest.enabled", true) ? "Stop automatic polling" : "Start automatic polling")),
+      toggle("ingest.fetch_article_text", true, "Each story's article is read from the outlet's page, so the writer has more than the headline.", "Articles are not fetched: stories are written from the feed's headline and summary."),
+      numRow("ingest.max_age_hours", 72, "Skip feed articles older than this many hours", { min: 1 }),
+      numRow("retention.source_items_days", 14, "Forget feed items nothing was made from after this many days", { min: 1 })),
     h("div", { class: "panel" }, h("h3", null, "Review and news"),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, val("news.paused", false) ? "News is paused: feeds are read, nothing is drafted." : "News is running."),
         h("button", { class: `btn sm${val("news.paused", false) ? " primary" : ""}`, onclick: () => save("news.paused", !val("news.paused", false), val("news.paused", false) ? "News resumed" : "News paused") }, val("news.paused", false) ? "Resume news" : "Pause news")),
@@ -1246,9 +1323,16 @@ pages.settings = async () => {
       toggle("planner.enabled", true, "The planner proposes ideas once a day per program.", "The daily planner is off."),
       toggle("style.auto_refine", true, "House styles learn from reviewers' edits and the best-performing posts.", "House styles only change by hand."),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Pass score for the quality check (0-1)"), minScore, h("button", { class: "btn sm", onclick: () => save("qa.min_score", Number(minScore.value)) }, "Save")),
-      h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Backup writers when a program has none (adapter keys)"), fb, h("button", { class: "btn sm", onclick: () => save("llm.default_fallbacks", fb.value.split(",").map((x) => x.trim()).filter(Boolean)) }, "Save"))),
+      numRow("desk.similarity", 0.84, "News desk: how alike two reports must be to count as one story, compared by meaning (0-1)", { step: "0.01", min: 0, max: 1 }),
+      numRow("desk.word_overlap", 0.5, "News desk: share of headline words two reports must share to count as one story, when meanings cannot be compared (0-1)", { step: "0.05", min: 0, max: 1 }),
+      toggle("image.text_card_fallback", true, "A story no picture could be made for goes out as a typographic text card.", "A story no picture could be made for fails instead of becoming a text card."),
+      chainRow("llm.default_fallbacks", "Backup writers when a programme has none of its own", adapters.scriptAdapters, "e.g. groq_live, mistral_live"),
+      chainRow("image.default_fallbacks", "Backup pictures when a programme has none of its own", adapters.imageAdapters, "e.g. pexels_stock, pollinations"),
+      chainRow("voice.default_fallbacks", "Backup voices when a programme has none of its own", adapters.voiceAdapters, "e.g. tts_edge, tts_piper")),
     h("div", { class: "panel" }, h("h3", null, "Alerts on Telegram"),
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "1. Create a bot with @BotFather and add its token on the API keys page (provider Telegram) or as TELEGRAM_BOT_TOKEN on Render. 2. Send your bot a message, then open api.telegram.org/bot<token>/getUpdates to find your chat id. 3. Paste it here."),
+      // TELEGRAM_CHAT_ID on the server wins over this box, so saving here would look like it did something.
+      stats?.telegramChatEnv ? h("p", { class: "small", style: "margin:0 0 8px;color:var(--amber)" }, "A chat id is set on the server (TELEGRAM_CHAT_ID), and it overrides this one. Change it there, or remove it to use this box.") : null,
       h("div", { class: "row" }, tgChat, h("button", { class: "btn sm", onclick: () => save("alerts.telegram_chat_id", tgChat.value.trim() || null) }, "Save"),
         h("button", { class: "btn sm", onclick: () => run(async () => { const r = await post("/api/notifications/test"); toast(r.telegram ? "Test alert sent to Telegram" : "Saved in the dashboard only — Telegram isn't configured yet", !r.telegram); }) }, "Send a test alert"))),
     h("div", { class: "panel" }, h("h3", null, "Daily spend cap"),
