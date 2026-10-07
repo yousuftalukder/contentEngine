@@ -33,7 +33,9 @@ const ENV = process.env;
 const PORT = Number(ENV.PORT) || 4000;
 const DATABASE_URL = ENV.DATABASE_URL;
 const TMP = join(ENV.WORK_DIR || tmpdir(), "content-engine");
-const LOCAL_MEDIA_DIR = join(__dirname, "data", "media");
+// Where this machine keeps the files it stores (your PC's store when files are kept there). Tests point it at their own
+// scratch folder: they were writing into the very folder that is now the production store.
+const LOCAL_MEDIA_DIR = ENV.MEDIA_DIR || join(__dirname, "data", "media");
 const FRONTEND_DIR = join(__dirname, "frontend");
 const WORKER_ID = `${ENV.RENDER_INSTANCE_ID || "local"}-${process.pid}`;
 const QUEUE_POLL_MS = Number(ENV.QUEUE_POLL_INTERVAL_MS) || 3000;
@@ -599,9 +601,11 @@ async function toTmpFile(url, ext) {
   // This engine's own files, read from disk — matched on the whole media path, because an outlet's photo under
   // /uploads/media/ is somebody else's file, not one of ours.
   if (IS_PC && url.startsWith(`${await serverBase()}/pc/`)) { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, decodeURIComponent(url.slice(`${await serverBase()}/pc/`.length))))); return out; }
+  // Only this process's own address, port and all: another engine on the same machine (the PC beside a server, two
+  // test engines) has a /media/ of its own, and the file is in its folder, not this one.
   if ((await storageBackend()).name === "local") {
-    const path = new URL(url).pathname, own = `${new URL(await STORAGE.local.publicBase()).pathname}/`;
-    if (path.startsWith(own)) { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, decodeURIComponent(path.slice(own.length))))); return out; }
+    const own = `${await STORAGE.local.publicBase()}/`;
+    if (url.startsWith(own)) { await writeFile(out, await readFile(join(LOCAL_MEDIA_DIR, decodeURIComponent(new URL(url).pathname.slice(new URL(own).pathname.length))))); return out; }
   }
   const gone = await one(`SELECT id FROM media_assets WHERE url=$1 AND deleted_at IS NOT NULL`, [url]);
   if (gone) throw new Error("This media file was already deleted by storage cleanup after publishing — regenerate the item to produce a new file");
