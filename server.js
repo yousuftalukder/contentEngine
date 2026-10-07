@@ -3315,7 +3315,13 @@ let deskTimer = null;
 const deskSoon = () => { if (!deskTimer) deskTimer = setTimeout(() => { deskTimer = null; sweepNewsDesk().catch((e) => warn("news desk", e.message)); }, 1000); };
 // One switch for all of it: "Pause news" on the dashboard. The feeds are still read and stories still grouped, so
 // that "Resume" starts on today's stories rather than on a backlog; nothing is drafted from them meanwhile.
-const newsPaused = async () => flag(await setting("news.paused", false));
+// Nothing is made on its own unless the owner turns automatic production on (Overview → Automatic production). Off, the
+// feeds are not read, the news desk drafts nothing, the planner proposes nothing and series do not advance; Generate and
+// a pasted video link still work. It was on by default and nobody had asked for it: on 2026-10-07 the engine had been
+// drafting news and planning ideas round the clock, and 4,800 card pictures of drafts nobody wanted filled the free
+// storage. The test harness starts engines with it on (AUTO_PRODUCTION_DEFAULT) so the pipelines can be exercised.
+const autoOn = async () => flag(await setting("auto.enabled", ENV.AUTO_PRODUCTION_DEFAULT === "on"));
+const newsPaused = async () => !(await autoOn()) || flag(await setting("news.paused", false));
 // One sweep at a time: the minute tick, a fresh batch of stories (deskSoon) and "Run the desk" could overlap, and two
 // sweeps drafted the same story twice — the second dying at Dedup after spending an embedding.
 let deskSweeping = null;
@@ -4854,7 +4860,7 @@ async function acceptSuggestion(id) {
   return { suggestion: await one(`SELECT * FROM suggestions WHERE id=$1`, [id]), ...out };
 }
 async function sweepPlanner() {
-  if (!(await setting("planner.enabled", true))) return;
+  if (!(await setting("planner.enabled", true)) || !(await autoOn())) return;
   const due = await q(`SELECT n.id FROM niches n WHERE n.is_active::int = 1 AND NOT EXISTS (SELECT 1 FROM suggestions s WHERE s.niche_id = n.id AND s.created_at > now() - interval '23 hours')
     AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'PLAN_PROGRAM' AND j.dedupe_key = 'plan:' || n.id AND j.created_at > now() - interval '23 hours') LIMIT 10`);
   for (const n of due) await enqueue("PLAN_PROGRAM", { nicheId: n.id }, { queue: "text", dedupeKey: `plan:${n.id}`, maxAttempts: 2 });
@@ -4867,6 +4873,7 @@ async function seriesBlock(item) {
   return `\nSERIES: this is episode ${item.episode_number || s.episode_counter + 1} of "${s.display_name}".${s.premise ? ` Premise: ${s.premise}.` : ""}${eps.length ? `\nEarlier episodes (newest first):\n${eps.map((e) => `- Ep ${e.episode_number ?? "?"}: ${e.headline} — ${e.summary || ""}`).join("\n")}\nContinue the series: build on earlier episodes where natural and never repeat one.` : ""}`;
 }
 async function sweepSeries() {
+  if (!(await autoOn())) return;
   const due = await q(`SELECT s.id, s.cadence_days FROM series s JOIN niches n ON n.id = s.niche_id WHERE s.auto_generate::int = 1 AND s.is_active::int = 1 AND n.is_active::int = 1 AND (s.next_due_at IS NULL OR s.next_due_at <= now()) LIMIT 10`);
   for (const s of due) {
     await q(`UPDATE series SET next_due_at = now() + ($2 || ' days')::interval WHERE id = $1`, [s.id, String(Number(s.cadence_days) || 7)]);
@@ -5089,7 +5096,7 @@ async function workerLoop(queue) {
   }
 }
 async function sweepDueSources() {
-  if (!(await setting("ingest.enabled", true))) return;
+  if (!(await setting("ingest.enabled", true)) || !(await autoOn())) return;
   const due = await q(`SELECT id, priority_hint FROM (SELECT s.id, 0 AS priority_hint FROM sources s WHERE s.is_active::int = 1 AND (s.last_polled_at IS NULL OR s.last_polled_at + (s.poll_interval_minutes || ' minutes')::interval <= now()) AND EXISTS (SELECT 1 FROM niche_sources ns WHERE ns.source_id = s.id)) d`);
   for (const s of due) await enqueue("INGEST_SOURCE", { sourceId: s.id }, { queue: "ingest", dedupeKey: `ingest:${s.id}`, maxAttempts: 1 });
 }
@@ -5425,7 +5432,7 @@ app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.
 app.get("/api/stats", async (ctx) => {
   const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
   json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), telegramChatEnv: !!ENV.TELEGRAM_CHAT_ID, quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses(), newsPaused: await newsPaused(),
-    storage: await storageUsage(),
+    storage: await storageUsage(), autoOn: await autoOn(),
     aiToday: (await q(`SELECT provider, SUM(units)::int AS requests FROM api_usage_daily WHERE day = CURRENT_DATE GROUP BY provider ORDER BY 2 DESC`)).filter((r) => r.requests > 0),
     newsPrograms: (await q(`SELECT id, display_name, content_type, is_active FROM niches WHERE content_type = ANY($1) ORDER BY display_name`, [[...DESK_TYPES]])).map((n) => ({ id: n.id, name: n.display_name, type: n.content_type, active: flag(n.is_active) })) });
 });

@@ -245,7 +245,8 @@ pages.overview = async () => {
       stats.quotaPauses.map((p) => h("div", { class: "sub" }, `${p.program}: starts taking stories again at ${fmtDate(p.until)}`)),
       h("p", { class: "small mute", style: "margin:8px 0 0" }, "Work already queued resumes by itself. A free Gemini key allows about 20 requests a day per model; add a second free writer (Groq or Mistral, on API keys) and it takes over while this one waits.")) : null,
 
-    stats?.newsPrograms?.length ? newsControls(stats) : null,
+    autoPanel(stats),
+    stats?.autoOn && stats?.newsPrograms?.length ? newsControls(stats) : null,
 
     // Free storage is 1 GB; past it Supabase refuses every file, so how full it is belongs on the first page.
     stats?.storage ? h("div", { class: "panel", style: `margin-top:12px${stats.storage.share >= 0.8 ? ";border-color:var(--amber)" : ""}` },
@@ -302,6 +303,17 @@ pages.overview = async () => {
 };
 // Pause or resume news drafting in one click, and each news programme on its own. "Pause news" keeps reading the
 // feeds (so resuming starts on today's stories); a paused programme takes nothing until it is resumed.
+// The one switch for everything the engine does by itself. Off (the default): nothing is made unless you ask — the
+// feeds are not read, no news is drafted, no ideas are planned.
+function autoPanel(st) {
+  if (!st) return null;
+  const set = (on) => run(() => put("/api/settings/auto.enabled", { value: on }), on ? "Automatic production is on" : "Automatic production is off").then(route);
+  return h("div", { class: "panel", style: `margin-top:12px${st.autoOn ? "" : ";border-color:var(--amber)"}` },
+    h("div", { class: "row" }, h("b", { style: "font-weight:500" }, st.autoOn ? "Automatic production is on" : "Automatic production is off"),
+      h("button", { class: `btn sm right${st.autoOn ? "" : " primary"}`, onclick: () => set(!st.autoOn) }, st.autoOn ? "Turn off" : "Turn on")),
+    h("div", { class: "sub" }, st.autoOn ? "The feeds are read, news is drafted from them, ideas are planned and series move on, within each programme's own limits."
+      : "Nothing is made by itself: the feeds are not read, no news is drafted, no ideas are planned. Generate a story or add a video link when you want something; turn this on to let the engine run on its own."));
+}
 function newsControls(st, { compact = false } = {}) {
   const paused = !!st?.newsPaused, progs = st?.newsPrograms || [];
   const toggleAll = () => run(() => put("/api/settings/news.paused", { value: !paused }), paused ? "News resumed — drafting from today's stories" : "News paused — nothing more is drafted until you resume").then(route);

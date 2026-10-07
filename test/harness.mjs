@@ -47,7 +47,7 @@ export async function startEngine({ env = {} } = {}) {
   const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !SECRET_ENV.test(k)));
   const child = spawn(process.execPath, ["server.js"], {
     cwd: ROOT,
-    env: { ...baseEnv, DATABASE_URL: databaseUrl, PORT: String(port), WORK_DIR: work, QUEUE_POLL_INTERVAL_MS: "100", PG_POOL_MAX: "4", ...env },
+    env: { ...baseEnv, AUTO_PRODUCTION_DEFAULT: "on", DATABASE_URL: databaseUrl, PORT: String(port), WORK_DIR: work, QUEUE_POLL_INTERVAL_MS: "100", PG_POOL_MAX: "4", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let logs = "";
