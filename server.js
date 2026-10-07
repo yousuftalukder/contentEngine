@@ -2109,11 +2109,12 @@ const pexelsClipUsed = new Map();
 async function pexelsFootage(query, { vertical = true, seconds = 6, country = null, ctx = {} } = {}) {
   const place = stockPlace(country), searches = stockSearches(query, place, 5);
   if (!searches.length) return null;
-  const base = await setting("footage.api_base", "https://api.pexels.com/videos");
-  return withKey("pexels", async (key) => {
+  // Only the search needs the key: on the PC without one it is the server's (KEY_RELAY), and the clip is still
+  // downloaded from Pexels' CDN by whoever renders.
+  const pick = async (search) => {
     const want = vertical ? { w: 720, h: 1080 } : { w: 1280, h: 720 };
     for (const q of searches) {
-      const r = await fetchJson(`${base}/search?${form({ query: q, per_page: 15, orientation: vertical ? "portrait" : "landscape", size: "medium" })}`, { headers: { Authorization: key } });
+      const r = await search({ query: q, per_page: 15, orientation: vertical ? "portrait" : "landscape", size: "medium" });
       const pool = (r.videos || []).filter((v) => v.duration >= Math.min(seconds, 4) && Date.now() - (pexelsClipUsed.get(v.id) || 0) > 14 * 86400e3 && stockIsLocal(v.url, place) && !STOCK_LOADED.test(v.url || ""));
       for (const v of pool.slice(0, 6)) {
         const file = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.width >= want.w && f.height >= want.h).sort((a, b) => a.width * a.height - b.width * b.height)[0];
@@ -2123,7 +2124,10 @@ async function pexelsFootage(query, { vertical = true, seconds = 6, country = nu
       }
     }
     return null;
-  }, ctx.pin).catch((e) => { warn(`stock footage "${searches[0]}": ${e.message.slice(0, 120)}`); return null; });
+  };
+  const found = (async () => ((await relayKeyed("pexels")) ? pick((p) => keyRelay("pexels_videos", p))
+    : withKey("pexels", async (key) => { const base = await setting("footage.api_base", "https://api.pexels.com/videos"); return pick((p) => fetchJson(`${base}/search?${form(p)}`, { headers: { Authorization: key } })); }, ctx.pin)))();
+  return found.catch((e) => { warn(`stock footage "${searches[0]}": ${e.message.slice(0, 120)}`); return null; });
 }
 // ---- 7a. Your own footage. Commercial script-to-video tools all draw on the same stock pool; a library of your own
 // clips is what makes a video look like nobody else's. The library is a folder on the machine that does the video work
@@ -2155,16 +2159,50 @@ async function footageIndex(dir, { describe = 0 } = {}) {
   // What Gemini saw in a clip, remembered by its name and size.
   const known = list.length ? await q(`SELECT key, value FROM settings WHERE key = ANY($1)`, [list.map((c) => c.key)]) : [];
   for (const r of known) { const c = list.find((x) => x.key === r.key); if (c) c.seen = String((typeof r.value === "string" ? P(r.value) ?? r.value : r.value)?.seen || ""); }
-  if (describe > 0 && (await credentialsFor("gemini")).length) {
-    const eyes = await resolve("TRANSCRIBE", "gemini_video").catch(() => null);
+  // The library lives on your PC, which has no Gemini key: there the clip is looked at by the server's (KEY_RELAY) from
+  // a few still frames, since the clip itself is too big to pass through the database. With a key here, as before.
+  const relayEyes = await relayKeyed("gemini");
+  if (describe > 0 && (relayEyes ? await canUseKey("gemini") : (await credentialsFor("gemini")).length)) {
+    const eyes = relayEyes ? null : await resolve("TRANSCRIBE", "gemini_video").catch(() => null);
     for (const c of list.filter((x) => !x.note && !x.seen).slice(0, describe)) {
-      try { const r = await eyes.transcribe({ path: c.path, duration: await ffprobeDuration(c.path) });
-        c.seen = r.segments.map((x) => x.visual).filter(Boolean).join(" ").slice(0, 800); await putSetting(c.key, { seen: c.seen, rel: c.rel }); }
+      try {
+        if (relayEyes) c.seen = String((await describeViaServer(c.path)).seen || "").slice(0, 800);
+        else { const r = await eyes.transcribe({ path: c.path, duration: await ffprobeDuration(c.path) }); c.seen = r.segments.map((x) => x.visual).filter(Boolean).join(" ").slice(0, 800); }
+        await putSetting(c.key, { seen: c.seen, rel: c.rel }); }
       catch (e) { warn(`describing ${c.rel}: ${e.message.slice(0, 120)}`); break; }
     }
   }
   for (const c of list) c.words = footWords(`${c.rel.replace(FOOTAGE_EXT, "")} ${c.note} ${c.seen}`);
   return list;
+}
+// The PC's half of a relayed look at a clip: four small stills spread across it, sent to the server, which asks Gemini.
+// Four frames at 480 pixels are a few tens of kilobytes each — enough to say "a rickshaw in the rain on a city street",
+// which is all the library match needs, and far under what a relay carries.
+async function describeViaServer(path) {
+  const seconds = await ffprobeDuration(path), frames = []; let total = 0;
+  for (const at of [0.15, 0.4, 0.65, 0.9]) {
+    const out = tmpPath("jpg");
+    try {
+      await exec("ffmpeg", ["-y", "-ss", (seconds * at).toFixed(2), "-i", path, "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "6", out], { timeoutMs: 60000 });
+      const bytes = await readFile(out);
+      if (bytes.length > MAX_RELAY_FRAME_BYTES || total + bytes.length > MAX_RELAY_FRAMES_BYTES) continue;
+      total += bytes.length; frames.push({ mime: "image/jpeg", data: bytes.toString("base64") });
+    } catch { /* a frame past the end of a short clip; the others still describe it */ } finally { await cleanup(out); }
+  }
+  if (!frames.length) throw new Error("no frame could be taken from this clip");
+  return keyRelay("gemini_describe", { frames, seconds: Math.round(seconds) });
+}
+// The server's half: what Gemini sees in those stills, in the same concrete terms the video path asks for.
+async function describeFrames(frames, seconds) {
+  const models = [DEFAULTS.GEMINI_MODEL, ...DEFAULTS.GEMINI_FALLBACK_MODELS];
+  return withKey("gemini", async (key) => {
+    const { model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await fetchJson(`${GEMINI_BASE}/v1beta/models/${m}:generateContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({
+      contents: [{ parts: [...frames.map((f) => ({ inline_data: { mime_type: f.mime, data: f.data } })), { text: `These are ${frames.length} still frames, in order, from one video clip${seconds ? ` of ${seconds} seconds` : ""}. Say what is SEEN in the clip, in English, in one or two concrete sentences — who, where, what happens ("a rickshaw puller pedals through heavy rain on a crowded city street"), not a judgement ("a nice shot"). Plain text only.` }] }],
+      generationConfig: { maxOutputTokens: 400 } }) }) }));
+    const text = (body.candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join("").trim(), u = body.usageMetadata || {};
+    if (!text) throw new Error("Gemini said nothing about these frames");
+    return { seen: text.slice(0, 800), cost: tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), units: 1 };
+  });
 }
 // The clip that fits a phrase best, cut to the section's length from a part of it the last use did not show. The cut
 // is kept beside the engine's work files, so a retried render finds it again.
@@ -2194,12 +2232,14 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
     if (specs.photo_query === null) { const e = new Error("A library photo could mislead for this story, so it has none"); e.editorial = true; throw e; }
     const place = stockPlace(specs.country), searches = stockSearches(specs.photo_query || prompt || headline, place, 6);
     if (!searches.length) throw new Error("No stock photo search phrase for this story");
-    return withKey("pexels", async (key) => {
+    // The search is the only call that needs the key. On the PC without one it is the server's (KEY_RELAY); the photo
+    // itself is still fetched from Pexels' CDN here.
+    const pick = async (search) => {
       const wide = specs.width && specs.height ? specs.width / specs.height : 1;
       let pool = [], query = searches[0];
       for (const s of searches) {
         query = s;
-        const r = await fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" })}`, { headers: { Authorization: key } });
+        const r = await search({ query, per_page: cfg.per_page || 15, orientation: cfg.orientation || "landscape" });
         // A photo of another country is never the stand-in for this one, so the place filter comes before freshness.
         const usable = (r.photos || []).filter((p) => p?.src && p.width >= 1000 && (wide < 1 || p.width >= p.height) && stockIsLocal(`${p.url} ${p.alt || ""}`, place) && !STOCK_LOADED.test(`${p.url} ${p.alt || ""}`.toLowerCase()));
         const fresh = usable.filter((p) => Date.now() - (pexelsUsed.get(p.id) || 0) > 14 * 86400e3);
@@ -2214,7 +2254,9 @@ impl("IMAGE", "pexels_stock", { label: "Stock photo (Pexels)", configSchema: { o
       const media = await storeImage(bytes, "image/jpeg", contentItemId, { provider: "pexels", photo_id: photo.id, photographer: photo.photographer, photo_url: photo.url, query, alt: photo.alt || null },
         {}, { headline, specs: { ...specs, photo_credit: credit } });
       return { ...media, cost: 0, units: 1 };
-    }, ctx.pin);
+    };
+    if (await relayKeyed("pexels")) return pick((p) => keyRelay("pexels_photos", { ...p, adapter: ctx.key }));
+    return withKey("pexels", (key) => pick((p) => fetchJson(`${cfg.api_base || "https://api.pexels.com/v1"}/search?${form(p)}`, { headers: { Authorization: key } })), ctx.pin);
   } }) });
 // The photo the outlet ran with the story — the actual people, the actual place. It is what every Bangladeshi news page
 // on Facebook is built from, it is free, and no generated illustration competes with it for a story about real people.
@@ -2405,19 +2447,30 @@ impl("VOICE", "gemini_tts", { label: "Gemini TTS (Bangla + English)", configSche
 // ---- 6i. Embeddings (stage EMBED). embed(text) -> number[] | null
 // embedMany(texts, {dimensions, task}) -> (number[] | null)[] — batched for the news desk, which embeds every new headline.
 impl("EMBED", "embed_mock", { label: "None", create: () => ({ async embed() { return null; }, async embedMany(texts) { return texts.map(() => null); } }) });
+// The two calls themselves, shared by the adapter and by the server's half of a relayed embedding (KEY_RELAY).
+async function geminiEmbedOne(model, text, pin = null) {
+  const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, pin);
+  return r.v;
+}
+async function geminiEmbedBatch(model, chunk, dimensions, task, pin = null) {
+  const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
+    body: JSON.stringify({ requests: chunk.map((t) => ({ model: `models/${model}`, content: { parts: [{ text: String(t).slice(0, 2000) }] }, taskType: task, outputDimensionality: dimensions })) }) })); return { v: (b.embeddings || []).map((e) => e.values || null), units: 1, cost: 0 }; }, pin);
+  return chunk.map((_, j) => r.v[j] || null);
+}
+// On the PC without a Gemini key of its own the embedding is the server's (KEY_RELAY); without it the duplicate check
+// on the PC fell back to counting shared words, which misses the same story told in other words.
 impl("EMBED", "gemini_embed", { label: "Gemini embeddings", configSchema: { model: { type: "string", default: DEFAULTS.GEMINI_EMBED_MODEL } }, create: (cfg, ctx = {}) => ({
   async embed(text) {
     const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL;
-    const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:embedContent`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" }, body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 8000) }] } }) })); return { v: b.embedding?.values || null, units: 1, cost: 0 }; }, ctx.pin);
-    return r.v;
+    if (await relayKeyed("gemini")) return (await keyRelay("gemini_embed", { model, texts: [String(text)] })).vectors?.[0] || null;
+    return geminiEmbedOne(model, text, ctx.pin);
   },
   async embedMany(texts, { dimensions = 256, task = "CLUSTERING" } = {}) {
-    const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL; const out = [];
+    const model = cfg.model || DEFAULTS.GEMINI_EMBED_MODEL, relay = await relayKeyed("gemini"), out = [];
     for (let i = 0; i < texts.length; i += 100) {
       const chunk = texts.slice(i, i + 100);
-      const r = await withKey("gemini", async (key) => { const b = await retryTransient(() => fetchJson(`${GEMINI_BASE}/v1beta/models/${model}:batchEmbedContents`, { method: "POST", headers: { "x-goog-api-key": key, "content-type": "application/json" },
-        body: JSON.stringify({ requests: chunk.map((t) => ({ model: `models/${model}`, content: { parts: [{ text: String(t).slice(0, 2000) }] }, taskType: task, outputDimensionality: dimensions })) }) })); return { v: (b.embeddings || []).map((e) => e.values || null), units: 1, cost: 0 }; }, ctx.pin);
-      out.push(...chunk.map((_, j) => r.v[j] || null));
+      if (relay) { const v = (await keyRelay("gemini_embed", { model, texts: chunk.map((t) => String(t).slice(0, 2000)), dimensions, task, batch: true })).vectors || []; out.push(...chunk.map((_, j) => v[j] || null)); }
+      else out.push(...(await geminiEmbedBatch(model, chunk, dimensions, task, ctx.pin)));
     }
     return out;
   } }) });
@@ -3624,6 +3677,10 @@ const llmFor = async (niche, fn) => {
 async function someUsable(keys) { for (const k of keys.filter(Boolean)) if (await adapterUsable(k)) return true; return false; }
 async function relayComplete(niche, request) {
   const id = await enqueue("LLM_RELAY", { nicheId: niche.id, request }, { queue: "text", priority: 9, maxAttempts: 2 });
+  return relayWait(id, "writing request");
+}
+// Waits for the server to answer a relayed job, and collects the answer it left in settings.
+async function relayWait(id, what) {
   const until = Date.now() + Number(ENV.RELAY_TIMEOUT_MS || 15 * 60000);
   for (;;) {
     const j = await one(`SELECT status, error_message FROM jobs WHERE id = $1`, [id]);
@@ -3638,12 +3695,80 @@ async function relayComplete(niche, request) {
       // Withdrawn if the server has not started it: answered later, it would spend the writer on an answer nobody reads.
       if (j?.status !== "FAILED") await q(`UPDATE jobs SET status='CANCELLED', finished_at=now(), error_message='the PC stopped waiting for this answer' WHERE id=$1 AND status='PENDING'`, [id]).catch(() => {});
       // The server's own reason, with its HTTP status where it gave one, so a spent allowance is still read as a quota.
-      const msg = j?.error_message || "the server did not answer the writing request in time";
+      const msg = j?.error_message || `the server did not answer the ${what} in time`;
       throw Object.assign(new Error(`via the server: ${msg}`), { status: Number((/-> (\d{3})/.exec(msg) || [])[1]) || undefined, transient: j?.status === "FAILED" ? undefined : true });   // a failure is judged by its own status; no answer in time is worth retrying
     }
     await sleep(Number(ENV.RELAY_POLL_MS || 2000));
   }
 }
+// The same crossing for the other keyed calls the PC makes: stock photos and footage from Pexels, Gemini embeddings for
+// the duplicate check, and Gemini's look at a clip of your own footage. The keys live in the server's environment and
+// the PC cannot read them, so without this every card made on the PC was a text card, every reel a photo sequence and
+// every duplicate check a word count. The server runs one of a few named operations with its own key and hands back
+// only what the PC needs — never a key, and never a call to an address or method the PC chose. Downloads from Pexels'
+// CDN stay on the PC: they need no key, and a video passing through the database would be absurd.
+// `relayKeyed` says whether this call should cross: only on the PC, and only when it has no key of its own for the
+// provider (a PC with its own key, and the server, behave exactly as before).
+const relayKeyed = async (provider) => IS_PC && !(await credentialsFor(provider)).length;
+// A server with no key either is remembered for ten minutes, so a reel's every section does not ask again and wait.
+const relayNoKey = new Map();                                                       // provider -> until when to stop asking
+const canUseKey = async (provider) => (await credentialsFor(provider)).length > 0 || (IS_PC && (relayNoKey.get(provider) || 0) < Date.now());
+async function keyRelay(op, params) {
+  const provider = KEY_RELAY_OPS[op].provider;
+  if ((relayNoKey.get(provider) || 0) > Date.now()) throw new Error(`No API key for "${provider}" on this PC or on the server`);
+  const id = await enqueue("KEY_RELAY", { op, params }, { queue: "text", priority: 9, maxAttempts: 1 });
+  try {
+    const out = await relayWait(id, `${op} request`);
+    if (out.error) {
+      if (/No API key/i.test(out.error)) relayNoKey.set(provider, Date.now() + 10 * 60000);
+      throw Object.assign(new Error(`via the server: ${out.error}`), { status: out.status || undefined, transient: typeof out.transient === "boolean" ? out.transient : undefined });
+    }
+    return out.result;
+  } finally {
+    // A frame or a batch of headlines has no business staying in the job history once it has been answered.
+    await q(`UPDATE jobs SET payload = $2 WHERE id = $1`, [id, JSON.stringify({ op })]).catch(() => {});
+  }
+}
+// What the PC may ask for, and nothing else. Every parameter is checked and rebuilt here, on the server: the addresses
+// are the server's own (its Pexels base, its footage setting, GEMINI_BASE), and only the fields used are sent back.
+const relayText = (v, max) => String(v ?? "").slice(0, max);
+const relayInt = (v, lo, hi, dflt) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
+const relayPick = (v, allowed, dflt) => (allowed.includes(v) ? v : dflt);
+const pexelsQuery = (p, orientations) => {
+  const query = relayText(p.query, 200).trim(); if (!query) throw new Error("a stock search needs a phrase");
+  return { query, per_page: relayInt(p.per_page, 1, 80, 15), orientation: relayPick(p.orientation, orientations, orientations[0]), ...(p.size ? { size: relayPick(p.size, ["large", "medium", "small"], "medium") } : {}) };
+};
+const MAX_RELAY_FRAME_BYTES = 400 * 1024, MAX_RELAY_FRAMES_BYTES = 1536 * 1024;
+const KEY_RELAY_OPS = {
+  // A Pexels photo search. The base address comes from the program's own pexels_stock instance, read here.
+  pexels_photos: { provider: "pexels", async run(p) {
+    const row = p.adapter ? (await instances()).find((r) => r.key === p.adapter && r.stage === "IMAGE" && r.impl === "pexels_stock") : null;
+    const base = P(row?.config)?.api_base || "https://api.pexels.com/v1";
+    const r = await withKey("pexels", (key) => fetchJson(`${base}/search?${form(pexelsQuery(p, ["landscape", "portrait", "square"]))}`, { headers: { Authorization: key } }), row?.credential_id || null);
+    return { photos: (r.photos || []).map((x) => ({ id: x.id, width: x.width, height: x.height, url: x.url, alt: x.alt || null, photographer: x.photographer, src: x.src ? { large2x: x.src.large2x, large: x.src.large, original: x.src.original } : null })) };
+  } },
+  // A Pexels video search, against the server's footage.api_base.
+  pexels_videos: { provider: "pexels", async run(p) {
+    const base = await setting("footage.api_base", "https://api.pexels.com/videos");
+    const r = await withKey("pexels", (key) => fetchJson(`${base}/search?${form(pexelsQuery(p, ["portrait", "landscape", "square"]))}`, { headers: { Authorization: key } }));
+    return { videos: (r.videos || []).map((v) => ({ id: v.id, duration: v.duration, url: v.url, user: { name: v.user?.name || null }, video_files: (v.video_files || []).map((f) => ({ file_type: f.file_type, width: f.width, height: f.height, link: f.link })) })) };
+  } },
+  // Gemini embeddings: one text (the duplicate check) or a batch of up to a hundred (the news desk).
+  gemini_embed: { provider: "gemini", async run(p) {
+    const model = relayText(p.model || DEFAULTS.GEMINI_EMBED_MODEL, 80); if (!/^[\w.-]+$/.test(model)) throw new Error("not an embedding model name");
+    const texts = (Array.isArray(p.texts) ? p.texts : []).slice(0, 100).map((t) => relayText(t, 8000)); if (!texts.length) throw new Error("nothing to embed");
+    if (!p.batch) return { vectors: [await geminiEmbedOne(model, texts[0])] };
+    return { vectors: await geminiEmbedBatch(model, texts, relayInt(p.dimensions, 1, 3072, 256), /^[A-Z_]{1,40}$/.test(p.task || "") ? p.task : "CLUSTERING") };
+  } },
+  // What is seen in a clip of your own footage, from a few still frames the PC took from it (7a).
+  gemini_describe: { provider: "gemini", async run(p) {
+    const frames = (Array.isArray(p.frames) ? p.frames : []).slice(0, 6).filter((f) => /^image\/(jpeg|png)$/.test(f?.mime || "") && typeof f.data === "string");
+    const sizes = frames.map((f) => Buffer.byteLength(f.data, "base64"));
+    if (!frames.length) throw new Error("no frames to describe");
+    if (sizes.some((n) => n > MAX_RELAY_FRAME_BYTES) || sizes.reduce((a, b) => a + b, 0) > MAX_RELAY_FRAMES_BYTES) throw new Error("the frames are larger than a relay carries");
+    return describeFrames(frames, relayInt(p.seconds, 0, 86400, 0));
+  } },
+};
 // `lead` puts an adapter in front of the program's own, without disturbing what the program is configured to use: the
 // story's own photo is tried first when it has one, and what the program would have drawn is the fallback.
 const imageFor = async (niche, fn, lead = null, tail = null) => {
@@ -3767,9 +3892,13 @@ async function clusterMaterial(item) {
 }
 // The material as prompt text. Several outlets' versions are each clipped so the total stays near ARTICLE_TEXT_MAX, and
 // the writer is told how to treat agreement and conflict between them.
-function materialBlock(m) {
+// Research is given twice the room (RESEARCH_MATERIAL_MAX): with five outlets on a story, an even share of
+// ARTICLE_TEXT_MAX is 1,200 characters each — a few paragraphs, and the figures are usually further down. A single
+// article is still the whole of what was read (it is clipped to ARTICLE_TEXT_MAX when it is fetched).
+const RESEARCH_MATERIAL_MAX = ARTICLE_TEXT_MAX * 2;
+function materialBlock(m, max = ARTICLE_TEXT_MAX) {
   const vs = m.versions?.length ? m.versions : [{ outlet: null, title: m.title, summary: m.summary, text: m.text, url: m.url }];
-  const per = Math.max(1200, Math.floor(ARTICLE_TEXT_MAX / vs.length));
+  const per = Math.max(1200, Math.floor(max / vs.length));
   const body = vs.map((v, i) => `--- Source ${i + 1}${v.outlet ? `: ${v.outlet}` : ""}${v.url ? ` (${v.url})` : ""}\nHeadline: ${v.title}\n${v.summary ? `Summary: ${v.summary}\n` : ""}${v.text ? `Text:\n"""\n${v.text.slice(0, per)}\n"""\n` : "(headline and summary only)\n"}`).join("\n");
   return `SOURCE MATERIAL — ${vs.length} source${vs.length > 1 ? "s" : ""} reporting this story\n${body}\n`
     + (vs.length > 1 ? "Use only facts the sources state. Prefer facts several sources agree on; where they differ (numbers, names, times) use the most careful wording or say that reports differ. Never merge details from different incidents.\n" : "")
@@ -3824,19 +3953,72 @@ async function generateStatic(item, niche, style) {
 // was refused) is the model's memory, so the fact check and the reviewer are told to check it against the source.
 const researchBy = (r) => `${r.model || "mock"}${r.searched === false ? " · no web search" : ""}`;
 const noteNoSearch = (id) => q(`UPDATE content_items SET source_data_ref = (COALESCE(NULLIF(source_data_ref, ''), '{}')::jsonb || '{"research_searched": false}'::jsonb)::text WHERE id=$1`, [id]);
+// Research still short of the floor after it was asked twice: the draft says so, and Review shows "check the facts".
+const noteThin = (id) => q(`UPDATE content_items SET source_data_ref = (COALESCE(NULLIF(source_data_ref, ''), '{}')::jsonb || '{"research_thin": true}'::jsonb)::text WHERE id=$1`, [id]);
+// Research is the floor everything after it stands on: a plan or a post can only be as good as its notes. On 2026-10-07
+// the smallest fallback model answered an explainer's research with four notes and not one useful number, and the
+// video that came out of it said the same sentence four times. So the notes are counted before they are used: fewer
+// than RESEARCH_MIN_NOTES, or (where figures are the point, a data explainer) fewer than two notes holding a figure,
+// and the research is asked once more — with the material again, told exactly what was missing — and the better of the
+// two answers is kept. Once, and only then: on the free tier every request is one of the day's twenty for the model.
+const RESEARCH_MIN_NOTES = 6;
+// What the mock writer answers research with: enough notes, two with figures, so a mock run is a research that passed.
+const mockNotes = (m) => ["was announced", "affects commuters", "was reported by the source", "has a cost of 120 crore taka", "began in 2016", "is expected to expand", "drew public comment", "is being reviewed"]
+  .map((x) => ({ fact: `Mock fact: ${m.title} ${x}`, source_url: m.url || "https://example.com", source_name: "mock" }));
+const researchNotes = (d) => (Array.isArray(d?.notes) ? d.notes : []).filter((n) => n && String(n.fact || "").trim());
+const hasFigure = (n) => /\p{N}/u.test(String(n?.fact || ""));
+function researchGaps(notes, figures) {
+  const withFigures = notes.filter(hasFigure).length;
+  return [notes.length < RESEARCH_MIN_NOTES ? `only ${notes.length} note(s), and at least ${RESEARCH_MIN_NOTES} are needed` : null,
+    figures && withFigures < 2 ? `only ${withFigures} note(s) holding a figure (a number, amount, percentage or date), and at least 2 are needed` : null].filter(Boolean);
+}
+async function deepResearch(item, niche, { system, prompt, mock, figures = false, maxTokens = 3000 }) {
+  const ask = (extra = "", grounding = true) => llmFor(niche, (llm) => llm.complete({ json: true, grounding, maxTokens, system, prompt: prompt + extra, mock }));
+  const judge = (r) => { const notes = researchNotes(r.data); return { r, notes, gaps: researchGaps(notes, figures), figures: notes.filter(hasFigure).length }; };
+  let best = judge(await ask()); await addCost(item.id, best.r.cost);
+  if (best.gaps.length) {
+    log(`research for ${item.id} came back with ${best.gaps.join("; ")} — asking once more`);
+    // A search refused the first time would be refused again, at the cost of another request: the second ask goes
+    // without it then. Inventing is the one thing worse than thin notes, so the prompt says that in as many words.
+    const again = await ask(`\nYOUR LAST NOTES WERE TOO THIN: they had ${best.gaps.join("; ")}. Go through the source material above again${best.r.searched === false ? "" : " and search for the reporting on it"}: every concrete number, amount, percentage, date, place and named person or organisation it states is a note of its own, with its source. Prefer facts that carry figures. Never invent: every note must come from the material or from what your search found, and fewer true notes are better than one made up. Return the full set of notes, not only the new ones.`, best.r.searched !== false)
+      .catch((e) => { warn(`research for ${item.id}: second ask failed: ${e.message}`); return null; });
+    if (again) {
+      await addCost(item.id, again.cost); const b = judge(again);
+      if (b.gaps.length < best.gaps.length || (b.gaps.length === best.gaps.length && b.notes.length + b.figures > best.notes.length + best.figures)) best = b;
+    }
+  }
+  return { research: best.r, notes: best.notes, thin: best.gaps.length > 0 };
+}
+// Spoken lines that say the same thing again: the plan that went out on 2026-10-07 said "The metro rail impacts daily
+// commuting in Dhaka regarding …" four times over. Counted without asking anyone: a five-word phrase said three times
+// or more, or two or more pairs of lines (five words or longer) sharing more than 70% of their words. The words are
+// letters, marks and digits in any script, so Bangla's vowel signs keep a word whole.
+const lineWords = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
+function repeatedLines(lines) {
+  const ws = lines.map(lineWords).filter((w) => w.length >= 5), sets = ws.map((w) => new Set(w));
+  let pairs = 0, example = null;
+  for (let i = 0; i < sets.length; i++) for (let j = i + 1; j < sets.length; j++) {
+    let shared = 0; for (const w of sets[i]) if (sets[j].has(w)) shared++;
+    if (shared / (sets[i].size + sets[j].size - shared) > 0.7) { pairs++; example ||= ws[j].join(" "); }
+  }
+  const counts = new Map(); for (const w of ws) for (let k = 0; k + 5 <= w.length; k++) { const g = w.slice(k, k + 5).join(" "); counts.set(g, (counts.get(g) || 0) + 1); }
+  const [phrase, times] = [...counts].filter(([, n]) => n >= 3).sort((a, b) => b[1] - a[1])[0] || [];
+  if (!phrase && pairs < 2) return null;
+  return `lines repeat: ${[phrase ? `"${phrase}" is said ${times} times` : null, pairs >= 2 ? `${pairs} pairs of lines say nearly the same thing (e.g. "${example.slice(0, 90)}")` : null].filter(Boolean).join("; ")}`;
+}
 // ---- 8b. LONG_POST: research first (notes with citations), then write in the style profile
 async function generateLongPost(item, niche, style) {
   const m = await materialFor(item, niche);
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, article_chars: String(m.text || "").length }, topic_embedding: J(dedup.embedding) });
-  const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
+  const { research, notes, thin } = await deepResearch(item, niche, {
     system: "You are a meticulous researcher. Gather verifiable facts with sources. Never fabricate a citation.",
-    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
-    mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
-  await addCost(item.id, research.cost);
-  const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
+    prompt: `Topic: ${m.title}\n${materialBlock(m, RESEARCH_MATERIAL_MAX)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
+    mock: { notes: mockNotes(m), angle: "mock angle" } });
+  const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
   await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify(cites), researchBy(research)]);
   if (research.searched === false) await noteNoSearch(item.id);
+  if (thin) await noteThin(item.id);
   const post = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
     system: `You write long-form Facebook posts for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)} Use ONLY the research notes as facts.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nReturn JSON: {"headline": "first line hook", "post": "the full 250-600 word post with paragraph breaks", "hashtags": ["..."], "image_prompt": "visual for a cover image"}`,
@@ -3896,7 +4078,7 @@ async function generateReel(item, niche, style) {
   // Your own footage first where the programme has a library (7a), the stock library behind it.
   const library = mc.footage_dir ? await footageIndex(String(mc.footage_dir), { describe: Number(mc.describe_per_day ?? 5) }) : null;
   if (library && !library.length) warn(`footage folder ${mc.footage_dir} has no clips in it`);
-  const stockOk = mc.broll !== false && !(library && mc.own_footage_only) && (await credentialsFor("pexels")).length > 0;
+  const stockOk = mc.broll !== false && !(library && mc.own_footage_only) && (await canUseKey("pexels"));   // on the PC, the server's key counts
   const broll = stockOk || !!library?.length;
   const storyPlace = String(d.place || "").trim() || niche.country;
   const images = []; let noPics = null, footage = 0;
@@ -4065,22 +4247,24 @@ async function generateExplainer(item, niche, style) {
     const sm = P((await one(`SELECT script_meta FROM content_items WHERE id=$1`, [item.id]))?.script_meta) || {};
     await setItem(item.id, { script_meta: { ...sm, draft: { ...(sm.draft?.job === item._job ? sm.draft : {}), job: item._job, ...part } } });
   };
-  const research = kept?.research || await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
-    system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
-    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
-    mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
-  const notes = research.data?.notes || [];
-  if (!kept?.research) {
-    await addCost(item.id, research.cost);
-    await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), researchBy(research)]);
-    if (item._job) await keep({ research: { data: research.data, model: research.model || null, searched: research.searched } });
+  let research = kept?.research, thin = !!kept?.research?.thin;
+  if (!research) {
+    ({ research, thin } = await deepResearch(item, niche, { figures: mc.explainer_style === "data",
+      system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
+      prompt: `Topic: ${m.title}\n${materialBlock(m, RESEARCH_MATERIAL_MAX)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
+      mock: { notes: mockNotes(m), angle: "mock angle" } }));
+    const found = researchNotes(research.data);
+    await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(found), JSON.stringify([...new Set(found.map((n) => n.source_url).filter(Boolean))]), researchBy(research)]);
+    if (item._job) await keep({ research: { data: research.data, model: research.model || null, searched: research.searched, thin } });
   }
+  const notes = researchNotes(research.data);
   if (research.searched === false) await noteNoSearch(item.id);
+  if (thin) await noteThin(item.id);
   const sceneCount = Math.max(4, Math.round(minutes * 3.5));
   const three = mc.explainer_style === "3d", layouts = three ? THREE_D_LAYOUTS : EXPLAINER_LAYOUTS;
   const askPlan = (extra = "") => llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
-    system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes. Every spoken line adds something new: never repeat a phrase or a sentence pattern from another line.${item._series || ""}`,
-    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(layouts).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
+    system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes and the source material. Every spoken line adds something new: never repeat a phrase or a sentence pattern from another line.${item._series || ""}`,
+    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\n${richMaterial(m) ? `The article the notes were taken from, for context and for any figure the notes left out:\n${materialBlock(m)}\n` : ""}Write a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(layouts).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
 ` : ""}${mc.explainer_style === "illustrated" ? `${ILLUSTRATED_STYLE(castOf(mc))}
 ` : ""}${three ? `${THREE_D_STYLE(lang)}
 ` : ""}Start with a ${three ? "Title3D" : "TitleCard"}; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).${extra}\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
@@ -4093,16 +4277,19 @@ async function generateExplainer(item, niche, style) {
   // rendered as it came. Short of the scenes asked for, or (for a data explainer whose research holds numbers) short of
   // scenes built from them, it is asked once more, told what was missing, and the better of the two is used.
   const usable = (d) => ((d || {}).scenes || []).filter((s) => s && layouts[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
-  const numbers = notes.filter((n) => /\d/.test(String(n.fact || ""))).length >= 2, wantData = mc.explainer_style === "data" && numbers;
+  const numbers = notes.filter(hasFigure).length >= 2, wantData = mc.explainer_style === "data" && numbers;
   const minScenes = Math.max(3, Math.ceil(sceneCount * 0.6)), dataScenes = (sc) => sc.filter((s) => ["DataChart", "BigNumber", "Timeline"].includes(s.layout)).length;
-  const shortOf = (sc) => [sc.length < minScenes ? `only ${sc.length} usable scene(s), and at least ${minScenes} are needed` : null, wantData && dataScenes(sc) < 2 ? `only ${dataScenes(sc)} scene(s) built from DataChart, BigNumber or Timeline, and at least 2 are needed from the numbers in the notes` : null].filter(Boolean);
+  // Lines that repeat each other are one more way to fall short, judged in the same check — so a plan that is both
+  // short and repetitive is still sent back only once, told both.
+  const shortOf = (sc) => [sc.length < minScenes ? `only ${sc.length} usable scene(s), and at least ${minScenes} are needed` : null, wantData && dataScenes(sc) < 2 ? `only ${dataScenes(sc)} scene(s) built from DataChart, BigNumber or Timeline, and at least 2 are needed from the numbers in the notes` : null,
+    repeatedLines(sc.flatMap((s) => [s.intro, ...s.parts]))].filter(Boolean);
   let plan = kept?.plan;
   if (!plan) {
     plan = await askPlan(); await addCost(item.id, plan.cost);
     const missing = shortOf(usable(plan.data));
     if (missing.length) {
       log(`explainer ${item.id}: the plan came back with ${missing.join("; ")} — asking once more`);
-      const again = await askPlan(`\nYOUR LAST PLAN WAS REJECTED: it had ${missing.join("; ")}. Write the full plan again and meet both.`).catch((e) => { warn(`explainer ${item.id}: second plan failed: ${e.message}`); return null; });
+      const again = await askPlan(`\nYOUR LAST PLAN WAS REJECTED: it had ${missing.join("; ")}. Write the full plan again and fix every point${missing.some((x) => x.startsWith("lines repeat")) ? ": each spoken line says something no other line says, a different fact from the notes in its own words" : ""}.`).catch((e) => { warn(`explainer ${item.id}: second plan failed: ${e.message}`); return null; });
       if (again) { await addCost(item.id, again.cost); const a = usable(again.data), b = usable(plan.data); if (shortOf(a).length < shortOf(b).length || (shortOf(a).length === shortOf(b).length && a.length > b.length)) plan = again; }
     }
     if (item._job) await keep({ plan: { data: plan.data } });
@@ -4150,7 +4337,7 @@ async function generateExplainer(item, niche, style) {
 async function renderBlender(itemId, niche, plan) {
   if (!(await blenderAvailable())) throw new Error("Blender is not installed on this machine: run pc\\setup.ps1 -Blender on your PC");
   const { brand, music } = await studioBrand(niche), landscape = plan.width > plan.height, w = landscape ? 1280 : 720, h = landscape ? 720 : 1280;
-  const parts = [], audio = await toTmpFile(plan.audio, "mp3"), list = tmpPath("txt"); let file = null;
+  const parts = [], audio = await toTmpFile(plan.audio, "mp3"), list = tmpPath("txt"); let file = null, caps = null;
   try {
     for (const s of plan.scenes) {
       const spec = tmpPath("json"), out = tmpPath("mp4");
@@ -4161,9 +4348,14 @@ async function renderBlender(itemId, niche, plan) {
       parts.push(out);
     }
     await writeFile(list, parts.map((f) => `file '${f.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"));
+    // The narration burned in, as the studio does for the other explainers: a 3D video went out with only its key words
+    // on screen, which says nothing to someone scrolling with the sound off. Each scene's words, timed from its start.
+    let at = 0; const segs = [];
+    for (const sc of plan.scenes) { const wd = sc.words || []; if (wd.length) segs.push({ start: at + wd[0].from / plan.fps, end: at + wd.at(-1).to / plan.fps, text: wd.map((x) => x.text).join(" ") }); at += sc.durationInFrames / plan.fps; }
+    caps = plan.subtitles !== false && segs.length ? await writeCaptionsAss(segs, 0, at, { width: w, height: h, accent: brand.accent || "#ffd400" }) : null;
     file = tmpPath("mp4");
     await exec("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", list, "-i", audio, "-map", "0:v", "-map", "1:a",
-      "-vf", `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,fps=${plan.fps},format=yuv420p`, ...X264, "-shortest", file], { timeoutMs: 30 * 60000 });
+      "-vf", `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,fps=${plan.fps}${caps ? `,${assVf(caps)}` : ""},format=yuv420p`, ...X264, "-shortest", file], { timeoutMs: 30 * 60000 });
     let finish = "off"; ({ file, finish } = await brandFinish(file, niche, { vertical: !landscape }));
     const video = await publishRender(file, itemId, { method: "EXPLAINER_3D", orientation: plan.orientation, scenes: plan.scenes.length, brand_finish: finish });
     try { const still = tmpPath("jpg"); await exec("ffmpeg", ["-y", "-ss", "1", "-i", parts[0], "-frames:v", "1", "-q:v", "2", still]);
@@ -4171,7 +4363,7 @@ async function renderBlender(itemId, niche, plan) {
       await recordMedia({ contentItemId: itemId, kind: "THUMBNAIL", url: await storeFile(`images/${newId()}-thumb.jpg`, j.bytes, j.mime), mime: j.mime, width: w, height: h, meta: { purpose: "youtube thumbnail" } }); }
     catch (e) { warn(`3d thumbnail: ${e.message.slice(0, 160)}`); }
     await setItem(itemId, { hero_media_id: video.id });
-  } finally { await cleanup(audio, list, ...parts, brand.logo, brand.fontUrl, music); }
+  } finally { await cleanup(audio, list, ...parts, brand.logo, brand.fontUrl, music, caps); }
 }
 // The studio half of an explainer: the plan in, the video (and a thumbnail) out. Runs where the studio is.
 async function renderExplainer(itemId, niche, plan) {
@@ -5076,6 +5268,16 @@ const HANDLERS = {
     await putSetting(`relay.${job.id}`, { text: r.text, data: r.data ?? null, cost: r.cost || 0, model: r.model || null });
     return { answered: true };
   },
+  // The server's half of a relayed keyed call (KEY_RELAY_OPS). A refusal is handed back as the answer rather than thrown:
+  // the PC is waiting on it now, and a retry an hour later, or a quota wait until midnight, would answer nobody.
+  async KEY_RELAY({ op, params }, job) {
+    const def = Object.hasOwn(KEY_RELAY_OPS, op) ? KEY_RELAY_OPS[op] : null; if (!def) throw new Error(`"${String(op).slice(0, 40)}" is not something the server does for the PC`);
+    let answer;
+    try { answer = { result: await def.run(params || {}) }; }
+    catch (e) { answer = { error: String(e.message || e).slice(0, 1000), status: Number(e.status) || null, transient: isTransient(e) }; }
+    await putSetting(`relay.${job.id}`, answer);
+    return { answered: !answer.error };
+  },
   async PICK_CLIPS({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return pickOnServer(candidateId); },
   async PUBLISH_ASSET({ assetId }) { return publishAsset(assetId); },
   async POLL_METRICS({ assetId }) { return pollMetrics(assetId); },
@@ -5193,7 +5395,7 @@ async function notifyQuota(quota, msg) {
 async function runJob(job) {
   const h = HANDLERS[job.type]; const payload = P(job.payload) || {};
   // A Blender or studio render can run for over an hour; without a fresh lock it looked abandoned at 45 minutes and was
-  // handed to another worker while still running here.
+  // handed to another worker while still running here. One timer per job, stopped with it: the PC runs several at once.
   const beat = setInterval(() => q(`UPDATE jobs SET locked_at = now() WHERE id = $1 AND locked_by = $2 AND status = 'RUNNING'`, [job.id, WORKER_ID]).catch(() => {}), 60000);
   try { await runJobInner(job, h, payload); } finally { clearInterval(beat); }
 }
@@ -5231,16 +5433,51 @@ async function runJobInner(job, h, payload) {
     }
   }
 }
-async function workerLoop(queue) {
-  log(`worker lane "${queue}" started`);
+// Your PC runs several jobs at once. Since files are kept on the PC every job that writes one runs there, and with one
+// loop a 20-minute Blender render held up a 20-second news card and a one-second upload hand-off behind it. So the PC
+// lane has several loops (PC_CONCURRENCY, or Settings → worker.pc_concurrency, re-read every minute) — but only the
+// first may take heavy work, so two renders never run together and starve the laptop. The others take light work only.
+// Heavy: anything that renders or transcribes — a studio or Blender render, a clip cut, a long video transcribed and
+// picked over, and a made video (a reel, a slideshow, an explainer, long form) drafted and rendered in one job, or
+// redrawn whole. A news card, a long post, an upload hand-off, a redrawn card or a post going out is light: mostly
+// waiting on a writer or a platform. A clip type is listed too, should one ever be drafted rather than cut.
+const HEAVY_JOB_KEYS = ["STUDIO_RENDER", "RENDER_CLIP", "PROCESS_CANDIDATE", ...[...MADE_VIDEO_TYPES, ...VIDEO_TYPES].flatMap((t) => [`GENERATE_CONTENT:${t}`, `REGENERATE:${t}:all`])];
+const PC_CONCURRENCY_MAX = 6;
+const pcSlots = { want: 0, loops: new Set() };
+async function pcConcurrency() {
+  const n = Math.round(Number((await setting("worker.pc_concurrency", null)) ?? ENV.PC_CONCURRENCY ?? 2));
+  return n >= 1 ? Math.min(PC_CONCURRENCY_MAX, n) : 2;
+}
+// Starts the loops the PC is asked for. A loop above the number stops by itself once its job is done (workerLoop), so
+// lowering it never cuts a job short.
+async function syncPcSlots() {
+  let want; try { want = await pcConcurrency(); } catch (e) { warn("pc concurrency:", e.message); want = pcSlots.want || 1; }
+  if (want !== pcSlots.want) {
+    log(`your PC runs up to ${want} job${want > 1 ? "s" : ""} at once${want > 1 ? ", one heavy render at a time" : ""}`);
+    putSetting("worker.pc_slots", { concurrency: want, at: nowIso(), worker: WORKER_ID }).catch((e) => warn("pc slots", e.message));
+  }
+  pcSlots.want = want;
+  for (let i = 0; i < want; i++) if (!pcSlots.loops.has(i)) { pcSlots.loops.add(i); workerLoop(PC_LANE, i); }
+}
+async function workerLoop(queue, slot = 0) {
+  const pc = queue === PC_LANE;
+  log(`worker lane "${queue}" started${pc && slot ? ` (loop ${slot + 1}, light work only)` : ""}`);
   for (;;) {
+    if (pc && slot >= pcSlots.want) break;
     let ran = false;
     try {
       const enabled = await setting("queues.enabled", {});
-      if (enabled[queue] !== false) { const [job] = await q(`SELECT * FROM claim_job($1, $2)`, [queue, WORKER_ID]); if (job) { ran = true; await runJob(job); } }
+      // One loop on its own takes anything, as before; with several, only the first takes heavy work (and takes it first).
+      const mode = pc && pcSlots.want > 1 ? (slot === 0 ? "heavy_first" : "light") : null;
+      if (enabled[queue] !== false) {
+        const [job] = mode ? await q(`SELECT * FROM claim_job($1, $2, $3, $4)`, [queue, WORKER_ID, mode, HEAVY_JOB_KEYS]) : await q(`SELECT * FROM claim_job($1, $2)`, [queue, WORKER_ID]);
+        if (job) { ran = true; await runJob(job); }
+      }
     } catch (e) { warn(`lane ${queue}:`, e.message); }
     await sleep(ran ? 100 : QUEUE_POLL_MS);
   }
+  pcSlots.loops.delete(slot);
+  log(`worker lane "${queue}" loop ${slot + 1} stopped (the PC was asked to run fewer jobs at once)`);
 }
 async function sweepDueSources() {
   if (!(await setting("ingest.enabled", true)) || !(await autoOn())) return;
@@ -5510,7 +5747,8 @@ async function sweepRetention() {
 }
 function startWorkers() {
   if (!LANES.length) { warn("LANES is set but names no known lane — this process serves HTTP only"); return; }
-  for (const qn of LANES) workerLoop(qn);
+  for (const qn of LANES) if (qn !== PC_LANE) workerLoop(qn);
+  if (LANES.includes(PC_LANE)) { syncPcSlots(); setInterval(() => syncPcSlots().catch(() => {}), Number(ENV.PC_SLOTS_POLL_MS) || 60000); }
   // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
   // leaving routed work to look stuck.
   if (LANES.includes(PC_LANE)) {
@@ -5866,9 +6104,9 @@ const CATALOG = [
   { id: "5b", type: "Recap", name: "Transcript recap", what: "A dialogue-led video retold from its transcript, cut by timestamp", runs: "pc or server", needs: ["pc", "writer", "voice"], status: "proven", setup: { contentType: "MOVIE_RECAP", productionMethod: "MOVIE_RECAP", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "5c", type: "Recap", name: "Twelve Labs recap", what: "Moment retrieval by a video-search API, same assembly", runs: "pc", needs: ["pc", "writer", "voice", "twelve_labs"], status: "built", note: "Optional: 5a does the same on Gemini's free tier", setup: { contentType: "MOVIE_RECAP", productionMethod: "SCENE_RECAP", transcriptAdapter: "twelve_labs", computeWhere: "pc" }, loose: ["computeWhere"] },
   { id: "6a", type: "Animation", name: "Explainer", what: "Script → motion graphics, type and transitions (Remotion)", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: null } }, loose: ["computeWhere"] },
-  { id: "6b", type: "Animation", name: "Data / research", what: "Animated charts, counted-up figures and timelines from the research's own numbers", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "An explainer programme with Explainer style set to Data", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "data" } }, loose: ["computeWhere"] },
+  { id: "6b", type: "Animation", name: "Data / research", what: "Animated charts, counted-up figures and timelines from the research's own numbers", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", note: "Proven 2026-10-07 on the PC with files kept there (23 s, 1920×1080). An explainer programme with Explainer style set to Data", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "data" } }, loose: ["computeWhere"] },
   { id: "6c", type: "Animation", name: "Illustrated series", what: "The series' characters drawn by a free image generator, put into drawn scenes and moved in code", runs: "pc", needs: ["pc", "writer", "voice"], status: "built", note: "Pictures from Pollinations: free, no key; a free Pollinations account's token removes its corner logo", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "illustrated" } }, loose: ["computeWhere"] },
-  { id: "6d", type: "Animation", name: "Blender 3D", what: "The narrated plan rendered in 3D by Blender: extruded titles, bars that grow as each figure is spoken, key words in 3D", runs: "pc", needs: ["pc", "writer", "voice", "blender"], status: "built", note: "Rendered on your PC's CPU (Workbench, 720p). On-screen 3D words are in English for Bangla programmes; the narration stays in Bangla", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "3d" } }, loose: ["computeWhere"] },
+  { id: "6d", type: "Animation", name: "Blender 3D", what: "The narrated plan rendered in 3D by Blender: extruded titles, bars that grow as each figure is spoken, key words in 3D", runs: "pc", needs: ["pc", "writer", "voice", "blender"], status: "proven", note: "Proven 2026-10-07 on the PC (49 s, 1280×720). Rendered on your PC's CPU (Workbench, 720p). On-screen 3D words are in English for Bangla programmes; the narration stays in Bangla", setup: { contentType: "ANIMATED_EXPLAINER", computeWhere: "pc", methodConfig: { explainer_style: "3d" } }, loose: ["computeWhere"] },
   { id: "7a", type: "Script → video", name: "Own footage", what: "Your footage library matched to each sentence, narrated", runs: "pc", needs: ["pc", "writer", "voice"], status: "proven", note: "Proven 2026-10-06 on the PC from a real footage folder. Set the folder on the programme; clips are found by their names, a .txt note beside them, or what Gemini sees in them", setup: { contentType: "IMAGE_SLIDESHOW", computeWhere: "pc", methodConfig: { footage_dir: true } }, loose: ["computeWhere"] },
   { id: "7b", type: "Script → video", name: "Stock footage", what: "A script narrated over stock footage of the right country", runs: "server", needs: ["writer", "voice", "pexels"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
   { id: "7c", type: "Script → video", name: "Photo sequence", what: "Stills with motion, narrated", runs: "server", needs: ["writer", "voice"], status: "proven", setup: { contentType: "IMAGE_SLIDESHOW" } },
@@ -6248,7 +6486,8 @@ async function measureMedia() {
   await recoverAbandonedWork();
   // Render sends SIGTERM before it replaces an instance or spins one down. A job this worker was in the middle of would
   // otherwise sit RUNNING until recovery gives up on it — LOCK_TIMEOUT_MIN later — and with several deploys a day that
-  // froze the ingest lane for most of an hour each time. Hand the work back first, then go.
+  // froze the ingest lane for most of an hour each time. Hand the work back first, then go: every job it holds, since
+  // the PC runs several at once (a run's final write checks it still owns its job, so a finish does not undo this).
   const handBack = async (sig) => {
     try {
       const r = await q(`UPDATE jobs SET status='PENDING', locked_by=NULL, locked_at=NULL, attempts=GREATEST(attempts-1,0) WHERE status='RUNNING' AND locked_by=$1 RETURNING id`, [WORKER_ID]);

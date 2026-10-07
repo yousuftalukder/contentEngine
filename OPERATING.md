@@ -7,18 +7,21 @@ see BLUEPRINT.md and the dashboard's **What it makes** page.
 
 | | what it does | always on? |
 |---|---|---|
-| **The server** (Render) | reads the news, writes cards and reels, makes light videos, publishes | yes |
-| **Your PC** (the worker) | anything from YouTube (Render is blocked there), heavy video, rendering animations (the server writes them) | only while it runs |
+| **The server** (Render) | reads the news feeds and groups the stories, answers your PC's writing requests with its AI keys, picks clip moments, transcribes Bangla, plans ideas, schedules posts | yes |
+| **Your PC** (the worker) | keeps every picture and video, and makes them: news cards and reels, clips (YouTube only works here), explainers and animations; sends the posts | only while it runs |
 | **The dashboard** | where you review, approve and set things up | — |
 
-A programme set to **"Video work runs on: My PC"** waits for your PC. Nothing is lost while it is off; the dashboard
-shows the PC as off and the work as waiting.
+Your PC is where the files are kept (since 2026-10-07; see *Storage* below), so **everything that makes or shows a
+picture or a video waits for it** — not only programmes set to "Video work runs on: My PC". Nothing is lost while it is
+off; the work waits, and the Overview says the PC is off.
 
 ## Every day
 
-1. Open **Review**. Everything waits there for you: approve, fix the caption, or reject with a reason (the reason
-   teaches the next draft).
-2. Notes you may see on a draft:
+1. **Make sure the PC worker is running** (`pc\start.ps1`, or set it to start at sign-in — see *The PC worker*). The
+   Overview's *Files are kept on your PC* panel says **reachable** when it is up and **PC off** when it is not.
+2. Open **Review**. Everything waits there for you: approve, fix the caption, or reject with a reason (the reason
+   teaches the next draft). Videos and pictures in Review only play while the PC is on.
+3. Notes you may see on a draft:
    - **"Written from headlines only"** — none of the outlets' articles could be read (Ittefaq, Desh Rupantor, Bangla
      Tribune and Dhaka Tribune block servers). Check every fact against the source before approving. These drafts are
      never published automatically.
@@ -32,45 +35,64 @@ shows the PC as off and the work as waiting.
      link, so a figure can be checked against where it came from.
    - On a video, editing the headline or caption changes the post's text, not the video. **Re-render** draws the same
      video again (a clip, or an explainer from its stored plan); **Regenerate everything** writes it afresh.
-3. **Overview** shows alerts (a key out of credit, a feed failing) and whether the AI allowance is waiting to reset.
-4. News you have not reviewed within **24 hours** is set aside as "Expired unreviewed" — day-old news is not worth
+4. **Overview**, top to bottom: what is waiting for review and what is being made; whether the AI allowance is
+   waiting to reset; **Automatic production** on or off, with its button; while it is on, the news controls (*Pause
+   news*, each news programme); whether your PC's files are reachable; the AI requests made today; programmes that
+   stopped drafting because too much is waiting for you; alerts (a key out of credit, a feed failing); the worker
+   lanes; and the variants with what each still needs.
+5. News you have not reviewed within **24 hours** is set aside as "Expired unreviewed" — day-old news is not worth
    publishing, and it buried the fresh stories (2,400 day-old drafts had piled up). Change the window, or turn it off
    with 0, in **Settings → review.news_expiry_hours**. Clips and other videos never expire.
-5. A programme you review by hand stops drafting while **30** of its drafts are already waiting for you, and starts
+6. A programme you review by hand stops drafting while **30** of its drafts are already waiting for you, and starts
    again as you review them (or they expire). Drafting faster than anyone reads spent the whole free Gemini allowance
    on news nobody saw — 222 drafts in one day — and left the clips without the AI that picks their best moments.
    Change it in **Settings → review.max_waiting** (0 = never stop), or per programme under Automation.
 
-**Automatic production is off unless you turn it on** (Overview). Off, nothing is made by itself: the feeds are not
-read, no news is drafted, no ideas are planned, series wait. *Generate* and pasting a video link always work. Turn it
-on to let the engine run on its own; *Pause news* below then pauses only the news within it.
+**Automatic production is off unless you turn it on** (Overview → *Turn on*; *Turn off* stops it again). Off, nothing
+is made by itself: the feeds are not read, no news is drafted, no ideas are planned, series wait. *Generate* and pasting
+a video link always work. On, the engine runs on its own within each programme's limits, and *Pause news* below
+pauses only the news within it. It was on by default until 2026-10-07, drafting round the clock, and that is what
+filled the free storage.
 
-**Pausing news.** *Pause news* on the Overview (or the News desk page) stops all drafting from the news feeds in one
-click; the feeds are still read, so *Resume news* starts on today's stories. Each news programme also has its own
-pause / resume beside it.
+**Pausing news.** While automatic production is on, *Pause news* on the Overview (or the News desk page) stops all
+drafting from the news feeds in one click; the feeds are still read, so *Resume news* starts on today's stories. Each
+news programme also has its own pause / resume beside it.
 
 **When something keeps failing.** A job whose worker stops in the middle of it (the server running out of memory, your
 PC switched off mid-render) goes back to the queue on its own — but the third time it happens to the same job it stops
 and says so, rather than looping. **Retry** on the job starts it completely afresh. A post that was interrupted while
 it was being sent is never sent again on its own: it is marked *check the channel first*, because it may already be up.
 
-**Storage: files are kept on your PC** (Settings → *Files are kept on your PC*). The server stores nothing; every
-step that makes a picture or a video runs on your PC and writes it there (`data\media` in the project folder). While
-the PC worker runs, it opens a free Cloudflare tunnel so the dashboard on your phone can play the videos and the
-publishers can fetch them; links always go through the server, so they keep working after the PC restarts. When the
-PC is off, pictures and videos can't be shown or posted, and the work that makes them waits. (Supabase's free 1 GB
-filled on 2026-10-07 and its storage was shut; the Overview shows how full cloud storage is if you switch back.)
+**Storage: files are kept on your PC** (Settings → Review and news → *Files are kept on your PC*; on in production).
+The server stores nothing; every step that makes a picture or a video — news cards too — runs on your PC and writes it
+there (`data\media` in the project folder), and posts are sent from the PC as well. While the PC worker runs, it opens
+a free Cloudflare tunnel so the dashboard on your phone can play the videos and the publishers can fetch them. The
+tunnel's address changes every time the PC starts, but links always go through the server, so they keep working after
+a restart. When the PC is off, pictures and videos can't be shown or posted, and the work that makes them waits. An
+upload (a logo, a reactor clip) made while the PC is off waits on the server until the PC writes it; an upload over
+150 MB has to be copied into `data\media` by hand. The PC deletes its own files on the same rules as cloud storage: an
+item's media 48 hours after every channel has published it (Settings → Media storage), and — only if you set a number
+of days — the pictures and videos of rejected and failed drafts (Settings → Review and news). Keep an eye on the PC's
+free disk space. With the switch off, files go to cloud storage (Supabase or R2) and the Overview shows how full
+Supabase is.
+
+**Delete the old files in Supabase yourself.** Supabase's free 1 GB filled on 2026-10-07 and its storage was
+restricted; the engine no longer uses it (the database is still Supabase). To clear it: Supabase dashboard → your
+project → **Storage → the `media` bucket → select all → Delete** (repeat until the bucket is empty). If the dashboard
+is restricted too, contact Supabase support and ask them to empty the bucket or lift the restriction. Drafts made
+before the switch still point at those files and will show no picture or video; regenerate any you still want.
 
 **Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
 Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each
 Page's token encrypted), attach it to your programmes, and approved posts go out with the source link as the first
-comment.
+comment — while your PC is on, since the posts are sent from it.
 
 ## Making clips from a long video
 
 1. **Videos to clip → paste the link**, pick the clips programme (`yt_clips` runs on your PC; YouTube links need it).
-2. The engine transcribes it (on your PC for YouTube links), an AI reads the transcript and picks the moments (on
-   fourteen famous speeches it put the line anyone would clip first in nine), cuts each to a captioned vertical reel,
+2. The engine transcribes it (on your PC — for YouTube links always, and for every link while the files are kept
+   there), an AI reads the transcript and picks the moments (on fourteen famous speeches it put the line anyone would
+   clip first in nine), cuts each to a captioned vertical reel,
    adds the logo and levels the sound. If your PC has no AI key of its own, the server does the picking from your
    PC's transcript and hands the clips back to the PC to cut.
    Bangla speech is never given to the PC's local transcriber (it cannot hear Bangla): it goes to Gemini — on the
@@ -91,24 +113,38 @@ a frame a second) and the server watches it.
 
 ## Starting a new kind of programme
 
-**What it makes** lists every variant in the blueprint with what each needs and whether that is in place now. Press
-**Make a programme** on any built variant: the form opens set up for it (content type, method, picker, where it runs),
+**What it makes** lists every variant in the blueprint with what each needs and whether that is in place now. (It
+lists *your PC on* only for the variants that always run there; while the files are kept on the PC, every variant
+needs it.) Press **Make a programme** on any built variant: the form opens set up for it (content type, method, picker, where it runs),
 and everything stays editable. On the **Programmes** page each programme shows which variant it is, who writes for it
 and who stands in when that writer's allowance runs out (*Engine choices* in the form edits those chains).
 
 ## The PC worker
 
-Your PC does not need an AI key of its own. Anything it has to write — a clip's caption, a recap script, the script
-for a video on your own footage — it asks the server's writer for, and the server answers. (Adding a key to the
-dashboard's API keys page lets the PC write directly, which is a little faster.)
+Your PC does not need an AI key of its own. Anything it has to write — a news draft, a clip's caption, a recap script,
+an explainer, the script for a video on your own footage — it asks the server's writer for, and the server answers.
+(Adding a key to the dashboard's API keys page lets the PC write directly, which is a little faster.) Other keys are
+different: the PC sees keys stored on the **API keys** page, not ones set only in Render's Environment tab. Now that the
+PC makes the news cards and script videos, a Pexels key that exists only on Render does not reach it — add it on API
+keys as well.
+
+While it runs, the worker also keeps your files: it writes them to `data\media` in the project folder and opens a free
+Cloudflare tunnel (cloudflared, no account) so the dashboard and the publishers can fetch them. Its window logs the
+tunnel's address when it opens; if cloudflared is missing it says so — run `pc\setup.ps1`.
 
 - **Start:** `powershell -ExecutionPolicy Bypass -File pc\start.ps1` (a window opens; minimise it).
-- **Stop:** close that window. Running jobs go back to the queue.
+- **Stop:** close that window. Running jobs go back to the queue, and pictures and videos can't be shown until it
+  starts again.
 - **Start it at every sign-in:** `powershell -ExecutionPolicy Bypass -File pc\autostart.ps1` (undo with `-Remove`).
-- First time on a new PC: `pc\setup.ps1`, then fill in `.env.pc` from Render's Environment tab.
-- **Pause just your PC:** Overview → Worker lanes → *Your PC*. Its work waits; nothing else stops.
-- **Run `pc\setup.ps1` once more** (added 2026-10-05): it now installs deno, which yt-dlp needs to keep reading YouTube
-  (it warns that YouTube without it is deprecated). Everything already installed is left alone.
+  With the files kept on the PC, this is the setting that keeps the engine usable.
+- First time on a new PC: `pc\setup.ps1`, then fill in `.env.pc` from Render's Environment tab. A new PC starts with an
+  empty `data\media`: copy that folder across from the old one, or every existing picture and video is missing.
+- **Pause just your PC:** Overview → Worker lanes → *your PC*. Its work waits — with the files kept on the PC, that
+  is everything that makes a picture or a video (news drafts included), and posting. Reading feeds and picking
+  moments carry on on the server.
+- **Run `pc\setup.ps1` once more** whenever it gains a tool; everything already installed is left alone. 2026-10-05
+  added deno, which yt-dlp needs to keep reading YouTube; 2026-10-07 added cloudflared, the tunnel that serves the
+  PC's files.
 
 ## What adding each thing unlocks
 
@@ -120,11 +156,11 @@ extras, never requirements.
 | your **Facebook Page** | dashboard → **Channels → Connect Facebook** | real publishing (today the channel is a mock) |
 | a free **Gemini key** | on Render (it is there now), or dashboard → **API keys** | the best free writer for Bangla; scene recaps (5a: Gemini watches the video); Bangla transcription; what Gemini sees in your own footage (7a). Your PC borrows the server's, so it needs none of its own |
 | a free **Groq** or **Mistral** key (or OpenRouter, Cerebras, xAI Grok) | API keys | more writers in the chain: when Gemini's ~20 requests a day per model run out, the next one writes. Groq: console.groq.com, no card |
-| a free **Pexels** key | on Render (it is there now), or API keys | stock photos on news cards (2c) and stock footage in script videos (7b); without it those become text cards and photo sequences |
+| a free **Pexels** key | API keys (it is on Render now, which your PC cannot see — and the PC makes the cards and videos while it keeps the files) | stock photos on news cards (2c) and stock footage in script videos (7b); without it those become text cards and photo sequences |
 | a **Pollinations** token (optional) | API keys | removes the small corner logo from free generated pictures (illustrated series, 6c). Pictures work without it |
 | a **reactor clip** of yourself | dashboard → Brands → Media library (purpose: reactor) | reaction videos you can publish (4a, 4c — proven with a stand-in) |
 | a **footage folder** on your PC | the programme → Video → *Your footage folder* | script videos on your own footage (7a), with stock behind it unless you tick *own footage only* (a 7a programme cannot be saved without a folder) |
-| a **Vizard** key *(optional, paid ~$14.50/month)* | API keys, then a clips programme with clipper `vizard` | clipping while your PC is off (1b). Everything else clips for free on your PC or the server |
+| a **Vizard** key *(optional, paid ~$14.50/month)* | API keys, then a clips programme with clipper `vizard` | clipping while your PC is off (1b) — not while the files are kept on the PC, since every job that makes a file then runs on the PC. Everything else clips for free on your PC or the server |
 | a **Twelve Labs** key *(optional)* | API keys, then a recap programme with transcriber `twelve_labs` | the Twelve Labs recap (5c); 5a does the same free on Gemini |
 
 ## Test programmes left from the proofs

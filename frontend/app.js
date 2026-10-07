@@ -216,8 +216,18 @@ async function newProgrammeFrom(variant) {
 }
 
 // ---------------------------------------------------------------- overview
+// How many jobs your PC runs at once. Only one of them is ever a heavy render (Blender, the studio, a clip cut), so a news
+// card or an upload hand-off does not wait behind a 20-minute render. The PC reads the setting within a minute; what it
+// is actually running at is what it last reported (worker.pc_slots), which its PC_CONCURRENCY decides while this is unset.
+function pcSlotsRow(sets) {
+  const set = sets?.["worker.pc_concurrency"], now = sets?.["worker.pc_slots"]?.concurrency;
+  const box = num(null, set ?? now ?? 2, { min: 1, max: 6, style: "max-width:70px" });
+  return h("div", { class: "row", style: "margin-top:12px" }, h("span", { class: "grow small" }, "Your PC runs up to ", box, " jobs at once, never more than one heavy render (Blender, the studio, a clip cut) at a time.",
+      now ? h("span", { class: "mute" }, ` It last reported ${now}.`) : null),
+    h("button", { class: "btn sm", onclick: () => { const n = Math.round(Number(box.value)); if (!(n >= 1 && n <= 6)) return toast("Enter 1 to 6", true); run(() => put("/api/settings/worker.pc_concurrency", { value: n }), `Your PC will run up to ${n} at once`).then(route); } }, "Save"));
+}
 pages.overview = async () => {
-  const [programs, sources, channels, alerts, setup, blueprint] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null), get("/api/catalog").catch(() => null)]);
+  const [programs, sources, channels, alerts, setup, blueprint, sets] = await Promise.all([get("/api/programs"), get("/api/sources"), get("/api/channels"), get("/api/notifications?limit=12").catch(() => []), get("/api/setup-status").catch(() => null), get("/api/catalog").catch(() => null), get("/api/settings").catch(() => ({}))]);
   const it = stats?.items || {}, as = stats?.assets || {};
   const pending = it.PENDING_REVIEW || 0;
   const seeded = programs.length > 0;
@@ -283,6 +293,7 @@ pages.overview = async () => {
         const next = { ...queues, [l]: queues[l] === false };
         await run(() => put("/api/settings/queues.enabled", { value: next }), `${LANE_LABEL[l] || l} lane ${next[l] === false ? "paused" : "resumed"}`); route();
       } }, h("span", { class: "dot" }), LANE_LABEL[l] || l))),
+      pcSlotsRow(sets),
       stats?.globalPause ? h("p", { style: "margin:12px 0 0;color:var(--amber)" }, "Publishing is globally paused (Settings). Approved items will wait.") : null),
 
     blueprint ? h("h2", null, "What it makes ", h("a", { class: "small", href: "#/catalog", style: "font-family:var(--sans);font-weight:400" }, "all variants →")) : null,
@@ -423,6 +434,11 @@ function proofView(it, onDone, notes = []) {
   const noSearch = src.research_searched === false ? h("div", { class: "panel", style: "border-color:var(--amber)" },
     h("b", { style: "font-weight:500" }, "Researched without web search"),
     h("div", { class: "sub" }, "Web search was refused for this draft (plan or search allowance), so its facts come from the writer's memory and the source article. Check figures, dates and names before approving.")) : null;
+  // Research that stayed short of the floor (too few notes, or too few figures for a data explainer) even after it was
+  // asked a second time: what was written from it is likely to be vague or to repeat itself.
+  const thin = src.research_thin === true ? h("div", { class: "panel", style: "border-color:var(--amber)" },
+    h("b", { style: "font-weight:500" }, "Thin research — check facts and consider regenerating"),
+    h("div", { class: "sub" }, "The research came back with too few facts (or too few figures) even after it was asked twice, so this draft was written from little. Check it against the source, and regenerate it later if it reads vague or repeats itself.")) : null;
   // A clip: why this moment, and where it is in the source — with a link that opens the source right there, so a pick
   // can be judged against what comes before and after it without hunting through an hour of video.
   const cl = it.clip_id && src.clip ? src.clip : null;
@@ -451,6 +467,7 @@ function proofView(it, onDone, notes = []) {
   return h("div", { class: "proof" },
     headlineOnly,
     noSearch,
+    thin,
     warning,
     why,
     qaPanel(it),

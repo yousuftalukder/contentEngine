@@ -14,18 +14,40 @@ is a swappable adapter, and which adapter runs is a per-programme choice.
 | Source | feeds for news; pasted links for video; uploads | engine |
 | Queue | one lane per stage, retries, fallback chains | engine |
 | **Production** | **the adapter for that content type** | **server, your PC, or a rented API** |
-| Library | every output stored, a review item created | engine |
+| Library | every output stored, a review item created | engine (files on your PC since 2026-10-07) |
 | Review | play it, fix the caption, approve or reject | dashboard |
 | Publish | Facebook + Instagram (source link as first comment), YouTube | engine |
+
+Nothing starts on its own unless the owner turns **automatic production** on (setting `auto.enabled`, off by default
+since 2026-10-07). Off, the feeds are not read, the news desk drafts nothing, the planner proposes nothing and series do
+not advance; *Generate* and a pasted video link always work.
 
 Three places the work can happen, and the difference matters:
 
 - **Server** — free Render instance, 512 MB, a tenth of a CPU, always on. Good for text, cards, light renders,
   publishing. Slow at video. YouTube refuses it (datacenter IP).
 - **Your PC** — fast, free, unlimited, and **YouTube works**. Available a few hours a day. Jobs queue and wait
-  when it is off; the dashboard says so.
+  when it is off; the dashboard says so. Since 2026-10-07 it is also **where the files are kept** (below), so while
+  it is off no picture or video can be made, played in Review or posted.
 - **Rented** — an API that does the expensive middle. Costs money, always available. **Optional everywhere:** every
   variant has a free route, and a rented one only switches on when its key is added (agreed 2026-10-04: no billing).
+
+**Files are kept on your PC (2026-10-07, setting `storage.on_pc`, on in production).** Supabase's free 1 GB of storage
+filled and was restricted, so the server now stores nothing. Every job that writes a file — drafting
+(`GENERATE_CONTENT`), `REGENERATE`, processing a pasted video (`PROCESS_CANDIDATE`), cutting a clip (`RENDER_CLIP`),
+rendering an explainer (`STUDIO_RENDER`) and publishing (`PUBLISH_ASSET`) — is queued to the PC whatever lane it was
+meant for, and so is a card redrawn after a headline edit (`RECOMPOSE_CARD`). The PC writes to `data\media` (`MEDIA_DIR`)
+and serves it through a free Cloudflare quick tunnel that the worker opens itself (cloudflared, installed by
+`pc\setup.ps1`). Stored links are the server's `https://<server>/pc/<path>`, which redirects to the tunnel's address of
+the day, or answers 503 while the PC is off; through the tunnel the PC answers only `GET /media/*`. An upload that reaches
+the server waits in the database (`pending_files`) until the PC writes it out (`STORE_FILE`); over 150 MB it has to be
+copied into `data\media` by hand. The database is still Supabase Postgres.
+
+What that leaves on the server: reading feeds and grouping stories, answering the PC's writing requests (`LLM_RELAY`),
+choosing moments, transcribing Bangla and watching scenes (`PICK_CLIPS`), planning ideas, proposing a series' next
+episode, style profiles, metrics, scheduling posts and every sweep. The PC makes everything with a file in it — news
+cards and reels, clips, script videos and explainers, written through the server's writer when it has no key — and
+sends the posts. The "server" entries in the *runs* columns below mean the PC while files are kept there.
 
 **Each step runs where it can (2026-10-05).** The server holds the AI keys and the free voice; the PC has YouTube, the
 studio and your footage, but usually no key. So a job is split at the step that needs the other machine, never failed:
@@ -34,11 +56,11 @@ studio and your footage, but usually no key. So a job is split at the step that 
 |---|---|---|
 | fetch a YouTube video, transcribe English, cut and render clips | PC | — |
 | choose the moments (LLM picker) | server, if the PC has no writer | `PICK_CLIPS` with the PC's transcript and soundtrack signals |
-| transcribe Bangla (local whisper cannot) | server (Gemini) | the PC uploads a 16 kHz copy of the audio |
-| watch a film's scenes (5a, 5c) | server, if the PC has no key for it | the PC uploads a 360p, one-frame-a-second copy; deleted once the scenes are read |
-| any other writing on the PC (captions, recap and reaction scripts, 7a scripts) | server | `LLM_RELAY`: the request goes as a job, the answer comes back |
-| write an explainer (research, plan, pictures, narration) | server | the plan is stored on the item |
-| render an explainer (Remotion) | PC | `STUDIO_RENDER` with the stored plan |
+| transcribe Bangla (local whisper cannot) | server (Gemini) | the PC stores a 16 kHz copy of the audio and the server fetches it (through the tunnel when files are on the PC) |
+| watch a film's scenes (5a, 5c) | server, if the PC has no key for it | the PC stores a 360p, one-frame-a-second copy; deleted once the scenes are read when it is in cloud storage (a copy on the PC stays in `data\media`) |
+| any other writing on the PC (news drafts and cards when files are on the PC, captions, recap and reaction scripts, explainers, 7a scripts) | server | `LLM_RELAY`: the request goes as a job, the answer comes back |
+| write an explainer (research, plan, pictures, narration) | the PC when files are kept there; otherwise the server | in cloud-storage mode the plan is stored on the item |
+| render an explainer (Remotion, or Blender for 6d) | PC | in cloud-storage mode `STUDIO_RENDER` with the stored plan; on the PC it renders straight after writing |
 
 The free allowance is protected for the work that matters: a hand-reviewed programme stops drafting at 30 waiting
 (news wrote 222 unread drafts a day and spent it all), and a clip waits for the LLM picker's reset rather than being cut
@@ -135,7 +157,8 @@ stock pool, and a library of your own footage is the difference.
 | a voice (edge-tts, free) | 3a, 3c, 4b, 4c, 5a–c, 6a–d, 7a–c |
 | a Pexels key *(free)* | 2c, 7b |
 | a clipping subscription *(optional, the only paid item)* | 1b only |
-| your PC switched on | 1a, 1c, 3b, 3c, 4a–c, 5a–c, 6a–d, 7a |
+| your PC switched on | 1a, 1c, 3b, 3c, 4a–c, 5a–c, 6a–d, 7a — and, while files are kept on the PC (production since 2026-10-07), every variant: each one makes a file, and the PC both makes and serves it |
+| cloudflared on your PC (`pc\setup.ps1`) | every variant while files are kept on the PC: without the tunnel nothing it keeps can be played or posted |
 | a persona from you | 4a, 4c *(4b puts yours in the corner when you set one, and works without)* |
 | Gemini video input (free tier) | 5a |
 | a Twelve Labs key *(optional)* | 5c |
@@ -182,6 +205,14 @@ without it.
 - **Stock footage is American unless told otherwise.** "government inspection" put a US flag in a Bangladesh reel;
   clips are now taken only when Pexels' own description names the programme's country.
 - Split-screen reaction on the free server, 21 s at 720p: **about 4–5 minutes** once both fixes above were in.
+- **Supabase's free storage (1 GB) filled in about two weeks** of news drafted round the clock: 4,800 card pictures of
+  drafts nobody approved. On 2026-10-07 the project's storage was restricted — every video in Review stopped playing
+  and every post was refused — which is why files are now kept on the PC and automatic production is off by default.
+- **A Cloudflare quick tunnel gets a new address every time it starts** (`https://<random>.trycloudflare.com`, no
+  account). Stored links therefore name the server (`/pc/<path>`), which looks up today's address (`pc.tunnel`).
+- **Gemini's Google Search allowance answers with a bare 429** on the free tier (every explainer's research,
+  2026-10-06 and 07) while plain writing on the same model goes through. Research is asked again without search, and
+  the draft says so.
 
 ## Clipping services, checked 2026-10-04 *(1b)*
 
@@ -211,11 +242,16 @@ is off. Its first test before building: one video through the API, to see whethe
 
 ## Built, not yet proven on real material (2026-10-04)
 
-5c (Twelve Labs, optional), 6b (data explainer), 6c (illustrated series) and 1b
-(Vizard, optional) — each passes its tests against stand-ins for the services, and none has yet been made from real
-material in production. 6d (Blender 3D) is built too (2026-10-06): the narrated plan in 3D layouts — extruded titles, growing bars, key words — rendered scene by scene by Blender's Workbench engine on the PC CPU (`blender/explainer3d.py`); install it with `pc\setup.ps1 -Blender`. It renders procedural scenes, not hand-authored ones, which is what makes it automatable.
+5c (Twelve Labs, optional), 6c (illustrated series) and 1b (Vizard, optional) — each passes its tests against
+stand-ins for the services, and none has yet been made from real material in production.
 
 ## Proven working
+
+**6b and 6d, 2026-10-07:** both made end to end on the PC in production with the files kept there: the job ran on the
+PC from plan to narration to render, and the finished video was stored and served by the PC. 6b (data explainer,
+Remotion): "How Dhaka's Metro Rail Changed Daily Commuting", 23 s, 1920×1080. 6d (Blender 3D: the narrated plan in procedural 3D layouts — extruded titles, growing bars, key words —
+rendered scene by scene by Blender's Workbench engine on the PC's CPU, `blender/explainer3d.py`, installed with
+`pc\setup.ps1 -Blender`): "How Dhaka Metro Rail Changed Commuting", 49 s, 1280×720.
 
 **7a, 2026-10-06:** an own-footage explainer made by the PC in production, its script written by the server's writer
 (the PC holds no AI key; `LLM_RELAY`): five sections on Bangladesh's fertiliser shortage, each narrated over the clip in
@@ -227,7 +263,8 @@ the way" — the three passages anyone would clip — each in Review with its ca
 The explainer proofs (6b, 6c, 6d) did not run that day: Gemini answered "high demand" for an hour after the reset, then
 gemini-flash-lite-latest refused with a bare 429 that names no limit. Read as a per-minute limit, the jobs went back to
 ordinary retries after two hours and failed; a "per-minute" limit still refusing after two hours now waits for the
-daily reset instead.
+daily reset instead. A bare 429 on research is now read as the web-search allowance and the research asked again
+without search (PR #133); 6b and 6d were proven the next day (above). 6c is still to be proven.
 
 **5a, 2026-10-05:** a scene recap made by the server from *Duck and Cover* (1951, archive.org): Gemini's free tier
 watched a 360p, one-frame-a-second proxy, the recap script narrates what is on screen (the turtle, the dynamite, the

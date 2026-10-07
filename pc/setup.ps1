@@ -1,5 +1,5 @@
-# Prepares this PC to be a video worker: ffmpeg, yt-dlp and whisper.cpp in the project's own .tools folder, nothing
-# installed system-wide. Safe to run again — anything already present is left alone. Every download is printed with
+# Prepares this PC to be a video worker: ffmpeg, yt-dlp, deno, cloudflared, whisper.cpp and edge-tts in the project's
+# own .tools folder, nothing installed system-wide. Safe to run again — anything already present is left alone. Every download is printed with
 # where it comes from before it starts.
 # -Blender also installs Blender (about 350 MB), for 3D explainers (blueprint 6d). Optional: nothing else needs it.
 param([switch]$Blender)

@@ -65,6 +65,14 @@ test("a 3D explainer plans in 3D layouts and renders every scene through Blender
     const expected = calls.reduce((n, c) => n + c.spec.frames / c.spec.fps, 0);
     assert.ok(Math.abs(Number(video.duration_seconds) - expected) < 1.5, `the scenes joined into one video (${video.duration_seconds}s of ${expected.toFixed(1)}s)`);
     assert.match(it.captions.youtube, /^3D PLAN/);
+    // The narration is burned in: the stand-in's frames are a flat dark blue, so white caption text is the only bright
+    // thing in the lower part of the picture.
+    const { spawnSync } = await import("node:child_process"), { writeFileSync } = await import("node:fs");
+    const [hero] = await eng.query(`SELECT url FROM media_assets WHERE content_item_id = $1 AND kind = 'VIDEO' ORDER BY created_at DESC LIMIT 1`, [id]);
+    const mp4 = join(dirname(log), "3d.mp4"); writeFileSync(mp4, Buffer.from(await (await fetch(hero.url.replace(/^https?:\/\/[^/]+/, eng.base))).arrayBuffer()));
+    const stats = spawnSync("ffmpeg", ["-hide_banner", "-ss", "1.5", "-i", mp4, "-frames:v", "1", "-vf", "crop=iw:ih*0.35:0:ih*0.65,signalstats,metadata=print:key=lavfi.signalstats.YMAX", "-f", "null", "-"], { encoding: "utf8" });
+    const ymax = Number((/YMAX=(\d+)/.exec(stats.stderr + stats.stdout) || [])[1]);
+    assert.ok(ymax > 180, `captions are burned into the 3D video (brightest pixel in the lower third: ${ymax})`);
   } finally { await eng.stop(); }
 });
 
