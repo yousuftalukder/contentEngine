@@ -35,6 +35,7 @@ studio and your footage, but usually no key. So a job is split at the step that 
 | fetch a YouTube video, transcribe English, cut and render clips | PC | — |
 | choose the moments (LLM picker) | server, if the PC has no writer | `PICK_CLIPS` with the PC's transcript and soundtrack signals |
 | transcribe Bangla (local whisper cannot) | server (Gemini) | the PC uploads a 16 kHz copy of the audio |
+| watch a film's scenes (5a, 5c) | server, if the PC has no key for it | the PC uploads a 360p, one-frame-a-second copy; deleted once the scenes are read |
 | any other writing on the PC (captions, recap and reaction scripts, 7a scripts) | server | `LLM_RELAY`: the request goes as a job, the answer comes back |
 | write an explainer (research, plan, pictures, narration) | server | the plan is stored on the item |
 | render an explainer (Remotion) | PC | `STUDIO_RENDER` with the stored plan |

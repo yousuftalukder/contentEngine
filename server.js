@@ -4119,6 +4119,23 @@ async function processCandidate(candidateId) {
     // A scene recap asks Gemini to watch first; on a day its allowance is spent the programme's own transcriber takes
     // over and the recap is told from the dialogue, as 5b does, rather than not at all.
     const chain = await transcribers(niche, sceneRecap);
+    // A scene recap needs a transcriber that watches the picture (Gemini, or Twelve Labs for 5c). On a PC with no key
+    // for one, the chain fell to whisper and the recap was quietly told from the dialogue alone — a 5b under a 5a's
+    // name. When the server can watch it, the PC sends it the copy Gemini would be given anyway (360p, a frame a
+    // second, about half a megabyte a minute); the server reads the scenes and the recap comes back here to be cut.
+    const watcher = sceneRecap ? await sceneWatcher(niche) : null;
+    if (watcher && LANES.includes(PC_LANE) && !LANES.includes("text") && !(chain.length && (await implOfKey(chain[0])) === watcher.impl) && (await serverHasKey(watcher.provider))) {
+      const small = tmpPath("mp4");
+      try {
+        await exec("ffmpeg", ["-y", "-i", file.path, "-vf", "scale=-2:360,fps=1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", "-b:a", "32k", "-ac", "1", "-movflags", "+faststart", small], { timeoutMs: 60 * 60000 });
+        const url = await storeFile(`scenes/${candidateId}.mp4`, await readFile(small), "video/mp4");
+        await q(`UPDATE video_candidates SET transcript = $2::jsonb WHERE id=$1`, [candidateId, JSON.stringify({ scene_video_url: url, signals: await audioSignals(file.path) })]);
+      } finally { await cleanup(small); }
+      await enqueue("PICK_CLIPS", { candidateId }, { queue: "text", priority: niche.priority, dedupeKey: `pick:${candidateId}` });
+      log(`candidate ${candidateId}: no ${watcher.provider} key here to watch the scenes; the server watches them`);
+      return { watching: "server" };
+    }
     if (!chain.length) {
       // Bangla speech and nothing here that can hear it (local whisper cannot; a hosted transcriber needs a key this
       // PC lacks): the soundtrack goes up to storage and the server, which has a key, transcribes and picks.
@@ -4179,6 +4196,22 @@ async function transcribers(niche, sceneRecap) {
   // For any other language an empty list is left to the adapters to explain ("No API key for …").
   return out.length || LOCAL_ASR_CANNOT.test(niche.language || "") ? out : keys;
 }
+// The transcriber a scene recap watches the picture with — the programme's own when it is one (Twelve Labs for 5c),
+// otherwise Gemini — and the provider whose key it needs.
+const SCENE_IMPLS = { gemini_video: "gemini", twelve_labs: "twelve_labs" };
+async function implOfKey(key) { return (await instances()).find((r) => r.key === key)?.impl || key; }
+async function sceneWatcher(niche) {
+  const own = niche.transcript_adapter ? await implOfKey(niche.transcript_adapter) : null;
+  const impl = SCENE_IMPLS[own] ? own : "gemini_video";
+  return { impl, provider: SCENE_IMPLS[impl] };
+}
+// Whether the server has a key for a provider: one in the dashboard's vault, or one in the server's environment, which
+// the server lists (provider names only) in its boot record so that your PC can tell.
+async function serverHasKey(provider) {
+  if (await hasKey(provider)) return true;
+  const boot = P((await one(`SELECT value FROM settings WHERE key = 'boot.last'`))?.value) || {};
+  return (boot.env_keys || []).includes(provider);
+}
 // Whether the programme's picker can run in this process: an LLM picker needs a writer whose key is here.
 async function canPickHere(niche) {
   const row = await one(`SELECT impl, config FROM adapter_configs WHERE key = $1 AND enabled::int = 1`, [niche.clip_adapter || "llm_clipper"]);
@@ -4222,6 +4255,21 @@ async function pickOnServer(candidateId) {
       Object.assign(stored, { segments: clean.segments, events: clean.events });
       await q(`UPDATE video_candidates SET transcript = $2::jsonb WHERE id=$1`, [candidateId, JSON.stringify(stored)]);
     } finally { await cleanup(audio); }
+  }
+  // A scene recap your PC could not watch arrives as a small copy of the video; its scenes are read here. The copy is
+  // deleted once they are: it was made only for this.
+  if (!stored.segments?.length && stored.scene_video_url) {
+    const chain = await transcribers(niche, true);
+    if (!chain.length) throw new Error("a scene recap needs Gemini (or Twelve Labs) to watch the video: add a key on API keys");
+    const video = await toTmpFile(stored.scene_video_url, "mp4");
+    try {
+      const t = await withFallbacks("TRANSCRIBE", chain[0], chain.slice(1), (tr) => tr.transcribe({ path: video, duration: cand.duration_seconds, language: niche.language }));
+      const clean = t.scenes ? { segments: t.segments, events: [] } : cleanTranscript(t.segments);
+      const url = stored.scene_video_url; delete stored.scene_video_url;
+      Object.assign(stored, { segments: clean.segments, events: clean.events, scenes: !!t.scenes });
+      await q(`UPDATE video_candidates SET transcript = $2::jsonb WHERE id=$1`, [candidateId, JSON.stringify(stored)]);
+      await deleteStored(url).catch((e) => warn(`scene copy ${candidateId}: ${e.message}`));
+    } finally { await cleanup(video); }
   }
   const transcript = stored.events ? stored : { ...stored, ...cleanTranscript(stored.segments) };
   if (!transcript.segments?.length) throw new Error("the transcript handed over by the PC is empty");
@@ -5934,7 +5982,8 @@ app.post("/api/seed", async (ctx) => {
     // record is how anyone tells which build the server is running. The PC writes its own.
     putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: nowIso(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
       url: ENV.RENDER_EXTERNAL_URL || null, lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
-      blender: await blenderAvailable(), memory_mb: memoryLimitMb(), cpu: cpuFeatures() }).catch((e) => warn("boot.last", e.message));
+      blender: await blenderAvailable(), memory_mb: memoryLimitMb(), cpu: cpuFeatures(),
+      env_keys: Object.entries(DEFAULT_ENV).filter(([, v]) => ENV[v]).map(([k]) => k) }).catch((e) => warn("boot.last", e.message));
     // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
     if (storage.name === "supabase") ensureSupabaseBucket().catch((e) => warn("supabase storage:", e.message.slice(0, 200)));
     startWorkers();

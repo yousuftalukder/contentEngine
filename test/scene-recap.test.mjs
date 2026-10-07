@@ -64,3 +64,52 @@ test("scene recap: Gemini reads the scenes from the picture and the recap is cut
     assert.ok(media, "and the recap was rendered");
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
+
+// 5a on your PC, which has no Gemini key: the recap used to be told from the dialogue alone (whisper), a 5b under a
+// 5a's name. Now the PC sends the server the small copy Gemini watches; the server, whose key lives only in its own
+// environment, reads the scenes; and the recap comes back to the PC to be cut.
+test("scene recap on a PC without a key: the server watches the scenes, the PC cuts the recap", { skip: !hasFfmpeg && "ffmpeg not installed" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ce-scenes-pc-")), src = join(dir, "film.mp4");
+  spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15:duration=40", "-f", "lavfi", "-i", "sine=frequency=220:duration=40", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", src]);
+  let watched = 0;
+  const stub = http.createServer((req, res) => {
+    const chunks = []; req.on("data", (d) => chunks.push(d)); req.on("end", () => {
+      const url = new URL(req.url, "http://x"), base = `http://127.0.0.1:${stub.address().port}`;
+      const send = (status, body, headers = {}) => { res.writeHead(status, { "content-type": "application/json", ...headers }); res.end(JSON.stringify(body)); };
+      if (url.pathname === "/upload/v1beta/files") return send(200, {}, { "x-goog-upload-url": `${base}/upload-here` });
+      if (url.pathname === "/upload-here") return send(200, { file: { name: "files/abc", uri: `${base}/files/abc`, state: "ACTIVE" } });
+      if (req.method === "DELETE") return send(200, {});
+      if (/:generateContent$/.test(url.pathname)) {
+        const text = JSON.stringify(JSON.parse(Buffer.concat(chunks).toString()).contents);
+        if (/file_data/.test(text)) { watched++; return send(200, { candidates: [{ content: { parts: [{ text: JSON.stringify([
+          { start: 0, end: 20, seen: "a woman opens a letter by a window", said: "" }, { start: 20, end: 40, seen: "she runs out into the rain", said: "Wait!" }]) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50 } }); }
+        return send(200, { candidates: [{ content: { parts: [{ text: JSON.stringify({ title: "The letter", beats: [{ narration: "She opens the letter.", start: 0, end: 20 }, { narration: "And she runs.", start: 20, end: 40 }], hashtags: [] }) }] } }], usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 20 } });
+      }
+      send(200, { models: [] });
+    });
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  const server = await startEngine({ env: { GEMINI_API_KEY: "server-only-key", GEMINI_API_BASE: `http://127.0.0.1:${stub.address().port}` } });
+  let pc;
+  try {
+    await server.api("PUT", "/api/settings/ingest.enabled", { value: false });
+    const b = await server.api("POST", "/api/brands", { name: "PC recaps" });
+    const p = await server.api("POST", "/api/programs", { brandId: b.id, key: "pc_scene_recap", displayName: "PC scene recap", contentType: "MOVIE_RECAP", productionMethod: "SCENE_RECAP", computeWhere: "pc",
+      useMocks: true, autoStyle: false, autoSources: false, downloadAdapter: "direct", transcriptAdapter: "whisper_cpp", scriptAdapter: "gemini_live", scriptAdapterFallbacks: [],
+      voiceAdapter: "tts_mock", renderAdapter: "render_mock", methodConfig: { qa: { enabled: false }, recap_seconds: 20 } });
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false" } });
+    const cand = await server.api("POST", "/api/video-candidates", { nicheId: p.id, url: src, title: "The Letter" });
+    await waitFor(async () => {
+      const [v] = await server.query(`SELECT status, error_message FROM video_candidates WHERE id = $1`, [cand.id]); if (v?.status === "FAILED") throw new Error(v.error_message);
+      const [it] = await server.query(`SELECT status, rejection_note FROM content_items WHERE niche_id = $1`, [p.id]); if (it?.status === "FAILED") throw new Error(it.rejection_note);
+      return it?.status === "PENDING_REVIEW"; }, { timeout: 180000, interval: 500, what: "the recap" });
+    assert.equal(watched, 1, "Gemini watched the copy once, on the server");
+    const [{ transcript }] = await server.query(`SELECT transcript FROM video_candidates WHERE id = $1`, [cand.id]);
+    const t = typeof transcript === "string" ? JSON.parse(transcript) : transcript;
+    assert.equal(t.scenes, true, "the recap was told from the scenes, not the dialogue");
+    assert.equal(t.segments[1].visual, "she runs out into the rain");
+    assert.equal(t.scene_video_url, undefined, "and the copy made for it is gone");
+    const jobs = (await server.query(`SELECT type, queue FROM jobs ORDER BY created_at`)).filter((j) => ["PROCESS_CANDIDATE", "PICK_CLIPS", "RENDER_CLIP"].includes(j.type)).map((j) => `${j.type}@${j.queue}`);
+    assert.deepEqual(jobs, ["PROCESS_CANDIDATE@video_local", "PICK_CLIPS@text", "RENDER_CLIP@video_local"]);
+  } finally { await pc?.stop(); await server.stop(); await new Promise((r) => stub.close(r)); }
+});
