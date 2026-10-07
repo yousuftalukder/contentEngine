@@ -45,6 +45,13 @@ if (-not (Test-Path (Join-Path $bin "deno.exe"))) {
   Remove-Item -Force $zip
 } else { Write-Host "deno: already present" }
 
+# cloudflared: when files are kept on this PC (Settings -> storage), the worker opens a free Cloudflare quick tunnel so the
+# dashboard on your phone and the publishers can fetch them. No account needed. Cloudflare's own signed GitHub release.
+if (-not (Test-Path (Join-Path $bin "cloudflared.exe"))) {
+  Write-Host "cloudflared"
+  Fetch "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" (Join-Path $bin "cloudflared.exe")
+} else { Write-Host "cloudflared: already present" }
+
 # Blender (only with -Blender): the portable Windows build of the 4.2 LTS release from blender.org, into
 # .tools\blender, where the worker finds it. Renders 3D explainers on the CPU; nothing else uses it.
 if ($Blender) {
