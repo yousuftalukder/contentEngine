@@ -16,8 +16,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # A mirror that stops answering once held this step for the job's whole 45 minutes (2026-10-07) and the tests never
+      # ran: apt gives up on a silent mirror after 30 s and tries again, and the step itself stops after 10 minutes.
       - name: Video tools (same packages as the Dockerfile)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fontconfig fonts-noto-core fonts-dejavu-core
+        timeout-minutes: 10
+        run: |
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends ffmpeg fontconfig fonts-noto-core fonts-dejavu-core
       - run: npm ci
       - run: node --check server.js
       - run: npm test
