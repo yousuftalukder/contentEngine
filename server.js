@@ -3707,9 +3707,13 @@ async function clusterMaterial(item) {
 }
 // The material as prompt text. Several outlets' versions are each clipped so the total stays near ARTICLE_TEXT_MAX, and
 // the writer is told how to treat agreement and conflict between them.
-function materialBlock(m) {
+// Research is given twice the room (RESEARCH_MATERIAL_MAX): with five outlets on a story, an even share of
+// ARTICLE_TEXT_MAX is 1,200 characters each — a few paragraphs, and the figures are usually further down. A single
+// article is still the whole of what was read (it is clipped to ARTICLE_TEXT_MAX when it is fetched).
+const RESEARCH_MATERIAL_MAX = ARTICLE_TEXT_MAX * 2;
+function materialBlock(m, max = ARTICLE_TEXT_MAX) {
   const vs = m.versions?.length ? m.versions : [{ outlet: null, title: m.title, summary: m.summary, text: m.text, url: m.url }];
-  const per = Math.max(1200, Math.floor(ARTICLE_TEXT_MAX / vs.length));
+  const per = Math.max(1200, Math.floor(max / vs.length));
   const body = vs.map((v, i) => `--- Source ${i + 1}${v.outlet ? `: ${v.outlet}` : ""}${v.url ? ` (${v.url})` : ""}\nHeadline: ${v.title}\n${v.summary ? `Summary: ${v.summary}\n` : ""}${v.text ? `Text:\n"""\n${v.text.slice(0, per)}\n"""\n` : "(headline and summary only)\n"}`).join("\n");
   return `SOURCE MATERIAL — ${vs.length} source${vs.length > 1 ? "s" : ""} reporting this story\n${body}\n`
     + (vs.length > 1 ? "Use only facts the sources state. Prefer facts several sources agree on; where they differ (numbers, names, times) use the most careful wording or say that reports differ. Never merge details from different incidents.\n" : "")
@@ -3764,19 +3768,72 @@ async function generateStatic(item, niche, style) {
 // was refused) is the model's memory, so the fact check and the reviewer are told to check it against the source.
 const researchBy = (r) => `${r.model || "mock"}${r.searched === false ? " · no web search" : ""}`;
 const noteNoSearch = (id) => q(`UPDATE content_items SET source_data_ref = (COALESCE(NULLIF(source_data_ref, ''), '{}')::jsonb || '{"research_searched": false}'::jsonb)::text WHERE id=$1`, [id]);
+// Research still short of the floor after it was asked twice: the draft says so, and Review shows "check the facts".
+const noteThin = (id) => q(`UPDATE content_items SET source_data_ref = (COALESCE(NULLIF(source_data_ref, ''), '{}')::jsonb || '{"research_thin": true}'::jsonb)::text WHERE id=$1`, [id]);
+// Research is the floor everything after it stands on: a plan or a post can only be as good as its notes. On 2026-10-07
+// the smallest fallback model answered an explainer's research with four notes and not one useful number, and the
+// video that came out of it said the same sentence four times. So the notes are counted before they are used: fewer
+// than RESEARCH_MIN_NOTES, or (where figures are the point, a data explainer) fewer than two notes holding a figure,
+// and the research is asked once more — with the material again, told exactly what was missing — and the better of the
+// two answers is kept. Once, and only then: on the free tier every request is one of the day's twenty for the model.
+const RESEARCH_MIN_NOTES = 6;
+// What the mock writer answers research with: enough notes, two with figures, so a mock run is a research that passed.
+const mockNotes = (m) => ["was announced", "affects commuters", "was reported by the source", "has a cost of 120 crore taka", "began in 2016", "is expected to expand", "drew public comment", "is being reviewed"]
+  .map((x) => ({ fact: `Mock fact: ${m.title} ${x}`, source_url: m.url || "https://example.com", source_name: "mock" }));
+const researchNotes = (d) => (Array.isArray(d?.notes) ? d.notes : []).filter((n) => n && String(n.fact || "").trim());
+const hasFigure = (n) => /\p{N}/u.test(String(n?.fact || ""));
+function researchGaps(notes, figures) {
+  const withFigures = notes.filter(hasFigure).length;
+  return [notes.length < RESEARCH_MIN_NOTES ? `only ${notes.length} note(s), and at least ${RESEARCH_MIN_NOTES} are needed` : null,
+    figures && withFigures < 2 ? `only ${withFigures} note(s) holding a figure (a number, amount, percentage or date), and at least 2 are needed` : null].filter(Boolean);
+}
+async function deepResearch(item, niche, { system, prompt, mock, figures = false, maxTokens = 3000 }) {
+  const ask = (extra = "", grounding = true) => llmFor(niche, (llm) => llm.complete({ json: true, grounding, maxTokens, system, prompt: prompt + extra, mock }));
+  const judge = (r) => { const notes = researchNotes(r.data); return { r, notes, gaps: researchGaps(notes, figures), figures: notes.filter(hasFigure).length }; };
+  let best = judge(await ask()); await addCost(item.id, best.r.cost);
+  if (best.gaps.length) {
+    log(`research for ${item.id} came back with ${best.gaps.join("; ")} — asking once more`);
+    // A search refused the first time would be refused again, at the cost of another request: the second ask goes
+    // without it then. Inventing is the one thing worse than thin notes, so the prompt says that in as many words.
+    const again = await ask(`\nYOUR LAST NOTES WERE TOO THIN: they had ${best.gaps.join("; ")}. Go through the source material above again${best.r.searched === false ? "" : " and search for the reporting on it"}: every concrete number, amount, percentage, date, place and named person or organisation it states is a note of its own, with its source. Prefer facts that carry figures. Never invent: every note must come from the material or from what your search found, and fewer true notes are better than one made up. Return the full set of notes, not only the new ones.`, best.r.searched !== false)
+      .catch((e) => { warn(`research for ${item.id}: second ask failed: ${e.message}`); return null; });
+    if (again) {
+      await addCost(item.id, again.cost); const b = judge(again);
+      if (b.gaps.length < best.gaps.length || (b.gaps.length === best.gaps.length && b.notes.length + b.figures > best.notes.length + best.figures)) best = b;
+    }
+  }
+  return { research: best.r, notes: best.notes, thin: best.gaps.length > 0 };
+}
+// Spoken lines that say the same thing again: the plan that went out on 2026-10-07 said "The metro rail impacts daily
+// commuting in Dhaka regarding …" four times over. Counted without asking anyone: a five-word phrase said three times
+// or more, or two or more pairs of lines (five words or longer) sharing more than 70% of their words. The words are
+// letters, marks and digits in any script, so Bangla's vowel signs keep a word whole.
+const lineWords = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
+function repeatedLines(lines) {
+  const ws = lines.map(lineWords).filter((w) => w.length >= 5), sets = ws.map((w) => new Set(w));
+  let pairs = 0, example = null;
+  for (let i = 0; i < sets.length; i++) for (let j = i + 1; j < sets.length; j++) {
+    let shared = 0; for (const w of sets[i]) if (sets[j].has(w)) shared++;
+    if (shared / (sets[i].size + sets[j].size - shared) > 0.7) { pairs++; example ||= ws[j].join(" "); }
+  }
+  const counts = new Map(); for (const w of ws) for (let k = 0; k + 5 <= w.length; k++) { const g = w.slice(k, k + 5).join(" "); counts.set(g, (counts.get(g) || 0) + 1); }
+  const [phrase, times] = [...counts].filter(([, n]) => n >= 3).sort((a, b) => b[1] - a[1])[0] || [];
+  if (!phrase && pairs < 2) return null;
+  return `lines repeat: ${[phrase ? `"${phrase}" is said ${times} times` : null, pairs >= 2 ? `${pairs} pairs of lines say nearly the same thing (e.g. "${example.slice(0, 90)}")` : null].filter(Boolean).join("; ")}`;
+}
 // ---- 8b. LONG_POST: research first (notes with citations), then write in the style profile
 async function generateLongPost(item, niche, style) {
   const m = await materialFor(item, niche);
   const dedup = await checkDuplicate(m.title, niche, item.series_id, item.id); if (dedup.isDuplicate) throw new Error(`Dedup: too similar to "${dedup.best.topic}"`);
   await setItem(item.id, { status: "DRAFTING", topic: m.title, source_data_ref: { ...(m.raw || {}), url: m.url, article_chars: String(m.text || "").length }, topic_embedding: J(dedup.embedding) });
-  const research = await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
+  const { research, notes, thin } = await deepResearch(item, niche, {
     system: "You are a meticulous researcher. Gather verifiable facts with sources. Never fabricate a citation.",
-    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
-    mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
-  await addCost(item.id, research.cost);
-  const notes = research.data?.notes || []; const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
+    prompt: `Topic: ${m.title}\n${materialBlock(m, RESEARCH_MATERIAL_MAX)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the most interesting angle for a long social post"} with 6-12 notes.`,
+    mock: { notes: mockNotes(m), angle: "mock angle" } });
+  const cites = [...new Set([...(research.citations || []), ...notes.map((n) => n.source_url).filter(Boolean)])];
   await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify(cites), researchBy(research)]);
   if (research.searched === false) await noteNoSearch(item.id);
+  if (thin) await noteThin(item.id);
   const post = await llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 3000,
     system: `You write long-form Facebook posts for "${niche.display_name}". ${langLine(niche.language)} Tone: ${niche.tone}.${styleBlock(style, niche)} Use ONLY the research notes as facts.${item._series || ""}`,
     prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nReturn JSON: {"headline": "first line hook", "post": "the full 250-600 word post with paragraph breaks", "hashtags": ["..."], "image_prompt": "visual for a cover image"}`,
@@ -4005,22 +4062,24 @@ async function generateExplainer(item, niche, style) {
     const sm = P((await one(`SELECT script_meta FROM content_items WHERE id=$1`, [item.id]))?.script_meta) || {};
     await setItem(item.id, { script_meta: { ...sm, draft: { ...(sm.draft?.job === item._job ? sm.draft : {}), job: item._job, ...part } } });
   };
-  const research = kept?.research || await llmFor(niche, (llm) => llm.complete({ json: true, grounding: true, maxTokens: 3000,
-    system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
-    prompt: `Topic: ${m.title}\n${materialBlock(m)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
-    mock: { notes: [{ fact: `Mock fact about ${m.title}`, source_url: m.url || "https://example.com", source_name: "mock" }], angle: "mock angle" } }));
-  const notes = research.data?.notes || [];
-  if (!kept?.research) {
-    await addCost(item.id, research.cost);
-    await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(notes), JSON.stringify([...new Set(notes.map((n) => n.source_url).filter(Boolean))]), researchBy(research)]);
-    if (item._job) await keep({ research: { data: research.data, model: research.model || null, searched: research.searched } });
+  let research = kept?.research, thin = !!kept?.research?.thin;
+  if (!research) {
+    ({ research, thin } = await deepResearch(item, niche, { figures: mc.explainer_style === "data",
+      system: "You are a meticulous researcher. Gather verifiable facts, figures and quotes with sources. Never fabricate a number, quote or citation.",
+      prompt: `Topic: ${m.title}\n${materialBlock(m, RESEARCH_MATERIAL_MAX)}\nReturn JSON: {"notes": [{"fact": "...", "source_url": "https://...", "source_name": "..."}], "angle": "the clearest way to explain this"} with 8-15 notes.`,
+      mock: { notes: mockNotes(m), angle: "mock angle" } }));
+    const found = researchNotes(research.data);
+    await q(`INSERT INTO research_notes (id, niche_id, content_item_id, topic, notes, citations, created_by) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)`, [newId(), niche.id, item.id, m.title, JSON.stringify(found), JSON.stringify([...new Set(found.map((n) => n.source_url).filter(Boolean))]), researchBy(research)]);
+    if (item._job) await keep({ research: { data: research.data, model: research.model || null, searched: research.searched, thin } });
   }
+  const notes = researchNotes(research.data);
   if (research.searched === false) await noteNoSearch(item.id);
+  if (thin) await noteThin(item.id);
   const sceneCount = Math.max(4, Math.round(minutes * 3.5));
   const three = mc.explainer_style === "3d", layouts = three ? THREE_D_LAYOUTS : EXPLAINER_LAYOUTS;
   const askPlan = (extra = "") => llmFor(niche, (llm) => llm.complete({ json: true, maxTokens: 8000,
-    system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes. Every spoken line adds something new: never repeat a phrase or a sentence pattern from another line.${item._series || ""}`,
-    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\nWrite a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(layouts).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
+    system: `You script animated explainer videos for "${niche.display_name}". ${langLine(lang)} Tone: ${niche.tone || "clear, friendly"}.${styleBlock(style, niche)} The narration drives the animation: every on-screen element is introduced by the sentence that speaks it. Use only facts from the research notes and the source material. Every spoken line adds something new: never repeat a phrase or a sentence pattern from another line.${item._series || ""}`,
+    prompt: `Topic: ${m.title}\nAngle: ${research.data?.angle || ""}\nResearch notes:\n${notes.map((n) => `- ${n.fact} (${n.source_name || n.source_url || "source"})`).join("\n")}\n\n${richMaterial(m) ? `The article the notes were taken from, for context and for any figure the notes left out:\n${materialBlock(m)}\n` : ""}Write a ${minutes}-minute explainer (about ${minutes * 140} spoken words) as about ${sceneCount} scenes, using only these layouts:\n${Object.entries(layouts).map(([k, v]) => `- ${k}: data ${v}`).join("\n")}\nIcons for IconGrid (use these names only): ${EXPLAINER_ICONS}\n${mc.explainer_style === "data" ? `${DATA_STYLE}
 ` : ""}${mc.explainer_style === "illustrated" ? `${ILLUSTRATED_STYLE(castOf(mc))}
 ` : ""}${three ? `${THREE_D_STYLE(lang)}
 ` : ""}Start with a ${three ? "Title3D" : "TitleCard"}; vary the layouts; mark a new chapter with a short "chapter" name on the scene that starts it (at least 3 chapters).${extra}\nJSON: {"title": "video title", "description": "YouTube description without timestamps", "hashtags": ["..."], "scenes": [{"layout": "...", "chapter": "... or null", "data": {...}, "intro": "optional spoken lead-in before the elements", "parts": ["spoken line per element"]}]}`,
@@ -4033,16 +4092,19 @@ async function generateExplainer(item, niche, style) {
   // rendered as it came. Short of the scenes asked for, or (for a data explainer whose research holds numbers) short of
   // scenes built from them, it is asked once more, told what was missing, and the better of the two is used.
   const usable = (d) => ((d || {}).scenes || []).filter((s) => s && layouts[s.layout] && s.data).map((s) => ({ ...s, ...sceneParts(s) })).filter((s) => s.parts.length);
-  const numbers = notes.filter((n) => /\d/.test(String(n.fact || ""))).length >= 2, wantData = mc.explainer_style === "data" && numbers;
+  const numbers = notes.filter(hasFigure).length >= 2, wantData = mc.explainer_style === "data" && numbers;
   const minScenes = Math.max(3, Math.ceil(sceneCount * 0.6)), dataScenes = (sc) => sc.filter((s) => ["DataChart", "BigNumber", "Timeline"].includes(s.layout)).length;
-  const shortOf = (sc) => [sc.length < minScenes ? `only ${sc.length} usable scene(s), and at least ${minScenes} are needed` : null, wantData && dataScenes(sc) < 2 ? `only ${dataScenes(sc)} scene(s) built from DataChart, BigNumber or Timeline, and at least 2 are needed from the numbers in the notes` : null].filter(Boolean);
+  // Lines that repeat each other are one more way to fall short, judged in the same check — so a plan that is both
+  // short and repetitive is still sent back only once, told both.
+  const shortOf = (sc) => [sc.length < minScenes ? `only ${sc.length} usable scene(s), and at least ${minScenes} are needed` : null, wantData && dataScenes(sc) < 2 ? `only ${dataScenes(sc)} scene(s) built from DataChart, BigNumber or Timeline, and at least 2 are needed from the numbers in the notes` : null,
+    repeatedLines(sc.flatMap((s) => [s.intro, ...s.parts]))].filter(Boolean);
   let plan = kept?.plan;
   if (!plan) {
     plan = await askPlan(); await addCost(item.id, plan.cost);
     const missing = shortOf(usable(plan.data));
     if (missing.length) {
       log(`explainer ${item.id}: the plan came back with ${missing.join("; ")} — asking once more`);
-      const again = await askPlan(`\nYOUR LAST PLAN WAS REJECTED: it had ${missing.join("; ")}. Write the full plan again and meet both.`).catch((e) => { warn(`explainer ${item.id}: second plan failed: ${e.message}`); return null; });
+      const again = await askPlan(`\nYOUR LAST PLAN WAS REJECTED: it had ${missing.join("; ")}. Write the full plan again and fix every point${missing.some((x) => x.startsWith("lines repeat")) ? ": each spoken line says something no other line says, a different fact from the notes in its own words" : ""}.`).catch((e) => { warn(`explainer ${item.id}: second plan failed: ${e.message}`); return null; });
       if (again) { await addCost(item.id, again.cost); const a = usable(again.data), b = usable(plan.data); if (shortOf(a).length < shortOf(b).length || (shortOf(a).length === shortOf(b).length && a.length > b.length)) plan = again; }
     }
     if (item._job) await keep({ plan: { data: plan.data } });

@@ -410,6 +410,11 @@ function proofView(it, onDone, notes = []) {
   const noSearch = src.research_searched === false ? h("div", { class: "panel", style: "border-color:var(--amber)" },
     h("b", { style: "font-weight:500" }, "Researched without web search"),
     h("div", { class: "sub" }, "Web search was refused for this draft (plan or search allowance), so its facts come from the writer's memory and the source article. Check figures, dates and names before approving.")) : null;
+  // Research that stayed short of the floor (too few notes, or too few figures for a data explainer) even after it was
+  // asked a second time: what was written from it is likely to be vague or to repeat itself.
+  const thin = src.research_thin === true ? h("div", { class: "panel", style: "border-color:var(--amber)" },
+    h("b", { style: "font-weight:500" }, "Thin research — check facts and consider regenerating"),
+    h("div", { class: "sub" }, "The research came back with too few facts (or too few figures) even after it was asked twice, so this draft was written from little. Check it against the source, and regenerate it later if it reads vague or repeats itself.")) : null;
   // A clip: why this moment, and where it is in the source — with a link that opens the source right there, so a pick
   // can be judged against what comes before and after it without hunting through an hour of video.
   const cl = it.clip_id && src.clip ? src.clip : null;
@@ -438,6 +443,7 @@ function proofView(it, onDone, notes = []) {
   return h("div", { class: "proof" },
     headlineOnly,
     noSearch,
+    thin,
     warning,
     why,
     qaPanel(it),
