@@ -6218,7 +6218,9 @@ app.post("/api/pc/setup-token", async (ctx) => {
   const row = await one(`INSERT INTO settings (key, value) VALUES ($1, $2::jsonb || jsonb_build_object('created_at', now(), 'expires_at', now() + make_interval(mins => $3::int))) RETURNING value->>'expires_at' AS expires_at`, [pcSetupKey(token), JSON.stringify(options), PC_SETUP_MINUTES]);
   await putSetting("pc.setup_status", { made_at: nowIso(), expires_at: row.expires_at, options, used_at: null });
   log(`pc setup: a setup command was made (valid ${PC_SETUP_MINUTES} min; blender ${options.blender}, autostart ${options.autostart}, takeover ${options.takeover})`);
-  const command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm '${base}/api/public/pc/install.ps1?t=${token}' | iex"`;
+  // The token travels in a header, not the address: Render's request log records every address, and a used-up token
+  // in a log is harmless but an unused one is not.
+  const command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm -UseBasicParsing -Headers @{ 'X-Setup-Token' = '${token}' } '${base}/api/public/pc/install.ps1' | iex"`;
   json(ctx, 201, { command, expires_at: row.expires_at, options });
 });
 // The installer, with the address, the token and the options filled in. Checks the token without using it up.

@@ -15,7 +15,7 @@ import { startEngine } from "./harness.mjs";
 // The installer itself is not run here: it installs software and starts a worker.
 const SECRET = "test secrets#key";                                    // a space and a # — must come back quoted in .env.pc
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const tokenOf = (command) => /install\.ps1\?t=([A-Za-z0-9_-]{32})'/.exec(command)?.[1];
+const tokenOf = (command) => /'X-Setup-Token' = '([A-Za-z0-9_-]{32})'/.exec(command)?.[1];
 // A raw request, so the Host and X-Forwarded-Proto headers can be set (fetch will not set Host).
 const raw = (base, method, path, headers = {}) => new Promise((resolve, reject) => {
   const u = new URL(base + path);
@@ -27,7 +27,8 @@ test("a setup command is made once, the installer is served for it, and the PC's
   const s = await startEngine({ env: { SECRETS_KEY: SECRET } });
   try {
     const made = await s.api("POST", "/api/pc/setup-token", { blender: true, autostart: false, takeover: true });
-    assert.match(made.command, /^powershell -NoProfile -ExecutionPolicy Bypass -Command "\[Net\.ServicePointManager\]::SecurityProtocol = 'Tls12'; irm 'http:\/\/localhost:\d+\/api\/public\/pc\/install\.ps1\?t=[A-Za-z0-9_-]{32}' \| iex"$/);
+    assert.match(made.command, /^powershell -NoProfile -ExecutionPolicy Bypass -Command "\[Net\.ServicePointManager\]::SecurityProtocol = 'Tls12'; irm -UseBasicParsing -Headers @\{ 'X-Setup-Token' = '[A-Za-z0-9_-]{32}' \} 'http:\/\/localhost:\d+\/api\/public\/pc\/install\.ps1' \| iex"$/);
+    assert.doesNotMatch(made.command, /\?t=/, "the token is not in the address, which request logs record");
     assert.deepEqual(made.options, { blender: true, autostart: false, takeover: true });
     const token = tokenOf(made.command);
     assert.ok(new Date(made.expires_at) - Date.now() > 25 * 60000, "valid for about 30 minutes");
