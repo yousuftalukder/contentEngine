@@ -60,6 +60,28 @@ test("work routed to your PC waits for your PC, and your PC does it", async () =
   } finally { await pc?.stop(); await server.stop(); }
 });
 
+// The server updates itself on every merge; a PC keeps the code it was started with. The PC reports the build it runs
+// (read from its git checkout, without git) and the dashboard says when it differs from the server's.
+test("the dashboard can tell when the PC runs another version of the engine than the server", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const serverSha = "a".repeat(40);
+  const server = await startEngine({ env: { RENDER_GIT_COMMIT: serverSha } });
+  let pc;
+  try {
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false", RENDER_GIT_COMMIT: "" } });
+    const boot = await waitFor(async () => { const [r] = await server.query(`SELECT value FROM settings WHERE key = 'boot.pc'`); return r && (typeof r.value === "string" ? JSON.parse(r.value) : r.value); }, { what: "the PC's boot record" });
+    const head = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" });
+    if (head.status === 0) assert.equal(boot.commit, head.stdout.trim(), "the PC read its build from its git checkout");
+    const differs = await waitFor(async () => { const w = await server.api("GET", "/api/workers"); return w.pc.online && w; }, { what: "the PC online" });
+    assert.equal(differs.server.commit, serverSha);
+    assert.equal(differs.pc.version_differs, boot.commit != null, "a PC on another build is flagged");
+    await pc.stop();
+    pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false", RENDER_GIT_COMMIT: serverSha } });
+    const same = await waitFor(async () => { const w = await server.api("GET", "/api/workers"); return w.pc.boot?.commit === serverSha && w; }, { what: "the updated PC's boot record" });
+    assert.equal(same.pc.version_differs, false, "and not once it runs the server's build");
+  } finally { await pc?.stop(); await server.stop(); }
+});
+
 // Your PC transcribes (YouTube serves it) but may have no AI key, while the server has one. The moment is chosen on
 // the server from the PC's transcript — the LLM picker, not the free one — and the clip goes back to the PC to cut.
 test("a PC without a writer hands the choosing to the server, and the clip comes back to the PC", async () => {

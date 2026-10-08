@@ -221,11 +221,15 @@ function statusStrip() {
   const waits = !pc.on && pc.needed ? h("div", { class: "strip-note" },
     stats.filesOnPc ? "Waiting for your PC: making and re-rendering content, cutting clips, playing media in Review, saving uploads and publishing." : "Video work set to run on your PC is waiting for it.",
     pc.waiting ? ` ${pc.waiting} job${pc.waiting > 1 ? "s" : ""} queued for it.` : "", " Start it with pc\\start.ps1 on your PC.") : null;
-  return h("div", { id: "statusStrip", class: "strip" + (waits ? " warn" : "") },
+  // The server updates itself on every change; the PC keeps running the code it was started with until it is updated.
+  const stale = pc.on && workers?.pc?.version_differs ? h("div", { class: "strip-note" },
+    "Your PC runs an older (or different) version of the engine than the server, so some new work may not run on it. Update it: on ",
+    h("a", { href: "#/pc-setup" }, "Set up a PC"), " make a setup command and paste it on your PC (or run git pull in the engine folder), then close the worker window and start pc\\start.ps1 again.") : null;
+  return h("div", { id: "statusStrip", class: "strip" + (waits || stale ? " warn" : "") },
     h("div", { class: "row" }, pcPill, autoPill,
       stats.globalPause ? h("a", { class: "pill", href: "#/settings", title: "Approved posts wait until publishing is resumed (Settings)" }, h("span", { class: "dot off" }), h("b", null, "Publishing paused")) : null,
       h("a", { class: "small right", href: "#/help" }, "What needs my PC?")),
-    waits);
+    waits, stale);
 }
 async function route() {
   const id = (location.hash.replace(/^#\/?/, "").split("/")[0]) || "overview";
