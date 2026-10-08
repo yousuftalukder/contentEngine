@@ -4,6 +4,11 @@
 # -Blender also installs Blender (about 350 MB), for 3D explainers (blueprint 6d). Optional: nothing else needs it.
 param([switch]$Blender)
 $ErrorActionPreference = "Stop"
+# Windows PowerShell redraws Invoke-WebRequest's progress bar for every chunk, which holds a download to a fraction of
+# the connection: the 100 MB ffmpeg zip took over ten minutes on a fresh install. Preferences are not inherited from the
+# script that started this one (pc\install.ps1 sets its own), so this script sets it too.
+$ProgressPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $root  = Split-Path $PSScriptRoot -Parent
 $tools = Join-Path $root ".tools"
 $bin   = Join-Path $tools "bin"
@@ -31,6 +36,8 @@ if (-not (Test-Path (Join-Path $studio "node_modules\@remotion\renderer"))) {
   Write-Host "video studio packages (npm ci)"
   Push-Location $studio; npm ci --no-audit --no-fund; $rc = $LASTEXITCODE; Pop-Location
   if ($rc) { Write-Error "Installing the video studio's packages failed (npm ci)."; exit 1 }
+  # Newer npm skips esbuild's install script and says so; esbuild's program arrives as its own package and works anyway.
+  Write-Host "  (an npm 'allow-scripts' warning about esbuild above is harmless)"
 } else { Write-Host "video studio packages: already present" }
 Write-Host "video studio browser"
 Push-Location $studio; npx --no-install remotion browser ensure; if ($LASTEXITCODE) { Write-Host "  (the studio fetches its browser on the first render instead)" }; Pop-Location
@@ -45,7 +52,12 @@ function Fetch($url, $dest) {
 if (-not (Test-Path (Join-Path $bin "ffmpeg.exe"))) {
   Write-Host "ffmpeg"
   $zip = Join-Path $env:TEMP "ffmpeg-essentials.zip"
-  Fetch "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" $zip
+  # The same builds are published on gyan's GitHub (GyanD/codexffmpeg), which serves them many times faster: gyan.dev
+  # gave a fresh install 38 KB/s (45 minutes for the zip), GitHub 7 MB/s. gyan.dev stays as the fallback.
+  $url = $null
+  try { $url = ((Invoke-RestMethod -Uri "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest" -UseBasicParsing).assets | Where-Object { $_.name -match '^ffmpeg-[\d.]+-essentials_build\.zip$' } | Select-Object -First 1).browser_download_url } catch {}
+  if (-not $url) { $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" }
+  Fetch $url $zip
   $x = Join-Path $env:TEMP "ffmpeg-x"; Remove-Item -Recurse -Force $x -ErrorAction SilentlyContinue
   Expand-Archive -Force $zip $x
   Get-ChildItem $x -Recurse -Include ffmpeg.exe, ffprobe.exe | Copy-Item -Destination $bin
