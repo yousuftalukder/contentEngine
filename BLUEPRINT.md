@@ -240,12 +240,24 @@ is off. Its first test before building: one video through the API, to see whethe
   to draw behind a character stays (removing it by colour leaked into the figure), and two drawings of the same
   character from the same description and seed look alike but not identical.
 
-## Built, not yet proven on real material (2026-10-04)
+## Built, not yet proven on real material
 
-5c (Twelve Labs, optional), 6c (illustrated series) and 1b (Vizard, optional) — each passes its tests against
-stand-ins for the services, and none has yet been made from real material in production.
+5c (Twelve Labs, optional) and 1b (Vizard, optional) — both pass their tests against stand-ins for the services and
+wait only for a paid key. Every variant that needs nothing paid is proven below.
 
 ## Proven working
+
+**Proven again with files kept on the PC, 2026-10-07 (PC holding no AI key):**
+- **3b in Bangla:** a 74 s Jamuna TV report (Gazipur garment-factory fire). The PC sent the soundtrack up; the server
+  heard it in Bangla script (not whisper's Urdu) on a fallback Gemini model the same day the first model's allowance
+  was spent (#152), picked 0–47 s (score 0.84), wrote the Bangla headline and caption; the PC cut it with word-by-word
+  Bangla captions. Served from the PC through `/pc/`.
+- **2c under the key relay (#142):** a Bangla news card ("Dhaka Metro Rail…") made on the PC: the duplicate check used
+  the server's Gemini embeddings and the picture the server's Pexels key (`KEY_RELAY` gemini_embed, pexels_photos), the
+  writing the server's writer (`LLM_RELAY`). A real Dhaka Metro photo with its credit, in Review.
+- **5a scene hand-off (#128):** *About Bananas* (1935, archive.org, silent). The PC exposed the film as
+  `scenes/<id>.mp4`, the server watched it (94 scenes described), the PC rendered a 53 s narrated recap whose captions
+  match the shots, and the hand-off copy was dropped.
 
 **6c, 2026-10-07:** an illustrated story made end to end on the PC with files kept there: "A Rickshaw Driver's Day
 in Dhaka During the Monsoon", drawn monsoon street scenes with cut-out figures moved in code, scene titles and burned
