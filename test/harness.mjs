@@ -66,7 +66,14 @@ export async function startEngine({ env = {} } = {}) {
   const usedUrl = env.DATABASE_URL || databaseUrl;
   const sql = new pg.Pool({ connectionString: usedUrl, max: 2 });
   async function api(method, path, body) {
-    const res = await fetch(base + path, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+    const send = () => fetch(base + path, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+    // Node's server drops a keep-alive connection after about five idle seconds, and fetch now and then reuses one at
+    // that very moment ("fetch failed", the socket closed before any answer — so the request never ran). A test that
+    // idled while ffmpeg made its fixtures failed on that in CI; one retry on exactly that error.
+    const res = await send().catch((e) => {
+      if (exited === null && ["UND_ERR_SOCKET", "ECONNRESET"].includes(e.cause?.code)) return new Promise((r) => setTimeout(r, 100)).then(send);
+      throw e;
+    });
     const data = await res.json().catch(() => null);
     if (!res.ok) { const e = new Error(`${method} ${path} -> ${res.status}: ${JSON.stringify(data)}`); e.status = res.status; e.body = data; throw e; }
     return data;
