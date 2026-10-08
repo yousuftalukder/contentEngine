@@ -5790,7 +5790,7 @@ function startWorkers() {
     const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, host: PC_HOST, lanes: LANES, media: pcMediaSize() }).catch((e) => warn("pc heartbeat", e.message));
     beat(); setInterval(beat, 30000);
     // The files this PC keeps: its tunnel opened (and reopened), and its own files cleaned up as the server's would be.
-    if (IS_PC) { keepTunnel(); setInterval(() => keepTunnel().catch(() => {}), 60000); setInterval(() => sweepStorageCleanup().catch((e) => warn("cleanup", e.message)), 60 * 60000); }
+    if (IS_PC) { keepTunnel(); setInterval(() => keepTunnel().catch(() => {}), Number(ENV.PC_TUNNEL_POLL_MS) || 60000); setInterval(() => sweepStorageCleanup().catch((e) => warn("cleanup", e.message)), 60 * 60000); }
   }
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
@@ -5833,6 +5833,8 @@ const server = http.createServer(async (req, res) => {
   // Through the tunnel the PC answers for its media and nothing else: the tunnel is a public address, and the rest of
   // the PC's engine (its API, the database behind it) is not for the internet. Cloudflare marks every request it relays.
   if (IS_PC && req.headers["cf-connecting-ip"] && !((req.method === "GET" || req.method === "HEAD") && pathname.startsWith("/media/"))) { res.writeHead(403, { "Content-Type": "text/plain" }); return res.end("Only media files are served here"); }
+  // The PC asking itself, through its public tunnel address, whether that address still reaches it (checkTunnel).
+  if (IS_PC && pathname === "/media/.tunnel-check") { res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-store" }); return res.end(TUNNEL_NONCE); }
   // A file kept on your PC, asked for by its permanent address: sent on to wherever the PC's tunnel is today.
   if (pathname.startsWith("/pc/") && (req.method === "GET" || req.method === "HEAD")) {
     const tunnel = await pcTunnel();
@@ -6567,16 +6569,41 @@ app.post("/api/seed", async (ctx) => {
 // server's /pc/ redirect. Restarted if it stops. Only while files are kept on the PC, and only on the PC.
 let tunnelProc = null;
 async function keepTunnel() {
-  if (!IS_PC || ENV.PC_TUNNEL === "off" || tunnelProc || !(await filesOnPc())) return;
+  if (tunnelProc) return checkTunnel();
+  if (!IS_PC || ENV.PC_TUNNEL === "off" || !(await filesOnPc())) return;
   let found = false;
-  try { tunnelProc = spawn(ENV.CLOUDFLARED_BIN || "cloudflared", ["tunnel", "--no-autoupdate", "--url", `http://localhost:${PORT}`], { stdio: ["ignore", "pipe", "pipe"] }); }
+  tunnel.url = null; tunnel.fails = 0; tunnel.since = Date.now();
+  // A .js stand-in for cloudflared (tests) runs under this Node, so the test works the same on every platform.
+  const bin = ENV.CLOUDFLARED_BIN || "cloudflared", pre = /\.m?js$/.test(bin) ? [bin] : [];
+  try { tunnelProc = spawn(pre.length ? process.execPath : bin, [...pre, "tunnel", "--no-autoupdate", "--url", `http://localhost:${PORT}`], { stdio: ["ignore", "pipe", "pipe"] }); }
   catch (e) { warn("tunnel:", e.message); tunnelProc = null; return; }
-  const read = (d) => { const m = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(String(d)); if (m && !found) { found = true; putSetting("pc.tunnel", { url: m[0], at: nowIso(), worker: WORKER_ID }).then(() => log(`tunnel: files on this PC are served at ${m[0]}`)).catch((e) => warn("tunnel:", e.message)); } };
+  const read = (d) => { const m = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(String(d)); if (m && !found) { found = true; tunnel.url = m[0]; putSetting("pc.tunnel", { url: m[0], at: nowIso(), worker: WORKER_ID }).then(() => log(`tunnel: files on this PC are served at ${m[0]}`)).catch((e) => warn("tunnel:", e.message)); } };
   tunnelProc.stdout.on("data", read); tunnelProc.stderr.on("data", read);
   tunnelProc.on("error", (e) => { warn(`tunnel: cloudflared could not start (${e.message}) — run pc\\setup.ps1`); tunnelProc = null; });
   tunnelProc.on("exit", (c) => { warn(`tunnel: cloudflared stopped (${c}); starting it again`); tunnelProc = null; q(`DELETE FROM settings WHERE key = 'pc.tunnel' AND value->>'worker' = $1`, [WORKER_ID]).catch(() => {}); });
 }
 process.on("exit", () => { try { tunnelProc?.kill(); } catch {} });
+// A quick tunnel can lose its address while cloudflared keeps running: on 2026-10-08 the address stopped existing in DNS
+// after a few hours, cloudflared never exited, and every file link failed while the dashboard showed the PC as on. So
+// the PC asks itself through its public address once a minute (on keepTunnel's timer); three misses in a row and the
+// tunnel is replaced — cloudflared is stopped, its exit clears pc.tunnel, and the next keepTunnel starts a new one.
+const TUNNEL_NONCE = randomBytes(12).toString("hex");
+const tunnel = { url: null, fails: 0, since: 0, busy: false };
+async function checkTunnel() {
+  const base = ENV.PC_TUNNEL_CHECK_URL === "self" ? `http://127.0.0.1:${PORT}` : tunnel.url;
+  if (!tunnelProc || !base || tunnel.busy || Date.now() - tunnel.since < Math.min(60000, Number(ENV.PC_TUNNEL_POLL_MS) || 60000)) return;
+  tunnel.busy = true;
+  try {
+    const ok = await fetch(`${base}/media/.tunnel-check`, { signal: AbortSignal.timeout(15000), headers: { "cache-control": "no-cache" } })
+      .then(async (r) => r.ok && (await r.text()) === TUNNEL_NONCE).catch(() => false);
+    if (ok) { tunnel.fails = 0; return; }
+    tunnel.fails++;
+    if (tunnel.fails < 3) return;
+    warn(`tunnel: ${tunnel.url} no longer reaches this PC (${tunnel.fails} checks in a row); starting a new tunnel`);
+    tunnel.fails = 0;
+    try { tunnelProc.kill(); } catch {}
+  } finally { tunnel.busy = false; }
+}
 // How much your PC's media folder holds, and how much room is left on its disk. Everything kept on the PC lands there
 // and nothing else said so until the disk filled. Walked in the background at most every ten minutes: the heartbeat
 // carries the last count and never waits for a walk, and the count is written beside the heartbeat as soon as it is in.
