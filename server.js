@@ -30,6 +30,23 @@ import pg from "pg";
 
 // === 1. config & utils ================================================
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// Which build this process runs. Render says so in RENDER_GIT_COMMIT; a PC worker reads the .commit file the dashboard's
+// installer writes after unpacking GitHub's zip (first: a zip copied over an old checkout on a PC without git leaves
+// .git behind, out of date; the installer removes .commit after a git pull), or else its git checkout (HEAD, then the
+// branch's ref, loose or packed). Read once at boot, without spawning git: a PC may not have git at all.
+function codeCommit() {
+  if (ENV.RENDER_GIT_COMMIT) return ENV.RENDER_GIT_COMMIT;
+  const sha = (v) => (/^[0-9a-f]{40}$/.test(v) ? v : null);
+  try { const v = sha(readFileSync(join(__dirname, ".commit"), "utf8").trim()); if (v) return v; } catch {}
+  try {
+    const head = readFileSync(join(__dirname, ".git", "HEAD"), "utf8").trim();
+    const ref = /^ref: (.+)$/.exec(head)?.[1];
+    if (!ref) return sha(head);
+    try { return sha(readFileSync(join(__dirname, ".git", ref), "utf8").trim()); }
+    catch { return sha(readFileSync(join(__dirname, ".git", "packed-refs"), "utf8").split(/\r?\n/).find((l) => l.endsWith(` ${ref}`))?.split(" ")[0] || ""); }
+  } catch {}
+  return null;
+}
 const ENV = process.env;
 const PORT = Number(ENV.PORT) || 4000;
 const DATABASE_URL = ENV.DATABASE_URL;
@@ -6191,7 +6208,10 @@ app.get("/api/workers", async (ctx) => {
   const server = read("boot.last"), pc = read("worker.pc"), pcBoot = read("boot.pc");
   const beat = rows.find((x) => x.key === "worker.pc"), age = beat ? Math.max(0, Number(beat.age)) : null;
   const waiting = (await one(`SELECT count(*)::int AS n FROM jobs WHERE queue = $1 AND status = 'PENDING'`, [PC_LANE])).n;
-  json(ctx, 200, { server, pc: { online: age != null && age < 90, seen_seconds_ago: age == null ? null : Math.round(age), boot: pcBoot, waiting } });
+  // A PC keeps the code it was started with while the server updates itself on every merge; a job type the old code
+  // does not know waits for it forever. Shown on the dashboard so the owner knows to update the PC.
+  const differs = !!(server?.commit && pcBoot?.commit && server.commit !== pcBoot.commit);
+  json(ctx, 200, { server, pc: { online: age != null && age < 90, seen_seconds_ago: age == null ? null : Math.round(age), boot: pcBoot, waiting, version_differs: differs } });
 });
 // ---- set up a PC from the dashboard (Set up a PC). The owner presses a button, copies one PowerShell command and pastes
 // it on the new PC; the PC installs itself (pc/install.ps1, served below) and connects without anyone copying .env.pc.
@@ -6617,7 +6637,7 @@ async function measureMedia() {
     // could say whether the new image was running at all.
     // A PC worker boots against the same database, and it must not overwrite the server's record of itself — that
     // record is how anyone tells which build the server is running. The PC writes its own.
-    putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: nowIso(), worker: WORKER_ID, commit: ENV.RENDER_GIT_COMMIT || null, branch: ENV.RENDER_GIT_BRANCH || null,
+    putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: nowIso(), worker: WORKER_ID, commit: codeCommit(), branch: ENV.RENDER_GIT_BRANCH || null,
       url: ENV.RENDER_EXTERNAL_URL || ENV.PUBLIC_BASE_URL || (RUN_SWEEPS ? `http://localhost:${PORT}` : null), lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
       blender: await blenderAvailable(), memory_mb: memoryLimitMb(), cpu: cpuFeatures(),
       env_keys: Object.entries(DEFAULT_ENV).filter(([, v]) => ENV[v]).map(([k]) => k) }).catch((e) => warn("boot.last", e.message));

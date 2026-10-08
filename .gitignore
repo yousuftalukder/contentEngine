@@ -9,3 +9,5 @@ data/
 studio/.bundle/
 # the PC worker's own tools (pc/setup.ps1)
 .tools/
+# the version a PC installed from GitHub's zip (pc/install.ps1)
+.commit

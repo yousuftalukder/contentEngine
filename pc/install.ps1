@@ -17,7 +17,7 @@ $CeToken     = '__CE_TOKEN__'
 $CeBlender   = '__CE_BLENDER__' -eq '1'
 $CeAutostart = '__CE_AUTOSTART__' -eq '1'
 $CeTakeover  = '__CE_TAKEOVER__' -eq '1'
-$CeZip       = 'https://codeload.github.com/yousuftalukder/contentEngine/zip/refs/heads/main'
+$CeRepo      = 'yousuftalukder/contentEngine'
 
 function Install-ContentEngine {
   $ErrorActionPreference = 'Stop'
@@ -58,7 +58,15 @@ function Install-ContentEngine {
   if ((Test-Path (Join-Path $dir '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
     Push-Location $dir; & git pull --ff-only; $rc = $LASTEXITCODE; Pop-Location
     if ($rc) { Stop-With 'git pull failed in this folder (see above). Sort it out, or delete the .git folder to use the zip instead, then paste the command again.'; return }
+    # The engine reads its version from git now; a .commit left by an earlier zip install would be out of date.
+    Remove-Item (Join-Path $dir '.commit') -Force -ErrorAction SilentlyContinue
   } else {
+    # The exact commit main is at, and that commit's zip: the engine reports it (.commit) so the dashboard can say when
+    # this PC runs another version than the server. Without the answer, main's zip, and no version to report.
+    $sha = $null
+    try { $sha = [string](Invoke-RestMethod -Uri "https://api.github.com/repos/$CeRepo/commits/main" -Headers @{ Accept = 'application/vnd.github.sha' } -UseBasicParsing) } catch {}
+    if ($sha -notmatch '^[0-9a-f]{40}$') { $sha = $null }
+    $CeZip = if ($sha) { "https://codeload.github.com/$CeRepo/zip/$sha" } else { "https://codeload.github.com/$CeRepo/zip/refs/heads/main" }
     $zip = Join-Path $env:TEMP 'contentengine-main.zip'
     $x = Join-Path $env:TEMP 'contentengine-main-x'
     Write-Host "  downloading $CeZip"
@@ -72,6 +80,7 @@ function Install-ContentEngine {
     $rc = $LASTEXITCODE
     Remove-Item -Recurse -Force $x, $zip -ErrorAction SilentlyContinue
     if ($rc -ge 8) { Stop-With "Copying the engine into $dir failed (robocopy exit $rc)."; return }
+    if ($sha) { [IO.File]::WriteAllText((Join-Path $dir '.commit'), $sha) } else { Remove-Item (Join-Path $dir '.commit') -Force -ErrorAction SilentlyContinue }
   }
   Get-ChildItem (Join-Path $dir 'pc') -Filter *.ps1 | Unblock-File
 
