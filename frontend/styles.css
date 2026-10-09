@@ -253,3 +253,16 @@ details.panel.start > summary { cursor: pointer; }
   .page-head .actions { margin-left: 0; }
   .proof .bar input[type=datetime-local] { width: auto; max-width: 100%; }
 }
+
+/* ---- layout that never scrolls sideways; a page dimmed while the next one loads ---- */
+/* A grid column is minmax(auto, 1fr) unless told otherwise: the Review card's widest line (a long caption note, a
+   source link, the button bar) pushed the whole page past the right edge, on the desk and on a phone. */
+.review { grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); }
+.review > *, .desk > *, .grid2 > *, .grid3 > *, .stat-list > * { min-width: 0; }
+.proof, .panel, .dialog, td, .sub, .qitem, .empty { overflow-wrap: anywhere; }
+.proof .headline, .qitem .t { overflow-wrap: normal; word-break: normal; }
+@media (max-width: 900px) { .desk, .review, .grid2, .grid3 { grid-template-columns: minmax(0, 1fr); } }
+#main.busy > *:not(#statusStrip) { opacity: .55; pointer-events: none; transition: opacity .15s; }
+.qitem.mute { cursor: default; color: var(--paper-mute); }
+.qitem.mute:hover { background: none; }
+input[type=search] { background: var(--ink); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 9px; width: 100%; color: var(--paper); }

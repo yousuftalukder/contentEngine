@@ -20,7 +20,10 @@ off; the work waits, and the Overview says the PC is off.
 1. **Make sure the PC worker is running** (`pc\start.ps1`, or set it to start at sign-in — see *The PC worker*). The
    Overview's *Files are kept on your PC* panel says **reachable** when it is up and **PC off** when it is not.
 2. Open **Review**. Everything waits there for you: approve, fix the caption, or reject with a reason (the reason
-   teaches the next draft). Videos and pictures in Review only play while the PC is on.
+   teaches the next draft; Enter in the reason box rejects). After each decision the next draft comes up by itself;
+   `j` / `k` or the arrow keys move along the queue, `/` jumps to the box that narrows it, and drafts that arrive while
+   you work are offered with a button rather than loaded under what you are editing. Videos and pictures in Review
+   only play while the PC is on.
 3. Notes you may see on a draft:
    - **"Written from headlines only"** — none of the outlets' articles could be read (Ittefaq, Desh Rupantor, Bangla
      Tribune and Dhaka Tribune block servers). Check every fact against the source before approving. These drafts are

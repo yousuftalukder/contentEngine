@@ -18,7 +18,7 @@
 import http from "node:http";
 import { readFile, writeFile, mkdir, unlink, rm, readdir, stat, statfs, open as openFile } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, createWriteStream, readFileSync } from "node:fs";
+import { existsSync, createWriteStream, createReadStream, readFileSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
@@ -5841,7 +5841,28 @@ function authOk(req) {
 async function readBody(req) { return new Promise((resolve, reject) => { let d = ""; req.on("data", (c) => { d += c; if (d.length > 1e6) { reject(new ApiError(413, null, "Body too large")); req.destroy(); } }); req.on("end", () => { if (!d) return resolve({}); try { resolve(JSON.parse(d)); } catch { reject(new ApiError(400, null, "Invalid JSON body")); } }); req.on("error", reject); }); }
 // The dashboard's own files are checked every time (a deploy must reach the open dashboard at once, not five minutes
 // later against a newer API); media files have unique names and can be kept.
-async function serveFile(res, path, cache = "public, max-age=300") { try { const data = await readFile(path); res.writeHead(200, { "Content-Type": MIME[extname(path)] || "application/octet-stream", "Cache-Control": cache }); res.end(data); return true; } catch { return false; } }
+// A file is streamed, not read whole into memory (a video from the PC's store is hundreds of megabytes), answers a Range
+// request with that part — which is how a player seeks, and how the browser asks for a video's header before playing —
+// and carries a validator, so the dashboard's own script and a picture already seen come back as a 304 and nothing.
+async function serveFile(res, path, cache = "public, max-age=300", req = null) {
+  let st; try { st = await stat(path); if (!st.isFile()) return false; } catch { return false; }
+  const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+  const headers = { "Content-Type": MIME[extname(path)] || "application/octet-stream", "Cache-Control": cache, ETag: etag, "Last-Modified": st.mtime.toUTCString(), "Accept-Ranges": "bytes" };
+  if (req?.headers["if-none-match"] === etag) { res.writeHead(304, headers); res.end(); return true; }
+  let start = 0, end = st.size - 1, status = 200;
+  const range = req && st.size ? /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || "") : null;
+  if (range && (range[1] !== "" || range[2] !== "")) {
+    if (range[1] === "") start = Math.max(0, st.size - Number(range[2]));
+    else { start = Number(range[1]); if (range[2] !== "") end = Math.min(end, Number(range[2])); }
+    if (start > end || start >= st.size) { res.writeHead(416, { "Content-Range": `bytes */${st.size}` }); res.end(); return true; }
+    status = 206; headers["Content-Range"] = `bytes ${start}-${end}/${st.size}`;
+  }
+  headers["Content-Length"] = st.size ? end - start + 1 : 0;
+  res.writeHead(status, headers);
+  if (req?.method === "HEAD" || !st.size) { res.end(); return true; }
+  await new Promise((resolve) => { const s = createReadStream(path, { start, end }); s.on("error", () => { res.destroy(); resolve(); }); s.on("close", resolve); s.pipe(res); });
+  return true;
+}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost"); const pathname = decodeURIComponent(url.pathname);
   res.setHeader("Access-Control-Allow-Origin", ENV.CORS_ORIGIN || "*"); res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS"); res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -5863,10 +5884,10 @@ const server = http.createServer(async (req, res) => {
   const isPublic = pathname === "/health" || pathname.startsWith("/api/public/") || pathname.startsWith("/media/") || pathname.startsWith("/a/");
   if (!isPublic && !authOk(req)) { res.writeHead(401, { "WWW-Authenticate": 'Basic realm="Content Engine"', "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "Unauthorized" })); }
   try {
-    if (pathname.startsWith("/media/") && req.method === "GET") { const p = join(LOCAL_MEDIA_DIR, pathname.slice(7)); if (!p.startsWith(LOCAL_MEDIA_DIR) || !(await serveFile(res, p))) send(res, 404, { error: "Not found" }); return; }
+    if (pathname.startsWith("/media/") && req.method === "GET") { const p = join(LOCAL_MEDIA_DIR, pathname.slice(7)); if (!p.startsWith(LOCAL_MEDIA_DIR) || !(await serveFile(res, p, "public, max-age=300", req))) send(res, 404, { error: "Not found" }); return; }
     const match = app.routes.find((r) => r.method === req.method && r.re.test(pathname));
     if (!match) {
-      if (req.method === "GET" && !pathname.startsWith("/api/")) { const p = join(FRONTEND_DIR, pathname === "/" ? "index.html" : pathname); if (p.startsWith(FRONTEND_DIR) && (await serveFile(res, p, "no-cache"))) return; if (await serveFile(res, join(FRONTEND_DIR, "index.html"), "no-cache")) return; }
+      if (req.method === "GET" && !pathname.startsWith("/api/")) { const p = join(FRONTEND_DIR, pathname === "/" ? "index.html" : pathname); if (p.startsWith(FRONTEND_DIR) && (await serveFile(res, p, "no-cache", req))) return; if (await serveFile(res, join(FRONTEND_DIR, "index.html"), "no-cache", req)) return; }
       return send(res, 404, { error: "Not found", path: pathname });
     }
     const groups = match.re.exec(pathname).slice(1); const params = {}; match.names.forEach((n, i) => (params[n] = groups[i]));
@@ -5882,11 +5903,19 @@ app.get("/health", async (ctx) => { const db = await one(`SELECT 1 AS ok`).then(
 app.get("/api/adapters", async (ctx) => json(ctx, 200, listAdapterKeys(await instances(true))));
 app.get("/api/adapter-impls", (ctx) => json(ctx, 200, Object.fromEntries(Object.entries(IMPLS).map(([stage, m]) => [stage, Object.values(m).map((d) => ({ id: d.id, label: d.label, configSchema: d.configSchema }))]))));
 app.get("/api/stats", async (ctx) => {
-  const [items, assets, cand, srcs, ideas, alerts] = await Promise.all([q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`)]);
-  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: await spentTodayUsd(), budgetCapUsd: await setting("budget.daily_cap_usd", 0), globalPause: await setting("publishing.global_pause", false), queues: await setting("queues.enabled", {}), telegramChatEnv: !!ENV.TELEGRAM_CHAT_ID, quotaPauses: await quotaPauses(), backlogPauses: await backlogPauses(), newsPaused: await newsPaused(),
-    storage: (await filesOnPc()) ? null : await storageUsage(), filesOnPc: await filesOnPc(), pcTunnel: await pcTunnel(), pcMedia: (await filesOnPc()) ? await pcMediaReport() : null, autoOn: await autoOn(),
-    aiToday: (await q(`SELECT provider, SUM(units)::int AS requests FROM api_usage_daily WHERE day = CURRENT_DATE GROUP BY provider ORDER BY 2 DESC`)).filter((r) => r.requests > 0),
-    newsPrograms: (await q(`SELECT id, display_name, content_type, is_active FROM niches WHERE content_type = ANY($1) ORDER BY display_name`, [[...DESK_TYPES]])).map((n) => ({ id: n.id, name: n.display_name, type: n.content_type, active: flag(n.is_active) })) });
+  // Read on every page, so its twenty reads go out together rather than one after the other: from the dashboard's own
+  // PC that was a second and a quarter of waiting on the database's round trips, now one round.
+  const onPc = await filesOnPc();
+  const [items, assets, cand, srcs, ideas, alerts, spent, cap, globalPause, queues, quota, backlog, npaused, storage, tunnel, pcMedia, auto, ai, newsProgs] = await Promise.all([
+    q(`SELECT status, COUNT(*)::int AS n FROM content_items GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM content_assets GROUP BY status`), q(`SELECT status, COUNT(*)::int AS n FROM video_candidates GROUP BY status`), one(`SELECT COUNT(*)::int AS n FROM sources WHERE is_active::int=1`), one(`SELECT COUNT(*)::int AS n FROM suggestions WHERE status='NEW'`), one(`SELECT COUNT(*)::int AS n FROM notifications WHERE read_at IS NULL AND level <> 'info'`),
+    spentTodayUsd(), setting("budget.daily_cap_usd", 0), setting("publishing.global_pause", false), setting("queues.enabled", {}), quotaPauses(), backlogPauses(), newsPaused(),
+    onPc ? null : storageUsage(), pcTunnel(), onPc ? pcMediaReport() : null, autoOn(),
+    q(`SELECT provider, SUM(units)::int AS requests FROM api_usage_daily WHERE day = CURRENT_DATE GROUP BY provider ORDER BY 2 DESC`),
+    q(`SELECT id, display_name, content_type, is_active FROM niches WHERE content_type = ANY($1) ORDER BY display_name`, [[...DESK_TYPES]])]);
+  json(ctx, 200, { items: Object.fromEntries(items.map((r) => [r.status, r.n])), assets: Object.fromEntries(assets.map((r) => [r.status, r.n])), candidates: Object.fromEntries(cand.map((r) => [r.status, r.n])), activeSources: srcs?.n ?? 0, ideas: ideas?.n ?? 0, alerts: alerts?.n ?? 0, spentTodayUsd: spent, budgetCapUsd: cap, globalPause, queues, telegramChatEnv: !!ENV.TELEGRAM_CHAT_ID, quotaPauses: quota, backlogPauses: backlog, newsPaused: npaused,
+    storage, filesOnPc: onPc, pcTunnel: tunnel, pcMedia, autoOn: auto,
+    aiToday: ai.filter((r) => r.requests > 0),
+    newsPrograms: newsProgs.map((n) => ({ id: n.id, name: n.display_name, type: n.content_type, active: flag(n.is_active) })) });
 });
 // ---- storage
 // What the PC last said its media folder holds (written with its heartbeat), read from the table: the PC writes it.
@@ -6407,7 +6436,9 @@ app.post("/api/style-profiles", async (ctx) => { const b = ctx.body; if (!b.name
 app.patch("/api/style-profiles/:id", async (ctx) => json(ctx, 200, rowJson(await patchRow("style_profiles", ctx.params.id, ctx.body, { name: "name", language: "language", tone: "tone", rules: "rules", examples: "examples", bannedTerms: "banned_terms", cta: "cta", hashtags: "hashtags", brandId: "brand_id" }), ["banned_terms", "hashtags"])));
 app.delete("/api/style-profiles/:id", async (ctx) => { await q(`UPDATE niches SET style_profile_id=NULL WHERE style_profile_id=$1`, [ctx.params.id]); await q(`DELETE FROM style_profiles WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
 // ---- sources
-app.get("/api/sources", async (ctx) => json(ctx, 200, (await q(`SELECT s.*, (SELECT json_agg(json_build_object('id', n.id, 'name', n.display_name)) FROM niches n JOIN niche_sources ns ON ns.niche_id=n.id WHERE ns.source_id=s.id) AS programs, (SELECT COUNT(*)::int FROM source_items si WHERE si.source_id=s.id) AS item_count FROM sources s ORDER BY created_at DESC`)).map((r) => rowJson(r, ["config"]))));
+// The item counts come from one pass over source_items, grouped, not one scan of the whole table per source: with 47,000
+// items and 32 sources that was 32 scans and most of a second, on the Overview as well as here.
+app.get("/api/sources", async (ctx) => json(ctx, 200, (await q(`SELECT s.*, (SELECT json_agg(json_build_object('id', n.id, 'name', n.display_name)) FROM niches n JOIN niche_sources ns ON ns.niche_id=n.id WHERE ns.source_id=s.id) AS programs, COALESCE(c.n, 0) AS item_count FROM sources s LEFT JOIN (SELECT source_id, COUNT(*)::int AS n FROM source_items GROUP BY source_id) c ON c.source_id = s.id ORDER BY s.created_at DESC`)).map((r) => rowJson(r, ["config"]))));
 app.post("/api/sources", async (ctx) => { const b = ctx.body; if (!b.name || !b.adapterKey) throw new ApiError(400, null, "name and adapterKey are required"); const id = newId(); await q(`INSERT INTO sources (id, brand_id, name, kind, adapter_key, config, poll_interval_minutes, license_policy) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`, [id, b.brandId || null, b.name, b.kind || b.adapterKey.toUpperCase(), b.adapterKey, JSON.stringify(b.config || {}), b.pollIntervalMinutes ?? 30, b.licensePolicy || "ANY"]); if (Array.isArray(b.nicheIds)) for (const n of b.nicheIds) await q(`INSERT INTO niche_sources (id, niche_id, source_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), n, id]); json(ctx, 201, rowJson(await one(`SELECT * FROM sources WHERE id=$1`, [id]), ["config"])); });
 app.patch("/api/sources/:id", async (ctx) => json(ctx, 200, rowJson(await patchRow("sources", ctx.params.id, ctx.body, { name: "name", kind: "kind", adapterKey: "adapter_key", config: "config", pollIntervalMinutes: "poll_interval_minutes", isActive: "is_active", licensePolicy: "license_policy" }), ["config"])));
 app.delete("/api/sources/:id", async (ctx) => { await q(`DELETE FROM sources WHERE id=$1`, [ctx.params.id]); json(ctx, 200, { ok: true }); });
@@ -6478,7 +6509,8 @@ app.post("/api/health/sweep", async (ctx) => { await sweepHealth(); json(ctx, 20
 app.get("/api/source-items", async (ctx) => { const s = ctx.query.get("sourceId"), st = ctx.query.get("status"); json(ctx, 200, await q(`SELECT si.*, s.name AS source_name FROM source_items si JOIN sources s ON s.id=si.source_id WHERE ($1::text IS NULL OR si.source_id=$1) AND ($2::text IS NULL OR si.status=$2) ORDER BY si.created_at DESC LIMIT 200`, [s, st])); });
 app.post("/api/source-items/:id/route", async (ctx) => { const it = await one(`SELECT * FROM source_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); const raw = P(it.raw) || {}; const n = await routeSourceItem({ ...it, thumbnail: it.thumbnail_url, duration: raw.duration, views: raw.views, platform: raw.platform, license: raw.license }); json(ctx, 200, { routed: n }); });
 // ---- video candidates & clips
-app.get("/api/video-candidates", async (ctx) => { const st = ctx.query.get("status"), n = ctx.query.get("nicheId"); json(ctx, 200, (await q(`SELECT vc.*, n.display_name AS program_name, (SELECT COUNT(*)::int FROM clips c WHERE c.video_candidate_id=vc.id) AS clip_count FROM video_candidates vc LEFT JOIN niches n ON n.id=vc.niche_id WHERE ($1::text IS NULL OR vc.status=$1) AND ($2::text IS NULL OR vc.niche_id=$2) ORDER BY vc.score DESC, vc.created_at DESC LIMIT 200`, [st, n])).map((r) => ({ ...r, transcript: undefined, has_transcript: !!r.transcript }))); });
+// The transcripts are not fetched for the list (they were, then dropped: most of the list's weight and time).
+app.get("/api/video-candidates", async (ctx) => { const st = ctx.query.get("status"), n = ctx.query.get("nicheId"); json(ctx, 200, await q(`SELECT vc.id, vc.source_id, vc.source_item_id, vc.niche_id, vc.platform, vc.external_id, vc.source_url, vc.title, vc.duration_seconds, vc.view_count, vc.published_at, vc.thumbnail_url, vc.license, vc.score, vc.score_reason, vc.status, vc.local_path, vc.error_message, vc.created_at, vc.updated_at, (vc.transcript IS NOT NULL) AS has_transcript, n.display_name AS program_name, (SELECT COUNT(*)::int FROM clips c WHERE c.video_candidate_id=vc.id) AS clip_count FROM video_candidates vc LEFT JOIN niches n ON n.id=vc.niche_id WHERE ($1::text IS NULL OR vc.status=$1) AND ($2::text IS NULL OR vc.niche_id=$2) ORDER BY vc.score DESC, vc.created_at DESC LIMIT 200`, [st, n])); });
 app.get("/api/video-candidates/:id", async (ctx) => { const r = await one(`SELECT * FROM video_candidates WHERE id=$1`, [ctx.params.id]); if (!r) throw new ApiError(404, null, "Not found"); json(ctx, 200, { ...rowJson(r, ["transcript"]), clips: await q(`SELECT * FROM clips WHERE video_candidate_id=$1 ORDER BY score DESC`, [r.id]) }); });
 app.post("/api/video-candidates", async (ctx) => { const b = ctx.body; if (!b.nicheId || !b.url) throw new ApiError(400, null, "nicheId and url are required"); const niche = await one(`SELECT * FROM niches WHERE id=$1`, [b.nicheId]); if (!niche) throw new ApiError(404, null, "Program not found"); const id = newId(); await q(`INSERT INTO video_candidates (id, niche_id, source_url, title, platform, license, score, score_reason, status) VALUES ($1,$2,$3,$4,$5,$6,1,'manual','QUEUED')`, [id, b.nicheId, b.url, b.title || b.url, b.platform || null, b.license || "UNKNOWN"]); await enqueue("PROCESS_CANDIDATE", { candidateId: id }, { queue: videoQueueFor(niche), priority: 10, dedupeKey: `cand:${id}` }); json(ctx, 202, await one(`SELECT * FROM video_candidates WHERE id=$1`, [id])); });
 app.post("/api/video-candidates/:id/process", async (ctx) => { await q(`UPDATE video_candidates SET status='QUEUED', error_message=NULL WHERE id=$1`, [ctx.params.id]); const owner = await one(`SELECT n.* FROM niches n JOIN video_candidates c ON c.niche_id = n.id WHERE c.id = $1`, [ctx.params.id]); await enqueue("PROCESS_CANDIDATE", { candidateId: ctx.params.id }, { queue: videoQueueFor(owner), priority: 10, dedupeKey: `cand:${ctx.params.id}` }); json(ctx, 202, { ok: true }); });
@@ -6496,7 +6528,10 @@ app.get("/api/research-notes", async (ctx) => { const it = ctx.query.get("conten
 // ---- content items (ledger + review)
 const ITEM_JSON = ["source_data_ref", "script_meta", "niche_profile_version", "captions", "hashtags"];
 async function itemWithMedia(row) { const r = rowJson(row, ITEM_JSON); r.hero_media = r.hero_media_id ? await one(`SELECT * FROM media_assets WHERE id=$1`, [r.hero_media_id]) : null; r.assets = await q(`SELECT a.*, c.display_name AS channel_name, c.platform FROM content_assets a JOIN channels c ON c.id=a.channel_id WHERE a.content_item_id=$1`, [r.id]); r.portal_url = r.portal_article_id ? portalUrlFor(await one(`SELECT slug FROM portal_articles WHERE id=$1`, [r.portal_article_id])) : null; return r; }
-app.get("/api/content-items", async (ctx) => { const st = ctx.query.get("status"), n = ctx.query.get("nicheId"); const rows = await q(`SELECT ci.*, m.url AS hero_url, m.kind AS hero_kind, n.display_name AS program_name FROM content_items ci LEFT JOIN media_assets m ON m.id=ci.hero_media_id LEFT JOIN niches n ON n.id=ci.niche_id WHERE ($1::text IS NULL OR ci.status=$1) AND ($2::text IS NULL OR ci.niche_id=$2) ORDER BY ci.created_at DESC LIMIT 200`, [st, n]); json(ctx, 200, rows.map((r) => rowJson(r, ITEM_JSON))); });
+// The dashboard's Content page asks for compact rows: the full ones carry every script, caption and research field of
+// 200 items (1.3 MB, two seconds) for a table that shows a headline and a status. Everything else gets whole rows.
+const ITEM_LIST_COLS = "ci.id, ci.niche_id, ci.status, ci.content_type, ci.topic, ci.headline, ci.rejection_note, ci.qa_status, ci.clip_id, ci.cluster_id, ci.derived_from_id, ci.episode_number, ci.hero_media_id, ci.generation_cost_usd, ci.review_deadline_at, ci.created_at, ci.updated_at";
+app.get("/api/content-items", async (ctx) => { const st = ctx.query.get("status"), n = ctx.query.get("nicheId"), cols = ctx.query.get("compact") ? ITEM_LIST_COLS : "ci.*"; const rows = await q(`SELECT ${cols}, m.url AS hero_url, m.kind AS hero_kind, n.display_name AS program_name FROM content_items ci LEFT JOIN media_assets m ON m.id=ci.hero_media_id LEFT JOIN niches n ON n.id=ci.niche_id WHERE ($1::text IS NULL OR ci.status=$1) AND ($2::text IS NULL OR ci.niche_id=$2) ORDER BY ci.created_at DESC LIMIT 200`, [st, n]); json(ctx, 200, rows.map((r) => rowJson(r, ITEM_JSON.filter((f) => f in r)))); });
 app.get("/api/review", async (ctx) => { const rows = await q(`SELECT ci.*, m.url AS hero_url, m.kind AS hero_kind, n.display_name AS program_name, n.content_type AS program_type FROM content_items ci LEFT JOIN media_assets m ON m.id=ci.hero_media_id LEFT JOIN niches n ON n.id=ci.niche_id WHERE ci.status='PENDING_REVIEW' ORDER BY ci.review_deadline_at NULLS LAST, ci.created_at ASC LIMIT 100`); json(ctx, 200, rows.map((r) => rowJson(r, ITEM_JSON))); });
 app.get("/api/content-items/:id", async (ctx) => { const it = await one(`SELECT * FROM content_items WHERE id=$1`, [ctx.params.id]); if (!it) throw new ApiError(404, null, "Not found"); json(ctx, 200, await itemWithMedia(it)); });
 app.post("/api/generate", async (ctx) => {
