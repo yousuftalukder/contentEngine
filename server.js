@@ -16,14 +16,14 @@
 // =====================================================================
 
 import http from "node:http";
-import { readFile, writeFile, mkdir, unlink, rm, readdir, stat, statfs, open as openFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink, rm, readdir, stat, statfs, rename, cp, open as openFile } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, createWriteStream, createReadStream, readFileSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { dirname, join, extname, basename } from "node:path";
+import { dirname, join, extname, basename, isAbsolute, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir, totalmem, hostname } from "node:os";
 import pg from "pg";
@@ -53,7 +53,47 @@ const DATABASE_URL = ENV.DATABASE_URL;
 const TMP = join(ENV.WORK_DIR || tmpdir(), "content-engine");
 // Where this machine keeps the files it stores (your PC's store when files are kept there). Tests point it at their own
 // scratch folder: they were writing into the very folder that is now the production store.
-const LOCAL_MEDIA_DIR = ENV.MEDIA_DIR || join(__dirname, "data", "media");
+const DEFAULT_MEDIA_DIR = ENV.MEDIA_DIR || join(__dirname, "data", "media");
+let LOCAL_MEDIA_DIR = DEFAULT_MEDIA_DIR;
+// Where this PC keeps its files: the folder chosen on the dashboard (Settings → Media storage, storage.pc_dir) wins over
+// MEDIA_DIR and the default data\media; cleared, it is the default again. Applied as the worker starts, and again
+// within a minute of a change while it runs (watchPcDir, which first lets the jobs under way finish and holds new ones):
+// the new folder gets the old one's files moved into it (renamed on the same disk; copied and removed across disks),
+// so nothing Review shows goes missing, and the old folder is left empty. A folder that cannot be used leaves the files
+// where they are, and says so on the dashboard. Returns whether the folder changed.
+async function applyPcDir() {
+  const want = String(await setting("storage.pc_dir", "") || "").trim().replace(/[\\/]+$/, "") || DEFAULT_MEDIA_DIR;
+  if (!isAbsolute(want)) { await notify("pc_dir", "The PC's media folder could not be used", `"${want}" is not a full path (like D:\\ContentEngine\\media). Files stay in ${LOCAL_MEDIA_DIR}.`, { key: "pc_dir", cooldownHours: 1 }); return false; }
+  const next = normalize(want), cur = normalize(LOCAL_MEDIA_DIR);
+  if (next.toLowerCase() === cur.toLowerCase()) return false;
+  try {
+    await mkdir(next, { recursive: true });
+    const here = await readdir(cur).catch(() => []), there = await readdir(next);
+    if (here.length && !there.length) {
+      for (const name of here) {
+        const from = join(cur, name), to = join(next, name);
+        try { await rename(from, to); } catch (e) { if (e.code !== "EXDEV") throw e; await cp(from, to, { recursive: true }); await rm(from, { recursive: true, force: true }); }
+      }
+      log(`media: moved ${here.length} entr${here.length === 1 ? "y" : "ies"} from ${cur} to ${next}`);
+    } else if (here.length && there.length) await notify("pc_dir", "The PC's old media files were left where they were", `${next} already held files, so those in ${cur} were not moved. Copy them across by hand if Review should still show them.`, { key: "pc_dir_left", cooldownHours: 24 });
+    LOCAL_MEDIA_DIR = next; log(`media: files are kept in ${next}`);
+    pcMedia.at = 0;   // the next heartbeat measures the new folder and reports it
+    return true;
+  } catch (e) { await notify("pc_dir", "The PC's media folder could not be used", `${next}: ${e.message}. Files stay in ${LOCAL_MEDIA_DIR}.`, { key: "pc_dir", cooldownHours: 1 }); return false; }
+}
+// The folder re-read every minute while the worker runs. A change waits for the jobs under way (a render writing its
+// file into the old folder would be left behind) and holds new ones until the move is done, then the lane goes on.
+async function watchPcDir() {
+  const want = String(await setting("storage.pc_dir", "") || "").trim().replace(/[\\/]+$/, "") || DEFAULT_MEDIA_DIR;
+  if (!isAbsolute(want) || normalize(want).toLowerCase() === normalize(LOCAL_MEDIA_DIR).toLowerCase() || pcSlots.hold) return;
+  let release; pcSlots.hold = new Promise((r) => (release = r));
+  try {
+    const until = Date.now() + 2 * 3600e3;
+    while (pcSlots.busy > 0 && Date.now() < until) await sleep(2000);
+    if (pcSlots.busy > 0) { warn("media folder: jobs still running after two hours; the move waits for a quieter minute"); return; }
+    if (await applyPcDir()) pcMediaSize();
+  } finally { pcSlots.hold = null; release(); }
+}
 const FRONTEND_DIR = join(__dirname, "frontend");
 const WORKER_ID = `${ENV.RENDER_INSTANCE_ID || "local"}-${process.pid}`;
 const QUEUE_POLL_MS = Number(ENV.QUEUE_POLL_INTERVAL_MS) || 3000;
@@ -333,13 +373,13 @@ function decryptSecret(blob) {
 }
 const secretHint = (s) => { const t = String(s || "").trim(); return t.length > 8 ? `…${t.slice(-4)}` : "…"; };
 // Some providers need several values (YouTube OAuth). Those are stored as one JSON secret and exposed as an object.
-const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"], meta_app: ["app_id", "app_secret"] };
+const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"], meta_app: ["app_id", "app_secret"], google_app: ["client_id", "client_secret"] };
 const parseSecret = (provider, raw) => (MULTI_FIELD_PROVIDERS[provider] && raw ? (P(raw) || {}) : raw);
 
 const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", pexels: "PEXELS_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN",
   groq: "GROQ_API_KEY", mistral: "MISTRAL_API_KEY", cerebras: "CEREBRAS_API_KEY", openrouter: "OPENROUTER_API_KEY", xai: "XAI_API_KEY", pollinations: "POLLINATIONS_TOKEN",
   vizard: "VIZARDAI_API_KEY", twelve_labs: "TWELVE_LABS_API_KEY" };
-const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2", "meta_app"];
+const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2", "meta_app", "google_app"];
 // Resolve the usable secret of one credential row: vault first, then the named env var.
 function credSecret(r) {
   if (r.secret_enc) return { secret: parseSecret(r.provider, decryptSecret(r.secret_enc)), source: "vault" };
@@ -530,8 +570,10 @@ const storageCache = { at: 0, backend: null };
 async function storageBackend() {
   if (Date.now() - storageCache.at < 30000 && storageCache.backend) return storageCache.backend;
   if (await filesOnPc()) { storageCache.backend = IS_PC ? STORAGE.pc : STORAGE.pcRemote; storageCache.at = Date.now(); return storageCache.backend; }
-  const forced = (ENV.STORAGE_BACKEND || "").toLowerCase();
-  let b = forced && STORAGE[forced] ? STORAGE[forced] : null;
+  // The dashboard's choice of cloud (Settings → Media storage, storage.backend) first, then Render's STORAGE_BACKEND,
+  // then whichever is set up: R2 before Supabase before the server's own disk.
+  const forced = String((await setting("storage.backend", "")) || ENV.STORAGE_BACKEND || "").toLowerCase();
+  let b = forced && STORAGE[forced] && (await STORAGE[forced].available()) ? STORAGE[forced] : null;
   if (!b) for (const k of ["r2", "supabase", "local"]) if (await STORAGE[k].available()) { b = STORAGE[k]; break; }
   storageCache.backend = b; storageCache.at = Date.now(); return b;
 }
@@ -5472,7 +5514,7 @@ async function runJobInner(job, h, payload) {
 // waiting on a writer or a platform. A clip type is listed too, should one ever be drafted rather than cut.
 const HEAVY_JOB_KEYS = ["STUDIO_RENDER", "RENDER_CLIP", "PROCESS_CANDIDATE", ...[...MADE_VIDEO_TYPES, ...VIDEO_TYPES].flatMap((t) => [`GENERATE_CONTENT:${t}`, `REGENERATE:${t}:all`])];
 const PC_CONCURRENCY_MAX = 6;
-const pcSlots = { want: 0, loops: new Set() };
+const pcSlots = { want: 0, loops: new Set(), busy: 0, hold: null };   // busy: PC jobs under way; hold: a promise while the media folder moves
 async function pcConcurrency() {
   const n = Math.round(Number((await setting("worker.pc_concurrency", null)) ?? ENV.PC_CONCURRENCY ?? 2));
   return n >= 1 ? Math.min(PC_CONCURRENCY_MAX, n) : 2;
@@ -5498,9 +5540,10 @@ async function workerLoop(queue, slot = 0) {
       const enabled = await setting("queues.enabled", {});
       // One loop on its own takes anything, as before; with several, only the first takes heavy work (and takes it first).
       const mode = pc && pcSlots.want > 1 ? (slot === 0 ? "heavy_first" : "light") : null;
+      if (pc && pcSlots.hold) await pcSlots.hold;   // the media folder is moving: no new job until it is done
       if (enabled[queue] !== false) {
         const [job] = mode ? await q(`SELECT * FROM claim_job($1, $2, $3, $4)`, [queue, WORKER_ID, mode, HEAVY_JOB_KEYS]) : await q(`SELECT * FROM claim_job($1, $2)`, [queue, WORKER_ID]);
-        if (job) { ran = true; await runJob(job); }
+        if (job) { ran = true; if (pc) pcSlots.busy++; try { await runJob(job); } finally { if (pc) pcSlots.busy--; } }
       }
     } catch (e) { warn(`lane ${queue}:`, e.message); }
     await sleep(ran ? 100 : QUEUE_POLL_MS);
@@ -5799,15 +5842,18 @@ async function sweepRetention() {
 function startWorkers() {
   if (!LANES.length) { warn("LANES is set but names no known lane — this process serves HTTP only"); return; }
   for (const qn of LANES) if (qn !== PC_LANE) workerLoop(qn);
-  if (LANES.includes(PC_LANE)) { syncPcSlots(); setInterval(() => syncPcSlots().catch(() => {}), Number(ENV.PC_SLOTS_POLL_MS) || 60000); }
-  // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
-  // leaving routed work to look stuck.
-  if (LANES.includes(PC_LANE)) {
+  // The PC's lane starts once its files are where the dashboard says they should be (applyPcDir): a job that wrote a
+  // picture while the folder was being moved would have left it behind.
+  if (LANES.includes(PC_LANE)) (async () => {
+    if (IS_PC) { await applyPcDir().catch((e) => warn("media folder", e.message)); setInterval(() => watchPcDir().catch((e) => warn("media folder", e.message)), Number(ENV.PC_DIR_POLL_MS) || 60000); }
+    syncPcSlots(); setInterval(() => syncPcSlots().catch(() => {}), Number(ENV.PC_SLOTS_POLL_MS) || 60000);
+    // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
+    // leaving routed work to look stuck.
     const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, host: PC_HOST, lanes: LANES, media: pcMediaSize() }).catch((e) => warn("pc heartbeat", e.message));
     beat(); setInterval(beat, 30000);
     // The files this PC keeps: its tunnel opened (and reopened), and its own files cleaned up as the server's would be.
     if (IS_PC) { keepTunnel(); setInterval(() => keepTunnel().catch(() => {}), Number(ENV.PC_TUNNEL_POLL_MS) || 60000); setInterval(() => sweepStorageCleanup().catch((e) => warn("cleanup", e.message)), 60 * 60000); }
-  }
+  })();
   if (!RUN_SWEEPS) { log(`sweeps disabled on this instance (lanes: ${LANES.join(",")})`); return; }
   const every = (ms, fn) => { const tick = () => fn().catch((e) => warn(fn.name, e.message)); setTimeout(tick, 3000); setInterval(tick, ms); };
   every(60000, sweepDueSources); every(60000, sweepNewsDesk); every(30000, sweepDueAssets); every(60000, sweepReviewDeadlines); every(10 * 60000, sweepStaleNews); every(30 * 60000, sweepMetrics);
@@ -5987,6 +6033,8 @@ app.post("/api/credentials/:id/test", async (ctx) => {
     meta: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/me?${form({ fields: "id,name", access_token: c.secret })}`),
     // An app token proves the id and secret belong together; nothing else is asked of them here.
     meta_app: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/oauth/access_token?${form({ client_id: c.secret?.app_id, client_secret: c.secret?.app_secret, grant_type: "client_credentials" })}`).then((r) => ({ app_token: !!r.access_token })),
+    // Google issues nothing to a bare client; the pair is proven the moment a channel is connected with it.
+    google_app: async () => { if (!c.secret?.client_id || !c.secret?.client_secret) throw new Error("client_id and client_secret are both needed"); return { note: "Both fields are present; the pair is checked when you connect a YouTube channel (Channels → Connect with YouTube)." }; },
     youtube_oauth: () => fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: c.secret.client_id, client_secret: c.secret.client_secret, refresh_token: c.secret.refresh_token, grant_type: "refresh_token" }) }).then((t) => ({ token_type: t.token_type, expires_in: t.expires_in })),
     telegram: () => fetchJson(`https://api.telegram.org/bot${c.secret}/getMe`).then((r) => ({ bot: r.result?.username })),
     r2: async () => { const cfg = await r2Config(); if (!cfg) throw new Error("R2 fields incomplete"); await r2Request("PUT", "healthcheck.txt", Buffer.from("ok"), "text/plain"); await r2Request("DELETE", "healthcheck.txt"); return { bucket: cfg.bucket, public_url: cfg.public_url || "(none — set public_url so platforms can fetch files)" }; },
@@ -6399,16 +6447,38 @@ app.post("/api/meta/pages", async (ctx) => {
 // token every Page's token (stored, as above), and the browser goes back to the dashboard it started from — which may
 // be the PC's own copy, while the callback must be the server's public https address, the one registered in the app.
 // The result waits under the state for the dashboard to collect once; nothing of it is in the address bar.
-const META_OAUTH_MINUTES = 15, metaOauthKey = (state) => `meta.oauth.${state}`;
+// One login's state, kept fifteen minutes under oauth.<kind>.<state>: begun by the dashboard (with where to come back
+// to), taken once by the public callback, and the result put back under it for the dashboard to collect once. Facebook
+// and YouTube share this; only the dialog, the exchange and what is stored differ.
+const OAUTH_MINUTES = 15, oauthKey = (kind, state) => `oauth.${kind}.${state}`;
+const OAUTH_GONE = (what) => `This ${what} login link was already used or has expired (each one works once, for ${OAUTH_MINUTES} minutes). Go back to the dashboard and connect again.`;
+async function oauthBegin(kind, ctx) {
+  const state = newId(), own = `${ctx.req.headers["x-forwarded-proto"] || "http"}://${ctx.req.headers.host}`;
+  const back = String(ctx.query.get("returnTo") || own);
+  const returnTo = /^https?:\/\//.test(back) ? back.replace(/#.*$/, "").replace(/\/$/, "") : own;
+  await q(`DELETE FROM settings WHERE key LIKE 'oauth.%' AND (value->>'expires_at')::timestamptz < now()`);
+  await q(`INSERT INTO settings (key, value) VALUES ($1, $2::jsonb || jsonb_build_object('expires_at', now() + make_interval(mins => $3::int)))`, [oauthKey(kind, state), JSON.stringify({ brandId: ctx.query.get("brandId") || null, returnTo }), OAUTH_MINUTES]);
+  return state;
+}
+async function oauthTake(kind, state) {
+  const row = state ? await one(`DELETE FROM settings WHERE key = $1 AND NOT (value ? 'done_at') RETURNING value, (value->>'expires_at')::timestamptz > now() AS live`, [oauthKey(kind, state)]) : null;
+  return row?.live ? P(row.value) || {} : null;
+}
+async function oauthFinish(ctx, kind, state, begun, result, page) {
+  await putSetting(oauthKey(kind, state), { ...result, brandId: begun.brandId, done_at: nowIso(), expires_at: new Date(nowMs() + OAUTH_MINUTES * 60000).toISOString() });
+  ctx.res.writeHead(302, { Location: `${begun.returnTo || await serverBase()}/#/channels/${page}/${state}`, "Cache-Control": "no-store" }); ctx.res.end();
+}
+async function oauthResult(ctx, kind) {
+  const row = await one(`DELETE FROM settings WHERE key = $1 AND value ? 'done_at' RETURNING value`, [oauthKey(kind, ctx.params.state)]);
+  if (!row) throw new ApiError(404, null, "No login result waits under that link: it was already shown, or it expired. Connect again.");
+  const { done_at, expires_at, ...rest } = P(row.value) || {};
+  json(ctx, 200, rest);
+}
 const metaRedirectUri = async () => `${await serverBase()}/api/public/meta/callback`;
 app.get("/api/meta/oauth/config", async (ctx) => { const app = await metaAppConfig(); json(ctx, 200, { configured: !!app, appIdHint: app ? `…${app.app_id.slice(-4)}` : null, redirectUri: await metaRedirectUri() }); });
 app.get("/api/meta/oauth/start", async (ctx) => {
   const app = await metaAppConfig(); if (!app) throw new ApiError(400, null, "Add the Facebook app's id and secret first (API keys → Facebook app), or paste a token instead");
-  const state = newId(), proto = ctx.req.headers["x-forwarded-proto"] || "http";
-  const back = String(ctx.query.get("returnTo") || `${proto}://${ctx.req.headers.host}/`);
-  const returnTo = /^https?:\/\//.test(back) ? back.replace(/#.*$/, "").replace(/\/$/, "") : `${proto}://${ctx.req.headers.host}`;
-  await q(`DELETE FROM settings WHERE key LIKE 'meta.oauth.%' AND (value->>'expires_at')::timestamptz < now()`);
-  await q(`INSERT INTO settings (key, value) VALUES ($1, $2::jsonb || jsonb_build_object('expires_at', now() + make_interval(mins => $3::int)))`, [metaOauthKey(state), JSON.stringify({ brandId: ctx.query.get("brandId") || null, returnTo }), META_OAUTH_MINUTES]);
+  const state = await oauthBegin("meta", ctx);
   // Instagram's two permissions only when asked for: an app whose use case has no Instagram is refused the whole login
   // for them ("Invalid Scopes"), and most Pages have no Instagram account to connect.
   const scope = ["pages_show_list", "pages_manage_posts", "pages_read_engagement", ...(ctx.query.get("ig") ? ["instagram_basic", "instagram_content_publish"] : [])].join(",");
@@ -6416,10 +6486,8 @@ app.get("/api/meta/oauth/start", async (ctx) => {
   ctx.res.writeHead(302, { Location: `${login}/${DEFAULTS.META_API_VERSION}/dialog/oauth?${form({ client_id: app.app_id, redirect_uri: await metaRedirectUri(), state, response_type: "code", scope })}`, "Cache-Control": "no-store" }); ctx.res.end();
 });
 app.get("/api/public/meta/callback", async (ctx) => {
-  const state = String(ctx.query.get("state") || "");
-  const row = state ? await one(`DELETE FROM settings WHERE key = $1 AND NOT (value ? 'done_at') RETURNING value, (value->>'expires_at')::timestamptz > now() AS live`, [metaOauthKey(state)]) : null;
-  if (!row?.live) return plainText(ctx, 400, "This Facebook login link was already used or has expired (each one works once, for 15 minutes). Go back to the dashboard and press Connect with Facebook again.");
-  const v = P(row.value) || {};
+  const state = String(ctx.query.get("state") || ""), begun = await oauthTake("meta", state);
+  if (!begun) return plainText(ctx, 400, OAUTH_GONE("Facebook"));
   let result;
   try {
     if (ctx.query.get("error")) throw new Error(ctx.query.get("error_description") || ctx.query.get("error_reason") || ctx.query.get("error"));
@@ -6427,16 +6495,62 @@ app.get("/api/public/meta/callback", async (ctx) => {
     const graph = await setting("meta.api_base", "https://graph.facebook.com");
     const tok = await fetchJson(`${graph}/${DEFAULTS.META_API_VERSION}/oauth/access_token?${form({ client_id: app.app_id, client_secret: app.app_secret, redirect_uri: await metaRedirectUri(), code: ctx.query.get("code") })}`);
     if (!tok.access_token) throw new Error("Facebook returned no access token for the login");
-    result = { ...(await metaConnectPages(tok.access_token, app.app_id, app.app_secret)), brandId: v.brandId };
-  } catch (e) { result = { error: String(e.message || e).slice(0, 400), brandId: v.brandId }; }
-  await putSetting(metaOauthKey(state), { ...result, done_at: nowIso(), expires_at: new Date(nowMs() + META_OAUTH_MINUTES * 60000).toISOString() });
-  ctx.res.writeHead(302, { Location: `${v.returnTo || await serverBase()}/#/channels/connected/${state}`, "Cache-Control": "no-store" }); ctx.res.end();
+    result = await metaConnectPages(tok.access_token, app.app_id, app.app_secret);
+  } catch (e) { result = { error: String(e.message || e).slice(0, 400) }; }
+  await oauthFinish(ctx, "meta", state, begun, result, "connected");
 });
-app.get("/api/meta/oauth/result/:state", async (ctx) => {
-  const row = await one(`DELETE FROM settings WHERE key = $1 AND value ? 'done_at' RETURNING value`, [metaOauthKey(ctx.params.state)]);
-  if (!row) throw new ApiError(404, null, "No Facebook login result waits under that link: it was already shown, or it expired. Press Connect with Facebook again.");
-  const { done_at, expires_at, ...rest } = P(row.value) || {};
-  json(ctx, 200, rest);
+app.get("/api/meta/oauth/result/:state", (ctx) => oauthResult(ctx, "meta"));
+// ---- Connect with YouTube: Google's login, the same way. The app is a Google Cloud OAuth client (API keys → Google
+// app, or YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET on Render). The login asks for offline access, so a refresh token
+// comes back; it is stored with the client as a youtube_oauth credential, one per channel the account owns, which is
+// exactly what the uploader already reads.
+async function googleAppConfig() {
+  const vault = (await credentialsFor("google_app"))[0]?.secret;
+  const c = vault && typeof vault === "object" ? vault : { client_id: ENV.YOUTUBE_CLIENT_ID, client_secret: ENV.YOUTUBE_CLIENT_SECRET };
+  return c.client_id && c.client_secret ? { client_id: String(c.client_id).trim(), client_secret: String(c.client_secret).trim() } : null;
+}
+const youtubeRedirectUri = async () => `${await serverBase()}/api/public/youtube/callback`;
+app.get("/api/youtube/oauth/config", async (ctx) => { const app = await googleAppConfig(); json(ctx, 200, { configured: !!app, clientIdHint: app ? `${app.client_id.slice(0, 10)}…` : null, redirectUri: await youtubeRedirectUri() }); });
+app.get("/api/youtube/oauth/start", async (ctx) => {
+  const app = await googleAppConfig(); if (!app) throw new ApiError(400, null, "Add the Google OAuth client's id and secret first (API keys → Google app)");
+  const state = await oauthBegin("youtube", ctx);
+  const login = await setting("youtube.login_base", "https://accounts.google.com");
+  ctx.res.writeHead(302, { Location: `${login}/o/oauth2/v2/auth?${form({ client_id: app.client_id, redirect_uri: await youtubeRedirectUri(), response_type: "code", scope: "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly", access_type: "offline", prompt: "consent", include_granted_scopes: "true", state })}`, "Cache-Control": "no-store" }); ctx.res.end();
+});
+app.get("/api/public/youtube/callback", async (ctx) => {
+  const state = String(ctx.query.get("state") || ""), begun = await oauthTake("youtube", state);
+  if (!begun) return plainText(ctx, 400, OAUTH_GONE("YouTube"));
+  let result;
+  try {
+    if (ctx.query.get("error")) throw new Error(ctx.query.get("error_description") || ctx.query.get("error"));
+    const app = await googleAppConfig(); if (!app) throw new Error("the Google OAuth client's id and secret are no longer set (API keys → Google app)");
+    if (!vaultReady()) throw new Error("SECRETS_KEY is not set on Render, so the refresh token cannot be stored");
+    const tokenBase = await setting("youtube.token_base", "https://oauth2.googleapis.com"), api = await setting("youtube.api_base", "https://www.googleapis.com");
+    const t = await fetchJson(`${tokenBase}/token`, { method: "POST", body: form({ code: ctx.query.get("code"), client_id: app.client_id, client_secret: app.client_secret, redirect_uri: await youtubeRedirectUri(), grant_type: "authorization_code" }) });
+    if (!t.refresh_token) throw new Error("Google returned no refresh token. Remove the engine from the Google account's connected apps (myaccount.google.com → Security → Third-party access) and connect again, so consent is asked afresh.");
+    const r = await fetchJson(`${api}/youtube/v3/channels?part=snippet&mine=true`, { headers: { Authorization: `Bearer ${t.access_token}` } });
+    const channels = [];
+    for (const ch of r.items || []) {
+      const label = `YouTube: ${ch.snippet?.title || ch.id}`, secret = JSON.stringify({ client_id: app.client_id, client_secret: app.client_secret, refresh_token: t.refresh_token });
+      let cred = await one(`SELECT id FROM api_credentials WHERE provider='youtube_oauth' AND label=$1`, [label]);
+      if (cred) await q(`UPDATE api_credentials SET secret_enc=$2, secret_hint='json' WHERE id=$1`, [cred.id, encryptSecret(secret)]);
+      else { const id = newId(); await q(`INSERT INTO api_credentials (id, provider, label, env_var, priority, secret_enc, secret_hint) VALUES ($1,'youtube_oauth',$2,'',0,$3,'json')`, [id, label, encryptSecret(secret)]); cred = { id }; }
+      channels.push({ channelId: ch.id, title: ch.snippet?.title || ch.id, credentialId: cred.id });
+    }
+    if (!channels.length) throw new Error("That Google account owns no YouTube channel. Log in with the account that owns the channel.");
+    result = { channels, note: "The channel's refresh token is stored encrypted with the client. It keeps working while the Google app is published; an app left in Testing has its tokens expire after seven days." };
+  } catch (e) { result = { error: String(e.message || e).slice(0, 400) }; }
+  await oauthFinish(ctx, "youtube", state, begun, result, "connected-youtube");
+});
+app.get("/api/youtube/oauth/result/:state", (ctx) => oauthResult(ctx, "youtube"));
+// A connected YouTube channel becomes a channel row: Shorts by default, since most of what the engine makes is vertical.
+app.post("/api/youtube/channels", async (ctx) => {
+  const b = ctx.body; for (const r of ["brandId", "channelId", "credentialId", "displayName"]) if (!b[r]) throw new ApiError(400, null, `${r} is required`);
+  const id = newId();
+  await q(`INSERT INTO channels (id, brand_id, key, display_name, platform, format, timezone, credential_id, platform_account_id, publisher_adapter) VALUES ($1,$2,$3,$4,'YOUTUBE',$5,$6,$7,$8,'youtube_upload')`,
+    [id, b.brandId, b.key || `yt_${String(b.channelId).slice(-6)}`, b.displayName, b.format === "LONG_FORM_VIDEO" ? "LONG_FORM_VIDEO" : "SHORT_FORM_VOICEOVER", b.timezone || "Asia/Dhaka", b.credentialId, String(b.channelId)]);
+  for (const n of b.nicheIds || []) await q(`INSERT INTO channel_niches (id, channel_id, niche_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [newId(), id, n]);
+  json(ctx, 201, rowJson(await one(`SELECT * FROM channels WHERE id=$1`, [id]), ["platform_config", "posting_windows"]));
 });
 // Turn a connected Page into a channel, so the whole path is: log in, pick a page, done.
 app.post("/api/meta/channels", async (ctx) => {
