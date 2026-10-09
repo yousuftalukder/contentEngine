@@ -24,9 +24,13 @@ jobs:
         run: |
           APT="-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
           PKGS="ffmpeg fontconfig fonts-noto-core fonts-dejavu-core"
-          if ! timeout 300 sh -c "sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends $PKGS"; then
+          # Eight minutes: a mirror that is merely slow (2026-10-09, cut off mid-unpack at five) is not a dead one. And an
+          # install cut off mid-unpack leaves dpkg interrupted, which refuses every later install until it is told to
+          # finish configuring — so the fallback does that first, then carries on from where the download got to.
+          if ! timeout 480 sh -c "sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends $PKGS"; then
             echo "The runner's mirror is not answering; using archive.ubuntu.com"
             sudo sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+            sudo dpkg --configure -a || true
             sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends $PKGS
           fi
       - run: npm ci
