@@ -60,6 +60,10 @@ test("scene recap: Gemini reads the scenes from the picture and the recap is cut
     assert.deepEqual([t.segments[1].start, t.segments[1].end], [8, 20], "clock times read as seconds");
     assert.ok(prompts.some((x) => /SEEN: he runs across the rooftop/.test(x) && /SAID: Look, up there!/.test(x)), "the recap writer was given the scenes by picture and word");
     assert.equal(item.script, "He came back, as he promised. And then he jumped.");
+    const [{ script_meta }] = await eng.query(`SELECT script_meta FROM content_items WHERE id = $1`, [item.id]);
+    const recap = (typeof script_meta === "string" ? JSON.parse(script_meta) : script_meta)?.recap;
+    assert.deepEqual(recap?.beats?.map((b) => [b.start, b.end, b.narration]), [[0, 8, "He came back, as he promised."], [8, 20, "And then he jumped."]], "the scenes the recap was cut from are kept with the item, for Review");
+    assert.equal(recap.seen, true, "and it says they were read from the picture");
     const [media] = await eng.query(`SELECT meta FROM media_assets WHERE content_item_id = $1 AND kind = 'VIDEO'`, [item.id]);
     assert.ok(media, "and the recap was rendered");
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
