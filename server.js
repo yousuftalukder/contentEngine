@@ -53,17 +53,19 @@ const DATABASE_URL = ENV.DATABASE_URL;
 const TMP = join(ENV.WORK_DIR || tmpdir(), "content-engine");
 // Where this machine keeps the files it stores (your PC's store when files are kept there). Tests point it at their own
 // scratch folder: they were writing into the very folder that is now the production store.
-let LOCAL_MEDIA_DIR = ENV.MEDIA_DIR || join(__dirname, "data", "media");
+const DEFAULT_MEDIA_DIR = ENV.MEDIA_DIR || join(__dirname, "data", "media");
+let LOCAL_MEDIA_DIR = DEFAULT_MEDIA_DIR;
 // Where this PC keeps its files: the folder chosen on the dashboard (Settings → Media storage, storage.pc_dir) wins over
-// MEDIA_DIR and the default data\media. Applied as the worker starts, before it takes a job: a new folder gets the old
-// one's files moved into it (renamed on the same disk; copied and removed across disks), so nothing Review shows goes
-// missing, and the old folder is left empty. A folder that cannot be used leaves the files where they are, and says so.
+// MEDIA_DIR and the default data\media; cleared, it is the default again. Applied as the worker starts, and again
+// within a minute of a change while it runs (watchPcDir, which first lets the jobs under way finish and holds new ones):
+// the new folder gets the old one's files moved into it (renamed on the same disk; copied and removed across disks),
+// so nothing Review shows goes missing, and the old folder is left empty. A folder that cannot be used leaves the files
+// where they are, and says so on the dashboard. Returns whether the folder changed.
 async function applyPcDir() {
-  const want = String(await setting("storage.pc_dir", "") || "").trim().replace(/[\\/]+$/, "");
-  if (!want) return;
-  if (!isAbsolute(want)) { warn(`storage.pc_dir "${want}" is not a full path (like D:\\ContentEngine\\media); files stay in ${LOCAL_MEDIA_DIR}`); return; }
+  const want = String(await setting("storage.pc_dir", "") || "").trim().replace(/[\\/]+$/, "") || DEFAULT_MEDIA_DIR;
+  if (!isAbsolute(want)) { await notify("pc_dir", "The PC's media folder could not be used", `"${want}" is not a full path (like D:\\ContentEngine\\media). Files stay in ${LOCAL_MEDIA_DIR}.`, { key: "pc_dir", cooldownHours: 1 }); return false; }
   const next = normalize(want), cur = normalize(LOCAL_MEDIA_DIR);
-  if (next.toLowerCase() === cur.toLowerCase()) return;
+  if (next.toLowerCase() === cur.toLowerCase()) return false;
   try {
     await mkdir(next, { recursive: true });
     const here = await readdir(cur).catch(() => []), there = await readdir(next);
@@ -73,9 +75,24 @@ async function applyPcDir() {
         try { await rename(from, to); } catch (e) { if (e.code !== "EXDEV") throw e; await cp(from, to, { recursive: true }); await rm(from, { recursive: true, force: true }); }
       }
       log(`media: moved ${here.length} entr${here.length === 1 ? "y" : "ies"} from ${cur} to ${next}`);
-    } else if (here.length && there.length) warn(`media: ${next} already holds files, so those in ${cur} were left there; copy them across by hand if Review should still show them`);
+    } else if (here.length && there.length) await notify("pc_dir", "The PC's old media files were left where they were", `${next} already held files, so those in ${cur} were not moved. Copy them across by hand if Review should still show them.`, { key: "pc_dir_left", cooldownHours: 24 });
     LOCAL_MEDIA_DIR = next; log(`media: files are kept in ${next}`);
-  } catch (e) { warn(`storage.pc_dir ${next} cannot be used (${e.message}); files stay in ${LOCAL_MEDIA_DIR}`); }
+    pcMedia.at = 0;   // the next heartbeat measures the new folder and reports it
+    return true;
+  } catch (e) { await notify("pc_dir", "The PC's media folder could not be used", `${next}: ${e.message}. Files stay in ${LOCAL_MEDIA_DIR}.`, { key: "pc_dir", cooldownHours: 1 }); return false; }
+}
+// The folder re-read every minute while the worker runs. A change waits for the jobs under way (a render writing its
+// file into the old folder would be left behind) and holds new ones until the move is done, then the lane goes on.
+async function watchPcDir() {
+  const want = String(await setting("storage.pc_dir", "") || "").trim().replace(/[\\/]+$/, "") || DEFAULT_MEDIA_DIR;
+  if (!isAbsolute(want) || normalize(want).toLowerCase() === normalize(LOCAL_MEDIA_DIR).toLowerCase() || pcSlots.hold) return;
+  let release; pcSlots.hold = new Promise((r) => (release = r));
+  try {
+    const until = Date.now() + 2 * 3600e3;
+    while (pcSlots.busy > 0 && Date.now() < until) await sleep(2000);
+    if (pcSlots.busy > 0) { warn("media folder: jobs still running after two hours; the move waits for a quieter minute"); return; }
+    if (await applyPcDir()) pcMediaSize();
+  } finally { pcSlots.hold = null; release(); }
 }
 const FRONTEND_DIR = join(__dirname, "frontend");
 const WORKER_ID = `${ENV.RENDER_INSTANCE_ID || "local"}-${process.pid}`;
@@ -5497,7 +5514,7 @@ async function runJobInner(job, h, payload) {
 // waiting on a writer or a platform. A clip type is listed too, should one ever be drafted rather than cut.
 const HEAVY_JOB_KEYS = ["STUDIO_RENDER", "RENDER_CLIP", "PROCESS_CANDIDATE", ...[...MADE_VIDEO_TYPES, ...VIDEO_TYPES].flatMap((t) => [`GENERATE_CONTENT:${t}`, `REGENERATE:${t}:all`])];
 const PC_CONCURRENCY_MAX = 6;
-const pcSlots = { want: 0, loops: new Set() };
+const pcSlots = { want: 0, loops: new Set(), busy: 0, hold: null };   // busy: PC jobs under way; hold: a promise while the media folder moves
 async function pcConcurrency() {
   const n = Math.round(Number((await setting("worker.pc_concurrency", null)) ?? ENV.PC_CONCURRENCY ?? 2));
   return n >= 1 ? Math.min(PC_CONCURRENCY_MAX, n) : 2;
@@ -5523,9 +5540,10 @@ async function workerLoop(queue, slot = 0) {
       const enabled = await setting("queues.enabled", {});
       // One loop on its own takes anything, as before; with several, only the first takes heavy work (and takes it first).
       const mode = pc && pcSlots.want > 1 ? (slot === 0 ? "heavy_first" : "light") : null;
+      if (pc && pcSlots.hold) await pcSlots.hold;   // the media folder is moving: no new job until it is done
       if (enabled[queue] !== false) {
         const [job] = mode ? await q(`SELECT * FROM claim_job($1, $2, $3, $4)`, [queue, WORKER_ID, mode, HEAVY_JOB_KEYS]) : await q(`SELECT * FROM claim_job($1, $2)`, [queue, WORKER_ID]);
-        if (job) { ran = true; await runJob(job); }
+        if (job) { ran = true; if (pc) pcSlots.busy++; try { await runJob(job); } finally { if (pc) pcSlots.busy--; } }
       }
     } catch (e) { warn(`lane ${queue}:`, e.message); }
     await sleep(ran ? 100 : QUEUE_POLL_MS);
@@ -5827,7 +5845,7 @@ function startWorkers() {
   // The PC's lane starts once its files are where the dashboard says they should be (applyPcDir): a job that wrote a
   // picture while the folder was being moved would have left it behind.
   if (LANES.includes(PC_LANE)) (async () => {
-    if (IS_PC) await applyPcDir().catch((e) => warn("media folder", e.message));
+    if (IS_PC) { await applyPcDir().catch((e) => warn("media folder", e.message)); setInterval(() => watchPcDir().catch((e) => warn("media folder", e.message)), Number(ENV.PC_DIR_POLL_MS) || 60000); }
     syncPcSlots(); setInterval(() => syncPcSlots().catch(() => {}), Number(ENV.PC_SLOTS_POLL_MS) || 60000);
     // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
     // leaving routed work to look stuck.
