@@ -573,6 +573,16 @@ function proofView(it, onDone, notes = []) {
       : h("div", { class: "sub" }, src.provider === "rented_clip" ? "Cut by the clipping service from " : "From ", src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener" }, src.title || "the source") : (src.title || "the source")),
     cl.reason ? h("div", { style: "margin-top:4px" }, cl.reason) : null,
     cl.score != null ? h("div", { class: "small mute" }, `score ${Number(cl.score).toFixed(2)}`) : null) : null;
+  // A recap: the scenes it was cut from, each narrated line against its place in the film, so a cut can be judged
+  // against the source the way a clip's moment can.
+  const rb = it.script_meta?.recap?.beats;
+  const scenesUsed = rb?.length ? h("details", { class: "panel", style: "margin-bottom:12px" },
+    h("summary", null, h("b", { style: "font-weight:500" }, "Scenes used"), h("span", { class: "small mute" }, ` — ${rb.length} scene${rb.length > 1 ? "s" : ""} of `,
+      /^https?:/.test(src.url || "") ? h("a", { href: src.url, target: "_blank", rel: "noopener" }, src.title || "the source") : (src.title || "the source"),
+      it.script_meta.recap.seen ? ", read from the picture" : ", from the transcript")),
+    h("ul", { class: "qa-list", style: "margin-top:8px" }, rb.map((b) => h("li", null,
+      atMoment(src.url, b.start) ? h("a", { href: atMoment(src.url, b.start), target: "_blank", rel: "noopener" }, `${mmss(b.start)}–${mmss(b.end)}`) : `${mmss(b.start)}–${mmss(b.end)}`,
+      " ", b.narration)))) : null;
   // A warning the engine left on the draft (a caption the writer refused to write, say) is something to act on before
   // approving, and it was only ever visible in the raw JSON.
   const warning = it.status === "PENDING_REVIEW" && it.rejection_note ? h("div", { class: "panel", style: "border-color:var(--amber)" },
@@ -588,6 +598,7 @@ function proofView(it, onDone, notes = []) {
     thin,
     warning,
     why,
+    scenesUsed,
     qaPanel(it),
     research,
     h("div", { class: "row small mute" }, tag(it.status), h("span", null, it.program_name), h("span", null, nice(it.content_type)), h("span", null, "created ", ago(it.created_at)), h("span", null, "cost ", usd(it.generation_cost_usd)),

@@ -33,6 +33,8 @@ off; the work waits, and the Overview says the PC is off.
      own words stand in. Rewrite the caption before posting.
    - **Research notes** (explainers and long posts) — the facts the draft was written from, each with its source
      link, so a figure can be checked against where it came from.
+   - **Scenes used** (recaps) — the scenes the recap was cut from, each narrated line with its time in the film and a
+     link to that moment in the source, so a cut can be checked the way a clip's moment can.
    - On a video, editing the headline or caption changes the post's text, not the video. **Re-render** draws the same
      video again (a clip, or an explainer from its stored plan); **Regenerate everything** writes it afresh.
 4. **Overview**, top to bottom: what is waiting for review and what is being made; whether the AI allowance is

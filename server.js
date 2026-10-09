@@ -4728,7 +4728,10 @@ async function renderClipItem(itemId, clipId) {
     const voice = await voiceFor(niche); const audio = await voice.synthesize({ script, voiceId: niche.voice_id, contentItemId: itemId }); await addCost(itemId, audio.cost);
     extras.audio = audio; extras.script = script;
     if (recap && d.beats?.length) { const total = d.beats.reduce((s, b) => s + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)), 0) || 1; const k = (audio.duration_seconds || total) / total; extras.scenes = d.beats.map((b) => ({ start: Number(b.start) || 0, end: (Number(b.start) || 0) + Math.max(1, (Number(b.end) || 0) - (Number(b.start) || 0)) * k })); }
-    await setItem(itemId, { headline: d.title || clip.title, script, voice_asset_url: audio.url, hashtags: d.hashtags || [] });
+    // The beats are kept with the item, in the source's own time: Review shows which scenes the recap was cut from,
+    // each narrated line against its place in the film, so a cut can be judged without opening the file.
+    const recapBeats = recap && d.beats?.length ? d.beats.map((b) => ({ narration: String(b.narration || ""), start: (Number(b.start) || 0) + cutOffset, end: (Number(b.end) || 0) + cutOffset })) : null;
+    await setItem(itemId, { headline: d.title || clip.title, script, voice_asset_url: audio.url, hashtags: d.hashtags || [], ...(recapBeats ? { script_meta: { ...(P(item.script_meta) || {}), recap: { seen, beats: recapBeats } } } : {}) });
   }
   // Telecast with an intro (3c): the report as it was broadcast, after a short headline card our own voice reads —
   // what a news page puts in front of a TV clip so the viewer knows what they are about to watch. The intro says only
@@ -5266,7 +5269,10 @@ const HANDLERS = {
       return { fetched: items.length, added, routed, clustered: toCluster.length };
     } catch (e) { await q(`UPDATE sources SET last_polled_at=now(), last_error=$2 WHERE id=$1`, [sourceId, String(e.message).slice(0, 800)]); throw e; }
   },
-  async GENERATE_CONTENT({ itemId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return runGeneration(itemId, job); },
+  // A desk story is checked against the news window as its job is claimed, on whichever machine claims it: the sweep
+  // that drops stale stories runs on the server every ten minutes, and a PC switched on after a day off took the whole
+  // queue before it ran. Regenerate everything (part set) is asked for by hand and always runs.
+  async GENERATE_CONTENT({ itemId, part }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } if (!part && await dropIfStaleStory(itemId)) return { skipped: "stale story" }; return runGeneration(itemId, job); },
   async REGENERATE({ itemId, part }) { return regenerate(itemId, part); },
   async PROCESS_CANDIDATE({ candidateId }, job) { if (!(await budgetOk())) { await deferJob(job, 60); return { deferred: "budget" }; } return processCandidate(candidateId); },
   async RENDER_CLIP({ itemId, clipId }) { return renderClipItem(itemId, clipId); },
@@ -5519,6 +5525,7 @@ async function sweepReviewDeadlines() {
 // than a day, and the morning's stories were buried under last week's. A news draft (a card or a news reel; clips and
 // other videos keep) still waiting after review.news_expiry_hours is set aside with a note saying why — a status, not a
 // deletion, and 0 turns it off.
+const staleNote = (hours) => `Not drafted: the story was over ${hours} hours old before it could be made (your PC was off, or the writer's allowance was spent).`;
 async function sweepStaleNews() {
   const hours = Number(await setting("review.news_expiry_hours", 24));
   if (!(hours > 0)) return;
@@ -5533,11 +5540,20 @@ async function sweepStaleNews() {
   const stale = await q(`UPDATE content_items ci SET status = 'REJECTED', rejection_note = $2
     WHERE status = 'QUEUED' AND cluster_id IS NOT NULL AND created_at < now() - ($1 || ' hours')::interval
       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.content_item_id = ci.id AND j.status = 'RUNNING') RETURNING id`,
-    [String(hours), `Not drafted: the story was over ${hours} hours old before it could be made (your PC was off, or the writer's allowance was spent).`]);
+    [String(hours), staleNote(hours)]);
   if (stale.length) {
     await q(`UPDATE jobs SET status = 'CANCELLED', finished_at = now(), error_message = 'the story went stale before it was drafted' WHERE status = 'PENDING' AND content_item_id = ANY($1)`, [stale.map((r) => r.id)]);
     log(`desk: ${stale.length} queued stor(y/ies) older than ${hours} h dropped before drafting`);
   }
+}
+// The same window, checked as a desk story's job is claimed (GENERATE_CONTENT): only a story the desk queued (it has a
+// cluster) that nobody has started on, and with the sweep's own note, so the dashboard reads the same either way.
+async function dropIfStaleStory(itemId) {
+  const hours = Number(await setting("review.news_expiry_hours", 24));
+  if (!(hours > 0)) return false;
+  const row = await one(`UPDATE content_items SET status = 'REJECTED', rejection_note = $2 WHERE id = $1 AND status = 'QUEUED' AND cluster_id IS NOT NULL AND created_at < now() - ($3 || ' hours')::interval RETURNING id, topic`, [itemId, staleNote(hours), String(hours)]);
+  if (row) log(`desk: story ${row.id} ("${(row.topic || "").slice(0, 60)}") was over ${hours} h old when its job was claimed — not drafted`);
+  return !!row;
 }
 async function sweepMetrics() {
   const rows = await q(`SELECT id FROM content_assets WHERE status='PUBLISHED' AND published_at > now() - interval '14 days' AND (last_metrics IS NULL OR (last_metrics->>'at')::timestamptz < now() - interval '6 hours') LIMIT 30`);

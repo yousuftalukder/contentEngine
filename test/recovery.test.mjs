@@ -205,3 +205,29 @@ test("a desk story queued past the news window is dropped before drafting; one a
     assert.equal((await eng.api("GET", `/api/content-items/${hand}`)).status, "QUEUED", "the one asked for by hand still waits to be made");
   } finally { await eng.api("PUT", "/api/settings/queues.enabled", { value: {} }); }
 });
+
+// The sweep above runs on the server every ten minutes. A PC switched on after a day off claims the queue at once, so
+// the same window is checked as the job is claimed — and Regenerate everything, asked for by hand, still runs.
+test("a stale desk story is dropped as its job is claimed, before any sweep; regenerate everything still runs", async () => {
+  const p = await program("stale_claim");
+  await eng.api("PUT", "/api/settings/queues.enabled", { value: { text: false, video_local: false } });
+  let desk, hand;
+  try {
+    ({ id: desk } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A desk story from yesterday" }));
+    ({ id: hand } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "A story asked for by hand" }));
+    await eng.query(`UPDATE content_items SET cluster_id = 'cluster-old' WHERE id = $1`, [desk]);
+    await eng.query(`UPDATE content_items SET created_at = now() - interval '30 hours' WHERE id = ANY($1)`, [[desk, hand]]);
+  } finally { await eng.api("PUT", "/api/settings/queues.enabled", { value: {} }); }
+  await waitFor(async () => (await eng.api("GET", `/api/content-items/${desk}`)).status === "REJECTED", { what: "the stale desk story dropped as its job was claimed" });
+  assert.match((await eng.api("GET", `/api/content-items/${desk}`)).rejection_note, /Not drafted/);
+  const [job] = await eng.query(`SELECT status FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT'`, [desk]);
+  assert.equal(job.status, "SUCCEEDED", "its job ends without drafting anything");
+  await waitFor(async () => (await eng.api("GET", `/api/content-items/${hand}`)).status === "PENDING_REVIEW", { what: "the story asked for by hand drafted" });
+  // An old desk story written again on purpose from Review is made: that is a person asking.
+  await eng.query(`UPDATE content_items SET cluster_id = 'cluster-old' WHERE id = $1`, [hand]);
+  await eng.api("POST", `/api/content-items/${hand}/regenerate`, { part: "all" });
+  await waitFor(async () => {
+    const [{ n }] = await eng.query(`SELECT COUNT(*)::int AS n FROM jobs WHERE content_item_id = $1 AND type = 'GENERATE_CONTENT' AND status = 'SUCCEEDED'`, [hand]);
+    return n >= 2 && (await eng.api("GET", `/api/content-items/${hand}`)).status === "PENDING_REVIEW";
+  }, { what: "the old story regenerated on request" });
+});
