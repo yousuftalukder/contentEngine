@@ -256,3 +256,50 @@ test("Connect with Facebook: the login is opened with the app's id, and the call
     assert.equal((await fetch(`${vault.base}/api/public/meta/callback?code=CODE-2&state=${state}`, { redirect: "manual" })).status, 400, "and the state cannot be replayed");
   } finally { await vault.stop(); await new Promise((r) => graph.close(r)); }
 });
+
+// "Connect with YouTube": Google's login the same way — offline access, so the refresh token comes back — and the
+// engine stores it with the client as the youtube_oauth credential the uploader reads, one per channel the account owns.
+test("Connect with YouTube: the login asks for offline access, and the callback stores the channel's refresh token", async () => {
+  const http = await import("node:http");
+  const vault = await startEngine({ env: { SECRETS_KEY: "7".repeat(64), PUBLIC_BASE_URL: "https://engine.example" } });
+  const seen = {};
+  const google = http.createServer((req, res) => {
+    const u = new URL(req.url, "http://x"); let body = ""; req.on("data", (d) => (body += d)); req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      if (u.pathname === "/token") { seen.token = Object.fromEntries(new URLSearchParams(body)); return res.end(JSON.stringify({ access_token: "ACCESS-1", refresh_token: "REFRESH-1", expires_in: 3599 })); }
+      if (u.pathname === "/youtube/v3/channels") { seen.bearer = req.headers.authorization; return res.end(JSON.stringify({ items: [{ id: "UCabc", snippet: { title: "Khobor TV" } }] })); }
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => google.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${google.address().port}`;
+  try {
+    for (const [k, v] of [["youtube.login_base", "https://login.example"], ["youtube.token_base", base], ["youtube.api_base", base]]) await vault.api("PUT", `/api/settings/${k}`, { value: v });
+    await vault.api("POST", "/api/credentials", { provider: "google_app", label: "Google", fields: { client_id: "cid.apps.googleusercontent.com", client_secret: "GOCSPX-x" } });
+    const cfg = await vault.api("GET", "/api/youtube/oauth/config");
+    assert.deepEqual([cfg.configured, cfg.redirectUri], [true, "https://engine.example/api/public/youtube/callback"]);
+    const brand = await vault.api("POST", "/api/brands", { name: "Tube" });
+
+    const start = await fetch(`${vault.base}/api/youtube/oauth/start?brandId=${brand.id}&returnTo=${encodeURIComponent("http://my-pc:4100/")}`, { redirect: "manual" });
+    assert.equal(start.status, 302);
+    const login = new URL(start.headers.get("location"));
+    assert.equal(login.origin + login.pathname, "https://login.example/o/oauth2/v2/auth");
+    assert.deepEqual([login.searchParams.get("client_id"), login.searchParams.get("access_type"), login.searchParams.get("prompt")], ["cid.apps.googleusercontent.com", "offline", "consent"], "offline access and a fresh consent, so a refresh token is issued");
+    assert.ok(login.searchParams.get("scope").includes("youtube.upload"));
+    const state = login.searchParams.get("state");
+
+    const back = await fetch(`${vault.base}/api/public/youtube/callback?code=CODE-Y&state=${state}`, { redirect: "manual" });
+    assert.equal(back.status, 302);
+    assert.equal(back.headers.get("location"), `http://my-pc:4100/#/channels/connected-youtube/${state}`);
+    assert.deepEqual([seen.token.code, seen.token.grant_type, seen.token.redirect_uri], ["CODE-Y", "authorization_code", cfg.redirectUri]);
+    assert.equal(seen.bearer, "Bearer ACCESS-1", "the channel is read with the login's token");
+
+    const result = await vault.api("GET", `/api/youtube/oauth/result/${state}`);
+    assert.deepEqual(result.channels.map((c) => [c.channelId, c.title]), [["UCabc", "Khobor TV"]]);
+    assert.ok(!JSON.stringify(result).includes("REFRESH-1"), "the refresh token never reaches the browser");
+    const [cred] = await vault.query(`SELECT id, label FROM api_credentials WHERE provider='youtube_oauth'`);
+    assert.equal(cred.label, "YouTube: Khobor TV");
+    const ch = await vault.api("POST", "/api/youtube/channels", { brandId: brand.id, channelId: "UCabc", credentialId: result.channels[0].credentialId, displayName: "Khobor TV" });
+    assert.deepEqual([ch.platform, ch.publisher_adapter, ch.platform_account_id, ch.format, ch.credential_id], ["YOUTUBE", "youtube_upload", "UCabc", "SHORT_FORM_VOICEOVER", cred.id]);
+  } finally { await vault.stop(); await new Promise((r) => google.close(r)); }
+});

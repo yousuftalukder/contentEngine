@@ -97,8 +97,8 @@ const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Tex
 let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
 let PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
 let MULTI_FIELD = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
-const PROVIDER_LABEL = { vizard: "Vizard (optional rented clipping)", twelve_labs: "Twelve Labs (optional video understanding)", pollinations: "Pollinations (free pictures — optional token)", groq: "Groq (free writer)", mistral: "Mistral (free writer)", cerebras: "Cerebras (free writer)", openrouter: "OpenRouter (free models)", xai: "xAI Grok", telegram: "Telegram bot (alerts)", meta_app: "Facebook app (App ID + Secret — for Connect with Facebook)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
-const PROVIDER_HELP = { vizard: "Optional and paid (Creator plan, about $14.50 a month): clips YouTube links while your PC is off. Then set a clips programme's clipper to vizard.", twelve_labs: "Optional: Twelve Labs reads a video's chapters for recaps (5c). Gemini does the same for free (5a). Then set a recap programme's transcriber to twelve_labs.", pollinations: "Not needed: pictures are drawn without a key. A free account's token (auth.pollinations.ai) removes the small logo in the corner.", groq: "Free, no card: console.groq.com → API Keys. Takes over writing when Gemini's daily allowance runs out.", mistral: "Free Experiment plan: console.mistral.ai → API Keys (asks for a phone number, no card).", cerebras: "cloud.cerebras.ai → API Keys.", openrouter: "openrouter.ai → Keys. Uses only its free models.", xai: "console.x.ai → API Keys. Uses your xAI credits.", telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", meta_app: "Your Facebook app's App ID and App Secret (developers.facebook.com → your app → Settings → Basic). Lets Channels → Connect with Facebook open the login itself, and makes pasted tokens permanent. Register the callback address shown on the Channels page under the app's Facebook Login settings.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
+const PROVIDER_LABEL = { vizard: "Vizard (optional rented clipping)", twelve_labs: "Twelve Labs (optional video understanding)", pollinations: "Pollinations (free pictures — optional token)", groq: "Groq (free writer)", mistral: "Mistral (free writer)", cerebras: "Cerebras (free writer)", openrouter: "OpenRouter (free models)", xai: "xAI Grok", telegram: "Telegram bot (alerts)", meta_app: "Facebook app (App ID + Secret — for Connect with Facebook)", google_app: "Google app (OAuth client id + secret — for Connect with YouTube)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
+const PROVIDER_HELP = { vizard: "Optional and paid (Creator plan, about $14.50 a month): clips YouTube links while your PC is off. Then set a clips programme's clipper to vizard.", twelve_labs: "Optional: Twelve Labs reads a video's chapters for recaps (5c). Gemini does the same for free (5a). Then set a recap programme's transcriber to twelve_labs.", pollinations: "Not needed: pictures are drawn without a key. A free account's token (auth.pollinations.ai) removes the small logo in the corner.", groq: "Free, no card: console.groq.com → API Keys. Takes over writing when Gemini's daily allowance runs out.", mistral: "Free Experiment plan: console.mistral.ai → API Keys (asks for a phone number, no card).", cerebras: "cloud.cerebras.ai → API Keys.", openrouter: "openrouter.ai → Keys. Uses only its free models.", xai: "console.x.ai → API Keys. Uses your xAI credits.", telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", meta_app: "Your Facebook app's App ID and App Secret (developers.facebook.com → your app → Settings → Basic). Lets Channels → Connect with Facebook open the login itself, and makes pasted tokens permanent. Register the callback address shown on the Channels page under the app's Facebook Login settings.", google_app: "A Google Cloud OAuth client (Web application) with the YouTube Data API enabled: its client id and secret. Lets Channels → Connect with YouTube open Google's login and store the channel's refresh token itself. Register the callback address shown on the Channels page as its authorised redirect URI.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
 const password = (name, extra = {}) => h("input", { type: "password", name, autocomplete: "new-password", spellcheck: false, ...extra });
 
 // form field builders
@@ -1476,6 +1476,39 @@ async function facebookLogin(brands) {
     h("button", { class: "btn", onclick: () => close() }, cfg?.configured ? "Cancel" : "Close"),
     cfg?.configured ? h("button", { class: "btn primary", onclick: () => { location.href = `/api/meta/oauth/start?${new URLSearchParams({ brandId: brandSel.value || "", ig: ig.checked ? "1" : "", returnTo: location.origin + location.pathname })}`; } }, "Continue to Facebook") : null)));
 }
+// "Connect with YouTube": Google's login, the same way. The engine keeps the channel's refresh token with the client,
+// which is what the uploader reads. Needs a Google Cloud OAuth client once (API keys → Google app).
+async function youtubeLogin(brands) {
+  const cfg = await get("/api/youtube/oauth/config", true).catch(() => null);
+  const brandSel = select(null, brands.map((b) => [b.id, b.name]));
+  const uri = h("span", { class: "mono", style: "user-select:all;word-break:break-all" }, cfg?.redirectUri || "");
+  const body = h("div", null, cfg?.configured ? [
+      h("p", { class: "small mute", style: "margin:0 0 10px" }, "Google opens its own login. Choose the account that owns the channel and allow uploading; you come back here with the channel ready to add. The engine stores its refresh token itself; nothing is pasted."),
+      brands.length > 1 ? field("Brand for the new channel", brandSel) : null,
+      h("p", { class: "small mute", style: "margin:0" }, "While the Google app is in Testing, only its test users can log in and their tokens expire after seven days; publish the app (OAuth consent screen → Publish) for a token that lasts. Google shows an \"unverified app\" page until the app is verified: press Advanced, then continue.")]
+    : [h("p", { class: "small", style: "margin:0 0 6px" }, "One-time setup, so the login can open itself:"),
+      h("ol", { class: "small", style: "margin:0 0 10px;padding-left:18px;line-height:1.7" },
+        h("li", null, "At ", h("a", { href: "https://console.cloud.google.com/", target: "_blank", rel: "noopener" }, "console.cloud.google.com"), " make a project (or open one) and enable the ", h("b", null, "YouTube Data API v3"), " under APIs & Services → Library."),
+        h("li", null, "APIs & Services → OAuth consent screen: External, your app name and email, add yourself as a test user. Later, Publish it, so tokens do not expire after a week."),
+        h("li", null, "APIs & Services → Credentials → Create credentials → ", h("b", null, "OAuth client ID"), ", type Web application. Under Authorised redirect URIs add: ", uri),
+        h("li", null, "Copy the client id and secret it shows and add them under ", h("a", { href: "#/keys" }, "API keys"), " as the provider ", h("b", null, "Google app"), ".")),
+      h("p", { class: "small mute", style: "margin:0" }, "Then press Connect with YouTube again. A refresh token obtained elsewhere can still be added by hand under API keys (provider YouTube OAuth) and picked on a channel.")]);
+  const close = modal("Connect with YouTube", h("div", null, body, h("div", { class: "foot" },
+    h("button", { class: "btn", onclick: () => close() }, cfg?.configured ? "Cancel" : "Close"),
+    cfg?.configured ? h("button", { class: "btn primary", onclick: () => { location.href = `/api/youtube/oauth/start?${new URLSearchParams({ brandId: brandSel.value || "", returnTo: location.origin + location.pathname })}`; } }, "Continue to Google") : null)));
+}
+// The channels a Google login owns, each with an "add" button and the format the channel takes.
+function youtubeChannelsList(r, brands, brandId, list) {
+  const brandSel = select(null, brands.map((b) => [b.id, b.name]), brandId || brands[0]?.id);
+  const fmt = select(null, [["SHORT_FORM_VOICEOVER", "Shorts — vertical videos (most of what the engine makes)"], ["LONG_FORM_VIDEO", "Long landscape videos"]], "SHORT_FORM_VOICEOVER");
+  list.innerHTML = "";
+  list.append(h("p", { class: "small" }, r.note), brands.length > 1 ? field("Brand for the new channel", brandSel) : null, field("What this channel takes", fmt));
+  for (const ch of r.channels) list.appendChild(h("div", { class: "panel", style: "padding:10px 12px;margin:6px 0" }, h("div", { class: "row" },
+    h("div", null, h("b", null, ch.title), h("div", { class: "small mute" }, "Channel ", h("span", { class: "mono" }, ch.channelId))),
+    h("div", { class: "right row" }, h("button", { class: "btn sm primary", onclick: () => run(async () => {
+      await post("/api/youtube/channels", { brandId: brandSel.value, channelId: ch.channelId, credentialId: ch.credentialId, displayName: ch.title, format: fmt.value });
+    }, `Added ${ch.title}`).then(route) }, "Add as YouTube channel")))));
+}
 // The pasted-token way: for a machine the login cannot come back to, or an app without Facebook Login set up.
 async function connectFacebook(brands, programs) {
   const cfg = await get("/api/meta/oauth/config", true).catch(() => ({ configured: false }));
@@ -1503,17 +1536,20 @@ pages.channels = async (sub) => {
   const root = h("div", null, pageHead("Channels", INFO.channels,
     h("div", { class: "row" },
       h("button", { class: "btn primary", disabled: !brands.length, onclick: () => facebookLogin(brands) }, "Connect with Facebook"),
-      h("button", { class: "btn", disabled: !brands.length, title: "For when the login cannot come back here: paste a token from Graph API Explorer", onclick: () => connectFacebook(brands, programs) }, "Paste a token"),
+      h("button", { class: "btn primary", disabled: !brands.length, onclick: () => youtubeLogin(brands) }, "Connect with YouTube"),
+      h("button", { class: "btn", disabled: !brands.length, title: "For when the login cannot come back here: paste a token from Graph API Explorer", onclick: () => connectFacebook(brands, programs) }, "Paste a Facebook token"),
       h("button", { class: "btn", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers, creds) }, "New channel"))));
-  // Back from Facebook's login: the result waits under the state for one reading, then the Pages are offered to add.
-  if (sub.startsWith("connected/")) {
+  // Back from a login: the result waits under the state for one reading, then the Pages or channels are offered to add.
+  const back = (kind, path, title, draw) => {
     history.replaceState(null, "", "#/channels");
-    get(`/api/meta/oauth/result/${sub.slice(10)}`, true).then((r) => {
-      if (r.error) return toast(`Facebook did not connect: ${r.error}`, true);
-      const list = h("div"); metaPagesList(r, brands, r.brandId, list);
-      modal("Connected to Facebook", h("div", null, h("p", { class: "small mute", style: "margin:0 0 6px" }, "Add each Page you want to publish to. A channel takes the posts of the programmes you subscribe to it."), list), { wide: true });
+    get(path, true).then((r) => {
+      if (r.error) return toast(`${kind} did not connect: ${r.error}`, true);
+      const list = h("div"); draw(r, list);
+      modal(title, h("div", null, h("p", { class: "small mute", style: "margin:0 0 6px" }, "A channel takes the posts of the programmes you subscribe to it (Programmes → Publishes to)."), list), { wide: true });
     }).catch((e) => toast(e.message, true));
-  }
+  };
+  if (sub.startsWith("connected/")) back("Facebook", `/api/meta/oauth/result/${sub.slice(10)}`, "Connected to Facebook", (r, list) => metaPagesList(r, brands, r.brandId, list));
+  if (sub.startsWith("connected-youtube/")) back("YouTube", `/api/youtube/oauth/result/${sub.slice(18)}`, "Connected to YouTube", (r, list) => youtubeChannelsList(r, brands, r.brandId, list));
   if (!channels.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No channels yet"), "Add one and subscribe it to a program."));
   for (const c of channels) root.appendChild(h("div", { class: "panel" }, h("div", { class: "row" },
     h("div", null, h("h3", { style: "margin:0" }, c.display_name, " ", yes(c.is_active) ? null : h("span", { class: "tag red" }, "inactive")),
@@ -1748,6 +1784,28 @@ pages["pc-setup"] = async () => {
         h("li", null, "Make the command with ", h("i", null, "This PC replaces my old one"), " ticked and run it on the new PC. Files not copied stop playing in Review.")),
       h("p", { class: "small mute", style: "margin:8px 0 0" }, "Running the command again on a PC that is already set up updates it to the latest version and keeps its files and settings.")));
 };
+// Three places the files can live, and what each costs you: the PC (free, unlimited, needs the PC on for everything
+// that makes or shows a file; any folder on it), Cloudflare R2 (free 10 GB; nothing needs the PC but YouTube and the
+// heavy video work) and Supabase (free 1 GB, which filled in two weeks). One is in use; the others are a click away.
+function storagePlaces(val, storage, save) {
+  const onPc = !!storage.onPc, cloud = !onPc ? storage.backend : null;
+  const dir = text(null, val("storage.pc_dir", "") || "", { placeholder: storage.pc?.media?.dir || "data\\media in the engine folder", style: "max-width:380px" });
+  const useCloud = (which) => run(async () => { await put("/api/settings/storage.backend", { value: which }); await put("/api/settings/storage.on_pc", { value: false }); }, `Files will be kept in ${which === "r2" ? "Cloudflare R2" : "Supabase"}`).then(route);
+  const place = (active, title, body, btn) => h("div", { class: "panel", style: `padding:10px 14px;margin:0 0 8px${active ? ";border-color:var(--green)" : ""}` },
+    h("div", { class: "row" }, h("b", { style: "font-weight:500" }, title), active ? h("span", { class: "tag green" }, "in use") : null, btn ? h("span", { class: "right" }, btn) : null), h("div", { class: "sub" }, body));
+  return h("div", { style: "margin:0 0 12px" },
+    h("p", { class: "muted small", style: "margin:0 0 8px" }, "Where pictures, videos and audio are kept. Files already stored stay where they are and keep their links, so switch when you are happy to regenerate what Review still shows."),
+    place(onPc, "Your PC", ["Free and unlimited, but everything that makes, shows or posts a file waits for the PC worker (", h("a", { href: "#/help" }, "what needs my PC"), ")."],
+      onPc ? null : h("button", { class: "btn sm", onclick: () => save("storage.on_pc", true, "Files will be kept on your PC") }, "Use my PC")),
+    onPc ? h("div", { style: "margin:-2px 0 10px 14px" },
+      h("div", { class: "row" }, h("span", { class: "small" }, "Folder on the PC"), dir, h("button", { class: "btn sm", onclick: () => save("storage.pc_dir", dir.value.trim() || null, dir.value.trim() ? "Folder saved. Restart the PC worker: it moves the files there itself" : "Back to the default folder. Restart the PC worker: it moves the files there itself") }, "Save folder")),
+      h("div", { class: "small mute" }, storage.pc?.media?.dir ? `Now: ${storage.pc.media.dir}. ` : "", "A full path, like D:\\ContentEngine\\media. Applies when the PC worker next starts: it moves the existing files to the new folder itself (nothing in Review goes missing). Leave empty for data\\media in the engine folder.")) : null,
+    place(cloud === "r2", "Cloudflare R2 (cloud)", ["Free 10 GB. No PC needed for news cards, text, pictures and server-made video (720p); only YouTube and the heavy video work go to the PC, and only when a programme says so. ",
+      storage.available?.r2 ? "The keys are in place." : h("span", null, "Needs the R2 keys first: ", h("a", { href: "#/keys" }, "API keys"), " → Cloudflare R2 (account id, access key, secret, bucket, public URL).")],
+      cloud === "r2" ? null : h("button", { class: "btn sm", disabled: !storage.available?.r2, title: storage.available?.r2 ? "" : "Add the R2 keys first", onclick: () => useCloud("r2") }, "Use R2")),
+    place(cloud === "supabase", "Supabase storage (cloud)", "Free 1 GB, which filled in two weeks of round-the-clock news. For testing only.",
+      cloud === "supabase" ? null : h("button", { class: "btn sm", disabled: !storage.available?.supabase, title: storage.available?.supabase ? "" : "Supabase storage is not set up", onclick: () => useCloud("supabase") }, "Use Supabase")));
+}
 pages.settings = async () => {
   const [s, storage, adapters] = await Promise.all([get("/api/settings"), get("/api/storage"), get("/api/adapters").catch(() => ({}))]);
   const val = (k, d) => (s[k] === undefined ? d : s[k]);
@@ -1762,7 +1820,7 @@ pages.settings = async () => {
   const expiry = num(null, val("review.news_expiry_hours", 24), { min: 0, style: "max-width:100px" });
   const waiting = num(null, val("review.max_waiting", 30), { min: 0, style: "max-width:100px" });
   const keepDays = num(null, val("storage.cleanup_rejected_days", 0), { min: 0, style: "max-width:100px" });
-  known.push("storage.on_pc", "pc.tunnel");
+  known.push("storage.on_pc", "pc.tunnel", "storage.pc_dir", "storage.backend");
   const tgChat = text(null, val("alerts.telegram_chat_id", "") || "", { placeholder: "chat id, e.g. 123456789", style: "max-width:220px" });
   known.push("alerts.telegram_chat_id", "upgrade.catalog_v1", "news.paused", "review.news_expiry_hours", "review.max_waiting", "storage.cleanup_rejected_days",
     "voice.default_fallbacks", "desk.similarity", "desk.word_overlap", "ingest.max_age_hours", "retention.source_items_days", "ingest.fetch_article_text", "image.text_card_fallback");
@@ -1785,8 +1843,7 @@ pages.settings = async () => {
         h("button", { class: `btn sm${val("news.paused", false) ? " primary" : ""}`, onclick: () => save("news.paused", !val("news.paused", false), val("news.paused", false) ? "News resumed" : "News paused") }, val("news.paused", false) ? "Resume news" : "Pause news")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Set aside news nobody has reviewed after this many hours (0 = never)"), expiry, h("button", { class: "btn sm", onclick: () => save("review.news_expiry_hours", Number(expiry.value) || 0) }, "Save")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "A hand-reviewed programme stops drafting while this many drafts wait for review (0 = never stop)"), waiting, h("button", { class: "btn sm", onclick: () => save("review.max_waiting", Number(waiting.value) || 0) }, "Save")),
-      toggle("storage.on_pc", false, "Files are kept on your PC: the server stores nothing, and work that makes pictures and videos runs on your PC (it must be on).", "Files are kept in cloud storage (Supabase or R2)."),
-      h("div", { class: "small mute", style: "margin:-2px 0 4px" }, "Where pictures, videos and audio are kept decides what needs your PC. ", h("a", { href: "#/help" }, "What needs my PC?")),
+      h("div", { class: "small mute", style: "padding:4px 0" }, "Where pictures and videos are kept — your PC, or the cloud — is chosen under Media storage below, and decides what needs your PC. ", h("a", { href: "#/help" }, "What needs my PC?")),
       h("div", { class: "row", style: "padding:4px 0" }, h("span", { class: "grow" }, "Delete the pictures and videos of rejected and failed drafts after this many days (0 = keep them). The drafts stay; this is what keeps free storage from filling up"), keepDays, h("button", { class: "btn sm", onclick: () => save("storage.cleanup_rejected_days", Number(keepDays.value) || 0) }, "Save"))),
     h("div", { class: "panel" }, h("h3", null, "Alerts on Telegram"),
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "1. Create a bot with @BotFather and add its token on the API keys page (provider Telegram) or as TELEGRAM_BOT_TOKEN on Render. 2. Send your bot a message, then open api.telegram.org/bot<token>/getUpdates to find your chat id. 3. Paste it here."),
@@ -1798,6 +1855,7 @@ pages.settings = async () => {
       h("p", { class: "muted small", style: "margin:0 0 8px" }, "When today's provider spend reaches this, generation pauses until tomorrow. Spent today: ", usd(stats?.spentTodayUsd), ". Set 0 for no cap."),
       h("div", { class: "row" }, h("span", null, "$"), cap, h("button", { class: "btn", onclick: () => save("budget.daily_cap_usd", Number(cap.value)) }, "Save cap"))),
     h("div", { class: "panel" }, h("h3", null, "Media storage"),
+      storagePlaces(val, storage, save),
       // Files kept on your PC: the backend is the PC, and the cloud backends (and their warnings) don't apply.
       storage.onPc ? h("p", { class: "muted small", style: "margin:0 0 8px" }, "Active backend: ", h("b", null, "Your PC"), " ", h("span", { class: `tag${storage.pc?.tunnel ? " green" : ""}` }, storage.pc?.tunnel ? "reachable" : "off"),
         storage.pc?.tunnel ? " — files are served through its tunnel." : " — its tunnel is down, so files can't be shown or posted until the PC worker runs (pc\\start.ps1).",
