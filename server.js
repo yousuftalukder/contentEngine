@@ -333,13 +333,13 @@ function decryptSecret(blob) {
 }
 const secretHint = (s) => { const t = String(s || "").trim(); return t.length > 8 ? `…${t.slice(-4)}` : "…"; };
 // Some providers need several values (YouTube OAuth). Those are stored as one JSON secret and exposed as an object.
-const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
+const MULTI_FIELD_PROVIDERS = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"], meta_app: ["app_id", "app_secret"] };
 const parseSecret = (provider, raw) => (MULTI_FIELD_PROVIDERS[provider] && raw ? (P(raw) || {}) : raw);
 
 const DEFAULT_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", pexels: "PEXELS_API_KEY", newsapi: "NEWSAPI_KEY", elevenlabs: "ELEVENLABS_API_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN", telegram: "TELEGRAM_BOT_TOKEN",
   groq: "GROQ_API_KEY", mistral: "MISTRAL_API_KEY", cerebras: "CEREBRAS_API_KEY", openrouter: "OPENROUTER_API_KEY", xai: "XAI_API_KEY", pollinations: "POLLINATIONS_TOKEN",
   vizard: "VIZARDAI_API_KEY", twelve_labs: "TWELVE_LABS_API_KEY" };
-const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2"];
+const PROVIDERS = [...Object.keys(DEFAULT_ENV), "youtube_oauth", "r2", "meta_app"];
 // Resolve the usable secret of one credential row: vault first, then the named env var.
 function credSecret(r) {
   if (r.secret_enc) return { secret: parseSecret(r.provider, decryptSecret(r.secret_enc)), source: "vault" };
@@ -5985,6 +5985,8 @@ app.post("/api/credentials/:id/test", async (ctx) => {
     pexels: () => fetchJson("https://api.pexels.com/v1/search?query=dhaka&per_page=1", { headers: { Authorization: c.secret } }).then((r) => ({ photos: r.total_results })),
     youtube: () => fetchJson(`https://www.googleapis.com/youtube/v3/videos?part=id&chart=mostPopular&maxResults=1&key=${encodeURIComponent(c.secret)}`),
     meta: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/me?${form({ fields: "id,name", access_token: c.secret })}`),
+    // An app token proves the id and secret belong together; nothing else is asked of them here.
+    meta_app: () => fetchJson(`https://graph.facebook.com/${DEFAULTS.META_API_VERSION}/oauth/access_token?${form({ client_id: c.secret?.app_id, client_secret: c.secret?.app_secret, grant_type: "client_credentials" })}`).then((r) => ({ app_token: !!r.access_token })),
     youtube_oauth: () => fetchJson("https://oauth2.googleapis.com/token", { method: "POST", body: form({ client_id: c.secret.client_id, client_secret: c.secret.client_secret, refresh_token: c.secret.refresh_token, grant_type: "refresh_token" }) }).then((t) => ({ token_type: t.token_type, expires_in: t.expires_in })),
     telegram: () => fetchJson(`https://api.telegram.org/bot${c.secret}/getMe`).then((r) => ({ bot: r.result?.username })),
     r2: async () => { const cfg = await r2Config(); if (!cfg) throw new Error("R2 fields incomplete"); await r2Request("PUT", "healthcheck.txt", Buffer.from("ok"), "text/plain"); await r2Request("DELETE", "healthcheck.txt"); return { bucket: cfg.bucket, public_url: cfg.public_url || "(none — set public_url so platforms can fetch files)" }; },
@@ -6349,12 +6351,19 @@ app.delete("/api/niches/:id/sources/:sourceId", async (ctx) => { await q(`DELETE
 // page: they grant once, the server exchanges the short-lived token for a long-lived one (Page tokens derived from a
 // long-lived user token do not expire — derived from a short-lived one they die in an hour, which is the mistake
 // everyone makes), stores each Page's token encrypted, and returns only names and ids. Tokens are never sent back.
-app.post("/api/meta/pages", async (ctx) => {
-  const b = ctx.body, ver = DEFAULTS.META_API_VERSION, graph = await setting("meta.api_base", "https://graph.facebook.com");
-  const userToken = String(b.userToken || "").trim();
-  if (!userToken) throw new ApiError(400, null, "userToken is required — log in at developers.facebook.com → Graph API Explorer, grant pages_show_list, pages_manage_posts and pages_read_engagement, and paste the token here");
+// The Facebook app's own id and secret: the API keys page (provider "meta_app") or Render's environment. With them a
+// login is exchanged for a long-lived one, so the Page tokens never expire, and "Connect with Facebook" can open the
+// login itself instead of asking for a pasted token.
+async function metaAppConfig() {
+  const vault = (await credentialsFor("meta_app"))[0]?.secret;
+  const c = vault && typeof vault === "object" ? vault : { app_id: ENV.META_APP_ID, app_secret: ENV.META_APP_SECRET };
+  return c.app_id && c.app_secret ? { app_id: String(c.app_id).trim(), app_secret: String(c.app_secret).trim() } : null;
+}
+// From a person's login to a stored token for every Page they manage: the pasted-token route and the login flow both
+// end here. Returns names and ids only.
+async function metaConnectPages(userToken, appId, appSecret) {
+  const ver = DEFAULTS.META_API_VERSION, graph = await setting("meta.api_base", "https://graph.facebook.com");
   if (!vaultReady()) throw new ApiError(400, null, "SECRETS_KEY is not set on Render — add a long random string and redeploy before storing Page tokens");
-  const appId = b.appId || ENV.META_APP_ID, appSecret = b.appSecret || ENV.META_APP_SECRET;
   let token = userToken, longLived = false;
   if (appId && appSecret) {
     try {
@@ -6375,9 +6384,59 @@ app.post("/api/meta/pages", async (ctx) => {
     pages.push({ pageId: pg.id, name: pg.name, canPost, credentialId: cred.id, instagram: pg.instagram_business_account ? { id: pg.instagram_business_account.id, username: pg.instagram_business_account.username } : null });
   }
   if (!pages.length) throw new ApiError(400, null, "That login manages no Pages the app can see. Check that pages_show_list was granted and that you have a role on the Page.");
-  json(ctx, 200, { longLived, pages,
+  return { longLived, pages,
     note: longLived ? "Page tokens stored. Derived from a long-lived login, so they do not expire."
-      : "Page tokens stored, but this login was short-lived, so they expire in about an hour. Add META_APP_ID and META_APP_SECRET (or pass appId/appSecret here) and connect again to make them permanent." });
+      : "Page tokens stored, but this login was short-lived, so they expire in about an hour. Add the Facebook app's id and secret (API keys → Facebook app) and connect again to make them permanent." };
+}
+app.post("/api/meta/pages", async (ctx) => {
+  const b = ctx.body, userToken = String(b.userToken || "").trim();
+  if (!userToken) throw new ApiError(400, null, "userToken is required — log in at developers.facebook.com → Graph API Explorer, grant pages_show_list, pages_manage_posts and pages_read_engagement, and paste the token here");
+  const app = b.appId && b.appSecret ? { app_id: String(b.appId).trim(), app_secret: String(b.appSecret).trim() } : await metaAppConfig();
+  json(ctx, 200, await metaConnectPages(userToken, app?.app_id, app?.app_secret));
+});
+// ---- Connect with Facebook: the login itself. The dashboard sends the browser to Facebook's login dialog with a
+// one-time state; Facebook sends it back to the public callback with a code; the code becomes the person's token, the
+// token every Page's token (stored, as above), and the browser goes back to the dashboard it started from — which may
+// be the PC's own copy, while the callback must be the server's public https address, the one registered in the app.
+// The result waits under the state for the dashboard to collect once; nothing of it is in the address bar.
+const META_OAUTH_MINUTES = 15, metaOauthKey = (state) => `meta.oauth.${state}`;
+const metaRedirectUri = async () => `${await serverBase()}/api/public/meta/callback`;
+app.get("/api/meta/oauth/config", async (ctx) => { const app = await metaAppConfig(); json(ctx, 200, { configured: !!app, appIdHint: app ? `…${app.app_id.slice(-4)}` : null, redirectUri: await metaRedirectUri() }); });
+app.get("/api/meta/oauth/start", async (ctx) => {
+  const app = await metaAppConfig(); if (!app) throw new ApiError(400, null, "Add the Facebook app's id and secret first (API keys → Facebook app), or paste a token instead");
+  const state = newId(), proto = ctx.req.headers["x-forwarded-proto"] || "http";
+  const back = String(ctx.query.get("returnTo") || `${proto}://${ctx.req.headers.host}/`);
+  const returnTo = /^https?:\/\//.test(back) ? back.replace(/#.*$/, "").replace(/\/$/, "") : `${proto}://${ctx.req.headers.host}`;
+  await q(`DELETE FROM settings WHERE key LIKE 'meta.oauth.%' AND (value->>'expires_at')::timestamptz < now()`);
+  await q(`INSERT INTO settings (key, value) VALUES ($1, $2::jsonb || jsonb_build_object('expires_at', now() + make_interval(mins => $3::int)))`, [metaOauthKey(state), JSON.stringify({ brandId: ctx.query.get("brandId") || null, returnTo }), META_OAUTH_MINUTES]);
+  // Instagram's two permissions only when asked for: an app whose use case has no Instagram is refused the whole login
+  // for them ("Invalid Scopes"), and most Pages have no Instagram account to connect.
+  const scope = ["pages_show_list", "pages_manage_posts", "pages_read_engagement", ...(ctx.query.get("ig") ? ["instagram_basic", "instagram_content_publish"] : [])].join(",");
+  const login = await setting("meta.login_base", "https://www.facebook.com");
+  ctx.res.writeHead(302, { Location: `${login}/${DEFAULTS.META_API_VERSION}/dialog/oauth?${form({ client_id: app.app_id, redirect_uri: await metaRedirectUri(), state, response_type: "code", scope })}`, "Cache-Control": "no-store" }); ctx.res.end();
+});
+app.get("/api/public/meta/callback", async (ctx) => {
+  const state = String(ctx.query.get("state") || "");
+  const row = state ? await one(`DELETE FROM settings WHERE key = $1 AND NOT (value ? 'done_at') RETURNING value, (value->>'expires_at')::timestamptz > now() AS live`, [metaOauthKey(state)]) : null;
+  if (!row?.live) return plainText(ctx, 400, "This Facebook login link was already used or has expired (each one works once, for 15 minutes). Go back to the dashboard and press Connect with Facebook again.");
+  const v = P(row.value) || {};
+  let result;
+  try {
+    if (ctx.query.get("error")) throw new Error(ctx.query.get("error_description") || ctx.query.get("error_reason") || ctx.query.get("error"));
+    const app = await metaAppConfig(); if (!app) throw new Error("the Facebook app's id and secret are no longer set (API keys → Facebook app)");
+    const graph = await setting("meta.api_base", "https://graph.facebook.com");
+    const tok = await fetchJson(`${graph}/${DEFAULTS.META_API_VERSION}/oauth/access_token?${form({ client_id: app.app_id, client_secret: app.app_secret, redirect_uri: await metaRedirectUri(), code: ctx.query.get("code") })}`);
+    if (!tok.access_token) throw new Error("Facebook returned no access token for the login");
+    result = { ...(await metaConnectPages(tok.access_token, app.app_id, app.app_secret)), brandId: v.brandId };
+  } catch (e) { result = { error: String(e.message || e).slice(0, 400), brandId: v.brandId }; }
+  await putSetting(metaOauthKey(state), { ...result, done_at: nowIso(), expires_at: new Date(nowMs() + META_OAUTH_MINUTES * 60000).toISOString() });
+  ctx.res.writeHead(302, { Location: `${v.returnTo || await serverBase()}/#/channels/connected/${state}`, "Cache-Control": "no-store" }); ctx.res.end();
+});
+app.get("/api/meta/oauth/result/:state", async (ctx) => {
+  const row = await one(`DELETE FROM settings WHERE key = $1 AND value ? 'done_at' RETURNING value`, [metaOauthKey(ctx.params.state)]);
+  if (!row) throw new ApiError(404, null, "No Facebook login result waits under that link: it was already shown, or it expired. Press Connect with Facebook again.");
+  const { done_at, expires_at, ...rest } = P(row.value) || {};
+  json(ctx, 200, rest);
 });
 // Turn a connected Page into a channel, so the whole path is: log in, pick a page, done.
 app.post("/api/meta/channels", async (ctx) => {

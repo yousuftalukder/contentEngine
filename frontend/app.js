@@ -97,8 +97,8 @@ const FORMATS = [["STATIC_IMAGE_CAPTION", "Image + caption"], ["TEXT_POST", "Tex
 let PROVIDERS = ["anthropic", "gemini", "openai", "elevenlabs", "newsapi", "youtube", "meta", "youtube_oauth", "r2"];
 let PROVIDER_ENV = { anthropic: "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY", openai: "OPENAI_API_KEY", elevenlabs: "ELEVENLABS_API_KEY", newsapi: "NEWSAPI_KEY", youtube: "YOUTUBE_API_KEY", meta: "META_ACCESS_TOKEN" };
 let MULTI_FIELD = { youtube_oauth: ["client_id", "client_secret", "refresh_token"], r2: ["account_id", "access_key_id", "secret_access_key", "bucket", "public_url"] };
-const PROVIDER_LABEL = { vizard: "Vizard (optional rented clipping)", twelve_labs: "Twelve Labs (optional video understanding)", pollinations: "Pollinations (free pictures — optional token)", groq: "Groq (free writer)", mistral: "Mistral (free writer)", cerebras: "Cerebras (free writer)", openrouter: "OpenRouter (free models)", xai: "xAI Grok", telegram: "Telegram bot (alerts)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
-const PROVIDER_HELP = { vizard: "Optional and paid (Creator plan, about $14.50 a month): clips YouTube links while your PC is off. Then set a clips programme's clipper to vizard.", twelve_labs: "Optional: Twelve Labs reads a video's chapters for recaps (5c). Gemini does the same for free (5a). Then set a recap programme's transcriber to twelve_labs.", pollinations: "Not needed: pictures are drawn without a key. A free account's token (auth.pollinations.ai) removes the small logo in the corner.", groq: "Free, no card: console.groq.com → API Keys. Takes over writing when Gemini's daily allowance runs out.", mistral: "Free Experiment plan: console.mistral.ai → API Keys (asks for a phone number, no card).", cerebras: "cloud.cerebras.ai → API Keys.", openrouter: "openrouter.ai → Keys. Uses only its free models.", xai: "console.x.ai → API Keys. Uses your xAI credits.", telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
+const PROVIDER_LABEL = { vizard: "Vizard (optional rented clipping)", twelve_labs: "Twelve Labs (optional video understanding)", pollinations: "Pollinations (free pictures — optional token)", groq: "Groq (free writer)", mistral: "Mistral (free writer)", cerebras: "Cerebras (free writer)", openrouter: "OpenRouter (free models)", xai: "xAI Grok", telegram: "Telegram bot (alerts)", meta_app: "Facebook app (App ID + Secret — for Connect with Facebook)", anthropic: "Anthropic (Claude)", gemini: "Google Gemini", openai: "OpenAI", elevenlabs: "ElevenLabs", newsapi: "NewsAPI", youtube: "YouTube Data API key (ingest)", meta: "Meta access token (Facebook / Instagram publishing)", youtube_oauth: "YouTube OAuth (upload to a channel)", r2: "Cloudflare R2 storage" };
+const PROVIDER_HELP = { vizard: "Optional and paid (Creator plan, about $14.50 a month): clips YouTube links while your PC is off. Then set a clips programme's clipper to vizard.", twelve_labs: "Optional: Twelve Labs reads a video's chapters for recaps (5c). Gemini does the same for free (5a). Then set a recap programme's transcriber to twelve_labs.", pollinations: "Not needed: pictures are drawn without a key. A free account's token (auth.pollinations.ai) removes the small logo in the corner.", groq: "Free, no card: console.groq.com → API Keys. Takes over writing when Gemini's daily allowance runs out.", mistral: "Free Experiment plan: console.mistral.ai → API Keys (asks for a phone number, no card).", cerebras: "cloud.cerebras.ai → API Keys.", openrouter: "openrouter.ai → Keys. Uses only its free models.", xai: "console.x.ai → API Keys. Uses your xAI credits.", telegram: "Create a bot with @BotFather and paste its token; put your chat id under Settings → Alerts.", meta: "One per Facebook Page / IG account you publish to. Pick it on the channel.", youtube_oauth: "One per YouTube channel. Same client id/secret, different refresh token per channel. Pick it on the channel.", r2: "Store here instead of Render env vars if you prefer. public_url must be the bucket's r2.dev or custom domain.", meta_app: "Your Facebook app's App ID and App Secret (developers.facebook.com → your app → Settings → Basic). Lets Channels → Connect with Facebook open the login itself, and makes pasted tokens permanent. Register the callback address shown on the Channels page under the app's Facebook Login settings.", gemini: "Add several and pin them on the Adapters page (e.g. one key for writing, one for images).", openai: "Used by openai_live (writing/clipping), whisper_api, openai_tts, openai_image." };
 const password = (name, extra = {}) => h("input", { type: "password", name, autocomplete: "new-password", spellcheck: false, ...extra });
 
 // form field builders
@@ -1432,52 +1432,88 @@ function clipsDialog(c) {
 // ---------------------------------------------------------------- channels
 // One login, every Page. A Page access token comes from the token of somebody with a role on the Page, and Facebook
 // hands back one per Page — so the job is to grant once and tick the pages you want, not to find a token per page.
+// The Pages a login manages, each with its "add as channel" button — the same list after a pasted token and after the
+// login flow. Adding one makes the channel; the Page's token is already stored.
+function metaPagesList(r, brands, brandId, list) {
+  const brandSel = select(null, brands.map((b) => [b.id, b.name]), brandId || brands[0]?.id);
+  list.innerHTML = "";
+  list.append(h("p", { class: "small" }, r.longLived ? null : h("span", { class: "tag amber", style: "margin-right:6px" }, "expires in an hour"), r.note),
+    brands.length > 1 ? field("Brand for new channels", brandSel) : null);
+  for (const pg of r.pages) {
+    list.appendChild(h("div", { class: "panel", style: "padding:10px 12px;margin:6px 0" }, h("div", { class: "row" },
+      h("div", null, h("b", null, pg.name), h("div", { class: "small mute" }, "Page ", h("span", { class: "mono" }, pg.pageId),
+        pg.instagram ? h("span", null, " · Instagram @", pg.instagram.username) : null,
+        pg.canPost ? null : h("span", { class: "tag red", style: "margin-left:6px" }, "cannot post — you only moderate this page"))),
+      h("div", { class: "right row" },
+        h("button", { class: "btn sm primary", disabled: !pg.canPost, onclick: () => run(async () => {
+          await post("/api/meta/channels", { brandId: brandSel.value, pageId: pg.pageId, credentialId: pg.credentialId, displayName: pg.name, platform: "FACEBOOK" });
+        }, `Added ${pg.name}`).then(route) }, "Add as Facebook channel"),
+        pg.instagram ? h("button", { class: "btn sm", disabled: !pg.canPost, onclick: () => run(async () => {
+          await post("/api/meta/channels", { brandId: brandSel.value, pageId: pg.instagram.id, credentialId: pg.credentialId, displayName: `@${pg.instagram.username}`, platform: "INSTAGRAM" });
+        }, `Added @${pg.instagram.username}`).then(route) }, "Add Instagram") : null))));
+  }
+}
+// "Connect with Facebook": Facebook opens its own login, sends the engine a one-time code, and the engine fetches and
+// stores a permanent token for every Page — nothing to copy. Needs the app's id and secret once (API keys) and the
+// callback address registered in the app; until then the dialog says exactly that, and offers the pasted token.
+async function facebookLogin(brands) {
+  const cfg = await get("/api/meta/oauth/config", true).catch(() => null);
+  const brandSel = select(null, brands.map((b) => [b.id, b.name]));
+  const ig = h("input", { type: "checkbox" });
+  const uri = h("span", { class: "mono", style: "user-select:all;word-break:break-all" }, cfg?.redirectUri || "");
+  const body = h("div", null, cfg?.configured ? [
+      h("p", { class: "small mute", style: "margin:0 0 10px" }, "Facebook opens its own login. Allow the Pages you want, and you come back here with each one ready to add. The engine fetches and stores the tokens itself; nothing is pasted, and nothing expires."),
+      brands.length > 1 ? field("Brand for new channels", brandSel) : null,
+      h("label", { class: "check" }, ig, "Also connect the Instagram accounts linked to these Pages"),
+      h("p", { class: "small mute", style: "margin:0" }, "If Facebook answers \"Invalid Scopes\" with Instagram ticked, the app's use case does not include Instagram yet: untick it, or add Instagram to the app first.")]
+    : [h("p", { class: "small", style: "margin:0 0 6px" }, "One-time setup, so the login can open itself:"),
+      h("ol", { class: "small", style: "margin:0 0 10px;padding-left:18px;line-height:1.7" },
+        h("li", null, "At ", h("a", { href: "https://developers.facebook.com/apps/", target: "_blank", rel: "noopener" }, "developers.facebook.com"), " open your app, or create one (any name; the Business type)."),
+        h("li", null, "Add the ", h("b", null, "Facebook Login"), " product. Under its Settings, put this in ", h("b", null, "Valid OAuth Redirect URIs"), ": ", uri),
+        h("li", null, "Copy the App ID and App Secret from Settings → Basic and add them under ", h("a", { href: "#/keys" }, "API keys"), " as the provider ", h("b", null, "Facebook app"), ".")),
+      h("p", { class: "small mute", style: "margin:0" }, "Then press Connect with Facebook again. Until then you can ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); connectFacebook(brands); } }, "paste a token instead"), ".")]);
+  const close = modal("Connect with Facebook", h("div", null, body, h("div", { class: "foot" },
+    h("button", { class: "btn", onclick: () => close() }, cfg?.configured ? "Cancel" : "Close"),
+    cfg?.configured ? h("button", { class: "btn primary", onclick: () => { location.href = `/api/meta/oauth/start?${new URLSearchParams({ brandId: brandSel.value || "", ig: ig.checked ? "1" : "", returnTo: location.origin + location.pathname })}`; } }, "Continue to Facebook") : null)));
+}
+// The pasted-token way: for a machine the login cannot come back to, or an app without Facebook Login set up.
 async function connectFacebook(brands, programs) {
+  const cfg = await get("/api/meta/oauth/config", true).catch(() => ({ configured: false }));
   const tok = h("input", { class: "input mono", type: "password", placeholder: "paste the user access token", autocomplete: "off" });
-  const appId = h("input", { class: "input mono", placeholder: "App ID (optional, makes the tokens permanent)" });
-  const appSecret = h("input", { class: "input mono", type: "password", placeholder: "App Secret (optional)", autocomplete: "off" });
+  const appId = h("input", { class: "input mono", placeholder: cfg.configured ? `(stored: App ID ${cfg.appIdHint})` : "App ID (optional, makes the tokens permanent)" });
+  const appSecret = h("input", { class: "input mono", type: "password", placeholder: cfg.configured ? "(stored)" : "App Secret (optional)", autocomplete: "off" });
   const list = h("div", { style: "margin-top:10px" });
-  const brandSel = h("select", { class: "input" }, ...brands.map((b) => h("option", { value: b.id }, b.name)));
-
   const body = h("div", null,
     h("p", { class: "small mute", style: "margin:0 0 8px" },
       "At ", h("a", { href: "https://developers.facebook.com/tools/explorer/", target: "_blank", rel: "noopener" }, "Graph API Explorer"),
       ": pick your app, press ", h("b", null, "Generate Access Token"), ", and grant ", h("span", { class: "mono" }, "pages_show_list"), ", ",
       h("span", { class: "mono" }, "pages_manage_posts"), " and ", h("span", { class: "mono" }, "pages_read_engagement"), ". Paste it below."),
-    h("p", { class: "small mute", style: "margin:0 0 10px" },
-      "Add the App ID and Secret too and the token is exchanged for a long-lived one, which is what makes the Page tokens permanent. Without them they expire in about an hour. Tokens are stored encrypted and never shown again."),
-    field("User access token", tok), field("App ID", appId), field("App Secret", appSecret), field("Brand for new channels", brandSel), list);
-
-  const connect = async () => {
-    const r = await post("/api/meta/pages", { userToken: tok.value.trim(), appId: appId.value.trim() || undefined, appSecret: appSecret.value.trim() || undefined });
-    list.innerHTML = "";
-    list.appendChild(h("p", { class: "small" }, r.longLived ? null : h("span", { class: "tag amber", style: "margin-right:6px" }, "expires in an hour"), r.note));
-    for (const pg of r.pages) {
-      const row = h("div", { class: "panel", style: "padding:10px 12px;margin:6px 0" }, h("div", { class: "row" },
-        h("div", null, h("b", null, pg.name), h("div", { class: "small mute" }, "Page ", h("span", { class: "mono" }, pg.pageId),
-          pg.instagram ? h("span", null, " · Instagram @", pg.instagram.username) : null,
-          pg.canPost ? null : h("span", { class: "tag red", style: "margin-left:6px" }, "cannot post — you only moderate this page"))),
-        h("div", { class: "right row" },
-          h("button", { class: "btn sm", disabled: !pg.canPost, onclick: () => run(async () => {
-            await post("/api/meta/channels", { brandId: brandSel.value, pageId: pg.pageId, credentialId: pg.credentialId, displayName: pg.name, platform: "FACEBOOK" });
-          }, `Added ${pg.name}`).then(route) }, "Add as Facebook channel"),
-          pg.instagram ? h("button", { class: "btn sm", disabled: !pg.canPost, onclick: () => run(async () => {
-            await post("/api/meta/channels", { brandId: brandSel.value, pageId: pg.instagram.id, credentialId: pg.credentialId, displayName: `@${pg.instagram.username}`, platform: "INSTAGRAM" });
-          }, `Added @${pg.instagram.username}`).then(route) }, "Add Instagram") : null)));
-      list.appendChild(row);
-    }
-  };
-  const close = modal("Connect Facebook", h("div", null, body, h("div", { class: "foot" },
+    h("p", { class: "small mute", style: "margin:0 0 10px" }, cfg.configured
+      ? "The app's id and secret are stored, so the token is exchanged for a long-lived one by itself and the Page tokens never expire. Tokens are stored encrypted and never shown again."
+      : "Add the App ID and Secret too and the token is exchanged for a long-lived one, which is what makes the Page tokens permanent. Without them they expire in about an hour. Tokens are stored encrypted and never shown again."),
+    field("User access token", tok), cfg.configured ? null : [field("App ID", appId), field("App Secret", appSecret)], list);
+  const connect = async () => metaPagesList(await post("/api/meta/pages", { userToken: tok.value.trim(), appId: appId.value.trim() || undefined, appSecret: appSecret.value.trim() || undefined }), brands, brands[0]?.id, list);
+  const close = modal("Connect Facebook with a pasted token", h("div", null, body, h("div", { class: "foot" },
     h("button", { class: "btn", onclick: () => close() }, "Close"),
     h("button", { class: "btn primary", onclick: () => run(connect, "Pages loaded") }, "Find my pages"))), { wide: true });
 }
-pages.channels = async () => {
+pages.channels = async (sub) => {
   const [channels, brands, programs, configs, creds] = await Promise.all([get("/api/channels"), get("/api/brands"), get("/api/programs"), get("/api/adapter-configs"), get("/api/credentials")]);
   const publishers = configs.filter((c) => c.stage === "PUBLISH" && yes(c.enabled)).map((c) => [c.key, `${c.label} (${c.key})`]);
   const root = h("div", null, pageHead("Channels", INFO.channels,
     h("div", { class: "row" },
-      h("button", { class: "btn", disabled: !brands.length, onclick: () => connectFacebook(brands, programs) }, "Connect Facebook"),
-      h("button", { class: "btn primary", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers, creds) }, "New channel"))));
+      h("button", { class: "btn primary", disabled: !brands.length, onclick: () => facebookLogin(brands) }, "Connect with Facebook"),
+      h("button", { class: "btn", disabled: !brands.length, title: "For when the login cannot come back here: paste a token from Graph API Explorer", onclick: () => connectFacebook(brands, programs) }, "Paste a token"),
+      h("button", { class: "btn", disabled: !brands.length, onclick: () => channelDialog(null, brands, programs, publishers, creds) }, "New channel"))));
+  // Back from Facebook's login: the result waits under the state for one reading, then the Pages are offered to add.
+  if (sub.startsWith("connected/")) {
+    history.replaceState(null, "", "#/channels");
+    get(`/api/meta/oauth/result/${sub.slice(10)}`, true).then((r) => {
+      if (r.error) return toast(`Facebook did not connect: ${r.error}`, true);
+      const list = h("div"); metaPagesList(r, brands, r.brandId, list);
+      modal("Connected to Facebook", h("div", null, h("p", { class: "small mute", style: "margin:0 0 6px" }, "Add each Page you want to publish to. A channel takes the posts of the programmes you subscribe to it."), list), { wide: true });
+    }).catch((e) => toast(e.message, true));
+  }
   if (!channels.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No channels yet"), "Add one and subscribe it to a program."));
   for (const c of channels) root.appendChild(h("div", { class: "panel" }, h("div", { class: "row" },
     h("div", null, h("h3", { style: "margin:0" }, c.display_name, " ", yes(c.is_active) ? null : h("span", { class: "tag red" }, "inactive")),

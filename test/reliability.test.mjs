@@ -206,3 +206,53 @@ test("the program's language reaches the voice, so a local engine picks the righ
   assert.equal(meta.provider, "command", "it went through the local engine");
   assert.equal(meta.voice, "bn", "and the engine was told the line is Bangla, not left to guess");
 });
+
+// "Connect with Facebook": the dashboard sends the browser to Facebook's login with a one-time state, Facebook sends it
+// back to the public callback with a code, and the engine turns the code into a stored token for every Page — then
+// sends the browser back to the dashboard it started from, with the result waiting there to be collected once.
+test("Connect with Facebook: the login is opened with the app's id, and the callback stores every Page's token", async () => {
+  const http = await import("node:http");
+  const vault = await startEngine({ env: { SECRETS_KEY: "7".repeat(64), PUBLIC_BASE_URL: "https://engine.example" } });
+  const seen = { code: null, redirect: null, exchanged: null };
+  const graph = http.createServer((req, res) => {
+    const u = new URL(req.url, "http://x");
+    res.writeHead(200, { "content-type": "application/json" });
+    if (u.pathname.endsWith("/oauth/access_token")) {
+      if (u.searchParams.get("code")) { seen.code = u.searchParams.get("code"); seen.redirect = u.searchParams.get("redirect_uri"); return res.end(JSON.stringify({ access_token: "SHORT-FROM-CODE" })); }
+      seen.exchanged = u.searchParams.get("fb_exchange_token"); return res.end(JSON.stringify({ access_token: "LONG-LIVED-USER", expires_in: 5184000 }));
+    }
+    return res.end(JSON.stringify({ data: [{ id: "1001", name: "Khobor 24", access_token: "PAGE-TOKEN-A", tasks: ["CREATE_CONTENT", "MANAGE"] }, { id: "1002", name: "Sideline", access_token: "PAGE-TOKEN-B", tasks: ["CREATE_CONTENT"] }] }));
+  });
+  await new Promise((r) => graph.listen(0, "127.0.0.1", r));
+  try {
+    await vault.api("PUT", "/api/settings/meta.api_base", { value: `http://127.0.0.1:${graph.address().port}` });
+    await vault.api("PUT", "/api/settings/meta.login_base", { value: "https://login.example" });
+    assert.equal((await vault.api("GET", "/api/meta/oauth/config")).configured, false, "nothing to log in with until the app is known");
+    await vault.api("POST", "/api/credentials", { provider: "meta_app", label: "My app", fields: { app_id: "app-123", app_secret: "s3cret" } });
+    const cfg = await vault.api("GET", "/api/meta/oauth/config");
+    assert.deepEqual([cfg.configured, cfg.redirectUri], [true, "https://engine.example/api/public/meta/callback"], "the callback is the server's public address");
+    const brand = await vault.api("POST", "/api/brands", { name: "Connected" });
+
+    const start = await fetch(`${vault.base}/api/meta/oauth/start?brandId=${brand.id}&returnTo=${encodeURIComponent("http://my-pc:4100/")}`, { redirect: "manual" });
+    assert.equal(start.status, 302);
+    const login = new URL(start.headers.get("location"));
+    assert.ok(login.origin === "https://login.example" && login.pathname.endsWith("/dialog/oauth"), `the login dialog, not ${login.href}`);
+    assert.equal(login.searchParams.get("client_id"), "app-123");
+    assert.equal(login.searchParams.get("redirect_uri"), cfg.redirectUri);
+    assert.equal(login.searchParams.get("scope"), "pages_show_list,pages_manage_posts,pages_read_engagement", "Instagram's permissions only when asked for");
+    const state = login.searchParams.get("state"); assert.ok(state);
+    assert.ok(!JSON.stringify(start.headers.get("location")).includes("s3cret"), "the secret never leaves the server");
+
+    const back = await fetch(`${vault.base}/api/public/meta/callback?code=CODE-1&state=${state}`, { redirect: "manual" });
+    assert.equal(back.status, 302);
+    assert.equal(back.headers.get("location"), `http://my-pc:4100/#/channels/connected/${state}`, "back to the dashboard it started from");
+    assert.deepEqual([seen.code, seen.redirect, seen.exchanged], ["CODE-1", cfg.redirectUri, "SHORT-FROM-CODE"], "code → login token → long-lived token");
+
+    const result = await vault.api("GET", `/api/meta/oauth/result/${state}`);
+    assert.deepEqual([result.longLived, result.brandId, result.pages.map((p) => p.name)], [true, brand.id, ["Khobor 24", "Sideline"]]);
+    assert.ok(!JSON.stringify(result).includes("PAGE-TOKEN"), "no token is ever sent back to the browser");
+    assert.equal((await vault.query(`SELECT COUNT(*)::int AS n FROM api_credentials WHERE provider='meta'`))[0].n, 2, "each Page's token is stored");
+    await assert.rejects(vault.api("GET", `/api/meta/oauth/result/${state}`), /already shown/, "the result is collected once");
+    assert.equal((await fetch(`${vault.base}/api/public/meta/callback?code=CODE-2&state=${state}`, { redirect: "manual" })).status, 400, "and the state cannot be replayed");
+  } finally { await vault.stop(); await new Promise((r) => graph.close(r)); }
+});

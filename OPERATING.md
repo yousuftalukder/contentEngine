@@ -88,9 +88,13 @@ is restricted too, contact Supabase support and ask them to empty the bucket or 
 before the switch still point at those files and will show no picture or video; regenerate any you still want.
 
 **Nothing is published yet.** The one channel, `fb_main`, uses the mock publisher — "published" there means nowhere.
-Connect your real Page under **Channels → Connect Facebook** (it lists the Pages your login manages and stores each
-Page's token encrypted), attach it to your programmes, and approved posts go out with the source link as the first
-comment — while your PC is on, since the posts are sent from it.
+Connect your real Page under **Channels → Connect with Facebook**: Facebook opens its own login, you allow the Pages
+you want, and you come back with each one ready to add — the engine fetches and stores a permanent token for every
+Page itself. One-time setup first: in your Facebook app (developers.facebook.com) add the **Facebook Login** product
+and put the callback address the dialog shows under its *Valid OAuth Redirect URIs*, then add the app's App ID and App
+Secret under **API keys** as the provider *Facebook app*. Without that setup, **Paste a token** does the same from a
+token copied out of Graph API Explorer. Attach the channel to your programmes, and approved posts go out with the
+source link as the first comment — while your PC is on, since the posts are sent from it.
 
 ## Making clips from a long video
 
@@ -195,7 +199,7 @@ extras, never requirements.
 
 | you add | where | unlocks |
 |---|---|---|
-| your **Facebook Page** | dashboard → **Channels → Connect Facebook** | real publishing (today the channel is a mock) |
+| your **Facebook Page** | dashboard → **Channels → Connect with Facebook** (the app's id and secret under API keys first, or *Paste a token*) | real publishing (today the channel is a mock) |
 | a free **Gemini key** | on Render (it is there now), or dashboard → **API keys** | the best free writer for Bangla; scene recaps (5a: Gemini watches the video); Bangla transcription; what Gemini sees in your own footage (7a). Your PC borrows the server's, so it needs none of its own |
 | a free **Groq** or **Mistral** key (or OpenRouter, Cerebras, xAI Grok) | API keys | more writers in the chain: when Gemini's ~20 requests a day per model run out, the next one writes. Groq: console.groq.com, no card |
 | a free **Pexels** key | API keys (it is on Render now, which your PC cannot see — and the PC makes the cards and videos while it keeps the files) | stock photos on news cards (2c) and stock footage in script videos (7b); without it those become text cards and photo sequences |
