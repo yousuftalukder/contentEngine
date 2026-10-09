@@ -20,17 +20,30 @@ function h(tag, attrs, ...children) {
 }
 const $ = (sel, root = document) => root.querySelector(sel);
 
+// What a page reads is kept for a few seconds, so going from page to page and back is instant and two pages asking for
+// the same list (programmes, the catalog) ask once. Anything written — a save, an approval, an upload — forgets all of
+// it, and so does the half-minute refresh: nothing shown after an action can be older than the action.
+const CACHE_MS = 15000, cache = new Map();
+let metaAt = 0;
+const invalidate = () => { cache.clear(); metaAt = 0; };
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    method: opts.method || "GET",
+  const method = opts.method || "GET", cached = method === "GET" && !opts.fresh;
+  if (cached) { const c = cache.get(path); if (c && (c.pending || Date.now() - c.at < CACHE_MS)) return c.pending || c.data; }
+  if (method !== "GET") invalidate();
+  const pending = fetch(path, {
+    method,
     headers: opts.body ? { "Content-Type": "application/json" } : {},
     body: opts.body ? JSON.stringify(opts.body) : undefined,
+  }).then(async (res) => {
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    return data;
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-  return data;
+  if (cached) cache.set(path, { pending });
+  try { const data = await pending; if (cached) cache.set(path, { at: Date.now(), data }); return data; }
+  catch (e) { if (cached) cache.delete(path); throw e; }
 }
-const get = (p) => api(p);
+const get = (p, fresh = false) => api(p, { fresh });
 const post = (p, body = {}) => api(p, { method: "POST", body });
 const patch = (p, body) => api(p, { method: "PATCH", body });
 const put = (p, body) => api(p, { method: "PUT", body });
@@ -185,10 +198,22 @@ const INFO = {
 const PAGES = NAV.flatMap(([, items]) => items);
 let health = null, stats = null, workers = null;
 
+// What each page reads, fetched as the pointer reaches its link in the menu (or a finger touches it), so that by the
+// click the answer is usually already in the cache and the page draws at once.
+const PREFETCH = {
+  overview: ["/api/programs", "/api/sources", "/api/channels", "/api/notifications?limit=12", "/api/setup-status", "/api/catalog", "/api/settings", "/api/brands"],
+  review: ["/api/review"], items: ["/api/programs", "/api/content-items?compact=1"], schedule: ["/api/schedule"], insights: ["/api/insights?days=30"],
+  catalog: ["/api/catalog"], programs: ["/api/programs", "/api/brands", "/api/sources", "/api/channels", "/api/adapters", "/api/style-profiles"],
+  candidates: ["/api/video-candidates", "/api/programs"], ideas: ["/api/suggestions", "/api/programs"], brands: ["/api/brands", "/api/uploads"],
+  sources: ["/api/sources", "/api/adapter-impls", "/api/programs", "/api/brands", "/api/adapter-configs"], channels: ["/api/channels", "/api/brands", "/api/programs", "/api/adapter-configs", "/api/credentials"],
+  keys: ["/api/credentials", "/api/usage", "/api/credentials/meta"], desk: ["/api/desk?hours=24"], adapters: ["/api/adapter-configs", "/api/adapter-impls", "/api/credentials"],
+  settings: ["/api/settings", "/api/storage", "/api/adapters"],
+};
+const prefetch = (id) => { for (const p of PREFETCH[id] || []) get(p).catch(() => {}); };
 function renderRail(active) {
   const links = $("#railLinks"); links.innerHTML = "";
   for (const [group, items] of NAV) { links.appendChild(h("div", { class: "rail-group" }, group)); for (const [id, label, badge] of items) {
-    const a = h("a", { href: "#/" + id, class: active === id ? "active" : "", title: INFO[id] || "" }, label);
+    const a = h("a", { href: "#/" + id, class: active === id ? "active" : "", title: INFO[id] || "", onmouseenter: () => prefetch(id), ontouchstart: () => prefetch(id) }, label);
     if (badge === "review") { const n = stats?.items?.PENDING_REVIEW || 0; if (n) a.appendChild(h("span", { class: "count" }, n)); }
     if (badge === "ideas") { const n = stats?.ideas || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n)); }
     if (id === "items") { const n = stats?.items?.FAILED || 0; if (n) a.appendChild(h("span", { class: "count quiet" }, n + " failed")); }
@@ -207,7 +232,8 @@ function renderRail(active) {
 // /api/workers rides along with the stats on the same 30-second refresh (no extra timer): it is the PC's heartbeat,
 // which the stats only reflect through the tunnel — and the tunnel exists only while files are kept on the PC.
 async function refreshMeta() {
-  [health, stats, workers] = await Promise.all([get("/health").catch(() => ({ ok: false })), get("/api/stats").catch(() => null), get("/api/workers").catch(() => null)]);
+  [health, stats, workers] = await Promise.all([get("/health", true).catch(() => ({ ok: false })), get("/api/stats", true).catch(() => null), get("/api/workers", true).catch(() => null)]);
+  metaAt = Date.now();
 }
 // On every page, above everything: is your PC on, is automatic production on — each a link to where it is explained or
 // switched — and, when the PC is off, what is waiting for it. Read-only: it shows what the stats already say.
@@ -231,17 +257,35 @@ function statusStrip() {
       h("a", { class: "small right", href: "#/help" }, "What needs my PC?")),
     waits, stale);
 }
+// What is on screen stays, dimmed, until the next page is ready: a blank "Loading…" between every two pages was a flash
+// on every click, and a page redrawn after a save jumped back to the top. A page that was still loading when the
+// address changed again draws nothing — before, the slower of two loads won, and the Overview could land on top of
+// the page just opened.
+let routeSeq = 0, routePage = null;
 async function route() {
   const id = (location.hash.replace(/^#\/?/, "").split("/")[0]) || "overview";
   const sub = location.hash.split("/").slice(2).join("/");
-  const main = $("#main"); main.innerHTML = "";
-  main.appendChild(h("p", { class: "muted" }, "Loading…"));
-  await refreshMeta();
+  const seq = ++routeSeq, main = $("#main"), keepY = routePage === id ? window.scrollY : 0;
+  if (!main.childElementCount) main.appendChild(h("p", { class: "muted" }, "Loading…"));
+  main.classList.add("busy");
+  // The engine's status (three requests, the better part of a second) is fetched alongside the page, not before it, and
+  // only when what is known is more than ten seconds old or something was written since; the menu is drawn from what
+  // is known right away, and again when the status arrives.
+  const metaP = Date.now() - metaAt > 10000 ? refreshMeta() : Promise.resolve();
+  if (!stats) await metaP;   // the first page of a visit reads the status; later ones redraw with it when it arrives
+  if (seq !== routeSeq) return;
   renderRail(id);
   $("#rail").classList.remove("open");
   const page = pages[id] || pages.overview;
-  try { main.innerHTML = ""; main.appendChild(statusStrip()); main.appendChild(await page(sub)); }
-  catch (e) { main.innerHTML = ""; main.appendChild(statusStrip()); main.appendChild(h("div", { class: "empty" }, h("b", null, "This page could not load"), e.message)); }
+  let node;
+  try { [node] = await Promise.all([page(sub), metaP]); }
+  catch (e) { node = h("div", { class: "empty" }, h("b", null, "This page could not load"), e.message, " ", h("button", { class: "btn sm", onclick: () => route() }, "Try again")); }
+  if (seq !== routeSeq) return;
+  renderRail(id);
+  main.innerHTML = ""; main.classList.remove("busy");
+  main.appendChild(statusStrip()); main.appendChild(node);
+  routePage = id;
+  window.scrollTo(0, keepY);
 }
 // desc may be text or nodes (a plain sentence, then a quieter line for the technical detail some pages carry).
 function pageHead(title, desc, ...actions) {
@@ -476,10 +520,17 @@ function stat(n, l, color) { return h("div", { class: "stat" }, h("div", { class
 function step(done, content) { return h("li", { class: done ? "done" : "" }, content); }
 
 // ---------------------------------------------------------------- review
+// Working through the queue: after each decision the next draft comes up by itself (the same one, now approved, used
+// to be shown again), j / k or the arrows move along it, a box narrows it, and drafts that arrive while you work are
+// offered with a button rather than loaded under what you are editing.
+let reviewHook = null;   // run by the 30-second refresh while the Review page is open
 pages.review = async (sub) => {
+  // A deep link or a refresh names the draft: its details are asked for alongside the queue, not after it.
+  if (sub) { get(`/api/content-items/${sub}`).catch(() => {}); get(`/api/research-notes?contentItemId=${sub}`).catch(() => {}); }
   const list = await get("/api/review");
   const clean = list.filter((it) => it.qa_status === "PASS");
-  const root = h("div", null, pageHead("Review", INFO.review,
+  const arrived = h("span", null);
+  const root = h("div", null, pageHead("Review", INFO.review, arrived,
     clean.length > 1 ? h("button", { class: "btn primary", onclick: () => confirmModal(`Approve ${clean.length} drafts?`,
       `These are the ones the standards check passed. Each is scheduled on its channel's next free slot. ${list.length - clean.length ? `The ${list.length - clean.length} it flagged stay here for you.` : ""}`,
       () => run(async () => { const r = await post("/api/review/approve-clean", {}); toast(`Approved ${r.approved}${r.failed.length ? ` · ${r.failed.length} could not be approved` : ""}`); }).then(route), "Approve them") },
@@ -488,21 +539,56 @@ pages.review = async (sub) => {
     root.appendChild(h("div", { class: "empty" }, h("b", null, "The queue is empty"), "New drafts appear here as programs generate them. ", h("a", { href: "#/programs" }, "Generate one now"), "."));
     return root;
   }
-  let activeId = sub || list[0].id;
+  let activeId = list.some((it) => it.id === sub) ? sub : list[0].id;
+  const filter = h("input", { type: "text", placeholder: "Narrow the queue: headline, programme, kind", "aria-label": "Narrow the queue", style: "flex:1;min-width:0" });
+  const count = h("span", { class: "small mute", style: "white-space:nowrap" });
   const queue = h("div", { class: "queue" });
   const proof = h("div", null);
+  const shown = () => { const q = filter.value.trim().toLowerCase(); return q ? list.filter((it) => [it.headline, it.topic, it.program_name, nice(it.content_type || it.program_type)].join(" ").toLowerCase().includes(q)) : list; };
   const draw = () => {
+    const rows = shown(), idx = rows.findIndex((it) => it.id === activeId);
+    count.textContent = rows.length === list.length ? `${idx >= 0 ? idx + 1 : "–"} of ${list.length}` : `${rows.length} of ${list.length} match`;
     queue.innerHTML = "";
-    for (const it of list) queue.appendChild(h("a", { class: "qitem" + (it.id === activeId ? " active" : ""), href: `#/review/${it.id}`, onclick: (e) => { e.preventDefault(); activeId = it.id; history.replaceState(null, "", `#/review/${it.id}`); draw(); load(); } },
+    if (!rows.length) queue.appendChild(h("div", { class: "qitem mute" }, "Nothing in the queue matches that."));
+    for (const it of rows) queue.appendChild(h("a", { class: "qitem" + (it.id === activeId ? " active" : ""), href: `#/review/${it.id}`, onclick: (e) => { e.preventDefault(); show(it.id); } },
       h("div", { class: "t" }, it.headline || it.topic || "(untitled)"),
       h("div", { class: "m" }, it.program_name, " · ", nice(it.content_type || it.program_type), it.review_deadline_at ? h("div", { class: "deadline" }, untilText(it.review_deadline_at)) : null)));
   };
+  const show = (id) => { activeId = id; history.replaceState(null, "", `#/review/${id}`); draw(); load(); queue.querySelector(".qitem.active")?.scrollIntoView({ block: "nearest" }); };
+  const move = (step) => { const rows = shown(); if (!rows.length) return; const i = rows.findIndex((it) => it.id === activeId); show(rows[Math.max(0, Math.min(rows.length - 1, i < 0 ? 0 : i + step))].id); };
+  // The draft decided on leaves the queue here at once (the server has it already) and the one after it comes up; the
+  // menu's count follows. The last one gone: the page is drawn afresh, which says the queue is empty.
+  const done = () => {
+    const rows = shown(), i = rows.findIndex((it) => it.id === activeId), next = rows[i + 1] || rows[i - 1];
+    const k = list.findIndex((it) => it.id === activeId); if (k >= 0) list.splice(k, 1);
+    refreshMeta().then(() => renderRail("review"));
+    if (!list.length || !next) return route();
+    show(next.id); window.scrollTo({ top: 0, behavior: "smooth" });
+  };
   // A draft that cannot be fetched (deleted meanwhile, the server restarting) says so instead of "Loading…" for ever.
   const load = async () => { proof.innerHTML = ""; proof.appendChild(h("p", { class: "muted" }, "Loading…"));
-    try { const [full, notes] = await Promise.all([get(`/api/content-items/${activeId}`), get(`/api/research-notes?contentItemId=${activeId}`).catch(() => [])]); proof.innerHTML = ""; proof.appendChild(proofView(full, () => route(), notes)); }
+    try { const [full, notes] = await Promise.all([get(`/api/content-items/${activeId}`), get(`/api/research-notes?contentItemId=${activeId}`).catch(() => [])]); proof.innerHTML = ""; proof.appendChild(proofView(full, done, notes)); }
     catch (e) { proof.innerHTML = ""; proof.appendChild(h("div", { class: "empty" }, h("b", null, "This draft could not load"), e.message, " ", h("button", { class: "btn sm", onclick: load }, "Try again"))); } };
+  filter.oninput = draw;
+  // Keys work only outside boxes and dialogs, so typing a caption never moves the queue.
+  const keys = (e) => {
+    if (!document.body.contains(queue)) return document.removeEventListener("keydown", keys);
+    if (!$("#modal").hidden || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); move(1); }
+    else if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); move(-1); }
+    else if (e.key === "/") { e.preventDefault(); filter.focus(); }
+  };
+  document.addEventListener("keydown", keys);
+  reviewHook = () => {
+    if (!document.body.contains(root)) return (reviewHook = null);
+    const extra = (stats?.items?.PENDING_REVIEW || 0) - list.length;
+    arrived.innerHTML = ""; if (extra > 0) arrived.appendChild(h("button", { class: "btn sm", onclick: () => route() }, `${extra} new draft${extra > 1 ? "s" : ""} — refresh`));
+  };
   draw(); load();
-  root.appendChild(h("div", { class: "review" }, queue, proof));
+  root.appendChild(h("div", { class: "review" },
+    h("div", null, h("div", { class: "row", style: "margin-bottom:8px;flex-wrap:nowrap" }, filter, count), queue,
+      h("p", { class: "small mute", style: "margin:8px 0 0" }, "j / k or ↑ ↓ move along the queue · / narrows it · after each decision the next draft comes up")),
+    proof));
   return root;
 };
 
@@ -528,7 +614,8 @@ function proofView(it, onDone, notes = []) {
   const hashtags = h("input", { type: "text", value: (it.hashtags || []).join(", ") });
   const imgPrompt = it.image_prompt != null ? h("textarea", { style: "min-height:48px" }, it.image_prompt) : null;
   const schedule = h("input", { type: "datetime-local" });
-  const note = h("input", { type: "text", placeholder: "Why? (optional — helps the next draft)" });
+  // Enter in the reason box rejects: type why, press Enter, the next draft comes up.
+  const note = h("input", { type: "text", placeholder: "Why? (optional — helps the next draft; Enter rejects)", onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); reject(); } } });
 
   const collect = () => {
     const p = { headline: headline.value, summary: summary.value, hashtags: hashtags.value.split(",").map((x) => x.trim()).filter(Boolean) };
@@ -647,19 +734,26 @@ function qaPanel(it) {
 }
 
 // ---------------------------------------------------------------- content ledger
+// Thousands of items by now: a status tab (with its count), a programme, and a search box narrow them — the search
+// works on what is loaded, without another request per keystroke. The server hands over the newest 200 of a filter.
 pages.items = async (sub) => {
   const filters = ["", "PENDING_REVIEW", "APPROVED", "RENDERING", "PUBLISHED", "FAILED", "REJECTED", "QUEUED", "DRAFTING"];
-  let status = sub || "";
-  const wrap = h("div", null);
-  const root = h("div", null, pageHead("Content", INFO.items), wrap);
-  const draw = async () => {
-    wrap.innerHTML = "";
-    const tabs = h("div", { class: "tabs" }, filters.map((f) => h("button", { class: f === status ? "active" : "", onclick: () => { status = f; history.replaceState(null, "", "#/items/" + f); draw(); } }, f ? nice(f) : "All")));
-    const rows = await get("/api/content-items" + (status ? `?status=${status}` : ""));
-    wrap.append(tabs, !rows.length ? h("div", { class: "empty" }, h("b", null, "Nothing here yet")) :
+  let status = sub || "", nicheId = "", rows = [];
+  const programs = await get("/api/programs").catch(() => []);
+  const wrap = h("div", null), table = h("div", null), count = h("span", { class: "small mute" });
+  const search = h("input", { type: "text", placeholder: "Find: headline, topic, programme, note", "aria-label": "Find content", style: "max-width:300px", oninput: () => show() });
+  const progSel = select(null, [["", "All programmes"], ...programs.map((p) => [p.id, p.display_name])], "", { style: "width:auto", onchange: () => { nicheId = progSel.value; draw(); } });
+  const root = h("div", null, pageHead("Content", INFO.items, progSel, search), wrap);
+  const total = (f) => { const it = stats?.items || {}; return f ? it[f] || 0 : Object.values(it).reduce((a, b) => a + b, 0); };
+  const show = () => {
+    const q = search.value.trim().toLowerCase();
+    const list = q ? rows.filter((r) => [r.headline, r.topic, r.program_name, r.rejection_note, nice(r.content_type)].join(" ").toLowerCase().includes(q)) : rows;
+    count.textContent = `${list.length}${list.length !== rows.length ? ` of ${rows.length}` : ""} shown${rows.length >= 200 ? " (the newest 200)" : ""}`;
+    table.innerHTML = "";
+    table.appendChild(!list.length ? h("div", { class: "empty" }, h("b", null, rows.length ? "Nothing matches" : "Nothing here yet"), rows.length ? "Clear the search box or pick another tab." : "") :
       h("div", { class: "table-wrap" }, h("table", null,
         h("thead", null, h("tr", null, h("th", null, "Item"), h("th", null, "Program"), h("th", null, "Status"), h("th", null, "Created"), h("th", null, "Cost"), h("th"))),
-        h("tbody", null, rows.map((r) => h("tr", null,
+        h("tbody", null, list.map((r) => h("tr", null,
           h("td", null, h("a", { href: "#", onclick: (e) => { e.preventDefault(); openItem(r.id); } }, r.headline || r.topic || "(untitled)"), h("span", { class: "sub" }, nice(r.content_type))),
           h("td", null, r.program_name),
           h("td", null, tag(r.status), r.rejection_note ? h("span", { class: "sub" }, r.rejection_note) : null),
@@ -670,6 +764,15 @@ pages.items = async (sub) => {
             r.status === "FAILED" ? [h("button", { class: "btn sm", onclick: () => run(() => post(`/api/content-items/${r.id}/regenerate`, { part: "all" }), "Regenerating").then(draw) }, "Retry"), pcMark("making it again")] : null,
             ["FAILED", "REJECTED"].includes(r.status) ? h("button", { class: "btn sm danger", onclick: () => confirmModal("Delete item?", "This removes the item and its media records.", () => run(() => del(`/api/content-items/${r.id}`), "Deleted").then(draw)) }, "Delete") : null)))))));
   };
+  const draw = async () => {
+    wrap.innerHTML = "";
+    const tabs = h("div", { class: "tabs" }, filters.map((f) => h("button", { class: f === status ? "active" : "", onclick: () => { status = f; history.replaceState(null, "", "#/items/" + f); draw(); } },
+      f ? nice(f) : "All", !nicheId && total(f) ? h("span", { class: "small mute" }, ` ${total(f)}`) : null)));
+    wrap.append(tabs, h("div", { class: "row", style: "margin:-6px 0 8px" }, count), table);
+    table.appendChild(h("p", { class: "muted" }, "Loading…"));
+    rows = await get("/api/content-items?compact=1" + (status ? `&status=${status}` : "") + (nicheId ? `&nicheId=${nicheId}` : ""));
+    show();
+  };
   await draw();
   return root;
 };
@@ -678,7 +781,11 @@ async function openItem(id) {
   const jobs = await get(`/api/jobs?contentItemId=${id}`);
   modal(it.headline || it.topic || "Item", h("div", null,
     h("div", { class: "row small mute", style: "margin-bottom:10px" }, tag(it.status), it.program_name, nice(it.content_type), "created " + ago(it.created_at)),
-    it.hero_media ? (it.hero_media.kind === "IMAGE" ? h("img", { class: "hero", src: it.hero_media.url, style: "max-height:260px;width:100%;object-fit:cover;border-radius:4px" }) : h("a", { href: it.hero_media.url, target: "_blank" }, "Open media")) : null,
+    // A video or a voice plays here, as it does in Review; "Open media" was a link out of the dashboard for both.
+    it.hero_media ? (it.hero_media.kind === "IMAGE" ? h("img", { class: "hero", src: it.hero_media.url, style: "max-height:260px;width:100%;object-fit:cover;border-radius:4px" })
+      : it.hero_media.kind === "VIDEO" ? h("video", { src: it.hero_media.url, controls: true, preload: "metadata", style: "width:100%;max-height:360px;border-radius:4px;background:var(--ink)" })
+      : it.hero_media.kind === "AUDIO" ? h("audio", { src: it.hero_media.url, controls: true, style: "width:100%" })
+      : h("a", { href: it.hero_media.url, target: "_blank" }, "Open media")) : null,
     it.summary ? h("p", null, it.summary) : null,
     it.portal_url ? h("p", null, "Portal article: ", h("a", { href: it.portal_url, target: "_blank" }, it.portal_url)) : null,
     h("h3", { style: "margin-top:14px" }, "Publish targets"),
@@ -1074,7 +1181,7 @@ function styleDialog(styles, brands) {
 pages.brands = async () => {
   const [brands, uploads] = await Promise.all([get("/api/brands"), get("/api/uploads").catch(() => [])]);
   const root = h("div", null, pageHead("Brands", [INFO.brands, h("span", { class: "sub" }, "A brand owns programmes and channels.")],
-    h("button", { class: "btn primary", onclick: () => run(async () => { const name = prompt("Brand name"); if (name) { await post("/api/brands", { name }); route(); } }) }, "New brand")));
+    h("button", { class: "btn primary", onclick: () => brandDialog(brands) }, "New brand")));
   if (!brands.length) root.appendChild(h("div", { class: "empty" }, h("b", null, "No brands yet"), "Create one, then give it a kit."));
   for (const b of brands) root.appendChild(brandKitPanel(b, uploads.filter((u) => u.meta?.purpose === "music")));
   root.appendChild(mediaLibrary(uploads));
@@ -1085,7 +1192,7 @@ function mediaLibrary(uploads) {
   const up = (purpose, accept) => h("input", { type: "file", accept, style: "max-width:230px", onchange: (e) => run(async () => {
     const f = e.target.files[0]; if (!f) return; toast(`Uploading ${f.name}…`);
     const res = await fetch(`/api/uploads?purpose=${purpose}&name=${encodeURIComponent(f.name)}`, { method: "POST", headers: { "Content-Type": f.type || "application/octet-stream" }, body: f });
-    const m = await res.json(); if (!res.ok) throw new Error(m.error); route(); }, "Uploaded") });
+    const m = await res.json(); if (!res.ok) throw new Error(m.error); invalidate(); route(); }, "Uploaded") });
   const rows = uploads.filter((u) => ["reactor", "music"].includes(u.meta?.purpose));
   return h("div", { class: "panel" }, h("h3", null, "Media library"),
     h("p", { class: "muted small", style: "margin:0 0 10px" }, "Reactor clips are looped beside the source in reaction videos (film yourself or a presenter reacting, 10-60 s). Music beds play quietly under reels and explainers — use tracks you have the rights to."),
@@ -1743,4 +1850,15 @@ pages.help = async () => {
 window.addEventListener("hashchange", route);
 $("#railToggle").onclick = () => $("#rail").classList.toggle("open");
 route();
-setInterval(async () => { if (document.hidden) return; await refreshMeta(); renderRail((location.hash.replace(/^#\/?/, "").split("/")[0]) || "overview"); }, 30000);
+// The status pages redraw themselves every half minute, in place with the scroll kept, so what is being made, waiting
+// or scheduled is current without pressing Refresh — unless a box on them has the cursor or a dialog is open.
+const LIVE_PAGES = new Set(["overview", "schedule", "candidates"]);
+setInterval(async () => {
+  if (document.hidden) return;
+  cache.clear();
+  await refreshMeta();
+  const id = (location.hash.replace(/^#\/?/, "").split("/")[0]) || "overview";
+  renderRail(id);
+  if (reviewHook) reviewHook();
+  if (LIVE_PAGES.has(id) && $("#modal").hidden && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "")) route();
+}, 30000);

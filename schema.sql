@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS source_items (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_source_items_status ON source_items(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_source_items_source ON source_items(source_id);
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS weight      REAL NOT NULL DEFAULT 1;   -- outlet importance in news-desk ranking
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS language    TEXT;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS catalog_key TEXT;                      -- set when created from the built-in catalog
