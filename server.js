@@ -179,13 +179,15 @@ function tokenCost(model, inTok = 0, outTok = 0) {
 function extractJson(text) {
   let t = String(text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
   try { return JSON.parse(t); } catch {}
+  // Unreadable answers are worth asking for again (transient): the same request usually comes back whole the second
+  // time. As a plain error it was read as permanent, and one cut-off answer failed a news draft outright (2026-10-11).
   const s = Math.min(...[t.indexOf("{"), t.indexOf("[")].filter((i) => i >= 0));
-  if (!Number.isFinite(s)) throw new Error("LLM did not return JSON: " + t.slice(0, 200));
+  if (!Number.isFinite(s)) throw Object.assign(new Error("LLM did not return JSON: " + t.slice(0, 200)), { transient: true });
   for (let e = t.length; e > s; e--) {
     const c = t[e - 1]; if (c !== "}" && c !== "]") continue;
     try { return JSON.parse(t.slice(s, e)); } catch {}
   }
-  throw new Error("LLM returned malformed JSON: " + t.slice(0, 200));
+  throw Object.assign(new Error("LLM returned malformed JSON: " + t.slice(0, 200)), { transient: true });
 }
 class ApiError extends Error { constructor(status, body, msg) { super(msg || `HTTP ${status}`); this.status = status; this.body = body; } }
 async function fetchJson(url, opts = {}) {
@@ -215,7 +217,9 @@ async function fetchBytes(url, opts = {}) {
 // with backoff. Permanent = retrying cannot help (bad request, auth, missing key, duplicate) → fail now.
 // e.transient (true/false) set by a caller overrides the guess.
 const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
-const TRANSIENT_TEXT = /UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|try again later|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|timed out/i;
+// An unreadable answer is in this list too: a relayed writing request reaches the PC as text only, and a model that
+// garbled one answer usually writes the next one whole.
+const TRANSIENT_TEXT = /UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|try again later|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|timed out|malformed JSON|did not return JSON/i;
 // 402 is Payment Required: an account out of credit. Retrying it is pointless and it is not a quota that resets, so
 // it is permanent — and it is the one failure a person can actually fix, so it says so rather than printing a url.
 const PERMANENT_STATUS = new Set([400, 401, 402, 404, 405, 409, 410, 413, 422]);
@@ -415,7 +419,7 @@ async function recordUsage(credId, provider, units = 1, cost = 0) {
 // that fails inside a step with a fallback (a caption the clip's own words stand in for) never fails the job, so no
 // alert fires, and a key that exists looked like a key that works. Written only when the state changes: refused on
 // the first billing or quota refusal, cleared by the first success after it.
-const refusedState = new Map();                                                   // provider -> true (refused) | false (clear)
+const refusedState = new Map();                                                   // provider -> { reason, at } (refused) | false (clear)
 const refusalOf = (e) => {
   const text = `${e?.message || ""} ${JSON.stringify(e?.body || "")}`;
   if (/credit balance|insufficient_quota|payment required|\b402\b/i.test(text) || e?.status === 402) return "out of credit";
@@ -424,8 +428,10 @@ const refusalOf = (e) => {
   return null;
 };
 async function markProvider(provider, reason) {
-  if (reason ? refusedState.get(provider) === reason : refusedState.get(provider) === false) return;
-  refusedState.set(provider, reason || false);
+  // A refusal that goes on is written again at most hourly, so how recent it is stays true (creditRefused reads that).
+  const cur = refusedState.get(provider);
+  if (reason ? cur?.reason === reason && Date.now() - cur.at < 3600e3 : cur === false) return;
+  refusedState.set(provider, reason ? { reason, at: Date.now() } : false);
   if (reason) await putSetting(`provider.refused.${provider}`, { reason }).catch(() => {});
   else await q(`DELETE FROM settings WHERE key = $1`, [`provider.refused.${provider}`]).catch(() => {});
 }
@@ -805,8 +811,21 @@ async function resolve(stage, key, extra = null) {
 // Try primary then fallbacks; fn(adapter) is attempted per adapter. When several fail, the error lists all of them and
 // stays retryable if any failure was transient — a fallback's missing key must not turn a temporary outage of the
 // primary into a permanent failure.
+// A provider that refused for money in the last six hours is not asked again while another tool is in the chain: the
+// call is a certain refusal, and its permanent "out of credit" became the job's reason to fail when the writer before
+// it had only stumbled (2026-10-11). After six hours it is tried again, so credit bought in the meantime is noticed.
+async function creditRefused() {
+  const rows = await q(`SELECT substring(key from 18) AS provider FROM settings WHERE key LIKE 'provider.refused.%' AND value->>'reason' = 'out of credit' AND updated_at > now() - interval '6 hours'`).catch(() => []);
+  return new Set(rows.map((r) => r.provider));
+}
+async function adapterProvider(key) {
+  const row = await one(`SELECT impl, config FROM adapter_configs WHERE key=$1`, [key]).catch(() => null);
+  return row ? (row.impl === "openai_compat" ? (P(row.config)?.provider || "groq") : IMPL_PROVIDER[row.impl] || null) : null;
+}
 async function withFallbacks(stage, primary, fallbacks, fn) {
-  const keys = [...new Set([primary, ...(P(fallbacks) || [])].filter(Boolean))];
+  let keys = [...new Set([primary, ...(P(fallbacks) || [])].filter(Boolean))];
+  const broke = keys.length > 1 ? await creditRefused() : new Set();
+  if (broke.size) { const usable = []; for (const k of keys) if (!broke.has(await adapterProvider(k))) usable.push(k); if (usable.length) keys = usable; }
   const errors = [];
   for (const k of keys) {
     let a; try { a = await resolve(stage, k); } catch (e) { errors.push([k, e]); continue; }
@@ -961,18 +980,26 @@ impl("SCRIPT", "gemini", { label: "Google Gemini", configSchema: { model: { type
         req = { ...req, tools: undefined, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { ...req.generationConfig, responseMimeType: json ? "application/json" : undefined } };
         ({ model, body } = await withGeminiModels(key, "text", models, async (m) => ({ model: m, body: await call(m, req) }))); searched = false;
       }
-      // Stopped at the length limit, mid-answer: Bangla takes several times the tokens of English, and the newer Flash
-      // models spend part of the budget thinking before they write. A JSON answer cut off there is unreadable — about
-      // one Bangla news draft in fifty was lost to it — so it is asked once more, on the same model, with twice the room.
-      let extra = 0;
-      if (json && body.candidates?.[0]?.finishReason === "MAX_TOKENS") {
-        const first = body.usageMetadata || {}; extra = tokenCost(model, first.promptTokenCount, first.candidatesTokenCount);
-        body = await call(model, { ...req, generationConfig: { ...req.generationConfig, maxOutputTokens: Math.min(16000, Math.max(2048, maxTokens * 2)) } });
+      // Stopped at the length limit, mid-answer, or not readable as JSON at all: Bangla takes several times the tokens of
+      // English, and the newer Flash models spend part of the budget thinking before they write. Twice the room was not
+      // always enough (a Bangla news card with four captions, 2026-10-11), so it is asked once more, on the same model,
+      // with plenty of room — the cap only bounds a runaway; what is billed is what is written.
+      let extra = 0, text, data = null;
+      const read = () => { text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join(""); };
+      read();
+      if (json) {
+        const cut = body.candidates?.[0]?.finishReason === "MAX_TOKENS";
+        try { if (cut) throw new Error("cut off"); data = extractJson(text); }
+        catch {
+          const first = body.usageMetadata || {}; extra = tokenCost(model, first.promptTokenCount, first.candidatesTokenCount);
+          warn(`Gemini ${model}: ${cut ? "answer cut off at the length limit" : "answer was not readable JSON"}; asking once more with more room`);
+          body = await call(model, { ...req, generationConfig: { ...req.generationConfig, maxOutputTokens: Math.min(16000, Math.max(8192, maxTokens * 4)) } });
+          read(); data = extractJson(text);
+        }
       }
-      const text = (body.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
       const u = body.usageMetadata || {};
       const cites = (body.candidates?.[0]?.groundingMetadata?.groundingChunks || []).map((c) => c.web?.uri).filter(Boolean);
-      return { text, data: json ? extractJson(text) : null, cost: extra + tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), model, citations: cites, searched, units: 1 };
+      return { text, data, cost: extra + tokenCost(model, u.promptTokenCount, u.candidatesTokenCount), model, citations: cites, searched, units: 1 };
     }, ctx.pin);
   } }) });
 impl("SCRIPT", "openai", { label: "OpenAI (GPT)", configSchema: { model: { type: "string", default: DEFAULTS.OPENAI_MODEL }, temperature: { type: "number", default: 0.7 } }, create: (cfg, ctx = {}) => ({
