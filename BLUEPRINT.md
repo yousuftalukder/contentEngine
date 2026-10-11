@@ -282,7 +282,7 @@ The explainer proofs (6b, 6c, 6d) did not run that day: Gemini answered "high de
 gemini-flash-lite-latest refused with a bare 429 that names no limit. Read as a per-minute limit, the jobs went back to
 ordinary retries after two hours and failed; a "per-minute" limit still refusing after two hours now waits for the
 daily reset instead. A bare 429 on research is now read as the web-search allowance and the research asked again
-without search (PR #133); 6b and 6d were proven the next day (above). 6c is still to be proven.
+without search (PR #133); 6b, 6d and then 6c were proven over the next two days (above).
 
 **5a, 2026-10-05:** a scene recap made by the server from *Duck and Cover* (1951, archive.org): Gemini's free tier
 watched a 360p, one-frame-a-second proxy, the recap script narrates what is on screen (the turtle, the dynamite, the

@@ -218,7 +218,9 @@ extras, never requirements.
 
 ## Test programmes left from the proofs
 
-Made between 2026-10-04 and 10-06 to prove variants on the real server, all under the demo brand, none publishing anywhere:
+Made between 2026-10-04 and 10-06 to prove variants on the real server, all under the demo brand, none publishing anywhere.
+Paused on 2026-10-11 (their drafts set aside), so they take no stories and make nothing; turn one back on from **Programmes** to
+re-run its proof:
 `reaction_test`, `voiceover_test`, `recap_test`, `reaction_long_test`, `telecast_intro_test`, `scene_recap_test`,
 `bn_clip_test`, `data_explainer_test`, `illustrated_test`, `blender_test`, `own_footage_test`, `stockvideo_test` (inactive), `eval_llm_picker` (inactive,
 the selection evaluation). Deactivate or delete them from **Programmes** when you no longer want them; keep
