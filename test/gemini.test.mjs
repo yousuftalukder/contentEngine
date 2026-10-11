@@ -81,6 +81,39 @@ test("Gemini: an answer cut off at the length limit is asked for again with more
   } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
 });
 
+// An answer that finished but is not readable JSON (2026-10-11: a Bangla card's answer ended mid-caption with no length
+// warning) is asked for once more on the same model, with plenty of room, and a writer refused for money is not asked
+// after it — its permanent "out of credit" used to become the draft's reason to fail.
+test("Gemini: an unreadable answer is asked for again, and a writer out of credit is passed over", async () => {
+  const budgets = [];
+  const full = JSON.stringify({ headline: "স্টারলিংকের খরচ কত", summary: "মোবাইল সেবার দাম জানা গেছে।", captions: { facebook: "স্টারলিংকের খরচ" }, hashtags: ["খবর"] });
+  const stub = http.createServer((req, res) => {
+    let raw = ""; req.on("data", (d) => (raw += d)); req.on("end", () => {
+      const url = new URL(req.url, "http://x");
+      if (!/:generateContent$/.test(url.pathname)) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ models: [] })); }
+      const body = JSON.parse(raw), writer = /Produce JSON/.test(JSON.stringify(body.contents));
+      if (writer) budgets.push(body.generationConfig?.maxOutputTokens);
+      const broken = writer && budgets.length === 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: broken ? `{"headline": "স্টারলিংকের খরচ", "summary": "মোবাইল` : full }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50 } }));
+    });
+  });
+  await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+  const eng = await startEngine({ env: { GEMINI_API_KEY: "not-a-real-key", ANTHROPIC_API_KEY: "not-a-real-key", GEMINI_API_BASE: `http://127.0.0.1:${stub.address().port}` } });
+  try {
+    await eng.query(`INSERT INTO settings (key, value) VALUES ('provider.refused.anthropic', '{"reason": "out of credit"}') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`);
+    const brand = await eng.api("POST", "/api/brands", { name: "Unreadable" });
+    const p = await eng.api("POST", "/api/programs", { brandId: brand.id, key: "unreadable", displayName: "Unreadable", contentType: "NEWS_STATIC", language: "bn",
+      useMocks: true, autoStyle: false, autoSources: false, scriptAdapter: "gemini_live", scriptAdapterFallbacks: ["anthropic_live"], methodConfig: { qa: { enabled: false } } });
+    const { id } = await eng.api("POST", "/api/generate", { nicheId: p.id, topic: "স্টারলিংকের মোবাইল সেবার খরচ" });
+    const it = await waitFor(async () => { const x = await eng.api("GET", `/api/content-items/${id}`); if (x.status === "FAILED") throw new Error(x.rejection_note); return x.status === "PENDING_REVIEW" && x; }, { timeout: 60000, what: "the draft" });
+    assert.equal(it.headline, "স্টারলিংকের খরচ কত", "the draft is the second, readable answer");
+    assert.equal(budgets.length, 2, `Gemini was asked twice (${budgets.join(" → ")})`);
+    assert.ok(budgets[1] >= 8192, `the second time with plenty of room (${budgets.join(" → ")})`);
+    assert.ok(!/anthropic|credit/i.test(eng.logs()), "the writer out of credit was never asked");
+  } finally { await eng.stop(); await new Promise((r) => stub.close(r)); }
+});
+
 // Research asks Gemini to search the web, and search is its own allowance: a plan or model can refuse it while the model
 // itself still answers. Then the research is asked once more without search and the draft says so — instead of every
 // researched format (long posts, explainers) failing at its first step. A spent daily allowance for the model is a
