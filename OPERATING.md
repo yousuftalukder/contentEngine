@@ -78,8 +78,12 @@ upload (a logo, a reactor clip) made while the PC is off waits on the server unt
 150 MB has to be copied into `data\media` by hand. The PC deletes its own files on the same rules as cloud storage: an
 item's media 48 hours after every channel has published it (Settings → Media storage), and — only if you set a number
 of days — the pictures and videos of rejected and failed drafts (Settings → Review and news). Keep an eye on the PC's
-free disk space. With the switch off, files go to cloud storage (Supabase or R2) and the Overview shows how full
-Supabase is.
+free disk space. The folder can be any folder on the PC (**Settings → Media storage → Your PC → Folder on the PC**, a
+full path like `D:\ContentEngine\media`): the worker picks it up within a minute, finishes the jobs under way, moves
+the existing files there itself and carries on; a folder it cannot use is reported under Alerts. The same panel switches to the cloud instead — **Cloudflare R2** (free 10 GB) or Supabase — for
+days the PC is off: then news cards, text, pictures and server-made video need no PC at all, and only YouTube and the
+heavy video work still go to it, when a programme says so. Files already stored stay where they are and keep their
+links.
 
 **Delete the old files in Supabase yourself.** Supabase's free 1 GB filled on 2026-10-07 and its storage was
 restricted; the engine no longer uses it (the database is still Supabase). To clear it: Supabase dashboard → your
@@ -92,9 +96,12 @@ Connect your real Page under **Channels → Connect with Facebook**: Facebook op
 you want, and you come back with each one ready to add — the engine fetches and stores a permanent token for every
 Page itself. One-time setup first: in your Facebook app (developers.facebook.com) add the **Facebook Login** product
 and put the callback address the dialog shows under its *Valid OAuth Redirect URIs*, then add the app's App ID and App
-Secret under **API keys** as the provider *Facebook app*. Without that setup, **Paste a token** does the same from a
-token copied out of Graph API Explorer. Attach the channel to your programmes, and approved posts go out with the
-source link as the first comment — while your PC is on, since the posts are sent from it.
+Secret under **API keys** as the provider *Facebook app*. Without that setup, **Paste a Facebook token** does the same
+from a token copied out of Graph API Explorer. **Connect with YouTube** works the same way with a Google Cloud OAuth
+client (YouTube Data API enabled, a Web application client whose authorised redirect URI is the callback address the
+dialog shows, its id and secret under **API keys** as *Google app*); publish the Google app, or its tokens expire after
+seven days. Attach each channel to your programmes, and approved posts go out with the source link as the first
+comment — while your PC is on, since the posts are sent from it.
 
 ## Making clips from a long video
 
