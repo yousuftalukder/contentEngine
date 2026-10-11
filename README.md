@@ -130,13 +130,15 @@ Everything goes into the project's `.tools` folder; nothing is installed system-
 request it cannot answer goes to the server as an `LLM_RELAY` job and the server's writer answers. It does see keys stored
 in the dashboard vault (it has the same `SECRETS_KEY`), but not env vars set only on Render.
 
-**Files kept on the PC** (Settings → *Files are kept on your PC*, setting `storage.on_pc`; on in production since
+**Files kept on the PC** (Settings → Media storage → *Your PC*, setting `storage.on_pc`; on in production since
 2026-10-07, when Supabase's free 1 GB of storage filled and was restricted). The server then stores nothing:
 
 - Every job that writes a file — `GENERATE_CONTENT`, `REGENERATE`, `PROCESS_CANDIDATE`, `RENDER_CLIP`, `STUDIO_RENDER`,
   `PUBLISH_ASSET` (the `FILE_JOBS` set in `server.js`), plus `RECOMPOSE_CARD` — is queued to the PC lane whatever lane it
   was meant for. A step that still tries to store a file on the server fails with a message saying so.
-- The PC writes to `MEDIA_DIR` (default `data/media`) and opens a Cloudflare quick tunnel to its own engine (`cloudflared
+- The PC writes to the folder chosen on the dashboard (Settings → Media storage → Your PC, setting `storage.pc_dir`),
+  else `MEDIA_DIR` (default `data/media`); a change is picked up within a minute, after the jobs under way, and the
+  files are moved there. It opens a Cloudflare quick tunnel to its own engine (`cloudflared
   tunnel --url http://localhost:<PORT>`, no account), recording the address in the `pc.tunnel` setting. A quick tunnel's
   address changes on every start, so stored links are the server's `https://<server>/pc/<path>`: the server redirects
   (302) to today's tunnel, or answers 503 while the PC is off.
@@ -160,10 +162,12 @@ in the dashboard vault (it has the same `SECRETS_KEY`), but not env vars set onl
 | `GEMINI_API_KEY` | yes | writing, images, embeddings, Bangla TTS, transcription (or add it on the API keys page) |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | recommended | alerts and the daily digest |
 | `PEXELS_API_KEY` | recommended | free stock photos when a picture cannot be generated (otherwise posts are text cards) |
-| `META_ACCESS_TOKEN` | to publish | Facebook Page / Instagram (or per-channel keys in the dashboard) |
-| `YOUTUBE_CLIENT_ID`, `_SECRET`, `_REFRESH_TOKEN` | to publish | YouTube uploads (or per-channel keys) |
+| `META_APP_ID`, `META_APP_SECRET` | to publish | the Facebook app, for Channels → Connect with Facebook (or the *Facebook app* key in the dashboard); the login stores a permanent token per Page |
+| `META_ACCESS_TOKEN` | optional | one Facebook token for every channel without its own (the login above stores per-Page tokens instead) |
+| `YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET` | to publish | the Google OAuth client, for Channels → Connect with YouTube (or the *Google app* key in the dashboard); the login stores the channel's refresh token |
+| `YOUTUBE_REFRESH_TOKEN` | optional | one refresh token for every YouTube channel without its own |
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY` | optional | alternative or backup writers and voices |
-| `R2_*` | optional | Cloudflare R2 instead of Supabase Storage |
+| `R2_*` | optional | Cloudflare R2 (free 10 GB), chosen under Settings → Media storage; or the *Cloudflare R2* key in the dashboard |
 | `MEDIA_DIR` | optional | the folder files are written to on local disk or the PC (default `data/media` in the project). The test harness gives each test engine its own, so tests stay out of the PC's store |
 | `PC_TUNNEL` | optional (PC) | `off` stops the PC worker opening its Cloudflare tunnel (the tests use it) |
 | `CLOUDFLARED_BIN` | optional (PC) | path to cloudflared; default `cloudflared` on PATH, which `pc\start.ps1` points at `.tools\bin` |
@@ -171,8 +175,8 @@ in the dashboard vault (it has the same `SECRETS_KEY`), but not env vars set onl
 
 Everything else — model names, voices, lanes, retries, fonts — has defaults; see `.env.example`.
 
-Two switches are settings in the dashboard, not env vars: `auto.enabled` (Overview → Automatic production, off by
-default) and `storage.on_pc` (Settings → Files are kept on your PC). The PC worker's own file, `.env.pc`, is described
+Some switches are settings in the dashboard, not env vars: `auto.enabled` (Overview → Automatic production, off by
+default), and where files are kept (Settings → Media storage: `storage.on_pc`, `storage.pc_dir`, `storage.backend`). The PC worker's own file, `.env.pc`, is described
 in `.env.pc.example`.
 
 ## How it's built
