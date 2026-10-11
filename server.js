@@ -5849,7 +5849,10 @@ function startWorkers() {
     syncPcSlots(); setInterval(() => syncPcSlots().catch(() => {}), Number(ENV.PC_SLOTS_POLL_MS) || 60000);
     // A heartbeat from the PC worker, so the dashboard can say "your PC is on" or "waiting for your PC" instead of
     // leaving routed work to look stuck.
-    const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, host: PC_HOST, lanes: LANES, media: pcMediaSize() }).catch((e) => warn("pc heartbeat", e.message));
+    // The folder is measured after the heartbeat is written: its result is merged into this row, and on a fresh
+    // database the first measurement could finish before the row existed, update nothing, and leave the dashboard
+    // without the folder until the next heartbeat.
+    const beat = () => putSetting("worker.pc", { at: nowIso(), worker: WORKER_ID, host: PC_HOST, lanes: LANES, media: pcMedia.value }).then(() => pcMediaSize()).catch((e) => warn("pc heartbeat", e.message));
     beat(); setInterval(beat, 30000);
     // The files this PC keeps: its tunnel opened (and reopened), and its own files cleaned up as the server's would be.
     if (IS_PC) { keepTunnel(); setInterval(() => keepTunnel().catch(() => {}), Number(ENV.PC_TUNNEL_POLL_MS) || 60000); setInterval(() => sweepStorageCleanup().catch((e) => warn("cleanup", e.message)), 60 * 60000); }

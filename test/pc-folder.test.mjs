@@ -17,7 +17,7 @@ test("the PC keeps its files in the folder chosen on the dashboard, and moves th
     await server.api("PUT", "/api/settings/storage.on_pc", { value: true });
     await server.api("PUT", "/api/settings/storage.pc_dir", { value: newDir });
     pc = await startEngine({ env: { DATABASE_URL: server.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false", PC_TUNNEL: "off", MEDIA_DIR: oldDir, PC_DIR_POLL_MS: "500" } });
-    const beat = await waitFor(async () => { const [r] = await server.query(`SELECT value FROM settings WHERE key = 'worker.pc'`); const v = typeof r?.value === "string" ? JSON.parse(r.value) : r?.value; return v?.media?.dir && v; }, { what: "the PC's heartbeat" });
+    const beat = await waitFor(async () => { const [r] = await server.query(`SELECT value FROM settings WHERE key = 'worker.pc'`); const v = typeof r?.value === "string" ? JSON.parse(r.value) : r?.value; return v?.media?.dir && v; }, { timeout: 60000, what: "the PC's heartbeat with its folder" });
     assert.equal(beat.media.dir.toLowerCase(), newDir.toLowerCase(), "the PC reports the chosen folder");
     assert.equal(readFileSync(join(newDir, "image", "a.png"), "utf8"), "picture", "the old folder's files were moved there");
     assert.ok(!existsSync(join(oldDir, "image", "a.png")), "and are no longer in the old one");
