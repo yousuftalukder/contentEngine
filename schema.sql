@@ -705,3 +705,15 @@ ON CONFLICT (key) DO NOTHING;
 INSERT INTO adapter_configs (id, key, stage, impl, label, config, enabled) VALUES
   (gen_random_uuid()::text, 'tts_command',      'VOICE',      'tts_command',      'Local speech engine (piper, espeak, any command)', '{}', 0)
 ON CONFLICT (key) DO NOTHING;
+
+-- Foreign keys the dashboard and the queue look up one row at a time (Supabase's advisor, 2026-10-11): an item's jobs
+-- (the Content dialog, crash recovery), a video's clips (the clip count on every row of Videos to clip), an item's
+-- research notes (every Review card), a channel's assets and programmes, a source's programmes, a programme's videos.
+CREATE INDEX IF NOT EXISTS idx_jobs_content_item ON jobs(content_item_id);
+CREATE INDEX IF NOT EXISTS idx_clips_candidate ON clips(video_candidate_id);
+CREATE INDEX IF NOT EXISTS idx_research_notes_item ON research_notes(content_item_id);
+CREATE INDEX IF NOT EXISTS idx_content_assets_channel ON content_assets(channel_id);
+CREATE INDEX IF NOT EXISTS idx_channel_niches_niche ON channel_niches(niche_id);
+CREATE INDEX IF NOT EXISTS idx_niche_sources_source ON niche_sources(source_id);
+CREATE INDEX IF NOT EXISTS idx_video_candidates_niche ON video_candidates(niche_id);
+CREATE INDEX IF NOT EXISTS idx_content_items_source_item ON content_items(source_item_id);

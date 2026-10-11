@@ -47,3 +47,21 @@ test("settings: values survive a round trip whatever their type", async () => {
   for (const [k, v] of Object.entries(cases)) assert.deepEqual(back[k], v, `${k} reads back as it was written`);
   assert.equal(typeof back["t.text"], "string", "a chat id stays a string, not null");
 });
+
+// The dashboard can be served by the PC, whose environment holds no keys, password or public address: its checklist
+// reads those from the server's own boot record, and says what the server has.
+test("go-live checklist served by the PC reports the server's environment, not the PC's", async () => {
+  const pc = await startEngine({ env: { DATABASE_URL: eng.databaseUrl, LANES: "video_local", RUN_SWEEPS: "false", PC_TUNNEL: "off" } });
+  try {
+    const mine = (await pc.api("GET", "/api/setup-status")).items;
+    assert.equal(mine.find((i) => i.key === "password").ok, false, "before: the test server has no password either");
+    await eng.query(`UPDATE settings SET value = value || $1::jsonb WHERE key = 'boot.last'`, [JSON.stringify({ password: true, public_url: true, url: "https://engine.example", env_keys: ["gemini", "pexels"] })]);
+    const items = Object.fromEntries((await pc.api("GET", "/api/setup-status")).items.map((i) => [i.key, i]));
+    assert.equal(items.password.ok, true, "the server's password counts");
+    assert.equal(items.public_url.ok, true);
+    assert.equal(items.public_url.detail, "https://engine.example");
+    assert.equal(items.ai.ok, true, "the server's Gemini key counts as a writer");
+    assert.match(items.ai.detail, /Gemini/);
+    assert.equal(items.photos.ok, true, "and its Pexels key as photos");
+  } finally { await pc.stop(); }
+});

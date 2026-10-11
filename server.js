@@ -6631,8 +6631,14 @@ app.get("/api/schedule", async (ctx) => json(ctx, 200, {
 }));
 // ---- setup checklist: what still stands between this install and running on its own
 app.get("/api/setup-status", async (ctx) => {
-  const has = async (p) => (await credentialsFor(p)).length > 0;
-  const [gem, oai, ant, pex, writers] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("pexels"), writerKeys()]);
+  // Served by the PC, the server's environment is what counts (it holds the keys, the password, the public address):
+  // read it from the server's own boot record. A key in the server's environment counts as a key in place.
+  const srv = RUN_SWEEPS ? null : P((await one(`SELECT value FROM settings WHERE key = 'boot.last'`))?.value) || null;
+  const srvEnv = new Set(srv?.env_keys || []);
+  const has = async (p) => srvEnv.has(p) || (await credentialsFor(p)).length > 0;
+  const [gem, oai, ant, pex, own] = await Promise.all([has("gemini"), has("openai"), has("anthropic"), has("pexels"), writerKeys()]);
+  const writers = [...own, ...WRITERS.filter(([prov]) => srvEnv.has(prov) && !own.some((w) => w.prov === prov)).map(([prov, key, name]) => ({ prov, key, name }))];
+  const env = { password: srv ? !!srv.password : !!ENV.DASHBOARD_PASSWORD, vault: srv ? srv.vault !== false : vaultReady(), publicUrl: srv ? !!srv.public_url || /^https:/.test(srv.url || "") : !!(ENV.PUBLIC_BASE_URL || ENV.RENDER_EXTERNAL_URL) };
   const storage = (await storageBackend()).name;
   const kit = await one(`SELECT COUNT(*)::int AS n FROM brands WHERE brand_kit ? 'logo_url' OR brand_kit ? 'primary_color'`);
   const programs = await one(`SELECT COUNT(*)::int AS n FROM niches WHERE is_active::int = 1`);
@@ -6641,10 +6647,10 @@ app.get("/api/setup-status", async (ctx) => {
   const freeTier = await one(`SELECT 1 AS x FROM notifications WHERE kind = 'quota' AND title ILIKE '%free tier%' AND created_at > now() - interval '48 hours' LIMIT 1`);
   const items = [
     { key: "ai", ok: writers.length > 0, title: "An AI key", detail: writers.length ? `${writers.map((w) => w.name).join(", ")} set` : "Add a free Gemini or Groq key (API keys page)", link: "#/keys" },
-    { key: "password", ok: !!ENV.DASHBOARD_PASSWORD, title: "Dashboard password", detail: ENV.DASHBOARD_PASSWORD ? "Set" : "Set DASHBOARD_PASSWORD on Render — the dashboard is open to anyone", link: null },
-    { key: "vault", ok: vaultReady(), title: "Key vault", detail: vaultReady() ? "On" : "Set SECRETS_KEY on Render to store keys from the dashboard", link: null },
-    { key: "storage", ok: storage !== "local", title: "Media storage", detail: storage !== "local" ? `Using ${storage}` : "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on Render (local disk is wiped on deploy and isn't shared with the video worker)", link: "#/settings" },
-    { key: "public_url", ok: !!ENV.PUBLIC_BASE_URL, title: "Public URL", detail: ENV.PUBLIC_BASE_URL || "Set PUBLIC_BASE_URL to this service's address (portal links)", link: null },
+    { key: "password", ok: env.password, title: "Dashboard password", detail: env.password ? "Set" : "Set DASHBOARD_PASSWORD on Render — the dashboard is open to anyone", link: null },
+    { key: "vault", ok: env.vault, title: "Key vault", detail: env.vault ? "On" : "Set SECRETS_KEY on Render to store keys from the dashboard", link: null },
+    { key: "storage", ok: storage !== "local", title: "Media storage", detail: storage !== "local" ? `Using ${storage === "pc" || storage === "pc (remote)" ? "your PC" : storage}` : "Choose where files are kept: Settings → Media storage (your PC, or Cloudflare R2)", link: "#/settings" },
+    { key: "public_url", ok: env.publicUrl, title: "Public URL", detail: env.publicUrl ? (srv?.url || ENV.PUBLIC_BASE_URL || ENV.RENDER_EXTERNAL_URL) : "Set PUBLIC_BASE_URL to this service's address (portal links)", link: null },
     { key: "brand", ok: kit.n > 0, title: "A brand kit", detail: kit.n ? "Set" : "Give a brand its logo and colours — every photocard and video uses them", link: "#/brands" },
     { key: "program", ok: programs.n > 0, title: "A program", detail: programs.n ? `${programs.n} active` : "Create one from a preset", link: "#/programs" },
     { key: "channel", ok: liveReady > 0, title: "A real publishing channel", detail: liveReady ? `${liveReady} ready` : live.length ? "A channel has no token yet — add a Meta or YouTube key and pick it on the channel" : "Add a Facebook Page, Instagram or YouTube channel with its token", link: "#/channels" },
@@ -6894,7 +6900,10 @@ async function measureMedia() {
     putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: nowIso(), worker: WORKER_ID, commit: codeCommit(), branch: ENV.RENDER_GIT_BRANCH || null,
       url: ENV.RENDER_EXTERNAL_URL || ENV.PUBLIC_BASE_URL || (RUN_SWEEPS ? `http://localhost:${PORT}` : null), lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
       blender: await blenderAvailable(), memory_mb: memoryLimitMb(), cpu: cpuFeatures(),
-      env_keys: Object.entries(DEFAULT_ENV).filter(([, v]) => ENV[v]).map(([k]) => k) }).catch((e) => warn("boot.last", e.message));
+      env_keys: Object.entries(DEFAULT_ENV).filter(([, v]) => ENV[v]).map(([k]) => k),
+      // What the go-live checklist reads from the server's environment, recorded so a dashboard served by the PC can
+      // say what the server has rather than what the PC has.
+      password: !!ENV.DASHBOARD_PASSWORD, vault: vaultReady(), public_url: !!(ENV.PUBLIC_BASE_URL || ENV.RENDER_EXTERNAL_URL) }).catch((e) => warn("boot.last", e.message));
     // Settle the media bucket at boot rather than at the first upload, so a storage problem shows up in the deploy log.
     if (storage.name === "supabase") ensureSupabaseBucket().catch((e) => warn("supabase storage:", e.message.slice(0, 200)));
     startWorkers();
