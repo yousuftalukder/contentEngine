@@ -589,7 +589,7 @@ const PC_HOST = ENV.PC_HOSTNAME || hostname();                        // which m
 const filesOnPc = async () => flag(await setting("storage.on_pc", false));
 // The server's own public address, as the server records it at boot — known to the PC too, through the database.
 async function serverBase() {
-  const own = ENV.RENDER_EXTERNAL_URL || ENV.PUBLIC_BASE_URL;
+  const own = ENV.PUBLIC_BASE_URL || ENV.RENDER_EXTERNAL_URL;
   if (own && !IS_PC) return own.replace(/\/$/, "");
   const boot = P((await one(`SELECT value FROM settings WHERE key = 'boot.last'`))?.value) || {};
   return String(boot.url || own || `http://localhost:${PORT}`).replace(/\/$/, "");
@@ -6925,7 +6925,7 @@ async function measureMedia() {
     // A PC worker boots against the same database, and it must not overwrite the server's record of itself — that
     // record is how anyone tells which build the server is running. The PC writes its own.
     putSetting(RUN_SWEEPS ? "boot.last" : "boot.pc", { at: nowIso(), worker: WORKER_ID, commit: codeCommit(), branch: ENV.RENDER_GIT_BRANCH || null,
-      url: ENV.RENDER_EXTERNAL_URL || ENV.PUBLIC_BASE_URL || (RUN_SWEEPS ? `http://localhost:${PORT}` : null), lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
+      url: ENV.PUBLIC_BASE_URL || ENV.RENDER_EXTERNAL_URL || (RUN_SWEEPS ? `http://localhost:${PORT}` : null), lanes: LANES, fonts_dir: fontsDirFor(null), piper: piperInstalled(), whisper: whisperInstalled(), studio: studioReady(),
       blender: await blenderAvailable(), memory_mb: memoryLimitMb(), cpu: cpuFeatures(),
       env_keys: Object.entries(DEFAULT_ENV).filter(([, v]) => ENV[v]).map(([k]) => k),
       // What the go-live checklist reads from the server's environment, recorded so a dashboard served by the PC can
